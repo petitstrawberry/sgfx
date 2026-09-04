@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sgfx",
+    "crates/sgfx-core",
+    "crates/sgfx-codegen-virgl",
+    "crates/sgfx-backend-wgpu",
+    "crates/sgfx-backend-scarlet-virgl",
+]
+default-members = [
+    "crates/sgfx",
+    "crates/sgfx-core",
+    "crates/sgfx-codegen-virgl",
+    "crates/sgfx-backend-wgpu",
+]
+
+# The Adreno backend still comes from scarlet-project-chromebook and currently
+# names sgfx-core through the old Scarlet source. Keep it on this workspace's
+# migrated core until that repository switches to the new SGFX repository.
+[patch."https://github.com/petitstrawberry/Scarlet"]
+sgfx-core = { path = "crates/sgfx-core" }
