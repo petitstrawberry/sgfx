@@ -4,8 +4,10 @@ This records the existing execution boundary while preparing 1.0. It does not
 declare the whole IR stable or introduce a new graphics API. Frontends record
 portable commands; the backend owns validation of its supported subset,
 resource materialization, lowering, transport limits, and submission.
-The [1.0 API inventory](1.0-api-scope.md) records the current exported surface,
-feature configurations, and the remaining work before freezing it.
+The [1.0 API inventory](1.0-api-scope.md) records the current exported surface
+and feature configurations. The [1.0 contract decisions](1.0-contract.md) are
+the authoritative release target; differences from today's behavior require
+conformance work before RC1.
 
 The common Rust boundary is
 [`CommandExecutor`](../crates/sgfx-core/src/backend.rs). The `sgfx` facade
@@ -49,8 +51,10 @@ Backends retain the physical objects required by accepted work until they can
 be released safely. Dropping a Rust cache or command buffer is not a portable
 GPU wait, and logical resource definitions are not physical allocations.
 
-Imported images have an additional producer/consumer lifetime. The platform
-must keep the image owner alive and obey the relevant frame-release protocol.
+Imported images have an additional producer/consumer lifetime. A by-value
+handle import transfers that owned reference; successful import must retain
+backend ownership for the mapping and accepted work. Keeping the producer's
+content lease is a separate obligation under the frame-release protocol.
 Releasing a borrowed view, finishing command recording, submitting GPU work,
 and receiving a compositor release are different events. In particular, a
 successful `execute()` does not authorize immediate reuse of an image still
@@ -92,16 +96,21 @@ Neither an `Err` nor the absence of an immediate error proves that no work ran.
 Do not blindly replay a failed command buffer. Backend-specific recovery must
 decide whether state can be reused or the context and mappings must be rebuilt.
 
-## Remaining 1.0 decisions
+## Selected 1.0 decisions and conformance boundary
 
-- Define a portable completion/error-observation interface if frontends need
-  to synchronize outside a backend's existing readback/presentation boundary.
-- Decide the supported capability query and error classification surface;
-  backend-specific errors remain associated types today.
-- Test device-loss and partial-submission recovery before promising a common
-  recovery policy. A synchronous success path is not evidence for fault safety.
-- Specify imported-image release guarantees together with SWS, independently
-  of package version numbers.
+The [1.0 decisions](1.0-contract.md) retain `CommandExecutor` without new
+required methods, portable completion tokens, capability queries or a common
+device-loss recovery API. Backend-specific observation/recovery remains
+explicit; absent a documented recovery boundary, callers must not replay
+failed work or assume externally shared storage is safe to reuse.
 
-These are contract decisions, not a requirement to implement a Vulkan frontend
-or every future backend before releasing the currently supported subset.
+Successful explicit native imported-image release must detach the mapping and
+finish that session's outstanding accesses to the image before returning.
+Failure does not promise rollback or permission to rebind/recycle. `Drop` is
+memory-safe cleanup, not an observable fence. SWS release additionally depends
+on the exact frame identity and all consumer uses, independently of unmapping.
+
+This is the target guarantee, not a claim that native failure/teardown paths
+have passed review. Audit those paths and rendering/backend-subset behavior
+against the decided contract before RC1. No Vulkan frontend or mandatory
+common synchronization API is added to the release scope.

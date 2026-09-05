@@ -9,9 +9,11 @@ The current implementation was migrated from the Scarlet repository without
 changing its public API or execution behavior. Its longer-term architecture is
 tracked in [issue #1](https://github.com/petitstrawberry/sgfx/issues/1).
 
-The [execution contract](docs/execution-contract.md) distinguishes queue
-acceptance, GPU completion, upload lifetimes, and presentation, and records
-the remaining compatibility decisions before 1.0.
+The [1.0 contract decisions](docs/1.0-contract.md) define the target API
+extension rules, rendering and execution semantics, imported-image retirement,
+and runtime feature policy. Implementation conformance is still required.
+The [execution contract](docs/execution-contract.md) distinguishes today's
+queue acceptance, GPU completion, upload lifetimes, and presentation.
 The [1.0 API inventory](docs/1.0-api-scope.md) lists the actual IR subset,
 public backend/facade surfaces, feature composition, and unfinished review.
 
