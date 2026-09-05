@@ -1,0 +1,86 @@
+# SGFX execution contract
+
+This records the existing execution boundary while preparing 1.0. It does not
+declare the whole IR stable or introduce a new graphics API. Frontends record
+portable commands; the backend owns validation of its supported subset,
+resource materialization, lowering, transport limits, and submission.
+
+The common Rust boundary is
+[`CommandExecutor`](../crates/sgfx-core/src/backend.rs). The `sgfx` facade
+delegates to the selected backend without strengthening its guarantees.
+
+## Successful execution is not portable GPU completion
+
+`execute()` returning `Ok(())` means the complete logical command stream was
+accepted with its recorded ordering. Sequential successful executions on the
+same bound queue preserve resource-access ordering. It does not mean that a
+frame is visible, that the CPU may inspect GPU-written memory, or that another
+queue or external image consumer can immediately use the results.
+
+An empty stream is a no-op, not a portable wait for earlier work. A backend may
+complete work synchronously; portable callers must rely only on the common
+acceptance guarantee. SGFX does not currently expose a portable completion
+token, wait operation, or cross-queue synchronization API.
+
+| Backend | Current success boundary | Observation / presentation |
+| --- | --- | --- |
+| WGPU | Uploads are copied into WGPU-owned staging and the encoded commands are queued. GPU execution remains asynchronous. | Same-queue operations retain ordering. Host surface presentation is separate; CPU readback must wait for the appropriate copy/map completion. |
+| Scarlet VirGL | Ordered backend operations use the synchronous Scarlet GPU ABI. Opaque submissions return after fenced backend completion; buffer-only updates may remain in the persistent shadow cache until needed. | Session BGRA readback is synchronous. Sharing an image with SWS still follows the SWS frame lifecycle. |
+| Scarlet Adreno | Ordered chunks use the synchronous Scarlet GPU ABI; earlier chunks are drained before direct CPU-visible uploads. | Session BGRA readback is synchronous. SWS presentation and buffer reuse remain separate from command execution. |
+
+The Scarlet ABI boundary is `GpuQueue::submit` in `gpu-raw`; this is not a
+reason to make WGPU block or to equate a Scarlet userspace target with no_std.
+Both normal Scarlet targets support Rust std.
+
+## Ownership and lifetime
+
+Logical references belong to a particular `ResourceTable`, not merely to a
+matching numeric slot. Backend caches and physical-image mappings must use
+the originating table and compatible device/context. Equal descriptors or
+slot numbers from another table do not make resources interchangeable.
+
+Command buffers borrow their logical table and upload slices. The caller
+keeps these borrows valid until execution returns and the command buffer is
+dropped. After that, upload storage can be overwritten or freed: pending GPU
+work must use backend-owned data, not retained pointers into those slices.
+Backends retain the physical objects required by accepted work until they can
+be released safely. Dropping a Rust cache or command buffer is not a portable
+GPU wait, and logical resource definitions are not physical allocations.
+
+Imported images have an additional producer/consumer lifetime. The platform
+must keep the image owner alive and obey the relevant frame-release protocol.
+Releasing a borrowed view, finishing command recording, submitting GPU work,
+and receiving a compositor release are different events. In particular, a
+successful `execute()` does not authorize immediate reuse of an image still
+owned by SWS for a pending frame.
+
+## Validation, supported subsets, and errors
+
+The core checks logical descriptors and recording rules. Each backend also
+validates its representable subset and context mappings. Unsupported commands
+must return an explicit error; they must not be silently skipped or replaced
+with a rendering approximation. For example, WGPU currently rejects uploads
+after the first copy or render pass, while Scarlet backends own their own
+ordered upload and transport-chunking rules.
+
+Execution is not a transaction. VirGL preflights its command plan, but later
+backend failures can follow completed uploads or earlier passes. Adreno can
+submit a prefix before encountering a later unsupported operation. WGPU can
+report validation or device failures asynchronously after queue acceptance.
+Neither an `Err` nor the absence of an immediate error proves that no work ran.
+Do not blindly replay a failed command buffer. Backend-specific recovery must
+decide whether state can be reused or the context and mappings must be rebuilt.
+
+## Remaining 1.0 decisions
+
+- Define a portable completion/error-observation interface if frontends need
+  to synchronize outside a backend's existing readback/presentation boundary.
+- Decide the supported capability query and error classification surface;
+  backend-specific errors remain associated types today.
+- Test device-loss and partial-submission recovery before promising a common
+  recovery policy. A synchronous success path is not evidence for fault safety.
+- Specify imported-image release guarantees together with SWS, independently
+  of package version numbers.
+
+These are contract decisions, not a requirement to implement a Vulkan frontend
+or every future backend before releasing the currently supported subset.
