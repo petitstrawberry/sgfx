@@ -4,6 +4,8 @@ This records the existing execution boundary while preparing 1.0. It does not
 declare the whole IR stable or introduce a new graphics API. Frontends record
 portable commands; the backend owns validation of its supported subset,
 resource materialization, lowering, transport limits, and submission.
+The [1.0 API inventory](1.0-api-scope.md) records the current exported surface,
+feature configurations, and the remaining work before freezing it.
 
 The common Rust boundary is
 [`CommandExecutor`](../crates/sgfx-core/src/backend.rs). The `sgfx` facade

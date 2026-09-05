@@ -12,6 +12,8 @@ tracked in [issue #1](https://github.com/petitstrawberry/sgfx/issues/1).
 The [execution contract](docs/execution-contract.md) distinguishes queue
 acceptance, GPU completion, upload lifetimes, and presentation, and records
 the remaining compatibility decisions before 1.0.
+The [1.0 API inventory](docs/1.0-api-scope.md) lists the actual IR subset,
+public backend/facade surfaces, feature composition, and unfinished review.
 
 ## Workspace
 

@@ -1,8 +1,8 @@
 //! Validated, backend-neutral logical graphics intermediate representation.
 //!
-//! Resources are descriptors held by [`ResourceTable`]. Commands recorded by
-//! [`CommandEncoder`] borrow both that table and upload data, so a future
-//! backend can lower the finished [`CommandBuffer`] without accepting forged
+//! Resources are descriptors held by [`crate::ir::ResourceTable`]. Commands recorded by
+//! [`crate::ir::CommandEncoder`] borrow both that table and upload data, so a
+//! backend can lower the finished [`crate::ir::CommandBuffer`] without accepting forged
 //! resource identities.
 
 pub(crate) mod command;

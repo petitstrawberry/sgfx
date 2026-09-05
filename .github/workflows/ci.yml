@@ -68,6 +68,12 @@ jobs:
           cargo test --locked -p sgfx --no-default-features --features backend-wgpu
           cargo-clippy clippy --locked -p sgfx --no-default-features --all-targets --no-deps -- -D warnings
           cargo-clippy clippy --locked -p sgfx --no-default-features --features backend-wgpu --all-targets --no-deps -- -D warnings
+      - name: Check public API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --locked --no-deps -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx
+          cargo doc --locked --no-deps -p sgfx --no-default-features
 
   scarlet:
     runs-on: ubuntu-latest
@@ -96,3 +102,7 @@ jobs:
         run: |
           nix shell "$SCARLET_TOOLCHAIN" --command cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features
           nix shell "$SCARLET_TOOLCHAIN" --command cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --no-deps -- -D warnings
+      - name: Check native public API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo doc --locked --no-deps -p sgfx -p sgfx-backend-scarlet-virgl --target '${{ matrix.target }}'
