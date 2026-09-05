@@ -62,6 +62,12 @@ jobs:
           cargo test --locked -p sgfx
       - name: Lint portable crates
         run: cargo-clippy clippy --locked -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx --all-targets --no-deps -- -D warnings
+      - name: Test and lint facade feature boundaries
+        run: |
+          cargo test --locked -p sgfx --no-default-features
+          cargo test --locked -p sgfx --no-default-features --features backend-wgpu
+          cargo-clippy clippy --locked -p sgfx --no-default-features --all-targets --no-deps -- -D warnings
+          cargo-clippy clippy --locked -p sgfx --no-default-features --features backend-wgpu --all-targets --no-deps -- -D warnings
 
   scarlet:
     runs-on: ubuntu-latest
@@ -86,3 +92,7 @@ jobs:
         run: nix shell "$SCARLET_TOOLCHAIN" --command cargo check --locked -p sgfx --target '${{ matrix.target }}'
       - name: Lint std-enabled Scarlet target
         run: nix shell "$SCARLET_TOOLCHAIN" --command cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-deps -- -D warnings
+      - name: Check backend-neutral facade without a runtime
+        run: |
+          nix shell "$SCARLET_TOOLCHAIN" --command cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features
+          nix shell "$SCARLET_TOOLCHAIN" --command cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --no-deps -- -D warnings

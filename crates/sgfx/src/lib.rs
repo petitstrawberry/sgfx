@@ -44,7 +44,8 @@ pub const BACKEND_ENV: &str = "SGFX_BACKEND";
 pub enum BackendKind {
     /// SGFX execution through WGPU.
     Wgpu,
-    /// Direct SGFX execution through Metal.
+    /// Reserved for direct SGFX execution through Metal; currently unavailable.
+    /// WGPU using Metal is still [`BackendKind::Wgpu`].
     Metal,
     /// SGFX VirGL execution through the Scarlet GPU ABI.
     ScarletVirgl,
@@ -82,7 +83,7 @@ pub enum BackendPreference {
     Auto,
     /// Require WGPU execution.
     Wgpu,
-    /// Require direct Metal execution.
+    /// Require direct Metal execution (currently unavailable).
     Metal,
     /// Require Scarlet/VirGL execution.
     ScarletVirgl,
@@ -95,7 +96,9 @@ impl BackendPreference {
     ///
     /// # Arguments
     ///
-    /// * `value` - `auto` or one stable [`BackendKind`] name.
+    /// * `value` - `auto` or one stable [`BackendKind`] name; `virgl` and
+    ///   `adreno` remain aliases for their `scarlet-` names. Parsing is
+    ///   case-sensitive and does not trim whitespace.
     ///
     /// # Returns
     ///
@@ -116,7 +119,8 @@ impl BackendPreference {
     /// # Returns
     ///
     /// The parsed [`BACKEND_ENV`] value, or [`BackendPreference::Auto`] when
-    /// the variable is absent.
+    /// the variable is absent. Without `std` or Scarlet's legacy runtime
+    /// feature, environment lookup is unavailable and this returns `Auto`.
     pub fn from_environment() -> Result<Self> {
         match backend_environment_value() {
             Some(value) => Self::parse(value.as_str()),
@@ -261,7 +265,7 @@ impl Instance {
     ///
     /// The stable configured backend identity. With [`BackendPreference::Auto`]
     /// on Scarlet, this is the compiled default used before opening a GPU; use
-    /// [`Device::backend`] after [`Device::open`] or [`Instance::open_device`]
+    /// `Device::backend` after `Device::open` or `Instance::open_device`
     /// to obtain the backend actually selected from the GPU's identifier.
     pub const fn backend(&self) -> BackendKind {
         self.backend
@@ -371,9 +375,20 @@ mod tests {
 
     #[test]
     fn parses_stable_backend_names() {
+        for (kind, preference) in [
+            (BackendKind::Wgpu, BackendPreference::Wgpu),
+            (BackendKind::Metal, BackendPreference::Metal),
+            (BackendKind::ScarletVirgl, BackendPreference::ScarletVirgl),
+            (BackendKind::ScarletAdreno, BackendPreference::ScarletAdreno),
+        ] {
+            assert_eq!(
+                BackendPreference::parse(kind.as_str()).expect("stable name"),
+                preference
+            );
+        }
         assert_eq!(
-            BackendPreference::parse("wgpu").unwrap(),
-            BackendPreference::Wgpu
+            BackendPreference::parse("auto").expect("auto"),
+            BackendPreference::Auto
         );
         assert_eq!(
             BackendPreference::parse("virgl").unwrap(),
@@ -383,20 +398,37 @@ mod tests {
             BackendPreference::parse("adreno").unwrap(),
             BackendPreference::ScarletAdreno
         );
-        assert!(matches!(
-            BackendPreference::parse("unknown"),
-            Err(Error::InvalidBackendPreference)
-        ));
+        for invalid in ["", "unknown", "WGPU", " wgpu", "wgpu "] {
+            assert!(matches!(
+                BackendPreference::parse(invalid),
+                Err(Error::InvalidBackendPreference)
+            ));
+        }
     }
 
+    #[cfg(not(target_os = "scarlet"))]
     #[test]
-    fn host_auto_selects_wgpu() {
-        #[cfg(not(target_os = "scarlet"))]
+    fn host_auto_respects_the_compiled_backend() {
+        let result = Instance::with_preference(BackendPreference::Auto);
+        if cfg!(feature = "backend-wgpu") {
+            assert_eq!(
+                result.expect("compiled WGPU backend").backend(),
+                BackendKind::Wgpu
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(Error::BackendUnavailable(BackendKind::Wgpu))
+            ));
+        }
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), not(feature = "std")))]
+    #[test]
+    fn host_facade_without_std_does_not_read_environment_overrides() {
         assert_eq!(
-            Instance::with_preference(BackendPreference::Auto)
-                .unwrap()
-                .backend(),
-            BackendKind::Wgpu
+            BackendPreference::from_environment().expect("no environment lookup"),
+            BackendPreference::Auto
         );
     }
 
