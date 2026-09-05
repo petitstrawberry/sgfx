@@ -74,6 +74,14 @@ with a rendering approximation. For example, WGPU currently rejects uploads
 after the first copy or render pass, while Scarlet backends own their own
 ordered upload and transport-chunking rules.
 
+WGPU buffer upload offsets and byte lengths must be multiples of four. The
+backend reports `Unsupported(BufferWriteAlignment)` for other valid IR byte
+ranges, and `Unsupported(ResourceSize)` for buffers or texture dimensions
+above the selected device's limits. These checks precede raw WGPU allocation
+or upload validation; they do not narrow the portable IR. Real-device tests
+check both the returned error and the absence of a raw WGPU validation error,
+then verify valid operations still work after rejection.
+
 Execution is not a transaction. VirGL preflights its command plan, but later
 backend failures can follow completed uploads or earlier passes. Adreno can
 submit a prefix before encountering a later unsupported operation. WGPU can

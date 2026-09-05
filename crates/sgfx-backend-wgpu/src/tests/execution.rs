@@ -212,3 +212,184 @@ fn executor_rejects_late_upload_instead_of_silently_reordering_it() {
         Err(Error::Unsupported(UnsupportedFeature::LateUpload))
     ));
 }
+
+#[test]
+fn executor_rejects_unaligned_buffer_uploads_before_wgpu_validation() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let queue = context.create_queue();
+    let table = Rc::new(ResourceTable::new());
+    let buffer = table
+        .define_buffer(ir::BufferDesc::new(8, BufferUsage::COPY_DST).expect("buffer descriptor"))
+        .expect("buffer");
+    let mut cache = context.create_resources(Rc::clone(&table));
+    for (offset, data) in [
+        (1, &[1, 2, 3, 4][..]),
+        (0, &[1, 2, 3][..]),
+        (1, &[1, 2, 3][..]),
+    ] {
+        let mut encoder = CommandEncoder::new(&table);
+        encoder
+            .write_buffer(buffer, offset, data)
+            .expect("byte-granular IR upload");
+        let commands = encoder.finish().expect("finish stream");
+        device
+            .raw_device()
+            .push_error_scope(raw::ErrorFilter::Validation);
+        let result = queue.executor(&mut cache).execute(&commands);
+        let raw_error = pollster::block_on(device.raw_device().pop_error_scope());
+        assert!(
+            matches!(
+                result,
+                Err(Error::Unsupported(UnsupportedFeature::BufferWriteAlignment))
+            ),
+            "result: {result:?}; raw error: {raw_error:?}"
+        );
+        assert!(
+            raw_error.is_none(),
+            "SGFX must reject before raw WGPU validation: {raw_error:?}"
+        );
+        assert!(
+            cache.buffers.is_empty(),
+            "rejected upload must not materialize its buffer"
+        );
+    }
+    let mut encoder = CommandEncoder::new(&table);
+    encoder
+        .write_buffer(buffer, 4, &[1, 2, 3, 4])
+        .expect("aligned upload");
+    device
+        .raw_device()
+        .push_error_scope(raw::ErrorFilter::Validation);
+    queue
+        .executor(&mut cache)
+        .execute(&encoder.finish().expect("finish stream"))
+        .expect("aligned upload after rejected writes");
+    assert!(pollster::block_on(device.raw_device().pop_error_scope()).is_none());
+}
+
+#[test]
+fn executor_rejects_buffers_exceeding_device_limits_before_allocation() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let table = Rc::new(ResourceTable::new());
+    let size = device
+        .raw_device()
+        .limits()
+        .max_buffer_size
+        .checked_add(4)
+        .expect("size beyond device limit");
+    let buffer = table
+        .define_buffer(
+            ir::BufferDesc::new(size, BufferUsage::COPY_DST).expect("logical descriptor"),
+        )
+        .expect("logical buffer");
+    let mut encoder = CommandEncoder::new(&table);
+    encoder
+        .write_buffer(buffer, 0, &[0; 4])
+        .expect("small in-bounds upload");
+    let mut cache = context.create_resources(Rc::clone(&table));
+    device
+        .raw_device()
+        .push_error_scope(raw::ErrorFilter::Validation);
+    let result = context
+        .create_queue()
+        .executor(&mut cache)
+        .execute(&encoder.finish().expect("finish stream"));
+    let raw_error = pollster::block_on(device.raw_device().pop_error_scope());
+    assert!(
+        matches!(
+            result,
+            Err(Error::Unsupported(UnsupportedFeature::ResourceSize))
+        ),
+        "result: {result:?}; raw error: {raw_error:?}"
+    );
+    assert!(
+        raw_error.is_none(),
+        "SGFX must reject before raw WGPU validation: {raw_error:?}"
+    );
+    assert!(cache.buffers.is_empty());
+}
+
+#[test]
+fn image_creation_and_ir_textures_reject_excessive_dimensions() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let dimension = device
+        .raw_device()
+        .limits()
+        .max_texture_dimension_2d
+        .checked_add(1)
+        .expect("dimension beyond device limit");
+    for (width, height) in [(dimension, 1), (1, dimension)] {
+        device
+            .raw_device()
+            .push_error_scope(raw::ErrorFilter::Validation);
+        let result = context.create_image(width, height, TextureFormat::Bgra8Unorm);
+        let raw_error = pollster::block_on(device.raw_device().pop_error_scope());
+        assert!(
+            matches!(
+                result,
+                Err(Error::Unsupported(UnsupportedFeature::ResourceSize))
+            ),
+            "image creation must reject excessive dimensions; raw error: {raw_error:?}"
+        );
+        assert!(
+            raw_error.is_none(),
+            "SGFX must reject before raw WGPU validation: {raw_error:?}"
+        );
+
+        let table = Rc::new(ResourceTable::new());
+        let texture = table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    Extent2D::new(width, height).expect("nonzero extent"),
+                    TextureUsage::COPY_DST,
+                )
+                .expect("logical descriptor"),
+            )
+            .expect("logical texture");
+        let mut encoder = CommandEncoder::new(&table);
+        encoder
+            .write_texture(
+                texture,
+                TextureWrite::new(PixelRect::new(0, 0, 1, 1).expect("one pixel"), 4, &[0; 4])
+                    .expect("upload layout"),
+            )
+            .expect("small in-bounds upload");
+        let mut cache = context.create_resources(Rc::clone(&table));
+        device
+            .raw_device()
+            .push_error_scope(raw::ErrorFilter::Validation);
+        let result = context
+            .create_queue()
+            .executor(&mut cache)
+            .execute(&encoder.finish().expect("finish stream"));
+        let raw_error = pollster::block_on(device.raw_device().pop_error_scope());
+        assert!(
+            matches!(
+                result,
+                Err(Error::Unsupported(UnsupportedFeature::ResourceSize))
+            ),
+            "result: {result:?}; raw error: {raw_error:?}"
+        );
+        assert!(
+            raw_error.is_none(),
+            "SGFX must reject before raw WGPU validation: {raw_error:?}"
+        );
+        assert!(cache.textures.is_empty());
+    }
+    context
+        .create_image(1, 1, TextureFormat::Bgra8Unorm)
+        .expect("valid image after rejected dimensions");
+}

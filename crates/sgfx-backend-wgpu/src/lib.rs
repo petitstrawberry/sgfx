@@ -82,6 +82,12 @@ impl fmt::Display for Error {
 pub enum UnsupportedFeature {
     /// A write command appeared after a copy or render pass had been encoded.
     LateUpload,
+    /// A buffer upload offset or byte length is not a multiple of WGPU's
+    /// four-byte copy alignment. The portable IR permits byte-granular writes.
+    BufferWriteAlignment,
+    /// A buffer's byte size or a texture's dimensions exceed the selected
+    /// WGPU device's resource-size limits.
+    ResourceSize,
     /// A render pipeline uses a format or vertex convention outside WGPU's
     /// current portable lowering.
     Pipeline,
@@ -187,7 +193,9 @@ impl Context {
     ///
     /// # Returns
     ///
-    /// A WGPU-backed image or an invalid-state error for unsupported formats.
+    /// A WGPU-backed image, an invalid-state error for zero dimensions or
+    /// unsupported formats, or [`UnsupportedFeature::ResourceSize`] when the
+    /// dimensions exceed this device's limits.
     pub fn create_image(
         &self,
         width: u32,
@@ -746,6 +754,9 @@ impl Resources {
         if let Some((_, buffer)) = self.buffers.iter().find(|(candidate, _)| *candidate == id) {
             return Ok(Arc::clone(buffer));
         }
+        if descriptor.size() > self.context.device.raw_device().limits().max_buffer_size {
+            return Err(Error::Unsupported(UnsupportedFeature::ResourceSize));
+        }
         let mut usage = raw::BufferUsages::empty();
         if descriptor.usage().contains(BufferUsage::VERTEX) {
             usage |= raw::BufferUsages::VERTEX;
@@ -900,6 +911,9 @@ impl Queue {
     /// # Returns
     ///
     /// Success after queue submission, or a translation/backend error.
+    /// Buffer upload offsets and lengths must be multiples of four bytes;
+    /// otherwise [`UnsupportedFeature::BufferWriteAlignment`] is returned
+    /// before the upload reaches WGPU.
     pub fn submit<'r, 'data>(
         &self,
         resources: &mut Resources,
@@ -932,6 +946,13 @@ impl Queue {
                 } => {
                     if !upload_phase {
                         return Err(Error::Unsupported(UnsupportedFeature::LateUpload));
+                    }
+                    if !offset.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
+                        || !data
+                            .len()
+                            .is_multiple_of(raw::COPY_BUFFER_ALIGNMENT as usize)
+                    {
+                        return Err(Error::Unsupported(UnsupportedFeature::BufferWriteAlignment));
                     }
                     let buffer = resources.buffer(*buffer)?;
                     buffer_writes.push((buffer, *offset, *data));
@@ -1461,6 +1482,10 @@ fn create_gpu_texture(
     format: TextureFormat,
     usage: raw::TextureUsages,
 ) -> Result<Arc<GpuTexture>> {
+    let max_dimension = device.limits().max_texture_dimension_2d;
+    if width > max_dimension || height > max_dimension {
+        return Err(Error::Unsupported(UnsupportedFeature::ResourceSize));
+    }
     let raw_format =
         raw_format(format).ok_or(Error::Unsupported(UnsupportedFeature::SurfaceFormat))?;
     let texture = device.create_texture(&raw::TextureDescriptor {
