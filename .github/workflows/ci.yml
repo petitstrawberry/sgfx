@@ -5,30 +5,72 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  SCARLET_TOOLCHAIN: github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain
+
 jobs:
   portable:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [scarlet, upstream]
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2025-12-31
+      CARGO_TARGET_DIR: target/${{ matrix.toolchain }}-host
     steps:
       - uses: actions/checkout@v4
-      - name: Install the pinned Rust toolchain
-        run: rustup show
+      - uses: cachix/install-nix-action@v31
+        if: matrix.toolchain == 'scarlet'
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-substituters = https://scarlet-rust-toolchain.cachix.org
+            extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
+      - name: Install the pinned Scarlet Rust toolchain
+        if: matrix.toolchain == 'scarlet'
+        run: |
+          scarlet_toolchain_path="$(nix build "${SCARLET_TOOLCHAIN}^out" --no-link --print-out-paths)"
+          echo "$scarlet_toolchain_path/bin" >> "$GITHUB_PATH"
+      - name: Install upstream Rust for portability checks
+        if: matrix.toolchain == 'upstream'
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - name: Show the selected compiler
+        run: |
+          rustc -vV
+          rustc --print sysroot
       - name: Check formatting
-        run: cargo fmt --all --check
+        # Invoke the selected toolchain's binary directly: `cargo fmt` can
+        # otherwise dispatch to a rustup proxy instead of the Nix toolchain.
+        run: cargo-fmt fmt --all --check
+      - name: Check SGFX core source identity
+        # An unqualified package name is ambiguous (and fails) if the graph
+        # contains multiple sgfx-core sources, even at the same version/SHA.
+        run: cargo tree --locked -p sgfx --invert sgfx-core
       - name: Test portable crates
         run: |
-          cargo test -p sgfx-core
-          cargo test -p sgfx-codegen-virgl
-          cargo test -p sgfx-backend-wgpu
-          cargo test -p sgfx
+          cargo test --locked -p sgfx-core
+          cargo test --locked -p sgfx-codegen-virgl
+          cargo test --locked -p sgfx-backend-wgpu
+          cargo test --locked -p sgfx
       - name: Lint portable crates
-        run: cargo clippy -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx --all-targets --no-deps -- -D warnings
+        run: cargo-clippy clippy --locked -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx --all-targets --no-deps -- -D warnings
 
   scarlet:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [riscv64gc-unknown-scarlet, aarch64-unknown-scarlet]
+    env:
+      CARGO_TARGET_DIR: target/scarlet-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
@@ -38,11 +80,9 @@ jobs:
             accept-flake-config = true
             extra-substituters = https://scarlet-rust-toolchain.cachix.org
             extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
-      - name: Check std-enabled Scarlet targets
-        run: |
-          nix shell 'github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain' --command cargo check -p sgfx --target riscv64gc-unknown-scarlet
-          nix shell 'github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain' --command cargo check -p sgfx --target aarch64-unknown-scarlet
-      - name: Lint std-enabled Scarlet targets
-        run: |
-          nix shell 'github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain' --command cargo-clippy clippy -p sgfx --target riscv64gc-unknown-scarlet --no-deps -- -D warnings
-          nix shell 'github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain' --command cargo-clippy clippy -p sgfx --target aarch64-unknown-scarlet --no-deps -- -D warnings
+      - name: Check SGFX core source identity
+        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo tree --locked -p sgfx --target '${{ matrix.target }}' --invert sgfx-core
+      - name: Check std-enabled Scarlet target
+        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo check --locked -p sgfx --target '${{ matrix.target }}'
+      - name: Lint std-enabled Scarlet target
+        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-deps -- -D warnings
