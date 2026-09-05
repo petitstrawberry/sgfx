@@ -1,0 +1,13 @@
+[package]
+name = "sgfx-codegen-virgl"
+version = "0.16.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/petitstrawberry/sgfx"
+
+[dependencies]
+sgfx-core = { path = "../sgfx-core", default-features = false }
+
+[lib]
+name = "sgfx_codegen_virgl"
+path = "src/lib.rs"

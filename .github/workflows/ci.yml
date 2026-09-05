@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Test portable crates
+        run: |
+          cargo test -p sgfx-core
+          cargo test -p sgfx-codegen-virgl
+          cargo test -p sgfx-backend-wgpu
+          cargo test -p sgfx
+      - name: Lint portable crates
+        run: cargo clippy -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx --all-targets --no-deps -- -D warnings
+
+  scarlet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-substituters = https://scarlet-rust-toolchain.cachix.org
+            extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
+      - name: Check std-enabled Scarlet targets
+        run: |
+          nix shell 'github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain' --command cargo check -p sgfx --target riscv64gc-unknown-scarlet
+          nix shell 'github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain' --command cargo check -p sgfx --target aarch64-unknown-scarlet
+      - name: Lint std-enabled Scarlet targets
+        run: |
+          nix shell 'github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain' --command cargo-clippy clippy -p sgfx --target riscv64gc-unknown-scarlet --no-deps -- -D warnings
+          nix shell 'github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain' --command cargo-clippy clippy -p sgfx --target aarch64-unknown-scarlet --no-deps -- -D warnings
