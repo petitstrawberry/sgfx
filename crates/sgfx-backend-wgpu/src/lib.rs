@@ -2220,6 +2220,23 @@ mod tests {
         StoreOp, TextureWrite, Transform, VertexBufferLayout,
     };
 
+    static HEADLESS_WGPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn request_headless_adapter(instance: &raw::Instance) -> Option<raw::Adapter> {
+        pollster::block_on(instance.request_adapter(&raw::RequestAdapterOptions {
+            power_preference: raw::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .or_else(|| {
+            pollster::block_on(instance.request_adapter(&raw::RequestAdapterOptions {
+                power_preference: raw::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        })
+    }
+
     #[test]
     fn surface_prefers_display_ready_unorm() {
         assert_eq!(
@@ -2358,13 +2375,19 @@ mod tests {
 
     #[test]
     fn headless_ccw_front_face_survives_back_culling_and_scissor() {
+        let _guard = HEADLESS_WGPU_TEST_LOCK
+            .lock()
+            .expect("lock headless WGPU tests");
         let instance = raw::Instance::new(&raw::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&raw::RequestAdapterOptions {
-            power_preference: raw::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .expect("headless WGPU adapter");
+        let Some(adapter) = request_headless_adapter(&instance) else {
+            #[cfg(target_os = "macos")]
+            panic!("Metal adapter must be available for the SGFX WGPU backend test");
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("skipping SGFX WGPU backend test: no adapter available");
+                return;
+            }
+        };
         let (raw_device, raw_queue) =
             pollster::block_on(adapter.request_device(&raw::DeviceDescriptor::default(), None))
                 .expect("headless WGPU device");
@@ -2520,19 +2543,11 @@ mod tests {
 
     #[test]
     fn headless_triangle_submission_uses_the_portable_ir() {
+        let _guard = HEADLESS_WGPU_TEST_LOCK
+            .lock()
+            .expect("lock headless WGPU tests");
         let instance = raw::Instance::new(&raw::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&raw::RequestAdapterOptions {
-            power_preference: raw::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .or_else(|| {
-            pollster::block_on(instance.request_adapter(&raw::RequestAdapterOptions {
-                power_preference: raw::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: true,
-            }))
-        });
+        let adapter = request_headless_adapter(&instance);
         let Some(adapter) = adapter else {
             #[cfg(target_os = "macos")]
             panic!("Metal adapter must be available for the SGFX WGPU backend test");
