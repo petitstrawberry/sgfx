@@ -449,6 +449,14 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         if !desc.area.is_within(target_desc.extent()) {
             return Err(Error::OutOfBounds);
         }
+        let depth_format = desc
+            .depth_attachment()
+            .map(|depth| {
+                self.resources
+                    .texture(depth.target())
+                    .map(|desc| desc.format())
+            })
+            .transpose()?;
         self.reserve_pass_begin()?;
         self.push(Command::BeginRenderPass(desc))?;
         self.pass_open = true;
@@ -456,6 +464,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             encoder: self,
             target: desc.target,
             target_format: target_desc.format(),
+            depth_format,
             area: desc.area,
             pipeline: None,
             vertex_buffer: None,
@@ -550,6 +559,7 @@ pub struct RenderPassEncoder<'encoder, 'r, 'data> {
     encoder: &'encoder mut CommandEncoder<'r, 'data>,
     target: TextureRef<'r>,
     target_format: super::TextureFormat,
+    depth_format: Option<TextureFormat>,
     area: PixelRect,
     pipeline: Option<RenderPipelineRef<'r>>,
     vertex_buffer: Option<(BufferRef<'r>, u64)>,
@@ -567,13 +577,22 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     /// * `pipeline` - Pipeline from this encoder's resource table.
     ///
     /// # Returns
-    /// Success, or an error when the table or target format differs.
+    /// Success, or an error when the table differs, a required color/depth
+    /// attachment format does not match, or command capacity is exhausted.
+    /// A pipeline without depth state does not require a depth attachment.
     pub fn set_pipeline(&mut self, pipeline: RenderPipelineRef<'r>) -> Result<()> {
-        let target_format = self
-            .encoder
-            .resources
-            .with_pipeline(pipeline, |descriptor| descriptor.target_format())?;
-        if target_format != self.target_format {
+        let (target_format, depth_format) =
+            self.encoder
+                .resources
+                .with_pipeline(pipeline, |descriptor| {
+                    (
+                        descriptor.target_format(),
+                        descriptor.depth_state().map(|depth| depth.format()),
+                    )
+                })?;
+        if target_format != self.target_format
+            || depth_format.is_some_and(|format| Some(format) != self.depth_format)
+        {
             return Err(Error::PipelineTargetMismatch);
         }
         self.encoder.push(Command::SetPipeline(pipeline))?;

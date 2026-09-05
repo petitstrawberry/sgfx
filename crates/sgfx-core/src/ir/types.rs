@@ -32,7 +32,7 @@ pub enum Error {
     UniformsNotSet,
     /// A textured pipeline requires both a texture and sampler binding.
     TextureBindingNotSet,
-    /// A render pipeline's target format differs from the active attachment.
+    /// A render pipeline's required color or depth attachment is absent or has a different format.
     PipelineTargetMismatch,
     /// Sampling the active render attachment would create feedback.
     AttachmentFeedback,

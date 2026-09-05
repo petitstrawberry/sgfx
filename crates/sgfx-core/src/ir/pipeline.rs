@@ -530,7 +530,8 @@ impl RenderPipelineDesc {
     ///
     /// # Returns
     /// The requested owned descriptor, or [`Error::InvalidDescriptor`] when
-    /// portable vertex conventions are absent. Location `0` is position and
+    /// the target is not a color format or portable vertex conventions are absent.
+    /// Location `0` is position and
     /// must use `Float32x2`, `Float32x3`, or `Float32x4`. `VertexColor`
     /// requires location `1` as `Float32x3`, `Float32x4`, or `Unorm8x4`; `Texture` requires
     /// location `1` as `Float32x2` texture coordinates; `TextureVertexColor` requires
@@ -543,6 +544,9 @@ impl RenderPipelineDesc {
         blend: BlendState,
         raster: RasterState,
     ) -> Result<Self> {
+        if target_format == TextureFormat::Depth32Float {
+            return Err(Error::InvalidDescriptor);
+        }
         let position = vertex_buffer
             .attributes()
             .iter()

@@ -56,6 +56,17 @@ owned by SWS for a pending frame.
 
 ## Validation, supported subsets, and errors
 
+Core recording rejects a depth format in the color-target slot and requires
+a matching depth attachment when a bound pipeline enables depth testing.
+Disabling depth testing does not require removing the pass's depth attachment
+from the logical IR; a backend may impose additional restrictions.
+
+Rejected recording operations do not append commands or replace previously
+accepted bindings. The command limit reserves room to end an open pass, and
+abandoning a pass without `end()` leaves `finish()` invalid. These invariants,
+table-qualified identities, byte-range checks, and borrowed uploads are tested
+without a GPU in [`sgfx-core`'s validation suite](../crates/sgfx-core/tests/validation.rs).
+
 The core checks logical descriptors and recording rules. Each backend also
 validates its representable subset and context mappings. Unsupported commands
 must return an explicit error; they must not be silently skipped or replaced
