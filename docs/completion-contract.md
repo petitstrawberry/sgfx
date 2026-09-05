@@ -97,14 +97,14 @@ codes and their result/layout meanings remain unchanged.
 - [x] Core receipt/observation/error traits and deterministic contract tests.
 - [x] WGPU tracked submission, bounded tracking, failure receipts and host facade.
 - [x] Additive Scarlet async ABI and authoritative completion objects.
-- [ ] VirtIO/VirGL asynchronous enqueue/completion with retained resources.
+- [x] VirtIO/VirGL asynchronous enqueue/completion with retained resources.
 - [ ] A618 asynchronous enqueue/completion and safe staging reuse.
 - [ ] Native SGFX/facade support and consumer lifetime integration.
 - [ ] Both architectures' tests/builds, real host rendering, and A618 hardware
   evidence, including multiple outstanding submissions and failure/teardown.
 
 These are checkpoints, not independent substitutes for the agreed end-to-end
-goal. No version bump or candidate tag is warranted by the first three alone.
+goal. No version bump or candidate tag is warranted by these checkpoints alone.
 
 The initial core/host implementation passes 45 portable tests with Scarlet Rust
 and upstream Rust, including five real-device completion scenarios on Metal.
@@ -113,17 +113,24 @@ normal Scarlet targets. Those cross-checks preserve the old native path; they
 do not certify native tracked/asynchronous submission. Existing tests continue
 to cover the retained untracked executor alongside the new path.
 
-Scarlet's [native implementation boundary](https://github.com/petitstrawberry/Scarlet/blob/d3e49266df55c8f2f01f42de38cd948b2c503823/docs/graphics/gpu-async-submission.md)
-now includes read-only completion queries, bounded owned async admission,
-attachment/backing snapshots, failure receipts, and `gpu-raw` wrappers. Kernel
-tests pass on both architectures (1,176 RISC-V / 1,147 AArch64), as do both full
-builds. The native transport's two pure tests and strict Clippy pass with
-Scarlet Rust on AArch64 Linux; both normal Scarlet std cross-checks pass.
+Scarlet's [native implementation boundary](https://github.com/petitstrawberry/Scarlet/blob/992d1b9dace1bd8ec7e0366741ac93ac930c9ab7/docs/graphics/gpu-async-submission.md)
+now includes the generic ABI **and real VirtIO/VirGL async execution**. The
+driver retains up to 16 submissions across the device, publishes payloads with
+independent retirement checkpoints, and progresses via a kernel worker with
+IRQ notification and timed fallback. Legacy detach/transfer/presentation remains
+synchronous and ordered after preceding async work. Faulted, unretired resources
+remain bounded and quarantined without a reset/quiescence proof.
 
-This is the generic ABI checkpoint, **not actual driver asynchrony**: VirtIO
-and A618 still advertise zero async capacity and retain their synchronous path.
-Their shared transport/staging pools, completion progress and mapping retention
-must be implemented before native SGFX uses the new interface. A raw control or
+Kernel tests pass on both architectures (1,187 RISC-V / 1,158 AArch64), as do both
+full builds. The new normal-std `gpu-async-smoke` passes check and strict Clippy
+on both Scarlet targets. Real AArch64 QEMU release-image runs pass with VirGL
+PCI/two CPUs and MMIO/one CPU: exact async clear/readback, ordered checkpoints,
+detach, dropped receipts, and completion after closing all owner handles.
+These are driver-level checks, not yet native SGFX adapter tests.
+
+**A618 still advertises zero async capacity**, and native SGFX/facade/SWS/UI
+still use their old paths. A618's staging/fence ownership and mapping retention,
+plus SGFX native receipts and chunking, remain to be implemented. A raw control or
 handle-adoption failure can also lose the current receipt; the SGFX adapter
 must report an unobservable failure, not certify unknown accepted work using
 only a preceding chunk's receipt. Native driver/consumer integration and fault,
