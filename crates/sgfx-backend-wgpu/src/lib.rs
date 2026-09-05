@@ -16,6 +16,11 @@ use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use wgpu as raw;
 
+use sgfx_core::backend::{CommandSubmitter, SubmitError};
+
+mod completion;
+pub use completion::Submission;
+
 use sgfx_core::ir::{
     self, AddressMode, BlendComponent, BlendFactor, BlendOp, BufferId, BufferRef, BufferUsage,
     Command, CommandBuffer, CompareFunction, DepthLoadOp, DrawUniforms, FilterMode,
@@ -50,6 +55,10 @@ pub enum Error {
     DeviceRequest,
     /// A configured surface frame could not be acquired for presentation.
     SurfaceAcquire,
+    /// The device was lost or explicitly destroyed; completion is not certified.
+    DeviceLost,
+    /// Submission retirement could not be established by the private marker.
+    CompletionObservation,
 }
 
 impl From<ir::Error> for Error {
@@ -73,6 +82,10 @@ impl fmt::Display for Error {
             Self::AdapterUnavailable => formatter.write_str("no compatible WGPU adapter"),
             Self::DeviceRequest => formatter.write_str("WGPU device creation failed"),
             Self::SurfaceAcquire => formatter.write_str("WGPU surface acquisition failed"),
+            Self::DeviceLost => formatter.write_str("WGPU device was lost or destroyed"),
+            Self::CompletionObservation => {
+                formatter.write_str("WGPU completion observation failed")
+            }
         }
     }
 }
@@ -99,6 +112,8 @@ pub enum UnsupportedFeature {
     PartialDepthClear,
     /// The physical surface format cannot be represented by SGFX.
     SurfaceFormat,
+    /// Blocking waits are unavailable in a browser; use nonblocking observation.
+    BlockingWait,
 }
 
 /// WGPU device and queue pair used by the SGFX backend.
@@ -107,6 +122,7 @@ pub struct Device {
     device: Arc<raw::Device>,
     queue: Arc<raw::Queue>,
     identity: Arc<()>,
+    tracker: Arc<completion::Tracker>,
 }
 
 impl Device {
@@ -120,11 +136,23 @@ impl Device {
     /// # Returns
     ///
     /// A reusable SGFX WGPU device.
+    ///
+    /// This installs SGFX's device-lost callback for completion observation.
+    /// Do not replace it or wrap another alias of this raw device while using
+    /// SGFX completion receipts. Other raw WGPU error handlers are unchanged.
     pub fn new(device: raw::Device, queue: raw::Queue) -> Self {
+        let tracker = Arc::new(completion::Tracker::default());
+        let loss_tracker = Arc::clone(&tracker);
+        device.set_device_lost_callback(move |_, _| {
+            loss_tracker
+                .lost
+                .store(true, core::sync::atomic::Ordering::Release);
+        });
         Self {
             device: Arc::new(device),
             queue: Arc::new(queue),
             identity: Arc::new(()),
+            tracker,
         }
     }
 
@@ -919,6 +947,77 @@ impl Queue {
         resources: &mut Resources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<()> {
+        self.submit_inner(resources, commands, None).map(|_| ())
+    }
+
+    /// Submit with bounded, owned completion tracking and no GPU-completion wait.
+    ///
+    /// # Arguments
+    ///
+    /// * `resources` - Persistent cache from this queue's device.
+    /// * `commands` - Finished logical commands and borrowed uploads.
+    ///
+    /// # Returns
+    ///
+    /// A receipt, `Busy` when tracking is full, a side-effect-free rejection
+    /// for invalid ownership/device loss, or a failed-prefix receipt. Tracking
+    /// capacity is shared by this device's SGFX queue wrappers and is reclaimed
+    /// by completion callbacks, not by dropping a public receipt.
+    pub fn submit_tracked<'r, 'data>(
+        &self,
+        resources: &mut Resources,
+        commands: &CommandBuffer<'r, 'data>,
+    ) -> core::result::Result<Submission, SubmitError<Error, Submission>> {
+        let device = &self.context.device;
+        if !Arc::ptr_eq(&device.identity, &resources.context.device.identity) {
+            return Err(SubmitError::Rejected(Error::InvalidState));
+        }
+        if !core::ptr::eq(resources.resources.as_ref(), commands.resources()) {
+            return Err(SubmitError::Rejected(Error::ResourceTableMismatch));
+        }
+        let _ = device.raw_device().poll(raw::Maintain::Poll);
+        if device
+            .tracker
+            .lost
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Err(SubmitError::Rejected(Error::DeviceLost));
+        }
+        let slot = device.tracker.reserve().ok_or(SubmitError::Busy)?;
+        let marker = device.raw_device().create_buffer(&raw::BufferDescriptor {
+            label: Some("sgfx submission completion marker"),
+            size: 4,
+            usage: raw::BufferUsages::COPY_DST | raw::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        match self.submit_inner(resources, commands, Some(&marker)) {
+            Ok(index) => Ok(Submission::new(device.clone(), index, marker, slot)),
+            Err(error) => {
+                // Lowering can stage WGPU uniform writes before encountering
+                // a later error. Flush and track that possible prefix rather
+                // than claiming a transactional rejection or dropping its receipt.
+                let mut checkpoint =
+                    device
+                        .raw_device()
+                        .create_command_encoder(&raw::CommandEncoderDescriptor {
+                            label: Some("sgfx failed submission checkpoint"),
+                        });
+                checkpoint.clear_buffer(&marker, 0, None);
+                let index = device.raw_queue().submit([checkpoint.finish()]);
+                Err(SubmitError::Failed {
+                    error,
+                    completion: Submission::new(device.clone(), index, marker, slot),
+                })
+            }
+        }
+    }
+
+    fn submit_inner<'r, 'data>(
+        &self,
+        resources: &mut Resources,
+        commands: &CommandBuffer<'r, 'data>,
+        marker: Option<&raw::Buffer>,
+    ) -> Result<raw::SubmissionIndex> {
         if !Arc::ptr_eq(
             &self.context.device.identity,
             &resources.context.device.identity,
@@ -1057,11 +1156,15 @@ impl Queue {
                 },
             );
         }
-        self.context
+        if let Some(marker) = marker {
+            encoder.clear_buffer(marker, 0, None);
+        }
+        let index = self
+            .context
             .device
             .raw_queue()
             .submit(core::iter::once(encoder.finish()));
-        Ok(())
+        Ok(index)
     }
 
     fn encode_render_pass<'r, 'data>(
@@ -1407,6 +1510,17 @@ impl sgfx_core::backend::CommandExecutor for Executor<'_> {
 
     fn execute<'r, 'data>(&mut self, commands: &CommandBuffer<'r, 'data>) -> Result<()> {
         self.queue.submit(self.resources, commands)
+    }
+}
+
+impl CommandSubmitter for Executor<'_> {
+    type Submission = Submission;
+
+    fn submit<'r, 'data>(
+        &mut self,
+        commands: &CommandBuffer<'r, 'data>,
+    ) -> core::result::Result<Submission, SubmitError<Error, Submission>> {
+        self.queue.submit_tracked(self.resources, commands)
     }
 }
 
@@ -2235,6 +2349,7 @@ fn sampled_alpha(sample: &str, sample_format: Option<TextureFormat>) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod completion;
     mod execution;
 
     use alloc::rc::Rc;

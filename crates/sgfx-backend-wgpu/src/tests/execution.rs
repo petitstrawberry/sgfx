@@ -4,7 +4,7 @@ use sgfx_core::backend::CommandExecutor;
 
 use super::*;
 
-fn headless_device() -> Option<Device> {
+pub(super) fn headless_device() -> Option<Device> {
     let instance = raw::Instance::new(&raw::InstanceDescriptor::default());
     let Some(adapter) = request_headless_adapter(&instance) else {
         #[cfg(target_os = "macos")]
@@ -22,7 +22,7 @@ fn headless_device() -> Option<Device> {
     Some(Device::new(device, queue))
 }
 
-fn readback_pixels(device: &Device, image: &Image) -> Vec<[u8; 4]> {
+pub(super) fn readback_pixels(device: &Device, image: &Image) -> Vec<[u8; 4]> {
     let stride = (image.width() * 4).div_ceil(256) * 256;
     let readback = device.raw_device().create_buffer(&raw::BufferDescriptor {
         label: Some("SGFX execution contract readback"),
