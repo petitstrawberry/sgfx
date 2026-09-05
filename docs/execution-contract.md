@@ -5,9 +5,9 @@ declare the whole IR stable or introduce a new graphics API. Frontends record
 portable commands; the backend owns validation of its supported subset,
 resource materialization, lowering, transport limits, and submission.
 The [1.0 API inventory](1.0-api-scope.md) records the current exported surface
-and feature configurations. The [1.0 contract decisions](1.0-contract.md) are
-the authoritative release target; differences from today's behavior require
-conformance work before RC1.
+and feature configurations. The [1.0 contract draft](1.0-contract.md) records
+proposals; the user-approved [completion scope](completion-contract.md) adds
+tracked submission and actual asynchronous Scarlet GPU execution as 1.0 gates.
 
 The common Rust boundary is
 [`CommandExecutor`](../crates/sgfx-core/src/backend.rs). The `sgfx` facade
@@ -23,8 +23,10 @@ queue or external image consumer can immediately use the results.
 
 An empty stream is a no-op, not a portable wait for earlier work. A backend may
 complete work synchronously; portable callers must rely only on the common
-acceptance guarantee. SGFX does not currently expose a portable completion
-token, wait operation, or cross-queue synchronization API.
+acceptance guarantee. The additional `CommandSubmitter` and `Completion`
+interfaces now expose owned receipts, nonblocking observation and timed waits
+on the host WGPU path. Native backend support is still being implemented.
+There is no common cross-queue GPU semaphore API.
 
 | Backend | Current success boundary | Observation / presentation |
 | --- | --- | --- |
@@ -35,6 +37,21 @@ token, wait operation, or cross-queue synchronization API.
 The Scarlet ABI boundary is `GpuQueue::submit` in `gpu-raw`; this is not a
 reason to make WGPU block or to equate a Scarlet userspace target with no_std.
 Both normal Scarlet targets support Rust std.
+
+WGPU `CommandSubmitter::submit` returns an owned receipt. A private marker
+written at the end of the submission identifies retirement even if a later
+raw-queue submit races callback registration. The backend bounds tracked
+callback slots, returns `Busy` when full, and retains the marker independently
+of receipt ownership. These slots do not bound external raw WGPU or legacy
+untracked submissions. `Device::new` installs the loss callback used by
+observation; replacing it or independently wrapping an alias of that raw device
+is incompatible with tracked observation.
+
+Failed lowering returns a conservative failed-prefix checkpoint, not a false
+rollback guarantee. Completion reports device loss separately from retirement.
+Finite host waits drive nonblocking WGPU progress with short bounded sleeps;
+indefinite native-host waits use the submission index. Browser blocking waits
+are explicitly unsupported; browser support is not certified by native tests.
 
 ## Ownership and lifetime
 
@@ -96,13 +113,14 @@ Neither an `Err` nor the absence of an immediate error proves that no work ran.
 Do not blindly replay a failed command buffer. Backend-specific recovery must
 decide whether state can be reused or the context and mappings must be rebuilt.
 
-## Selected 1.0 decisions and conformance boundary
+## Approved completion scope and remaining conformance
 
-The [1.0 decisions](1.0-contract.md) retain `CommandExecutor` without new
-required methods, portable completion tokens, capability queries or a common
-device-loss recovery API. Backend-specific observation/recovery remains
-explicit; absent a documented recovery boundary, callers must not replay
-failed work or assume externally shared storage is safe to reuse.
+The [completion contract](completion-contract.md) adds `CommandSubmitter`
+without adding required methods to existing `CommandExecutor` implementations.
+Portable receipt observation and actual asynchronous Scarlet submission are
+required for 1.0. Failure recovery remains explicit; absent a documented recovery
+boundary, callers must not replay failed work or assume external storage is
+safe to reuse. No common capability-query or device-recovery API is added here.
 
 Successful explicit native imported-image release must detach the mapping and
 finish that session's outstanding accesses to the image before returning.
@@ -112,5 +130,5 @@ on the exact frame identity and all consumer uses, independently of unmapping.
 
 This is the target guarantee, not a claim that native failure/teardown paths
 have passed review. Audit those paths and rendering/backend-subset behavior
-against the decided contract before RC1. No Vulkan frontend or mandatory
-common synchronization API is added to the release scope.
+against the agreed completion scope and reviewed lifecycle rules before RC1.
+No Vulkan frontend is added to the release scope.
