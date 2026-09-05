@@ -96,7 +96,7 @@ codes and their result/layout meanings remain unchanged.
 
 - [x] Core receipt/observation/error traits and deterministic contract tests.
 - [x] WGPU tracked submission, bounded tracking, failure receipts and host facade.
-- [ ] Additive Scarlet async ABI and authoritative completion objects.
+- [x] Additive Scarlet async ABI and authoritative completion objects.
 - [ ] VirtIO/VirGL asynchronous enqueue/completion with retained resources.
 - [ ] A618 asynchronous enqueue/completion and safe staging reuse.
 - [ ] Native SGFX/facade support and consumer lifetime integration.
@@ -104,7 +104,7 @@ codes and their result/layout meanings remain unchanged.
   evidence, including multiple outstanding submissions and failure/teardown.
 
 These are checkpoints, not independent substitutes for the agreed end-to-end
-goal. No version bump or candidate tag is warranted by the first two alone.
+goal. No version bump or candidate tag is warranted by the first three alone.
 
 The initial core/host implementation passes 45 portable tests with Scarlet Rust
 and upstream Rust, including five real-device completion scenarios on Metal.
@@ -112,3 +112,19 @@ Strict host Clippy and Rustdoc pass, as do std and backend-free checks for both
 normal Scarlet targets. Those cross-checks preserve the old native path; they
 do not certify native tracked/asynchronous submission. Existing tests continue
 to cover the retained untracked executor alongside the new path.
+
+Scarlet's [native implementation boundary](https://github.com/petitstrawberry/Scarlet/blob/d3e49266df55c8f2f01f42de38cd948b2c503823/docs/graphics/gpu-async-submission.md)
+now includes read-only completion queries, bounded owned async admission,
+attachment/backing snapshots, failure receipts, and `gpu-raw` wrappers. Kernel
+tests pass on both architectures (1,176 RISC-V / 1,147 AArch64), as do both full
+builds. The native transport's two pure tests and strict Clippy pass with
+Scarlet Rust on AArch64 Linux; both normal Scarlet std cross-checks pass.
+
+This is the generic ABI checkpoint, **not actual driver asynchrony**: VirtIO
+and A618 still advertise zero async capacity and retain their synchronous path.
+Their shared transport/staging pools, completion progress and mapping retention
+must be implemented before native SGFX uses the new interface. A raw control or
+handle-adoption failure can also lose the current receipt; the SGFX adapter
+must report an unobservable failure, not certify unknown accepted work using
+only a preceding chunk's receipt. Native driver/consumer integration and fault,
+reset, teardown and hardware evidence remain open.
