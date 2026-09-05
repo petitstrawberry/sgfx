@@ -2210,6 +2210,8 @@ fn sampled_alpha(sample: &str, sample_format: Option<TextureFormat>) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod execution;
+
     use alloc::rc::Rc;
     use alloc::vec;
 
@@ -2558,12 +2560,9 @@ mod tests {
             }
         };
         eprintln!("SGFX WGPU test adapter: {:?}", adapter.get_info());
-        let (raw_device, raw_queue) = match pollster::block_on(
-            adapter.request_device(&raw::DeviceDescriptor::default(), None),
-        ) {
-            Ok(pair) => pair,
-            Err(_) => return,
-        };
+        let (raw_device, raw_queue) =
+            pollster::block_on(adapter.request_device(&raw::DeviceDescriptor::default(), None))
+                .expect("headless WGPU device");
         let device = Device::new(raw_device, raw_queue);
         let context = device.create_context();
         let image = context
