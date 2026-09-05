@@ -29,7 +29,7 @@ mod host;
 mod scarlet;
 
 #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
-pub use host::{Executor, MappedTargetSession, WindowContext};
+pub use host::{Executor, MappedTargetSession, Submission, WindowContext};
 #[cfg(all(
     target_os = "scarlet",
     any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")

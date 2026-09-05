@@ -1,7 +1,10 @@
 //! Window-surface integration for host SGFX backends.
 
+use core::time::Duration;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use sgfx_core::backend::CommandExecutor;
+use sgfx_core::backend::{
+    CommandExecutor, CommandSubmitter, Completion, CompletionStatus, SubmitError,
+};
 
 use crate::{BackendKind, Error, Instance, Result, ir};
 
@@ -172,5 +175,39 @@ impl CommandExecutor for Executor<'_> {
 
     fn execute<'r, 'data>(&mut self, commands: &ir::CommandBuffer<'r, 'data>) -> Result<()> {
         self.backend.execute(commands).map_err(Error::Wgpu)
+    }
+}
+
+/// Owned host submission receipt, independent of its mapped session/executor.
+///
+/// Observe it through [`Completion`]; dropping it neither waits nor cancels.
+#[derive(Clone, Debug)]
+pub struct Submission {
+    backend: sgfx_backend_wgpu::Submission,
+}
+
+impl Completion for Submission {
+    type Error = Error;
+
+    fn poll(&self) -> Result<CompletionStatus> {
+        self.backend.poll().map_err(Error::Wgpu)
+    }
+
+    fn wait(&self, timeout: Option<Duration>) -> Result<CompletionStatus> {
+        self.backend.wait(timeout).map_err(Error::Wgpu)
+    }
+}
+
+impl CommandSubmitter for Executor<'_> {
+    type Submission = Submission;
+
+    fn submit<'r, 'data>(
+        &mut self,
+        commands: &ir::CommandBuffer<'r, 'data>,
+    ) -> core::result::Result<Submission, SubmitError<Error, Submission>> {
+        self.backend
+            .submit(commands)
+            .map(|backend| Submission { backend })
+            .map_err(|error| error.map(Error::Wgpu, |backend| Submission { backend }))
     }
 }
