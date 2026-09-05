@@ -5,6 +5,10 @@
 
 use crate::ir::CommandBuffer;
 
+mod completion;
+
+pub use completion::{CommandSubmitter, Completion, CompletionStatus, SubmitError};
+
 /// Executes portable SGFX command buffers using backend-owned state.
 ///
 /// An implementation binds the queue, resource cache, platform context, and
