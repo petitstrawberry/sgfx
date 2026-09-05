@@ -14,8 +14,9 @@ default-members = [
     "crates/sgfx-backend-wgpu",
 ]
 
-# The Adreno backend still comes from scarlet-project-chromebook and currently
-# names sgfx-core through the old Scarlet source. Keep it on this workspace's
-# migrated core until that repository switches to the new SGFX repository.
-[patch."https://github.com/petitstrawberry/Scarlet"]
+# Only for development in this workspace: the external Adreno backend imports
+# our core through Git, while workspace crates use path dependencies. Both must
+# use this checkout's IR types. Consumers use the Git source throughout and do
+# not need this override (dependency-level patches are not inherited).
+[patch."https://github.com/petitstrawberry/sgfx"]
 sgfx-core = { path = "crates/sgfx-core" }
