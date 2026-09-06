@@ -330,7 +330,7 @@ dependencies = [
 [[package]]
 name = "gpu-raw"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#1991dd163e457fe7bbfe9c209957376ab575cf41"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#602bee5326965f7e5173c039365ac72769c942d2"
 dependencies = [
  "scarlet-os",
  "scarlet-std",
@@ -675,12 +675,12 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "scarlet-abi"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#1991dd163e457fe7bbfe9c209957376ab575cf41"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#602bee5326965f7e5173c039365ac72769c942d2"
 
 [[package]]
 name = "scarlet-os"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#1991dd163e457fe7bbfe9c209957376ab575cf41"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#602bee5326965f7e5173c039365ac72769c942d2"
 dependencies = [
  "scarlet-abi",
  "scarlet-rt",
@@ -690,7 +690,7 @@ dependencies = [
 [[package]]
 name = "scarlet-rt"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#1991dd163e457fe7bbfe9c209957376ab575cf41"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#602bee5326965f7e5173c039365ac72769c942d2"
 dependencies = [
  "lock_api",
  "scarlet-sys",
@@ -701,7 +701,7 @@ dependencies = [
 [[package]]
 name = "scarlet-std"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#1991dd163e457fe7bbfe9c209957376ab575cf41"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#602bee5326965f7e5173c039365ac72769c942d2"
 dependencies = [
  "hashbrown 0.15.5",
  "scarlet-abi",
@@ -714,7 +714,7 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#1991dd163e457fe7bbfe9c209957376ab575cf41"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#602bee5326965f7e5173c039365ac72769c942d2"
 dependencies = [
  "scarlet-abi",
 ]
