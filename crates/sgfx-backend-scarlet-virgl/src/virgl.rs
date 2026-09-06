@@ -1,7 +1,7 @@
 //! VirGL execution through Scarlet's GPU transport.
 
-use alloc::{rc::Rc, vec::Vec};
-use core::cell::Cell;
+use alloc::{rc::Rc, sync::Arc, vec::Vec};
+use core::cell::{Cell, RefCell};
 
 use gpu_raw::{
     GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_DEPTH, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
@@ -10,7 +10,7 @@ use gpu_raw::{
     GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT, GPU_IMAGE_USAGE_PRESENTABLE,
     GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED, GPU_IMAGE_USAGE_TRANSFER_DST,
     GPU_IMAGE_USAGE_TRANSFER_SRC, GPU_MAX_IMAGE_UPLOAD_SIZE, GPU_RESULT_SUCCESS, Gpu as RawGpu,
-    GpuBuffer as RawBuffer, GpuContext as RawContext, GpuDialect as RawDialect,
+    GpuBuffer as RawBuffer, GpuCompletion, GpuContext as RawContext, GpuDialect as RawDialect,
     GpuImage as RawImage, GpuImageBgraRect, GpuQueryInfo, GpuQueue as RawQueue,
 };
 #[cfg(feature = "std")]
@@ -717,6 +717,7 @@ impl Context {
             context_handle: self.handle_id(),
             vertex_buffer,
             vertex_resource_id,
+            upload_arenas: Vec::new(),
             buffers: empty_slots(IR_BUFFER_SLOTS)?,
             textures: empty_slots(IR_TEXTURE_SLOTS)?,
             texture_specs: empty_slots(IR_TEXTURE_SLOTS)?,
@@ -895,6 +896,7 @@ pub(crate) struct IrResources {
     context_handle: i32,
     vertex_buffer: RawBuffer,
     vertex_resource_id: u32,
+    upload_arenas: Vec<Rc<UploadArena>>,
     buffers: Vec<Option<IrBuffer>>,
     textures: Vec<Option<IrTexture>>,
     texture_specs: Vec<Option<IrTextureSpec>>,
@@ -918,6 +920,37 @@ struct IrBuffer {
     resource_id: u32,
     size: u64,
     uploaded_revision: Option<u64>,
+}
+
+// RESOURCE_INLINE_WRITE maps PIPE_BUFFER storage with UNSYNCHRONIZED even
+// when its unused "usage" word is zero. Only write an idle arena, using each
+// range once. GPU copies into the actual vertex buffers then obey draw order.
+pub(crate) struct UploadArena {
+    _raw: RawBuffer,
+    pub(crate) resource_id: u32,
+    pub(crate) capacity: u32,
+    completion: RefCell<Option<Arc<GpuCompletion>>>,
+    unobservable: Cell<bool>,
+}
+
+impl UploadArena {
+    pub(crate) fn retain_submission(&self, completion: Option<Arc<GpuCompletion>>) {
+        self.unobservable.set(completion.is_none());
+        *self.completion.borrow_mut() = completion;
+    }
+
+    fn is_idle(&self) -> HandleResult<bool> {
+        if self.unobservable.get() {
+            return Err(HandleError::SystemError(-1));
+        }
+        let completion = self.completion.borrow();
+        let Some(completion) = completion.as_ref() else {
+            return Ok(true);
+        };
+        crate::completion::completion_status(completion.query()?)
+            .map(|status| status == sgfx_core::backend::CompletionStatus::Complete)
+            .map_err(|_| HandleError::SystemError(-1))
+    }
 }
 
 /// CPU cache state before staged commands have been accepted.
@@ -1155,6 +1188,47 @@ struct CompositionQuad {
 }
 
 impl Queue {
+    fn prepare_ir_upload_arena(
+        &self,
+        context: &Context,
+        resources: &mut IrResources,
+        mode: &mut SubmitMode,
+    ) -> HandleResult<()> {
+        if !mode.needs_upload_arena() {
+            return Ok(());
+        }
+        for arena in &resources.upload_arenas {
+            if arena.is_idle()? {
+                mode.set_upload_arena(Rc::clone(arena));
+                return Ok(());
+            }
+        }
+        // Bounded, persistent storage. Do not wait in submit or recycle a busy
+        // range when a caller drops its receipt. The pool retains observation.
+        const MAX_UPLOAD_ARENAS: usize = 16;
+        if resources.upload_arenas.len() == MAX_UPLOAD_ARENAS {
+            mode.mark_busy();
+            return Err(HandleError::OutOfResources);
+        }
+        resources
+            .upload_arenas
+            .try_reserve(1)
+            .map_err(|_| HandleError::OutOfResources)?;
+        let capacity = gpu_raw::GPU_MAX_OPAQUE_COMMAND_SIZE;
+        let raw = context.device.raw.create_buffer(u64::from(capacity), 0)?;
+        let resource_id = resource_id_from_token(context.raw.attach_buffer(&raw)?)?;
+        let arena = Rc::new(UploadArena {
+            _raw: raw,
+            resource_id,
+            capacity,
+            completion: RefCell::new(None),
+            unobservable: Cell::new(false),
+        });
+        resources.upload_arenas.push(Rc::clone(&arena));
+        mode.set_upload_arena(arena);
+        Ok(())
+    }
+
     pub(crate) fn materialize_ir_texture(
         &self,
         context: &Context,
@@ -1241,11 +1315,20 @@ impl Queue {
         if uploaded_revision == Some(spec.revision) {
             return Ok(());
         }
+        self.prepare_ir_upload_arena(context, resources, mode)?;
 
         const INLINE_WRITE_FIXED_BYTES: usize = 12 * core::mem::size_of::<u32>();
+        const BUFFER_COPY_BYTES: usize = 14 * core::mem::size_of::<u32>();
         let max_payload = self
             .max_command_size()
-            .checked_sub(INLINE_WRITE_FIXED_BYTES)
+            .checked_sub(
+                INLINE_WRITE_FIXED_BYTES
+                    + if mode.is_tracked() {
+                        BUFFER_COPY_BYTES
+                    } else {
+                        0
+                    },
+            )
             .map(|bytes| bytes & !(core::mem::size_of::<u32>() - 1))
             .filter(|bytes| *bytes > 0)
             .ok_or(HandleError::InvalidParameter)?;
@@ -1259,11 +1342,12 @@ impl Queue {
             commands
                 .try_reserve_exact(INLINE_WRITE_FIXED_BYTES.saturating_add(chunk.len()))
                 .map_err(|_| HandleError::OutOfResources)?;
-            push_ir_buffer_inline_write(
+            push_ir_buffer_upload(
                 &mut commands,
                 resource_id,
                 u32::try_from(offset).map_err(|_| HandleError::InvalidParameter)?,
                 chunk,
+                mode,
             )?;
             mode.submit(&self.raw, &commands)?;
             offset = end;
@@ -1463,6 +1547,9 @@ impl Queue {
             None
         };
 
+        if !submission.vertices.is_empty() {
+            self.prepare_ir_upload_arena(context, resources, mode)?;
+        }
         let mut commands = Vec::new();
         commands
             .try_reserve(16 * 1024)
@@ -1587,6 +1674,7 @@ impl Queue {
                 &mut commands,
                 resources.vertex_resource_id,
                 &submission.vertices,
+                mode,
             )?;
         }
 
@@ -2998,6 +3086,7 @@ fn push_ir_inline_write(
     commands: &mut Vec<u8>,
     resource_id: u32,
     vertices: &[IrVertex],
+    mode: &mut SubmitMode,
 ) -> HandleResult<()> {
     let components = vertices
         .len()
@@ -3013,8 +3102,14 @@ fn push_ir_inline_write(
         commands,
         command_header(VIRGL_CCMD_RESOURCE_INLINE_WRITE, 0, 11 + components),
     );
-    push_dword(commands, resource_id);
-    for _ in 0..7 {
+    let upload = mode.upload_range(byte_len)?;
+    let (upload_resource, upload_offset) = upload.unwrap_or((resource_id, 0));
+    push_dword(commands, upload_resource);
+    for _ in 0..4 {
+        push_dword(commands, 0);
+    }
+    push_dword(commands, upload_offset);
+    for _ in 0..2 {
         push_dword(commands, 0);
     }
     push_dword(commands, byte_len);
@@ -3031,7 +3126,66 @@ fn push_ir_inline_write(
             push_float(commands, component);
         }
     }
+    if upload.is_some() {
+        push_ir_buffer_copy(
+            commands,
+            resource_id,
+            0,
+            upload_resource,
+            upload_offset,
+            byte_len,
+        );
+    }
     Ok(())
+}
+
+fn push_ir_buffer_upload(
+    commands: &mut Vec<u8>,
+    resource_id: u32,
+    offset: u32,
+    bytes: &[u8],
+    mode: &mut SubmitMode,
+) -> HandleResult<()> {
+    let length = u32::try_from(bytes.len()).map_err(|_| HandleError::InvalidParameter)?;
+    if let Some((source, source_offset)) = mode.upload_range(length)? {
+        push_ir_buffer_inline_write(commands, source, source_offset, bytes)?;
+        push_ir_buffer_copy(commands, resource_id, offset, source, source_offset, length);
+        Ok(())
+    } else {
+        push_ir_buffer_inline_write(commands, resource_id, offset, bytes)
+    }
+}
+
+fn push_ir_buffer_copy(
+    commands: &mut Vec<u8>,
+    destination: u32,
+    destination_offset: u32,
+    source: u32,
+    source_offset: u32,
+    length: u32,
+) {
+    // PIPE_BUFFER copies use byte offsets and byte lengths, not texture pixels.
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, 13),
+    );
+    for value in [
+        destination,
+        0,
+        destination_offset,
+        0,
+        0,
+        source,
+        0,
+        source_offset,
+        0,
+        0,
+        length,
+        1,
+        1,
+    ] {
+        push_dword(commands, value);
+    }
 }
 
 fn push_ir_buffer_inline_write(
@@ -3138,7 +3292,7 @@ fn submit_ir_texture_inline_write(
             );
             push_dword(&mut commands, resource_id);
             push_dword(&mut commands, 0); // mip level
-            push_dword(&mut commands, 0); // transfer usage (no unsynchronized hint)
+            push_dword(&mut commands, 0); // unused transfer usage; not a synchronization flag
             push_dword(&mut commands, stride);
             push_dword(&mut commands, length as u32); // layer stride
             push_dword(&mut commands, rect.x + x);
@@ -3440,6 +3594,31 @@ mod tests {
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte command word")))
             .collect()
+    }
+
+    #[test]
+    fn vertex_buffer_copies_preserve_distinct_source_ranges_and_destination_offsets() {
+        let mut commands = Vec::new();
+        push_ir_buffer_copy(&mut commands, 17, 4096, 23, 120, 240);
+        assert_eq!(
+            dwords(&commands),
+            [
+                command_header(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, 13),
+                17,
+                0,
+                4096,
+                0,
+                0,
+                23,
+                0,
+                120,
+                0,
+                0,
+                240,
+                1,
+                1,
+            ]
+        );
     }
 
     #[test]

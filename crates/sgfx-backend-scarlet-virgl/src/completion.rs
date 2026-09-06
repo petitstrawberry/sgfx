@@ -1,6 +1,6 @@
 //! Owned observation of every native chunk in one logical submission.
 
-use alloc::vec::Vec;
+use alloc::{rc::Rc, sync::Arc, vec::Vec};
 use core::time::Duration;
 
 use gpu_raw::{
@@ -13,6 +13,7 @@ use sgfx_core::backend::{Completion, CompletionStatus, SubmitError};
 #[cfg(not(feature = "std"))]
 use std::poll::{POLLIN, PollHandle, poll};
 
+use crate::virgl::UploadArena;
 use crate::{HandleError, HandleResult, IrSubmitError};
 
 /// Owned completion receipt for a logical stream, including all accepted chunks.
@@ -23,7 +24,7 @@ use crate::{HandleError, HandleResult, IrSubmitError};
 /// SWS buffer-release acknowledgement.
 #[derive(Debug)]
 pub struct Submission {
-    chunks: Vec<GpuCompletion>,
+    chunks: Vec<Arc<GpuCompletion>>,
     unobservable: bool,
 }
 
@@ -110,7 +111,9 @@ impl Completion for Submission {
     }
 }
 
-fn completion_status(info: GpuCompletionInfo) -> Result<CompletionStatus, IrSubmitError> {
+pub(crate) fn completion_status(
+    info: GpuCompletionInfo,
+) -> Result<CompletionStatus, IrSubmitError> {
     if info.abi_version != GPU_ABI_VERSION || info.reserved != 0 || info.reserved2 != 0 {
         return Err(IrSubmitError::CompletionUnavailable);
     }
@@ -141,6 +144,8 @@ pub(crate) enum SubmitMode {
         busy: bool,
         commands: Vec<u8>,
         limit: usize,
+        upload: Option<Rc<UploadArena>>,
+        upload_offset: u32,
     },
 }
 
@@ -154,11 +159,43 @@ impl SubmitMode {
             busy: false,
             commands: Vec::new(),
             limit: gpu_raw::GPU_MAX_OPAQUE_COMMAND_SIZE as usize,
+            upload: None,
+            upload_offset: 0,
         }
     }
 
     pub(crate) fn is_tracked(&self) -> bool {
         matches!(self, Self::Tracked { .. })
+    }
+
+    pub(crate) fn needs_upload_arena(&self) -> bool {
+        matches!(self, Self::Tracked { upload: None, .. })
+    }
+
+    pub(crate) fn set_upload_arena(&mut self, arena: Rc<UploadArena>) {
+        if let Self::Tracked { upload, .. } = self {
+            *upload = Some(arena);
+        }
+    }
+
+    pub(crate) fn upload_range(&mut self, length: u32) -> HandleResult<Option<(u32, u32)>> {
+        let Self::Tracked {
+            upload,
+            upload_offset,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let arena = upload.as_ref().ok_or(HandleError::InvalidParameter)?;
+        let start = reserve_upload_range(upload_offset, length, arena.capacity)?;
+        Ok(Some((arena.resource_id, start)))
+    }
+
+    pub(crate) fn mark_busy(&mut self) {
+        if let Self::Tracked { busy, .. } = self {
+            *busy = true;
+        }
     }
 
     pub(crate) fn submit(&mut self, queue: &GpuQueue, commands: &[u8]) -> HandleResult<()> {
@@ -184,6 +221,7 @@ impl SubmitMode {
             receipt,
             busy,
             commands,
+            upload,
             ..
         } = self
         else {
@@ -196,6 +234,10 @@ impl SubmitMode {
             .map_err(|_| HandleError::OutOfResources)?;
         match queue.submit_async(commands) {
             Ok(chunk) => {
+                let chunk = Arc::new(chunk);
+                if let Some(arena) = upload {
+                    arena.retain_submission(Some(Arc::clone(&chunk)));
+                }
                 receipt.chunks.push(chunk);
                 Ok(())
             }
@@ -205,6 +247,10 @@ impl SubmitMode {
             }
             Err(GpuSubmitError::Rejected(error)) => Err(error),
             Err(GpuSubmitError::Failed { error, completion }) => {
+                let completion = completion.map(Arc::new);
+                if let Some(arena) = upload {
+                    arena.retain_submission(completion.clone());
+                }
                 if let Some(chunk) = completion {
                     receipt.chunks.push(chunk);
                 } else {
@@ -213,6 +259,9 @@ impl SubmitMode {
                 Err(error)
             }
             Err(_) => {
+                if let Some(arena) = upload {
+                    arena.retain_submission(None);
+                }
                 receipt.unobservable = true;
                 Err(HandleError::SystemError(-1))
             }
@@ -248,6 +297,18 @@ impl SubmitMode {
     }
 }
 
+// Every inline write uses a disjoint source range until the logical stream's
+// fence retires. A rejected reservation must leave the cursor unchanged.
+fn reserve_upload_range(offset: &mut u32, length: u32, capacity: u32) -> HandleResult<u32> {
+    let start = *offset;
+    let end = start
+        .checked_add(length)
+        .filter(|end| *end <= capacity)
+        .ok_or(HandleError::OutOfResources)?;
+    *offset = end;
+    Ok(start)
+}
+
 // Lowering may emit many native packets, but admission happens only once.
 // Exceeding the advertised bound is a rejection before any GPU work is sent.
 fn append_commands(staged: &mut Vec<u8>, commands: &[u8], limit: usize) -> HandleResult<()> {
@@ -267,7 +328,7 @@ fn append_commands(staged: &mut Vec<u8>, commands: &[u8], limit: usize) -> Handl
 
 #[cfg(test)]
 mod tests {
-    use super::{SubmitMode, append_commands, completion_status};
+    use super::{SubmitMode, append_commands, completion_status, reserve_upload_range};
     use crate::{HandleError, IrSubmitError};
     use core::time::Duration;
     use gpu_raw::{
@@ -275,6 +336,22 @@ mod tests {
         GPU_COMPLETION_FAILURE_DEVICE_LOST, GPU_RESULT_SUCCESS, GpuCompletionInfo,
     };
     use sgfx_core::backend::{Completion, CompletionStatus, SubmitError};
+
+    #[test]
+    fn inline_upload_ranges_never_overlap_within_a_submission() {
+        let mut offset = 0;
+        for expected in [0, 120, 240, 360] {
+            assert_eq!(
+                reserve_upload_range(&mut offset, 120, 480).unwrap(),
+                expected
+            );
+        }
+        assert!(reserve_upload_range(&mut offset, 4, 480).is_err());
+        assert_eq!(offset, 480);
+        let mut overflow = u32::MAX - 3;
+        assert!(reserve_upload_range(&mut overflow, 4, u32::MAX).is_err());
+        assert_eq!(overflow, u32::MAX - 3);
+    }
 
     #[test]
     fn native_packets_are_staged_in_order_with_no_partial_admission() {
