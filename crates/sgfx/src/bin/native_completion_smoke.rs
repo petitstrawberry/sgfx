@@ -405,11 +405,169 @@ mod native {
         println!("[sgfx-native-completion-smoke] multiple ordered submissions PASS");
         persistent_vertex_upload_is_ordered_and_owned_by_the_queue();
         println!("[sgfx-native-completion-smoke] persistent vertex upload + drawing PASS");
+        reused_vertex_storage_preserves_every_earlier_draw();
+        println!("[sgfx-native-completion-smoke] reused vertex storage + every earlier draw PASS");
         dropped_receipts_do_not_cancel_work_and_last_receipt_outlives_every_owner();
         println!("[sgfx-native-completion-smoke] dropped receipts + closed owners PASS");
         rejection_leaves_the_session_usable_and_legacy_execute_orders_after_async();
         println!("[sgfx-native-completion-smoke] rejection + legacy ordering PASS");
         println!("[sgfx-native-completion-smoke] ALL PASS");
+    }
+
+    #[cfg_attr(test, test)]
+    fn reused_vertex_storage_preserves_every_earlier_draw() {
+        const ROWS: u32 = 32;
+        const WIDTH: u32 = 32;
+        const STRIP_HEIGHT: u32 = 3;
+        let color = |row: u32, round: u32| {
+            let bits = (row + round) % 7 + 1;
+            [
+                f32::from((bits & 1 != 0) as u8),
+                f32::from((bits & 2 != 0) as u8),
+                f32::from((bits & 4 != 0) as u8),
+                1.0,
+            ]
+        };
+        for persistent in [false, true] {
+            let table = Rc::new(ResourceTable::new());
+            let output = target(&table, WIDTH, ROWS * STRIP_HEIGHT);
+            let stride = if persistent { 40 } else { 24 };
+            let attributes = if persistent {
+                vec![
+                    VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                    VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+                    VertexAttribute::new(2, VertexFormat::Float32x2, 32),
+                ]
+            } else {
+                // Deliberately noncanonical: every pass lowers through the
+                // shared inline scratch buffer used by noncanonical UI draws.
+                vec![
+                    VertexAttribute::new(0, VertexFormat::Float32x2, 0),
+                    VertexAttribute::new(1, VertexFormat::Float32x4, 8),
+                ]
+            };
+            let pipeline = table
+                .define_render_pipeline(
+                    RenderPipelineDesc::new(
+                        TextureFormat::Bgra8Unorm,
+                        PrimitiveTopology::TriangleList,
+                        VertexBufferLayout::new(stride, attributes).expect("layout"),
+                        FragmentProgram::VertexColor,
+                        BlendState::REPLACE,
+                        RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                    )
+                    .expect("pipeline"),
+                )
+                .expect("define pipeline");
+            let buffer = table
+                .define_buffer(
+                    BufferDesc::new(
+                        u64::from(ROWS * 3 * stride),
+                        BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                    )
+                    .expect("buffer"),
+                )
+                .expect("define buffer");
+            let mut session = session(&table, &[output]);
+            let full = PixelRect::new(0, 0, WIDTH, ROWS * STRIP_HEIGHT).expect("full area");
+            for round in 0..8 {
+                let mut bytes = Vec::new();
+                for row in 0..ROWS {
+                    for position in [[-1.0_f32, -1.0], [3.0, -1.0], [-1.0, 3.0]] {
+                        for value in position {
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                        if persistent {
+                            for value in [0.0_f32, 1.0] {
+                                bytes.extend_from_slice(&value.to_le_bytes());
+                            }
+                        }
+                        for value in color(row, round) {
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                        if persistent {
+                            bytes.extend_from_slice(&[0; 8]);
+                        }
+                    }
+                }
+                let mut encoder = CommandEncoder::new(&table);
+                if !persistent {
+                    encoder
+                        .write_buffer(buffer, 0, &bytes)
+                        .expect("all inline vertices");
+                }
+                for row in 0..ROWS {
+                    if persistent {
+                        let start = (row * 3 * stride) as usize;
+                        // Overwrite the same persistent buffer for each queued
+                        // strip, without waiting after the previous draw.
+                        encoder
+                            .write_buffer(buffer, 0, &bytes[start..start + (3 * stride) as usize])
+                            .expect("persistent vertex update");
+                    }
+                    let mut pass = encoder
+                        .begin_render_pass(
+                            RenderPassDesc::new(
+                                &table,
+                                table.texture_ref(output).expect("output"),
+                                full,
+                                if row == 0 {
+                                    LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 1.0).expect("black"))
+                                } else {
+                                    LoadOp::Load
+                                },
+                                StoreOp::Store,
+                            )
+                            .expect("pass"),
+                        )
+                        .expect("begin pass");
+                    pass.set_pipeline(pipeline).expect("pipeline");
+                    pass.set_vertex_buffer(buffer, 0).expect("vertices");
+                    pass.set_uniforms(DrawUniforms::new(
+                        Transform::identity(),
+                        Color::rgba(1.0, 1.0, 1.0, 1.0).expect("white"),
+                    ))
+                    .expect("uniforms");
+                    pass.set_scissor(Some(
+                        PixelRect::new(0, row * STRIP_HEIGHT, WIDTH, STRIP_HEIGHT).expect("strip"),
+                    ))
+                    .expect("scissor");
+                    pass.draw(3, if persistent { 0 } else { row * 3 })
+                        .expect("draw");
+                    pass.end().expect("end pass");
+                    if persistent {
+                        // Dropping the receipt must not recycle its upload arena.
+                        drop(submit(
+                            &mut session,
+                            &encoder.finish().expect("strip commands"),
+                        ));
+                        encoder = CommandEncoder::new(&table);
+                    }
+                }
+                // Inline mode puts all 32 scratch-buffer writes and draws in
+                // ONE native admission. A final-only color check cannot catch
+                // earlier draws reading the last upload, so verify every pixel.
+                complete(&submit(
+                    &mut session,
+                    &encoder.finish().expect("frame checkpoint"),
+                ));
+                for (index, pixel) in pixels(&session, output).chunks_exact(4).enumerate() {
+                    let row = index as u32 / WIDTH / STRIP_HEIGHT;
+                    let [r, g, b, a] = color(row, round);
+                    assert_eq!(
+                        pixel,
+                        [
+                            (b * 255.0) as u8,
+                            (g * 255.0) as u8,
+                            (r * 255.0) as u8,
+                            (a * 255.0) as u8
+                        ],
+                        "vertex reuse: persistent={persistent}, round={round}, row={row}"
+                    );
+                }
+                bytes.fill(0);
+            }
+        }
     }
 }
 
