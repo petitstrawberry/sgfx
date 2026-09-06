@@ -34,7 +34,9 @@ pub use host::{Executor, MappedTargetSession, Submission, WindowContext};
     target_os = "scarlet",
     any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
 ))]
-pub use scarlet::{Capabilities, Context, Device, Executor, Handle, ImageRef, MappedTargetSession};
+pub use scarlet::{
+    Capabilities, Context, Device, Executor, Handle, ImageRef, MappedTargetSession, Submission,
+};
 
 /// Environment variable used to override automatic SGFX backend selection.
 pub const BACKEND_ENV: &str = "SGFX_BACKEND";

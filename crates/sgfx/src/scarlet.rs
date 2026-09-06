@@ -1,8 +1,11 @@
 //! Scarlet device and mapped-target integration for the SGFX frontend.
 
 use alloc::rc::Rc;
+use core::time::Duration;
 use gpu_raw::Gpu;
-use sgfx_core::backend::CommandExecutor;
+use sgfx_core::backend::{
+    CommandExecutor, CommandSubmitter, Completion, CompletionStatus, SubmitError,
+};
 
 use crate::{BackendKind, BackendPreference, Error, Instance, Result, ir};
 
@@ -477,6 +480,89 @@ impl CommandExecutor for Executor<'_> {
             Self::Virgl(executor) => executor.execute(commands).map_err(Error::ScarletVirglIr),
             #[cfg(feature = "backend-scarlet-adreno")]
             Self::Adreno(executor) => executor.execute(commands).map_err(Error::ScarletAdrenoIr),
+        }
+    }
+}
+
+/// Owned completion receipt from the selected Scarlet execution backend.
+///
+/// It does not borrow its session or command data. Dropping it neither waits
+/// nor cancels work; kernel-owned retention is independent of this receipt.
+/// GPU completion is separate from presentation and SWS buffer release.
+#[derive(Debug)]
+pub enum Submission {
+    /// Completion of all VirGL chunks in one logical submission.
+    #[cfg(feature = "backend-scarlet-virgl")]
+    Virgl(sgfx_backend_scarlet_virgl::Submission),
+}
+
+impl Completion for Submission {
+    type Error = Error;
+
+    /// Observe completion without waiting for the GPU.
+    ///
+    /// # Returns
+    ///
+    /// Pending, complete, or the selected backend's observation/execution error.
+    fn poll(&self) -> Result<CompletionStatus> {
+        match *self {
+            #[cfg(feature = "backend-scarlet-virgl")]
+            Self::Virgl(ref receipt) => receipt.poll().map_err(Error::ScarletVirglIr),
+        }
+    }
+
+    /// Wait for completion with an optional deadline.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Zero polls, `None` waits without a caller deadline.
+    ///
+    /// # Returns
+    ///
+    /// Complete, pending on timeout, or a backend error. Timeout never cancels
+    /// work or grants permission to recycle an externally shared buffer.
+    fn wait(&self, timeout: Option<Duration>) -> Result<CompletionStatus> {
+        #[cfg(not(feature = "backend-scarlet-virgl"))]
+        let _ = timeout;
+        match *self {
+            #[cfg(feature = "backend-scarlet-virgl")]
+            Self::Virgl(ref receipt) => receipt.wait(timeout).map_err(Error::ScarletVirglIr),
+        }
+    }
+}
+
+impl CommandSubmitter for Executor<'_> {
+    type Submission = Submission;
+
+    /// Submit a portable command stream with owned completion observation.
+    ///
+    /// # Arguments
+    ///
+    /// * `commands` - Finished logical stream and borrowed upload bytes.
+    ///
+    /// # Returns
+    ///
+    /// An owned receipt or a classified rejection/partial failure. VirGL may
+    /// synchronize during first-use resource creation, but uploads, copies,
+    /// and drawing use the async transport without waiting for completion or
+    /// capacity. Adreno currently rejects this operation as unsupported;
+    /// there is no synchronous fallback disguised as a completed receipt.
+    fn submit<'r, 'data>(
+        &mut self,
+        commands: &ir::CommandBuffer<'r, 'data>,
+    ) -> core::result::Result<Submission, SubmitError<Error, Submission>> {
+        #[cfg(not(feature = "backend-scarlet-virgl"))]
+        let _ = commands;
+        match self {
+            #[cfg(feature = "backend-scarlet-virgl")]
+            Self::Virgl(executor) => executor
+                .submit(commands)
+                .map(Submission::Virgl)
+                .map_err(|error| error.map(Error::ScarletVirglIr, Submission::Virgl)),
+            #[cfg(feature = "backend-scarlet-adreno")]
+            Self::Adreno(_) => Err(SubmitError::Rejected(Error::ScarletAdrenoHandle(
+                sgfx_backend_scarlet_adreno::HandleError::Unsupported,
+            ))),
         }
     }
 }
