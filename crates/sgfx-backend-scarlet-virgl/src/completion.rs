@@ -136,7 +136,12 @@ fn monotonic_time_ns() -> u64 {
 /// Per-call state, never a mode stored on a shared queue or connection.
 pub(crate) enum SubmitMode {
     Synchronous,
-    Tracked { receipt: Submission, busy: bool },
+    Tracked {
+        receipt: Submission,
+        busy: bool,
+        commands: Vec<u8>,
+        limit: usize,
+    },
 }
 
 impl SubmitMode {
@@ -147,6 +152,8 @@ impl SubmitMode {
                 unobservable: false,
             },
             busy: false,
+            commands: Vec::new(),
+            limit: gpu_raw::GPU_MAX_OPAQUE_COMMAND_SIZE as usize,
         }
     }
 
@@ -155,8 +162,32 @@ impl SubmitMode {
     }
 
     pub(crate) fn submit(&mut self, queue: &GpuQueue, commands: &[u8]) -> HandleResult<()> {
-        let Self::Tracked { receipt, busy } = self else {
+        let Self::Tracked {
+            commands: staged,
+            limit,
+            ..
+        } = self
+        else {
             return queue.submit(commands).map(|_| ());
+        };
+        append_commands(staged, commands, *limit)
+    }
+
+    pub(crate) fn set_limit(&mut self, max_bytes: usize) {
+        if let Self::Tracked { limit, .. } = self {
+            *limit = max_bytes.min(gpu_raw::GPU_MAX_OPAQUE_COMMAND_SIZE as usize);
+        }
+    }
+
+    pub(crate) fn flush(&mut self, queue: &GpuQueue) -> HandleResult<()> {
+        let Self::Tracked {
+            receipt,
+            busy,
+            commands,
+            ..
+        } = self
+        else {
+            return Ok(());
         };
         // Reserve observation storage before handing the kernel any new work.
         receipt
@@ -196,7 +227,7 @@ impl SubmitMode {
         self,
         result: Result<(), IrSubmitError>,
     ) -> Result<Submission, SubmitError<IrSubmitError, Submission>> {
-        let Self::Tracked { receipt, busy } = self else {
+        let Self::Tracked { receipt, busy, .. } = self else {
             return Err(SubmitError::Rejected(IrSubmitError::CompletionUnavailable));
         };
         match result {
@@ -217,9 +248,26 @@ impl SubmitMode {
     }
 }
 
+// Lowering may emit many native packets, but admission happens only once.
+// Exceeding the advertised bound is a rejection before any GPU work is sent.
+fn append_commands(staged: &mut Vec<u8>, commands: &[u8], limit: usize) -> HandleResult<()> {
+    if staged
+        .len()
+        .checked_add(commands.len())
+        .is_none_or(|size| size > limit)
+    {
+        return Err(HandleError::OutOfResources);
+    }
+    staged
+        .try_reserve(commands.len())
+        .map_err(|_| HandleError::OutOfResources)?;
+    staged.extend_from_slice(commands);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SubmitMode, completion_status};
+    use super::{SubmitMode, append_commands, completion_status};
     use crate::{HandleError, IrSubmitError};
     use core::time::Duration;
     use gpu_raw::{
@@ -227,6 +275,16 @@ mod tests {
         GPU_COMPLETION_FAILURE_DEVICE_LOST, GPU_RESULT_SUCCESS, GpuCompletionInfo,
     };
     use sgfx_core::backend::{Completion, CompletionStatus, SubmitError};
+
+    #[test]
+    fn native_packets_are_staged_in_order_with_no_partial_admission() {
+        let mut bytes = alloc::vec::Vec::new();
+        append_commands(&mut bytes, &[1, 2, 3, 4], 8).unwrap();
+        append_commands(&mut bytes, &[5, 6, 7, 8], 8).unwrap();
+        assert!(append_commands(&mut bytes, &[9], 8).is_err());
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(!SubmitMode::tracked().accepted());
+    }
 
     #[test]
     fn completion_requires_a_valid_successful_terminal_observation() {
@@ -297,7 +355,7 @@ mod tests {
     #[test]
     fn unknown_acceptance_cannot_be_reclassified_as_busy_or_complete() {
         let mut mode = SubmitMode::tracked();
-        if let SubmitMode::Tracked { receipt, busy } = &mut mode {
+        if let SubmitMode::Tracked { receipt, busy, .. } = &mut mode {
             receipt.unobservable = true;
             *busy = true;
         }

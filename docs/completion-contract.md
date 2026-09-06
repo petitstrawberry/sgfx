@@ -28,6 +28,14 @@ resource-creation calls can drain earlier GPU work. They are not repeated for
 cached resources. After cold setup, all uploads/copies/draws and checkpoints
 use the async transport; no completion wait or capacity-wait fallback is allowed.
 
+VirGL stages a logical stream's native packets and admits them in a single
+owned queue request (currently bounded by the advertised 2 MiB async limit).
+Contention therefore returns `Busy` before any packet is accepted. CPU object
+initialization and buffer revision bookkeeping are restored on rejection.
+Exceeding the bound rejects the stream before GPU submission; consumers split
+large independent uploads explicitly. Transport/adoption failures still retain
+the conservative `Failed` contract and must never be blindly replayed.
+
 A receipt covers the complete logical command stream, including all backend
 chunks and uploads, and the preceding work ordered on its queue. It does not
 cover later submissions, unrelated queues, display presentation, or SWS leases.

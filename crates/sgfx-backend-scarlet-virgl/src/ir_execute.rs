@@ -545,6 +545,11 @@ impl Queue {
     /// setup may wait for earlier GPU work. Once materialized, uploads, copies,
     /// draws, and empty checkpoints use only the bounded async queue operation;
     /// submission never waits for their completion or for admission capacity.
+    /// All lowered packets are staged within the advertised async byte bound
+    /// and published in one admission operation. Busy/Rejected restore CPU
+    /// initialization/revision bookkeeping and do not send an uploaded prefix.
+    /// Larger streams are rejected before submission; consumers may partition
+    /// independent uploads into separate bounded logical command buffers.
     ///
     /// # Arguments
     ///
@@ -565,13 +570,36 @@ impl Queue {
         resources: &mut IrResources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<Submission, SubmitError<IrSubmitError, Submission>> {
-        self.backend
+        let limit = self
+            .backend
             .check_async_support()
             .map_err(|error| SubmitError::Rejected(IrSubmitError::Backend(error)))?;
+        let snapshot = resources
+            .backend
+            .snapshot()
+            .map_err(|error| SubmitError::Rejected(IrSubmitError::Backend(error)))?;
+        let mut surfaces = Vec::new();
+        surfaces
+            .try_reserve_exact(resources.images.len())
+            .map_err(|_| SubmitError::Rejected(IrSubmitError::OutOfMemory))?;
+        surfaces.extend(
+            resources
+                .images
+                .iter()
+                .map(|mapping| mapping.image.backend.ir_surface_initialized()),
+        );
         let mut mode = SubmitMode::tracked();
+        mode.set_limit(limit);
         let result = self.submit_ir_with(context, resources, commands, &mut mode);
-        if result.is_err() && mode.accepted() {
-            resources.submission_failed = true;
+        if result.is_err() {
+            if mode.accepted() {
+                resources.submission_failed = true;
+            } else {
+                resources.backend.restore(snapshot);
+                for (mapping, initialized) in resources.images.iter().zip(surfaces) {
+                    mapping.image.backend.restore_ir_surface(initialized);
+                }
+            }
         }
         mode.finish(result)
     }
@@ -755,11 +783,10 @@ impl Queue {
             .map_err(IrSubmitError::Backend)?;
         }
         if mode.is_tracked() {
-            // Even a CPU-shadow-only stream or an empty stream must establish
-            // a real queue checkpoint before its logical updates are accepted.
-            if !mode.accepted() {
-                self.backend.checkpoint(mode)?;
-            }
+            // Publish every staged packet in one admission operation, including
+            // a real checkpoint for empty/CPU-shadow-only streams. Busy cannot
+            // strand a successfully uploaded prefix of this logical stream.
+            self.backend.checkpoint(mode)?;
             resources.commit_buffer_updates(buffer_updates);
             resources.commit_canonical_validations(canonical_validations);
         }

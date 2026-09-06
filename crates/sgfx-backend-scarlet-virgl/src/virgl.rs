@@ -920,6 +920,101 @@ struct IrBuffer {
     uploaded_revision: Option<u64>,
 }
 
+/// CPU cache state before staged commands have been accepted.
+pub(crate) struct IrStateSnapshot {
+    initialized: bool,
+    buffers: Vec<Option<u64>>,
+    textures: Vec<(bool, bool)>,
+    samplers: Vec<bool>,
+    pipelines: Vec<bool>,
+}
+
+impl IrResources {
+    pub(crate) fn snapshot(&self) -> HandleResult<IrStateSnapshot> {
+        fn collect<T>(length: usize, values: impl Iterator<Item = T>) -> HandleResult<Vec<T>> {
+            let mut result = Vec::new();
+            result
+                .try_reserve_exact(length)
+                .map_err(|_| HandleError::OutOfResources)?;
+            result.extend(values);
+            Ok(result)
+        }
+        Ok(IrStateSnapshot {
+            initialized: self.initialized.get(),
+            buffers: collect(
+                self.buffers.len(),
+                self.buffers
+                    .iter()
+                    .map(|value| value.as_ref().and_then(|buffer| buffer.uploaded_revision)),
+            )?,
+            textures: collect(
+                self.textures.len(),
+                self.textures.iter().map(|value| {
+                    value.as_ref().map_or((false, false), |texture| {
+                        (
+                            texture.sampler_view_initialized(),
+                            texture.surface_initialized(),
+                        )
+                    })
+                }),
+            )?,
+            samplers: collect(
+                self.samplers.len(),
+                self.samplers.iter().map(|value| {
+                    value
+                        .as_ref()
+                        .is_some_and(|sampler| sampler.initialized.get())
+                }),
+            )?,
+            pipelines: collect(
+                self.pipelines.len(),
+                self.pipelines.iter().map(|value| {
+                    value
+                        .as_ref()
+                        .is_some_and(|pipeline| pipeline.initialized.get())
+                }),
+            )?,
+        })
+    }
+
+    pub(crate) fn restore(&mut self, snapshot: IrStateSnapshot) {
+        self.initialized.set(snapshot.initialized);
+        for (index, buffer) in self.buffers.iter_mut().enumerate() {
+            if let Some(buffer) = buffer {
+                buffer.uploaded_revision = snapshot.buffers.get(index).copied().flatten();
+            }
+        }
+        for (index, texture) in self.textures.iter().enumerate() {
+            let (view, surface) = snapshot.textures.get(index).copied().unwrap_or_default();
+            match texture {
+                Some(IrTexture::Internal(texture)) => {
+                    texture.sampler_view_initialized.set(view);
+                    texture.ir_surface_initialized.set(surface);
+                }
+                Some(IrTexture::Mapped(texture)) => {
+                    texture.sampler_view_initialized.set(view);
+                    texture.surface_initialized.set(surface);
+                }
+                None => {}
+            }
+        }
+        for (index, sampler) in self.samplers.iter().enumerate() {
+            if let Some(sampler) = sampler {
+                sampler
+                    .initialized
+                    .set(snapshot.samplers.get(index).copied().unwrap_or(false));
+            }
+        }
+        for (index, pipeline) in self.pipelines.iter().enumerate() {
+            if let Some(pipeline) = pipeline {
+                pipeline
+                    .initialized
+                    .set(snapshot.pipelines.get(index).copied().unwrap_or(false));
+            }
+        }
+    }
+}
+
 struct IrSampler {
     handle: u32,
     state: IrSamplerState,
@@ -1092,7 +1187,7 @@ impl Queue {
         Ok(())
     }
 
-    pub(crate) fn check_async_support(&self) -> HandleResult<()> {
+    pub(crate) fn check_async_support(&self) -> HandleResult<usize> {
         let info = self.raw.query_async()?;
         if info.abi_version != gpu_raw::GPU_ABI_VERSION
             || info.reserved != 0
@@ -1102,11 +1197,11 @@ impl Queue {
         {
             return Err(HandleError::Unsupported);
         }
-        Ok(())
+        Ok(info.max_opaque_command_size as usize)
     }
 
     pub(crate) fn checkpoint(&self, mode: &mut SubmitMode) -> HandleResult<()> {
-        mode.submit(&self.raw, &[])
+        mode.flush(&self.raw)
     }
 
     fn max_command_size(&self) -> usize {
@@ -1885,7 +1980,7 @@ pub(crate) struct Image {
     composition_surface_handle: u32,
     composition_surface_initialized: Cell<bool>,
     ir_surface_handle: u32,
-    ir_surface_initialized: Cell<bool>,
+    pub(crate) ir_surface_initialized: Cell<bool>,
 }
 
 pub(crate) struct Texture {

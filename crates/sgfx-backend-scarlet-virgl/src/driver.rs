@@ -262,7 +262,7 @@ impl Queue {
         }
     }
 
-    pub(crate) fn check_async_support(&self) -> HandleResult<()> {
+    pub(crate) fn check_async_support(&self) -> HandleResult<usize> {
         match self {
             Self::Virgl(queue) => queue.check_async_support(),
         }
@@ -423,6 +423,17 @@ pub(crate) enum Image {
 }
 
 impl Image {
+    pub(crate) fn ir_surface_initialized(&self) -> bool {
+        match self {
+            Self::Virgl(image) => image.ir_surface_initialized.get(),
+        }
+    }
+
+    pub(crate) fn restore_ir_surface(&self, initialized: bool) {
+        match self {
+            Self::Virgl(image) => image.ir_surface_initialized.set(initialized),
+        }
+    }
     pub(crate) fn context_id(&self) -> i32 {
         match self {
             Self::Virgl(image) => image.context_id(),
@@ -663,6 +674,20 @@ pub(crate) struct IrSubmission {
 /// Private persistent materialization cache owned by the creating context.
 pub(crate) enum IrResources {
     Virgl(virgl::IrResources),
+}
+
+impl IrResources {
+    pub(crate) fn snapshot(&self) -> HandleResult<virgl::IrStateSnapshot> {
+        match self {
+            Self::Virgl(resources) => resources.snapshot(),
+        }
+    }
+
+    pub(crate) fn restore(&mut self, snapshot: virgl::IrStateSnapshot) {
+        match self {
+            Self::Virgl(resources) => resources.restore(snapshot),
+        }
+    }
 }
 
 pub(crate) enum Texture {
