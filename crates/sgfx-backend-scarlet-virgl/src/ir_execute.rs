@@ -1,7 +1,9 @@
 //! Ordered lowering of portable logical IR to the Scarlet VirGL adapter.
 
 use alloc::{rc::Rc, vec::Vec};
+use sgfx_core::backend::SubmitError;
 
+use crate::completion::SubmitMode;
 use crate::driver::{
     self, IrAddressMode, IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec,
     IrCompareFunction, IrCullMode, IrDepthState, IrDraw, IrFilterMode, IrFragmentProgram,
@@ -16,7 +18,7 @@ use crate::ir::{
     TextureId, TextureRef, TextureSampleMode, TextureUsage, TextureWrite, VertexAttribute,
     VertexFormat,
 };
-use crate::{Context, HandleError, Image, Queue, Texture};
+use crate::{Context, HandleError, Image, Queue, Submission, Texture};
 
 /// An IR feature that the active backend facade cannot lower faithfully yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,12 @@ pub enum IrSubmitError {
     OutOfMemory,
     /// The active graphics backend rejected resource creation, upload, or submission.
     Backend(HandleError),
+    /// A native chunk failed; the value is its `GPU_COMPLETION_FAILURE_*` reason.
+    CompletionFailed(u32),
+    /// Possibly accepted work has no trustworthy completion observation.
+    CompletionUnavailable,
+    /// Earlier partial submission failed; recreate this resource cache before reuse.
+    SubmissionFailed,
 }
 
 impl From<ir::Error> for IrSubmitError {
@@ -123,6 +131,7 @@ pub struct IrResources {
     buffer_shadows: Vec<Option<Vec<u8>>>,
     buffer_revisions: Vec<u64>,
     canonical_buffer_revisions: Vec<Option<u64>>,
+    submission_failed: bool,
 }
 
 struct ImageMapping {
@@ -165,6 +174,7 @@ impl IrResources {
             buffer_shadows,
             buffer_revisions,
             canonical_buffer_revisions,
+            submission_failed: false,
         })
     }
 
@@ -528,6 +538,44 @@ struct PipelineInfo {
 }
 
 impl Queue {
+    /// Validate, materialize new resources, and asynchronously submit logical IR.
+    ///
+    /// New physical resources are created using Scarlet's existing synchronous
+    /// resource API before any upload or draw from this call is sent. This cold
+    /// setup may wait for earlier GPU work. Once materialized, uploads, copies,
+    /// draws, and empty checkpoints use only the bounded async queue operation;
+    /// submission never waits for their completion or for admission capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - Context that created this queue and `resources`.
+    /// * `resources` - Persistent resource cache, retained across submissions.
+    /// * `commands` - Finished logical stream and borrowed upload bytes.
+    ///
+    /// # Returns
+    ///
+    /// An owned receipt, or a rejection, capacity limit, or partial-failure
+    /// receipt. Partial failure invalidates this cache: do not replay the
+    /// stream or reuse the cache, even after its accepted prefix completes.
+    /// Completion errors likewise require recovery rather than replay. The
+    /// kernel retains in-flight resources independently of these owners.
+    pub fn submit_ir_async<'r, 'data>(
+        &self,
+        context: &Context,
+        resources: &mut IrResources,
+        commands: &CommandBuffer<'r, 'data>,
+    ) -> Result<Submission, SubmitError<IrSubmitError, Submission>> {
+        self.backend
+            .check_async_support()
+            .map_err(|error| SubmitError::Rejected(IrSubmitError::Backend(error)))?;
+        let mut mode = SubmitMode::tracked();
+        let result = self.submit_ir_with(context, resources, commands, &mut mode);
+        if result.is_err() && mode.accepted() {
+            resources.submission_failed = true;
+        }
+        mode.finish(result)
+    }
+
     /// Validate, lower, and synchronously submit one logical IR command buffer.
     ///
     /// The supported subset contains buffer and texture uploads, compatible
@@ -553,6 +601,19 @@ impl Queue {
         resources: &mut IrResources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<(), IrSubmitError> {
+        self.submit_ir_with(context, resources, commands, &mut SubmitMode::Synchronous)
+    }
+
+    fn submit_ir_with<'r, 'data>(
+        &self,
+        context: &Context,
+        resources: &mut IrResources,
+        commands: &CommandBuffer<'r, 'data>,
+        mode: &mut SubmitMode,
+    ) -> Result<(), IrSubmitError> {
+        if resources.submission_failed {
+            return Err(IrSubmitError::SubmissionFailed);
+        }
         if !core::ptr::eq(resources.resources(), commands.resources()) {
             return Err(IrSubmitError::ResourceTableMismatch);
         }
@@ -562,8 +623,53 @@ impl Queue {
             return Err(IrSubmitError::ContextMismatch);
         }
         let plan = ExecutionPlan::from_commands(resources, commands)?;
+        if !mode.is_tracked() && plan.events.is_empty() {
+            return Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::CommandSequence,
+            ));
+        }
         plan.validate_transport_chunks()?;
         register_mapped_images(context, resources)?;
+        if mode.is_tracked() {
+            // First-use allocation is explicitly synchronous. Do it for the
+            // whole stream before sending anything, so later lazy resources
+            // cannot drain uploads/draws accepted earlier in this same call.
+            for event in &plan.events {
+                match event {
+                    ExecutionEvent::Upload(texture, _) => self.backend.materialize_ir_texture(
+                        &context.backend,
+                        &mut resources.backend,
+                        *texture,
+                    )?,
+                    ExecutionEvent::Copy(copy) => {
+                        self.backend.materialize_ir_texture(
+                            &context.backend,
+                            &mut resources.backend,
+                            copy.source,
+                        )?;
+                        self.backend.materialize_ir_texture(
+                            &context.backend,
+                            &mut resources.backend,
+                            copy.destination,
+                        )?;
+                    }
+                    ExecutionEvent::Pass(pass) => {
+                        if let ExecutionTarget::Internal(texture) = pass.target {
+                            self.backend.materialize_ir_texture(
+                                &context.backend,
+                                &mut resources.backend,
+                                texture,
+                            )?;
+                        }
+                        self.backend.materialize_ir_pass(
+                            &context.backend,
+                            &mut resources.backend,
+                            &pass.submission,
+                        )?;
+                    }
+                }
+            }
+        }
         let mut prepared_buffers = Vec::new();
         for event in &plan.events {
             let ExecutionEvent::Pass(pass) = event else {
@@ -593,6 +699,7 @@ impl Queue {
                     &mut resources.backend,
                     binding.buffer,
                     bytes,
+                    mode,
                 )?;
                 prepared_buffers
                     .try_reserve(1)
@@ -600,18 +707,19 @@ impl Queue {
                 prepared_buffers.push(binding.buffer.slot);
             }
         }
-        // Buffer uploads are already visible to the backend at this point.
-        // Commit their CPU revisions before executing later events so a pass
-        // failure cannot leave the backend and shadow cache claiming the same
-        // revision for different bytes on a retry. Texture uploads likewise
-        // are not rolled back when a later event fails.
+        // Synchronous uploads are already visible: preserve the existing
+        // failure/retry revision policy. Tracked submission commits shadows
+        // only on full acceptance; Busy/Rejected must not change the logical
+        // contents. An accepted partial failure invalidates the entire cache.
         let ExecutionPlan {
             events,
-            buffer_updates,
-            canonical_validations,
+            mut buffer_updates,
+            mut canonical_validations,
         } = plan;
-        resources.commit_buffer_updates(buffer_updates);
-        resources.commit_canonical_validations(canonical_validations);
+        if !mode.is_tracked() {
+            resources.commit_buffer_updates(core::mem::take(&mut buffer_updates));
+            resources.commit_canonical_validations(core::mem::take(&mut canonical_validations));
+        }
         for event in &events {
             match event {
                 ExecutionEvent::Upload(texture, upload) => self.backend.upload_ir_texture(
@@ -619,27 +727,41 @@ impl Queue {
                     &mut resources.backend,
                     *texture,
                     upload,
+                    mode,
                 ),
-                ExecutionEvent::Copy(copy) => {
-                    self.backend
-                        .copy_ir_texture(&context.backend, &mut resources.backend, *copy)
-                }
+                ExecutionEvent::Copy(copy) => self.backend.copy_ir_texture(
+                    &context.backend,
+                    &mut resources.backend,
+                    *copy,
+                    mode,
+                ),
                 ExecutionEvent::Pass(pass) => match &pass.target {
                     ExecutionTarget::Mapped(image) => self.backend.submit_ir(
                         &context.backend,
                         &mut resources.backend,
                         &image.as_ref().backend,
                         &pass.submission,
+                        mode,
                     ),
                     ExecutionTarget::Internal(target) => self.backend.submit_ir_internal(
                         &context.backend,
                         &mut resources.backend,
                         *target,
                         &pass.submission,
+                        mode,
                     ),
                 },
             }
             .map_err(IrSubmitError::Backend)?;
+        }
+        if mode.is_tracked() {
+            // Even a CPU-shadow-only stream or an empty stream must establish
+            // a real queue checkpoint before its logical updates are accepted.
+            if !mode.accepted() {
+                self.backend.checkpoint(mode)?;
+            }
+            resources.commit_buffer_updates(buffer_updates);
+            resources.commit_canonical_validations(canonical_validations);
         }
         Ok(())
     }
@@ -944,7 +1066,7 @@ impl ExecutionPlan {
                 }
             }
         }
-        if active.is_some() || events.is_empty() {
+        if active.is_some() {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::CommandSequence,
             ));

@@ -23,6 +23,7 @@ use std::{
     ipc::SharedMemory,
 };
 
+use crate::completion::SubmitMode;
 use crate::driver::{
     IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrCompareFunction,
     IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram, IrFrontFace, IrPipelineState,
@@ -1059,6 +1060,55 @@ struct CompositionQuad {
 }
 
 impl Queue {
+    pub(crate) fn materialize_ir_texture(
+        &self,
+        context: &Context,
+        resources: &mut IrResources,
+        texture: IrTextureSpec,
+    ) -> HandleResult<()> {
+        ir_texture(context, resources, texture).map(|_| ())
+    }
+
+    pub(crate) fn materialize_ir_pass(
+        &self,
+        context: &Context,
+        resources: &mut IrResources,
+        submission: &IrSubmission,
+    ) -> HandleResult<()> {
+        if let Some(texture) = submission.depth_attachment {
+            ir_texture(context, resources, texture)?;
+        }
+        for upload in &submission.texture_uploads {
+            ir_texture(context, resources, upload.texture)?;
+        }
+        for draw in &submission.draws {
+            if let Some(binding) = draw.vertex_buffer {
+                ir_buffer(context, resources, binding.buffer)?;
+            }
+            if let Some(texture) = draw.texture {
+                ir_texture(context, resources, texture)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_async_support(&self) -> HandleResult<()> {
+        let info = self.raw.query_async()?;
+        if info.abi_version != gpu_raw::GPU_ABI_VERSION
+            || info.reserved != 0
+            || info.reserved2 != 0
+            || info.max_pending_submissions == 0
+            || info.max_opaque_command_size < self.raw.max_opaque_command_size()
+        {
+            return Err(HandleError::Unsupported);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint(&self, mode: &mut SubmitMode) -> HandleResult<()> {
+        mode.submit(&self.raw, &[])
+    }
+
     fn max_command_size(&self) -> usize {
         self.raw.max_opaque_command_size() as usize
     }
@@ -1077,6 +1127,7 @@ impl Queue {
         resources: &mut IrResources,
         spec: IrBufferSpec,
         bytes: &[u8],
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
             || resources.context_handle != context.handle_id()
@@ -1119,7 +1170,7 @@ impl Queue {
                 u32::try_from(offset).map_err(|_| HandleError::InvalidParameter)?,
                 chunk,
             )?;
-            self.submit_commands(&commands)?;
+            mode.submit(&self.raw, &commands)?;
             offset = end;
         }
         let buffer = ir_buffer(context, resources, spec)?;
@@ -1133,6 +1184,7 @@ impl Queue {
         resources: &mut IrResources,
         spec: IrTextureSpec,
         upload: &IrTextureUpload,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
             || resources.context_handle != context.handle_id()
@@ -1146,15 +1198,23 @@ impl Queue {
         let IrTexture::Internal(texture) = texture else {
             return Err(HandleError::InvalidParameter);
         };
-        context.upload_texture_bgra(
-            texture,
-            &upload.pixels,
-            upload
-                .destination
-                .width
-                .checked_mul(4)
-                .ok_or(HandleError::InvalidParameter)?,
-            ir_rect_to_pixel_rect(upload.destination)?,
+        if !mode.is_tracked() {
+            return context.upload_texture_bgra(
+                texture,
+                &upload.pixels,
+                upload
+                    .destination
+                    .width
+                    .checked_mul(4)
+                    .ok_or(HandleError::InvalidParameter)?,
+                ir_rect_to_pixel_rect(upload.destination)?,
+            );
+        }
+        submit_ir_texture_inline_write(
+            texture.resource_id,
+            upload,
+            self.max_command_size(),
+            |commands| mode.submit(&self.raw, commands),
         )
     }
 
@@ -1163,6 +1223,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         copy: IrTextureCopy,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
             || resources.context_handle != context.handle_id()
@@ -1192,7 +1253,7 @@ impl Queue {
             source_id,
             copy.source_rect,
         );
-        self.submit_commands(&commands)
+        mode.submit(&self.raw, &commands)
     }
 
     pub(crate) fn submit_ir_internal(
@@ -1201,6 +1262,7 @@ impl Queue {
         resources: &mut IrResources,
         target: IrTextureSpec,
         submission: &IrSubmission,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if !target.render_attachment
             || self.context_handle != context.handle_id()
@@ -1226,7 +1288,7 @@ impl Queue {
                 orientation: FramebufferOrientation::UPPER_LEFT,
             }
         };
-        self.submit_ir_target(context, resources, pass_target, submission)?;
+        self.submit_ir_target(context, resources, pass_target, submission, mode)?;
         let texture = resources
             .textures
             .get(target.slot)
@@ -1242,6 +1304,7 @@ impl Queue {
         resources: &mut IrResources,
         image: &Image,
         submission: &IrSubmission,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         self.submit_ir_target(
             context,
@@ -1255,6 +1318,7 @@ impl Queue {
                 orientation: image.orientation,
             },
             submission,
+            mode,
         )?;
         image.ir_surface_initialized.set(true);
         Ok(())
@@ -1266,6 +1330,7 @@ impl Queue {
         resources: &mut IrResources,
         target: IrPassTarget,
         submission: &IrSubmission,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
             || resources.context_handle != context.handle_id()
@@ -1524,26 +1589,9 @@ impl Queue {
         }
 
         for upload in &submission.texture_uploads {
-            let texture = resources
-                .textures
-                .get(upload.texture.slot)
-                .and_then(Option::as_ref)
-                .ok_or(HandleError::InvalidParameter)?;
-            let IrTexture::Internal(texture) = texture else {
-                return Err(HandleError::InvalidParameter);
-            };
-            context.upload_texture_bgra(
-                texture,
-                &upload.pixels,
-                upload
-                    .destination
-                    .width
-                    .checked_mul(4)
-                    .ok_or(HandleError::InvalidParameter)?,
-                ir_rect_to_pixel_rect(upload.destination)?,
-            )?;
+            self.upload_ir_texture(context, resources, upload.texture, upload, mode)?;
         }
-        self.submit_commands(&commands)?;
+        mode.submit(&self.raw, &commands)?;
         if !resources.initialized.get() {
             resources.initialized.set(true);
         }
@@ -2927,6 +2975,92 @@ fn push_ir_buffer_inline_write(
     Ok(())
 }
 
+// Inline bytes belong to the submitted packet, not to a shared transfer
+// backing that a later upload could overwrite while the GPU is still reading.
+// VirGL's payload is 11 header words followed by tightly packed pixel bytes.
+fn submit_ir_texture_inline_write(
+    resource_id: u32,
+    upload: &IrTextureUpload,
+    max_command_size: usize,
+    mut submit: impl FnMut(&[u8]) -> HandleResult<()>,
+) -> HandleResult<()> {
+    const FIXED_BYTES: usize = 12 * core::mem::size_of::<u32>();
+    // The packet header has a 16-bit word count, excluding the header itself.
+    const MAX_PACKET_BYTES: usize = (u16::MAX as usize + 1) * 4;
+    let max_payload = max_command_size
+        .min(MAX_PACKET_BYTES)
+        .checked_sub(FIXED_BYTES)
+        .map(|bytes| bytes & !3)
+        .filter(|bytes| *bytes >= 4)
+        .ok_or(HandleError::InvalidParameter)?;
+    let rect = upload.destination;
+    let row_bytes = usize::try_from(rect.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or(HandleError::InvalidParameter)?;
+    let byte_len = row_bytes
+        .checked_mul(rect.height as usize)
+        .ok_or(HandleError::InvalidParameter)?;
+    if resource_id == 0
+        || !ir_rect_is_within(rect, upload.texture.width, upload.texture.height)
+        || upload.texture.format == IrTextureFormat::Depth32Float
+        || upload.pixels.len() != byte_len
+    {
+        return Err(HandleError::InvalidParameter);
+    }
+
+    let mut commands = Vec::new();
+    commands
+        .try_reserve_exact(FIXED_BYTES + max_payload.min(byte_len))
+        .map_err(|_| HandleError::OutOfResources)?;
+    let mut y = 0;
+    while y < rect.height {
+        // Prefer whole rows. If even one row exceeds the transport limit,
+        // split that row into horizontal spans without carrying source padding.
+        let rows = if row_bytes <= max_payload {
+            (max_payload / row_bytes).min((rect.height - y) as usize) as u32
+        } else {
+            1
+        };
+        let mut x = 0;
+        while x < rect.width {
+            let width = (rect.width - x).min((max_payload / 4) as u32);
+            let stride = width * 4;
+            let length = stride as usize * rows as usize;
+            let start = y as usize * row_bytes + x as usize * 4;
+            let pixels = upload
+                .pixels
+                .get(start..start + length)
+                .ok_or(HandleError::InvalidParameter)?;
+            commands.clear();
+            push_dword(
+                &mut commands,
+                command_header(
+                    VIRGL_CCMD_RESOURCE_INLINE_WRITE,
+                    0,
+                    11 + (length / 4) as u32,
+                ),
+            );
+            push_dword(&mut commands, resource_id);
+            push_dword(&mut commands, 0); // mip level
+            push_dword(&mut commands, 0); // transfer usage (no unsynchronized hint)
+            push_dword(&mut commands, stride);
+            push_dword(&mut commands, length as u32); // layer stride
+            push_dword(&mut commands, rect.x + x);
+            push_dword(&mut commands, rect.y + y);
+            push_dword(&mut commands, 0);
+            push_dword(&mut commands, width);
+            push_dword(&mut commands, rows);
+            push_dword(&mut commands, 1);
+            commands.extend_from_slice(pixels);
+            submit(&commands)?;
+            x += width;
+        }
+        y += rows;
+    }
+    Ok(())
+}
+
 fn ir_fragment_shader_handle(resources: &IrResources, fragment: IrFragmentProgram) -> u32 {
     match fragment {
         IrFragmentProgram::Solid => resources.solid_fragment_shader_handle,
@@ -3364,5 +3498,127 @@ mod tests {
                 0x8877_6655,
             ]
         );
+    }
+
+    fn texture_upload(width: u32, height: u32) -> IrTextureUpload {
+        IrTextureUpload {
+            texture: IrTextureSpec {
+                slot: 0,
+                width: width + 3,
+                height: height + 5,
+                sampled: true,
+                render_attachment: false,
+                copy_destination: true,
+                present: false,
+                format: IrTextureFormat::Bgra8,
+            },
+            destination: crate::driver::IrRect {
+                x: 3,
+                y: 5,
+                width,
+                height,
+            },
+            pixels: (0..width * height * 4).map(|value| value as u8).collect(),
+        }
+    }
+
+    fn check_upload_chunks(upload: &IrTextureUpload, limit: usize) -> Vec<(u32, u32, u32, u32)> {
+        let mut covered = alloc::vec![false; upload.pixels.len() / 4];
+        let mut rectangles = Vec::new();
+        submit_ir_texture_inline_write(17, upload, limit, |commands| {
+            assert!(commands.len() <= limit);
+            let words = dwords(commands);
+            assert_eq!(words[0] & 0xffff, VIRGL_CCMD_RESOURCE_INLINE_WRITE);
+            assert_eq!(words[0] >> 16, words.len() as u32 - 1);
+            assert_eq!(words[1], 17);
+            let (x, y, width, height) = (words[6] - 3, words[7] - 5, words[9], words[10]);
+            assert_eq!(words[4], width * 4);
+            assert_eq!(words[5], width * height * 4);
+            assert_eq!(words[8], 0);
+            assert_eq!(words[11], 1);
+            for row in 0..height {
+                for column in 0..width {
+                    let source = ((y + row) * upload.destination.width + x + column) as usize;
+                    assert!(!covered[source], "a pixel must be uploaded exactly once");
+                    covered[source] = true;
+                    let packet = 48 + ((row * width + column) * 4) as usize;
+                    assert_eq!(
+                        &commands[packet..packet + 4],
+                        &upload.pixels[source * 4..source * 4 + 4]
+                    );
+                }
+            }
+            rectangles.push((x, y, width, height));
+            Ok(())
+        })
+        .unwrap();
+        assert!(covered.into_iter().all(|pixel| pixel));
+        rectangles
+    }
+
+    #[test]
+    fn texture_inline_upload_packs_complete_rows_with_a_short_tail() {
+        assert_eq!(
+            check_upload_chunks(&texture_upload(3, 5), 48 + 24),
+            [(0, 0, 3, 2), (0, 2, 3, 2), (0, 4, 3, 1)]
+        );
+    }
+
+    #[test]
+    fn texture_inline_upload_splits_rows_wider_than_the_packet_limit() {
+        assert_eq!(
+            check_upload_chunks(&texture_upload(5, 2), 48 + 8),
+            [
+                (0, 0, 2, 1),
+                (2, 0, 2, 1),
+                (4, 0, 1, 1),
+                (0, 1, 2, 1),
+                (2, 1, 2, 1),
+                (4, 1, 1, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn texture_inline_upload_honors_word_alignment_and_header_length() {
+        check_upload_chunks(&texture_upload(2, 2), 55);
+        check_upload_chunks(&texture_upload(256, 512), 1024 * 1024);
+    }
+
+    #[test]
+    fn invalid_texture_inline_upload_is_rejected_before_any_chunk() {
+        let mut upload = texture_upload(3, 2);
+        let mut submitted = 0;
+        assert!(
+            submit_ir_texture_inline_write(17, &upload, 51, |_| {
+                submitted += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        upload.pixels.pop();
+        assert!(
+            submit_ir_texture_inline_write(17, &upload, 72, |_| {
+                submitted += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(submitted, 0);
+    }
+
+    #[test]
+    fn texture_inline_upload_stops_after_a_partial_transport_failure() {
+        let mut submitted = 0;
+        let result = submit_ir_texture_inline_write(17, &texture_upload(3, 5), 72, |_| {
+            submitted += 1;
+            if submitted == 2 {
+                Err(HandleError::OutOfResources)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(HandleError::OutOfResources)));
+        assert_eq!(submitted, 2);
     }
 }

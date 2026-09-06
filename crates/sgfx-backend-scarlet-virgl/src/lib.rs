@@ -45,10 +45,12 @@ pub fn matches_backend_id(backend_id: &[u8]) -> bool {
 /// Supported command subsets can be lowered through [`Queue::submit_ir`].
 pub use sgfx_core::ir;
 
+mod completion;
 mod driver;
 mod ir_execute;
 mod virgl;
 
+pub use completion::Submission;
 pub use ir_execute::{IrResources, IrSubmitError, UnsupportedIrFeature};
 
 /// Device capabilities expressed in application rendering terms.
@@ -706,6 +708,29 @@ impl sgfx_core::backend::CommandExecutor for Executor<'_> {
         commands: &ir::CommandBuffer<'r, 'data>,
     ) -> Result<(), Self::Error> {
         self.queue.submit_ir(self.context, self.resources, commands)
+    }
+}
+
+impl sgfx_core::backend::CommandSubmitter for Executor<'_> {
+    type Submission = Submission;
+
+    /// Submit portable commands with owned completion tracking.
+    ///
+    /// # Arguments
+    ///
+    /// * `commands` - Finished logical commands and borrowed upload data.
+    ///
+    /// # Returns
+    ///
+    /// A receipt for all accepted work or a classified submission error.
+    /// First-use resource creation may synchronize; see [`Queue::submit_ir_async`].
+    fn submit<'r, 'data>(
+        &mut self,
+        commands: &ir::CommandBuffer<'r, 'data>,
+    ) -> Result<Self::Submission, sgfx_core::backend::SubmitError<Self::Error, Self::Submission>>
+    {
+        self.queue
+            .submit_ir_async(self.context, self.resources, commands)
     }
 }
 

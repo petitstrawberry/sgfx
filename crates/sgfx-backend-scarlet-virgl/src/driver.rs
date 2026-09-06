@@ -3,6 +3,7 @@
 use alloc::{rc::Rc, vec::Vec};
 use gpu_raw::{Gpu, GpuQueryInfo};
 
+use crate::completion::SubmitMode;
 #[cfg(feature = "std")]
 use scarlet_os::handle::{Handle, HandleError, HandleResult};
 #[cfg(not(feature = "std"))]
@@ -235,6 +236,44 @@ pub(crate) enum Queue {
 }
 
 impl Queue {
+    pub(crate) fn materialize_ir_texture(
+        &self,
+        context: &Context,
+        resources: &mut IrResources,
+        texture: IrTextureSpec,
+    ) -> HandleResult<()> {
+        match (self, context, resources) {
+            (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
+                queue.materialize_ir_texture(context, resources, texture)
+            }
+        }
+    }
+
+    pub(crate) fn materialize_ir_pass(
+        &self,
+        context: &Context,
+        resources: &mut IrResources,
+        submission: &IrSubmission,
+    ) -> HandleResult<()> {
+        match (self, context, resources) {
+            (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
+                queue.materialize_ir_pass(context, resources, submission)
+            }
+        }
+    }
+
+    pub(crate) fn check_async_support(&self) -> HandleResult<()> {
+        match self {
+            Self::Virgl(queue) => queue.check_async_support(),
+        }
+    }
+
+    pub(crate) fn checkpoint(&self, mode: &mut SubmitMode) -> HandleResult<()> {
+        match self {
+            Self::Virgl(queue) => queue.checkpoint(mode),
+        }
+    }
+
     pub(crate) fn context_id(&self) -> i32 {
         match self {
             Self::Virgl(queue) => queue.context_id(),
@@ -247,6 +286,7 @@ impl Queue {
         resources: &mut IrResources,
         image: &Image,
         submission: &IrSubmission,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources, image) {
             (
@@ -254,7 +294,7 @@ impl Queue {
                 Context::Virgl(context),
                 IrResources::Virgl(resources),
                 Image::Virgl(image),
-            ) => queue.submit_ir(context, resources, image, submission),
+            ) => queue.submit_ir(context, resources, image, submission, mode),
         }
     }
 
@@ -264,10 +304,11 @@ impl Queue {
         resources: &mut IrResources,
         target: IrTextureSpec,
         submission: &IrSubmission,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
-                queue.submit_ir_internal(context, resources, target, submission)
+                queue.submit_ir_internal(context, resources, target, submission, mode)
             }
         }
     }
@@ -278,10 +319,11 @@ impl Queue {
         resources: &mut IrResources,
         texture: IrTextureSpec,
         upload: &IrTextureUpload,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
-                queue.upload_ir_texture(context, resources, texture, upload)
+                queue.upload_ir_texture(context, resources, texture, upload, mode)
             }
         }
     }
@@ -292,10 +334,11 @@ impl Queue {
         resources: &mut IrResources,
         buffer: IrBufferSpec,
         bytes: &[u8],
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
-                queue.prepare_ir_buffer(context, resources, buffer, bytes)
+                queue.prepare_ir_buffer(context, resources, buffer, bytes, mode)
             }
         }
     }
@@ -305,10 +348,11 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         copy: IrTextureCopy,
+        mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
-                queue.copy_ir_texture(context, resources, copy)
+                queue.copy_ir_texture(context, resources, copy, mode)
             }
         }
     }
