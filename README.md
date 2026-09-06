@@ -5,9 +5,10 @@ frontends record backend-neutral resources and commands, while complete
 backends materialize resources, lower commands, and submit work to a GPU or
 host graphics API.
 
-The current implementation was migrated from the Scarlet repository without
-changing its public API or execution behavior. Its longer-term architecture is
-tracked in [issue #1](https://github.com/petitstrawberry/sgfx/issues/1).
+SGFX was initially migrated from the Scarlet repository without changing its
+public API or execution behavior. The [architecture](docs/architecture.md)
+maps [issue #1](https://github.com/petitstrawberry/sgfx/issues/1) onto the current
+IR, execution backends and platform adapters, including native tracked submission.
 
 The [1.0 contract draft](docs/1.0-contract.md) proposes the target API
 extension rules, rendering and execution semantics, imported-image retirement,

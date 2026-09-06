@@ -25,18 +25,28 @@ An empty stream is a no-op, not a portable wait for earlier work. A backend may
 complete work synchronously; portable callers must rely only on the common
 acceptance guarantee. The additional `CommandSubmitter` and `Completion`
 interfaces now expose owned receipts, nonblocking observation and timed waits
-on the host WGPU path. Native backend support is still being implemented.
+on host WGPU and native VirGL. Adreno tracked submission remains unsupported.
 There is no common cross-queue GPU semaphore API.
 
 | Backend | Current success boundary | Observation / presentation |
 | --- | --- | --- |
 | WGPU | Uploads are copied into WGPU-owned staging and the encoded commands are queued. GPU execution remains asynchronous. | Same-queue operations retain ordering. Host surface presentation is separate; CPU readback must wait for the appropriate copy/map completion. |
-| Scarlet VirGL | Ordered backend operations use the synchronous Scarlet GPU ABI. Opaque submissions return after fenced backend completion; buffer-only updates may remain in the persistent shadow cache until needed. | Session BGRA readback is synchronous. Sharing an image with SWS still follows the SWS frame lifecycle. |
-| Scarlet Adreno | Ordered chunks use the synchronous Scarlet GPU ABI; earlier chunks are drained before direct CPU-visible uploads. | Session BGRA readback is synchronous. SWS presentation and buffer reuse remain separate from command execution. |
+| Scarlet VirGL tracked `submit` | One logical stream is accepted into the context-owned dispatcher. Its worker schedules native chunks using the asynchronous Scarlet GPU ABI. First-use resource creation can still synchronize. | The owned receipt covers all chunks and their ordered prefix. Observation is not required to drive dispatch. Readback and explicit detach drain preceding logical work. SWS leases remain separate. |
+| Scarlet VirGL legacy `execute` / direct submit | Ordered backend operations retain the synchronous Scarlet GPU ABI path after draining preceding tracked work. Opaque submissions return after fenced backend completion; buffer-only updates may remain in the persistent shadow cache until needed. | Session BGRA readback is synchronous. Sharing an image with SWS still follows the SWS frame lifecycle. |
+| Scarlet Adreno | Ordered chunks use the synchronous Scarlet GPU ABI; earlier chunks are drained before direct CPU-visible uploads. The facade rejects tracked `submit` as unsupported. | Session BGRA readback is synchronous. A618 asynchronous completion and staging retention remain required work. SWS presentation and buffer reuse remain separate from command execution. |
 
-The Scarlet ABI boundary is `GpuQueue::submit` in `gpu-raw`; this is not a
-reason to make WGPU block or to equate a Scarlet userspace target with no_std.
-Both normal Scarlet targets support Rust std.
+The Scarlet ABI retains synchronous `GpuQueue::submit` and adds tracked
+asynchronous submission with authoritative completion observation in `gpu-raw`.
+The [architecture](architecture.md) describes the division between IR,
+backend scheduling and platform ownership. Both normal Scarlet targets support
+Rust std; that runtime choice does not select synchronous execution.
+
+VirGL admits up to 16 logical streams and 64 MiB of retained command bytes.
+Native packet splitting, FIFO progress and upload-arena reuse belong to the
+backend. A receipt remains pending until every chunk and its ordered prefix
+retire. Dropping a frontend owner or receipt does not cancel accepted work or
+stop the worker. See the [completion contract](completion-contract.md) for
+the admission and failure rules.
 
 WGPU `CommandSubmitter::submit` returns an owned receipt. A private marker
 written at the end of the submission identifies retirement even if a later
@@ -112,6 +122,14 @@ report validation or device failures asynchronously after queue acceptance.
 Neither an `Err` nor the absence of an immediate error proves that no work ran.
 Do not blindly replay a failed command buffer. Backend-specific recovery must
 decide whether state can be reused or the context and mappings must be rebuilt.
+
+Tracked submission distinguishes `Busy` and `Rejected` (the current logical
+stream was not accepted) from `Failed` (possible accepted work with a receipt).
+Neither rejection rolls back earlier submissions in the same frame. The facade's
+`Error::is_recoverable_rejection()` classifies only an error inside `Rejected`;
+it must not downgrade `Failed` or completion errors. ScarletUI retires an accepted
+prefix before discarding a recoverably rejected frame and preserving its prior
+presentation. An oversized unchanged stream is not a transient Busy condition.
 
 ## Approved completion scope and remaining conformance
 

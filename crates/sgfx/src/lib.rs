@@ -1,9 +1,11 @@
-//! Cross-platform SGFX frontend and execution-backend selector.
+//! Cross-platform SGFX execution facade and backend selector.
 //!
 //! Portable renderers record resources and command buffers through
 //! [`sgfx_core`]. Applications and platform composition roots use this crate
 //! to select one complete execution backend. A selected backend continues to
 //! own physical resources, command lowering, transport limits, and submission.
+//! Renderer/API frontends lower into the common IR; this facade delegates
+//! execution and does not introduce a separate application command model.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
