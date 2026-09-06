@@ -46,8 +46,11 @@ pub fn matches_backend_id(backend_id: &[u8]) -> bool {
 pub use sgfx_core::ir;
 
 mod completion;
+mod dispatch;
 mod driver;
 mod ir_execute;
+mod packets;
+mod scheduler;
 mod virgl;
 
 pub use completion::Submission;

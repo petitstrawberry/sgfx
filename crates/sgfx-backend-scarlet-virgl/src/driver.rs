@@ -236,6 +236,11 @@ pub(crate) enum Queue {
 }
 
 impl Queue {
+    pub(crate) fn wait_idle(&self) -> HandleResult<()> {
+        match self {
+            Self::Virgl(queue) => queue.wait_idle(),
+        }
+    }
     pub(crate) fn materialize_ir_texture(
         &self,
         context: &Context,

@@ -125,8 +125,8 @@ mod native {
     #[cfg_attr(test, test)]
     fn split_upload_and_copy_snapshot_borrowed_bytes() {
         let table = Rc::new(ResourceTable::new());
-        // An odd row width and a >64 KiB upload exercise multiple native chunks.
-        let (width, height) = (257, 129);
+        // Exceed the native 2 MiB request limit without any consumer-side split.
+        let (width, height) = (1025, 769);
         let output = target(&table, width, height);
         let source = table
             .define_texture(
@@ -199,17 +199,21 @@ mod native {
             .expect("begin")
             .end()
             .expect("end");
-        encoder
-            .write_texture(
-                source,
-                TextureWrite::new(
-                    PixelRect::new(0, 0, 1024, 513).expect("upload area"),
-                    4096,
-                    &bytes,
+        // The limit belongs to logical admission, not one native request.
+        // Repeated writes exceed 64 MiB without requiring a giant GPU image.
+        for _ in 0..32 {
+            encoder
+                .write_texture(
+                    source,
+                    TextureWrite::new(
+                        PixelRect::new(0, 0, 1024, 513).expect("upload area"),
+                        4096,
+                        &bytes,
+                    )
+                    .expect("upload"),
                 )
-                .expect("upload"),
-            )
-            .expect("write");
+                .expect("write");
+        }
         let commands = encoder.finish().expect("oversized commands");
         assert!(
             matches!(
@@ -310,6 +314,9 @@ mod native {
 
     #[cfg_attr(test, test)]
     fn persistent_vertex_upload_is_ordered_and_owned_by_the_queue() {
+        // More than the complete four-arena ring: the worker must retire and
+        // reuse staging inside one logical submission, even with one mesh.
+        const VERTEX_COUNT: u32 = 240_000;
         let table = Rc::new(ResourceTable::new());
         let target = target(&table, 32, 32);
         let pipeline = table
@@ -335,8 +342,11 @@ mod native {
             .expect("pipeline");
         let buffer = table
             .define_buffer(
-                BufferDesc::new(120, BufferUsage::VERTEX | BufferUsage::COPY_DST)
-                    .expect("buffer descriptor"),
+                BufferDesc::new(
+                    u64::from(VERTEX_COUNT) * 40,
+                    BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                )
+                .expect("buffer descriptor"),
             )
             .expect("buffer");
         let mut session = session(&table, &[target]);
@@ -352,6 +362,7 @@ mod native {
                     bytes.extend_from_slice(&component.to_le_bytes());
                 }
             }
+            let mut bytes = bytes.repeat(VERTEX_COUNT as usize / 3);
             let mut encoder = CommandEncoder::new(&table);
             encoder
                 .write_buffer(buffer, 0, &bytes)
@@ -375,7 +386,8 @@ mod native {
                 Color::rgba(1.0, 1.0, 1.0, 1.0).expect("white"),
             ))
             .expect("uniforms");
-            pass.draw(3, 0).expect("triangle");
+            pass.draw(3, VERTEX_COUNT - 3)
+                .expect("last uploaded triangle");
             pass.end().expect("end");
             let commands = encoder.finish().expect("commands");
             receipts.push(submit(&mut session, &commands));

@@ -94,13 +94,15 @@ pub enum IrSubmitError {
     InvalidVertexData,
     /// Allocation for persistent shadow data or decoded backend data failed.
     OutOfMemory,
+    /// The lowered stream exceeds the queue's 64 MiB logical-admission budget.
+    SubmissionTooLarge,
     /// The active graphics backend rejected resource creation, upload, or submission.
     Backend(HandleError),
     /// A native chunk failed; the value is its `GPU_COMPLETION_FAILURE_*` reason.
     CompletionFailed(u32),
     /// Possibly accepted work has no trustworthy completion observation.
     CompletionUnavailable,
-    /// Earlier partial submission failed; recreate this resource cache before reuse.
+    /// Earlier accepted work failed; recreate the context and resource cache before reuse.
     SubmissionFailed,
 }
 
@@ -545,11 +547,13 @@ impl Queue {
     /// setup may wait for earlier GPU work. Once materialized, uploads, copies,
     /// draws, and empty checkpoints use only the bounded async queue operation;
     /// submission never waits for their completion or for admission capacity.
-    /// All lowered packets are staged within the advertised async byte bound
-    /// and published in one admission operation. Busy/Rejected restore CPU
+    /// Native packets are batched within the advertised transport limit; a
+    /// bounded context-owned worker dispatches them after one logical admission.
+    /// Busy/Rejected restore CPU
     /// initialization/revision bookkeeping and do not send an uploaded prefix.
-    /// Larger streams are rejected before submission; consumers may partition
-    /// independent uploads into separate bounded logical command buffers.
+    /// Logical admission is bounded to 16 streams and 64 MiB of retained command
+    /// bytes. A single stream exceeding that byte budget is rejected explicitly;
+    /// consumers do not partition meshes or uploads to fit native request sizes.
     ///
     /// # Arguments
     ///
@@ -560,8 +564,8 @@ impl Queue {
     /// # Returns
     ///
     /// An owned receipt, or a rejection, capacity limit, or partial-failure
-    /// receipt. Partial failure invalidates this cache: do not replay the
-    /// stream or reuse the cache, even after its accepted prefix completes.
+    /// receipt. Partial failure invalidates the dispatcher and cache: do not replay
+    /// the stream or reuse the context/cache, even after its accepted prefix completes.
     /// Completion errors likewise require recovery rather than replay. The
     /// kernel retains in-flight resources independently of these owners.
     pub fn submit_ir_async<'r, 'data>(
@@ -629,6 +633,7 @@ impl Queue {
         resources: &mut IrResources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<(), IrSubmitError> {
+        self.backend.wait_idle()?;
         self.submit_ir_with(context, resources, commands, &mut SubmitMode::Synchronous)
     }
 
@@ -783,9 +788,10 @@ impl Queue {
             .map_err(IrSubmitError::Backend)?;
         }
         if mode.is_tracked() {
-            // Publish every staged packet in one admission operation, including
-            // a real checkpoint for empty/CPU-shadow-only streams. Busy cannot
-            // strand a successfully uploaded prefix of this logical stream.
+            // Publish the complete stream to the bounded logical scheduler,
+            // including a real checkpoint for empty/CPU-shadow-only streams.
+            // Busy cannot strand an uploaded prefix. The worker owns future
+            // packet dispatch; acceptance commits this ordered stream's state.
             self.backend.checkpoint(mode)?;
             resources.commit_buffer_updates(buffer_updates);
             resources.commit_canonical_validations(canonical_validations);
@@ -1690,7 +1696,7 @@ fn pipeline_info(
             .iter()
             .find(|attribute| attribute.location() == 2)
             .copied();
-        let result = (
+        (
             descriptor.target_format(),
             descriptor.topology(),
             descriptor.fragment(),
@@ -1701,8 +1707,7 @@ fn pipeline_info(
             position,
             secondary,
             tertiary,
-        );
-        result
+        )
     };
     if target != TextureFormat::Bgra8Unorm {
         return Err(IrSubmitError::Unsupported(

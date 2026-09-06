@@ -2,6 +2,7 @@
 
 use alloc::{rc::Rc, sync::Arc, vec::Vec};
 use core::cell::{Cell, RefCell};
+use std::sync::Mutex;
 
 use gpu_raw::{
     GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_DEPTH, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
@@ -24,12 +25,14 @@ use std::{
 };
 
 use crate::completion::SubmitMode;
+use crate::dispatch::NativeScheduler;
 use crate::driver::{
     IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrCompareFunction,
     IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram, IrFrontFace, IrPipelineState,
     IrSamplerState, IrSubmission, IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload,
     IrVertex, MAX_IR_VERTICES,
 };
+use crate::packets::UPLOAD_ARENA_COUNT;
 use crate::{
     Capabilities, Color, CullMode, FrontFace, MAX_COMPOSITION_OPERATIONS, PipelineDesc,
     PipelineKind, PixelRect, SourceAlpha, VertexClip4Color3, Viewport,
@@ -120,6 +123,15 @@ const IR_BUFFER_SLOTS: usize = 1_024;
 const IR_TEXTURE_SLOTS: usize = 1_024;
 const IR_SAMPLER_SLOTS: usize = 256;
 const IR_PIPELINE_SLOTS: usize = 256;
+
+type SharedScheduler = Rc<RefCell<Option<Arc<NativeScheduler>>>>;
+
+fn wait_scheduled(scheduler: &SharedScheduler) -> HandleResult<()> {
+    let scheduler = scheduler.borrow().clone();
+    scheduler
+        .as_ref()
+        .map_or(Ok(()), |scheduler| scheduler.wait_idle())
+}
 
 #[derive(Clone, Copy)]
 struct FramebufferOrientation {
@@ -370,6 +382,7 @@ impl Device {
             device: Rc::clone(self),
             raw: self.raw.create_context(&self.dialect)?,
             next_object_handle: Cell::new(FIRST_DYNAMIC_OBJECT_HANDLE),
+            scheduler: Rc::new(RefCell::new(None)),
         })
     }
 }
@@ -378,6 +391,7 @@ pub(crate) struct Context {
     device: Rc<Device>,
     raw: RawContext,
     next_object_handle: Cell<u32>,
+    scheduler: SharedScheduler,
 }
 
 impl Context {
@@ -533,6 +547,7 @@ impl Context {
         {
             return Err(HandleError::InvalidParameter);
         }
+        wait_scheduled(&self.scheduler)?;
         self.raw.upload_image_bgra(
             &texture.raw,
             pixels,
@@ -596,6 +611,7 @@ impl Context {
         {
             return Err(HandleError::InvalidParameter);
         }
+        wait_scheduled(&self.scheduler)?;
         self.raw.transfer_imported_image_bgra(
             &texture.raw,
             GpuImageBgraRect::new(damage.x(), damage.y(), damage.width(), damage.height()),
@@ -626,6 +642,7 @@ impl Context {
             .filter(|rows| *rows != 0)
             .ok_or(HandleError::InvalidParameter)?;
 
+        wait_scheduled(&self.scheduler)?;
         let mut y = rect.y();
         let mut remaining = rect.height();
         while remaining != 0 {
@@ -646,6 +663,7 @@ impl Context {
         if texture.context_handle != self.handle_id() {
             return Err(HandleError::InvalidParameter);
         }
+        wait_scheduled(&self.scheduler)?;
         self.raw.detach_image(&texture.raw)
     }
 
@@ -653,6 +671,7 @@ impl Context {
         if image.context_handle != self.handle_id() {
             return Err(HandleError::InvalidParameter);
         }
+        wait_scheduled(&self.scheduler)?;
         self.raw.detach_image(&image.raw)
     }
 
@@ -700,7 +719,8 @@ impl Context {
         let composition_vertex_resource_id =
             resource_id_from_token(self.raw.attach_buffer(&raw_vertex_buffer)?)?;
         Ok(Queue {
-            raw: self.raw.create_queue()?,
+            raw: Arc::new(self.raw.create_queue()?),
+            scheduler: Rc::clone(&self.scheduler),
             context_handle: self.handle_id(),
             composition_vertex_buffer: raw_vertex_buffer,
             composition_vertex_resource_id,
@@ -869,7 +889,8 @@ impl Context {
 }
 
 pub(crate) struct Queue {
-    raw: RawQueue,
+    raw: Arc<RawQueue>,
+    scheduler: SharedScheduler,
     context_handle: i32,
     composition_vertex_buffer: RawBuffer,
     composition_vertex_resource_id: u32,
@@ -896,7 +917,7 @@ pub(crate) struct IrResources {
     context_handle: i32,
     vertex_buffer: RawBuffer,
     vertex_resource_id: u32,
-    upload_arenas: Vec<Rc<UploadArena>>,
+    upload_arenas: Vec<Arc<UploadArena>>,
     buffers: Vec<Option<IrBuffer>>,
     textures: Vec<Option<IrTexture>>,
     texture_specs: Vec<Option<IrTextureSpec>>,
@@ -928,29 +949,7 @@ struct IrBuffer {
 pub(crate) struct UploadArena {
     _raw: RawBuffer,
     pub(crate) resource_id: u32,
-    pub(crate) capacity: u32,
-    completion: RefCell<Option<Arc<GpuCompletion>>>,
-    unobservable: Cell<bool>,
-}
-
-impl UploadArena {
-    pub(crate) fn retain_submission(&self, completion: Option<Arc<GpuCompletion>>) {
-        self.unobservable.set(completion.is_none());
-        *self.completion.borrow_mut() = completion;
-    }
-
-    fn is_idle(&self) -> HandleResult<bool> {
-        if self.unobservable.get() {
-            return Err(HandleError::SystemError(-1));
-        }
-        let completion = self.completion.borrow();
-        let Some(completion) = completion.as_ref() else {
-            return Ok(true);
-        };
-        crate::completion::completion_status(completion.query()?)
-            .map(|status| status == sgfx_core::backend::CompletionStatus::Complete)
-            .map_err(|_| HandleError::SystemError(-1))
-    }
+    pub(crate) completion: Mutex<Option<Arc<GpuCompletion>>>,
 }
 
 /// CPU cache state before staged commands have been accepted.
@@ -1197,35 +1196,27 @@ impl Queue {
         if !mode.needs_upload_arena() {
             return Ok(());
         }
-        for arena in &resources.upload_arenas {
-            if arena.is_idle()? {
-                mode.set_upload_arena(Rc::clone(arena));
-                return Ok(());
-            }
-        }
-        // Bounded, persistent storage. Do not wait in submit or recycle a busy
-        // range when a caller drops its receipt. The pool retains observation.
-        const MAX_UPLOAD_ARENAS: usize = 16;
-        if resources.upload_arenas.len() == MAX_UPLOAD_ARENAS {
-            mode.mark_busy();
-            return Err(HandleError::OutOfResources);
-        }
         resources
             .upload_arenas
-            .try_reserve(1)
+            .try_reserve(UPLOAD_ARENA_COUNT.saturating_sub(resources.upload_arenas.len()))
             .map_err(|_| HandleError::OutOfResources)?;
-        let capacity = gpu_raw::GPU_MAX_OPAQUE_COMMAND_SIZE;
-        let raw = context.device.raw.create_buffer(u64::from(capacity), 0)?;
-        let resource_id = resource_id_from_token(context.raw.attach_buffer(&raw)?)?;
-        let arena = Rc::new(UploadArena {
-            _raw: raw,
-            resource_id,
-            capacity,
-            completion: RefCell::new(None),
-            unobservable: Cell::new(false),
-        });
-        resources.upload_arenas.push(Rc::clone(&arena));
-        mode.set_upload_arena(arena);
+        // A fixed ring is reused between native chunks, never within a chunk.
+        // The worker waits for its previous fence before transmitting a write
+        // to an arena again, independently of caller receipts or submission size.
+        while resources.upload_arenas.len() < UPLOAD_ARENA_COUNT {
+            let capacity = gpu_raw::GPU_MAX_OPAQUE_COMMAND_SIZE;
+            let raw = context.device.raw.create_buffer(u64::from(capacity), 0)?;
+            let resource_id = resource_id_from_token(context.raw.attach_buffer(&raw)?)?;
+            resources.upload_arenas.push(Arc::new(UploadArena {
+                _raw: raw,
+                resource_id,
+                completion: Mutex::new(None),
+            }));
+        }
+        mode.set_upload_arenas(&resources.upload_arenas)?;
+        // Consecutive small logical streams must not all contend for arena 0.
+        // Already staged chunks own their Arc mapping independently of this hint.
+        resources.upload_arenas.rotate_left(1);
         Ok(())
     }
 
@@ -1262,6 +1253,9 @@ impl Queue {
     }
 
     pub(crate) fn check_async_support(&self) -> HandleResult<usize> {
+        if let Some(scheduler) = self.scheduler.borrow().as_ref() {
+            scheduler.check()?;
+        }
         let info = self.raw.query_async()?;
         if info.abi_version != gpu_raw::GPU_ABI_VERSION
             || info.reserved != 0
@@ -1275,7 +1269,18 @@ impl Queue {
     }
 
     pub(crate) fn checkpoint(&self, mode: &mut SubmitMode) -> HandleResult<()> {
-        mode.flush(&self.raw)
+        let scheduler = {
+            let mut slot = self.scheduler.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(Arc::new(NativeScheduler::new()?));
+            }
+            slot.as_ref().cloned().ok_or(HandleError::OutOfResources)?
+        };
+        mode.flush(&scheduler, Arc::clone(&self.raw))
+    }
+
+    pub(crate) fn wait_idle(&self) -> HandleResult<()> {
+        wait_scheduled(&self.scheduler)
     }
 
     fn max_command_size(&self) -> usize {
@@ -1283,6 +1288,7 @@ impl Queue {
     }
 
     fn submit_commands(&self, commands: &[u8]) -> HandleResult<()> {
+        self.wait_idle()?;
         self.raw.submit(commands).map(|_| ())
     }
 
@@ -1334,6 +1340,7 @@ impl Queue {
             .ok_or(HandleError::InvalidParameter)?;
         let mut offset = 0usize;
         while offset < bytes.len() {
+            mode.prepare_packet(self.max_command_size())?;
             let end = offset.saturating_add(max_payload).min(bytes.len());
             let chunk = bytes
                 .get(offset..end)
@@ -1547,6 +1554,7 @@ impl Queue {
             None
         };
 
+        mode.prepare_packet(self.max_command_size())?;
         if !submission.vertices.is_empty() {
             self.prepare_ir_upload_arena(context, resources, mode)?;
         }
