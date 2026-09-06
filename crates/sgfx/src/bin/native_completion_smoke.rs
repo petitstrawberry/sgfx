@@ -169,6 +169,66 @@ mod native {
     }
 
     #[cfg_attr(test, test)]
+    fn oversized_stream_is_rejected_before_initializing_gpu_state() {
+        let table = Rc::new(ResourceTable::new());
+        let output = target(&table, 32, 32);
+        let source = table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    Extent2D::new(1024, 513).expect("extent"),
+                    TextureUsage::COPY_DST,
+                )
+                .expect("source descriptor"),
+            )
+            .expect("source");
+        let mut session = session(&table, &[output]);
+        let bytes = vec![0; 1024 * 513 * 4];
+        let mut encoder = CommandEncoder::new(&table);
+        encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    &table,
+                    table.texture_ref(output).expect("output"),
+                    PixelRect::new(0, 0, 32, 32).expect("area"),
+                    LoadOp::Clear(Color::rgba(1.0, 0.0, 0.0, 1.0).expect("color")),
+                    StoreOp::Store,
+                )
+                .expect("pass"),
+            )
+            .expect("begin")
+            .end()
+            .expect("end");
+        encoder
+            .write_texture(
+                source,
+                TextureWrite::new(
+                    PixelRect::new(0, 0, 1024, 513).expect("upload area"),
+                    4096,
+                    &bytes,
+                )
+                .expect("upload"),
+            )
+            .expect("write");
+        let commands = encoder.finish().expect("oversized commands");
+        assert!(
+            matches!(
+                session.executor().submit(&commands),
+                Err(SubmitError::Rejected(_))
+            ),
+            "oversized staging must reject without accepting the preceding clear"
+        );
+        drop(commands);
+        let commands = clear(&table, output, [0.0, 1.0, 0.0, 1.0]);
+        complete(&submit(&mut session, &commands));
+        assert!(
+            pixels(&session, output)
+                .chunks_exact(4)
+                .all(|pixel| pixel == [0, 255, 0, 255])
+        );
+    }
+
+    #[cfg_attr(test, test)]
     fn several_submissions_share_a_queue_without_an_intermediate_wait() {
         let table = Rc::new(ResourceTable::new());
         let targets: Vec<_> = (0..4).map(|_| target(&table, 32, 32)).collect();
@@ -337,6 +397,10 @@ mod native {
         println!("[sgfx-native-completion-smoke] starting");
         split_upload_and_copy_snapshot_borrowed_bytes();
         println!("[sgfx-native-completion-smoke] split upload + copy + owned bytes PASS");
+        oversized_stream_is_rejected_before_initializing_gpu_state();
+        println!(
+            "[sgfx-native-completion-smoke] oversized rejection + initialization rollback PASS"
+        );
         several_submissions_share_a_queue_without_an_intermediate_wait();
         println!("[sgfx-native-completion-smoke] multiple ordered submissions PASS");
         persistent_vertex_upload_is_ordered_and_owned_by_the_queue();
