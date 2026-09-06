@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "sgfx"
-version = "0.16.0"
+version = "1.0.0"
 dependencies = [
  "gpu-raw",
  "raw-window-handle",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "sgfx-backend-scarlet-virgl"
-version = "0.16.0"
+version = "1.0.0"
 dependencies = [
  "gpu-raw",
  "scarlet-os",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "sgfx-backend-wgpu"
-version = "0.16.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -807,14 +807,14 @@ dependencies = [
 
 [[package]]
 name = "sgfx-codegen-virgl"
-version = "0.16.0"
+version = "1.0.0"
 dependencies = [
  "sgfx-core",
 ]
 
 [[package]]
 name = "sgfx-core"
-version = "0.16.0"
+version = "1.0.0"
 
 [[package]]
 name = "slab"
