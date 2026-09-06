@@ -179,9 +179,11 @@ These are driver-level checks, not yet native SGFX adapter tests.
 
 The native VirGL adapter and facade now expose real asynchronous receipts.
 Normal std checks pass on both Scarlet targets; the AArch64 native test
-harness compiles. `sgfx-native-completion-smoke` is installed by Scarlet's
-experimental bundle. The user ran the six-scenario diagnostic successfully
-15 times, including oversized rejection and initialization rollback. That
+harness compiles. The former `sgfx-native-completion-smoke` was installed by
+Scarlet's experimental bundle; the binary and dedicated image fixture were
+removed at the user's request on 2026-09-06. The user had run the six-scenario
+diagnostic successfully 15 times, including oversized rejection and initialization
+rollback. That
 verified the admission repair, but did not cover intermediate draw pixels:
 gears, mesh swarm, and normal UI subsequently showed rendering corruption.
 

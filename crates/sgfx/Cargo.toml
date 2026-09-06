@@ -53,10 +53,5 @@ sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-f
 name = "sgfx"
 path = "src/lib.rs"
 
-[[bin]]
-name = "sgfx-native-completion-smoke"
-path = "src/bin/native_completion_smoke.rs"
-required-features = ["std"]
-
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
