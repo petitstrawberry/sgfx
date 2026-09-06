@@ -21,6 +21,13 @@ not a hard real-time latency promise. Capacity is bounded: `Busy` rejects a
 new submission without accepting any of its work, rather than silently waiting
 for a previous GPU submission to make room.
 
+The agreed native boundary permits **synchronous first-use physical resource
+creation**. Scarlet/VirGL materializes all new buffers/images needed by a stream
+before sending any of that stream's uploads, copies, or draws. These existing
+resource-creation calls can drain earlier GPU work. They are not repeated for
+cached resources. After cold setup, all uploads/copies/draws and checkpoints
+use the async transport; no completion wait or capacity-wait fallback is allowed.
+
 A receipt covers the complete logical command stream, including all backend
 chunks and uploads, and the preceding work ordered on its queue. It does not
 cover later submissions, unrelated queues, display presentation, or SWS leases.

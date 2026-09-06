@@ -131,7 +131,11 @@ pub trait CommandSubmitter: CommandExecutor {
     /// backpressure, rejection, and possible partial acceptance. On every
     /// return path, the backend has consumed/copied all borrowed data needed
     /// by pending work. An empty stream establishes a queue checkpoint.
-    /// CPU validation/lowering is allowed; GPU-completion waiting is not.
+    /// CPU validation/lowering is allowed. A backend may synchronously create
+    /// physical resources on their first use, before accepting uploads/copies/
+    /// draws from this call, and must document that cold-setup boundary. After
+    /// that setup, submission must not wait for GPU completion or capacity.
+    /// Reusing already-materialized resources does not repeat the setup wait.
     fn submit<'r, 'data>(
         &mut self,
         commands: &CommandBuffer<'r, 'data>,
