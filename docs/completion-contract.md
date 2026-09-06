@@ -102,6 +102,15 @@ does not prove hardware quiescence: retain affected resources until backend
 reset/retirement establishes safety. Borrowed command/upload memory must no
 longer be needed on **every** return path.
 
+The frontend's `Error::is_recoverable_rejection()` positively classifies input,
+support, and allocation limits that permit continued executor use. It applies
+only to `SubmitError::Rejected`, never to completion or failed-prefix errors.
+Unknown transport/device errors are not assumed recoverable. Even a recoverable
+rejection does not certify earlier work's retirement: frame integrations must
+retire their accepted prefix, discard the incomplete image, and encode a new
+frame before presentation. An unchanged oversized stream must not be retried as
+if it were transient Busy.
+
 ## Scarlet implementation obligations
 
 The current `GpuQueue::submit_and_signal` still waits inside the driver and

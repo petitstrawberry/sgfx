@@ -173,6 +173,59 @@ pub enum Error {
     ScarletAdrenoIr(sgfx_backend_scarlet_adreno::IrSubmitError),
 }
 
+impl Error {
+    /// Whether a side-effect-free rejection permits continued use of the executor.
+    ///
+    /// # Returns
+    ///
+    /// `true` for input, support, or allocation limits that do not poison the
+    /// executor. This classification applies **only** to
+    /// [`backend::SubmitError::Rejected`], never to a failed-prefix or completion
+    /// error. Earlier accepted work must still retire successfully before its
+    /// images or storage are reused. Retrying unchanged oversized/invalid input
+    /// is not guaranteed to succeed. Unknown transport/device errors return false.
+    pub fn is_recoverable_rejection(&self) -> bool {
+        match self {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            Self::Wgpu(error) => {
+                use sgfx_backend_wgpu::Error as E;
+                matches!(
+                    error,
+                    E::InvalidIr(_)
+                        | E::ResourceTableMismatch
+                        | E::ImageNotMapped
+                        | E::ImageAlreadyMapped
+                        | E::Unsupported(_)
+                )
+            }
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            Self::ScarletVirglIr(error) => {
+                use sgfx_backend_scarlet_virgl::{HandleError, IrSubmitError as E};
+                matches!(
+                    error,
+                    E::InvalidIr(_)
+                        | E::ResourceTableMismatch
+                        | E::ContextMismatch
+                        | E::TargetExtentMismatch
+                        | E::ImageNotMapped
+                        | E::TextureAlreadyMapped
+                        | E::ImageAlreadyMapped
+                        | E::Unsupported(_)
+                        | E::InvalidVertexData
+                        | E::OutOfMemory
+                        | E::SubmissionTooLarge
+                        | E::Backend(
+                            HandleError::InvalidParameter
+                                | HandleError::Unsupported
+                                | HandleError::OutOfResources
+                        )
+                )
+            }
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -374,6 +427,46 @@ fn backend_environment_value() -> Option<alloc::string::String> {
 #[cfg(test)]
 mod tests {
     use super::{BackendKind, BackendPreference, Error, Instance};
+
+    #[test]
+    fn rejection_classification_never_assumes_unknown_errors_are_recoverable() {
+        assert!(!Error::InvalidBackendPreference.is_recoverable_rejection());
+        assert!(!Error::BackendUnavailable(BackendKind::Metal).is_recoverable_rejection());
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    fn rejection_classification_separates_host_limits_from_device_failure() {
+        use sgfx_backend_wgpu::{Error as E, UnsupportedFeature};
+        assert!(
+            Error::Wgpu(E::Unsupported(UnsupportedFeature::ResourceSize))
+                .is_recoverable_rejection()
+        );
+        for error in [E::DeviceLost, E::CompletionObservation, E::InvalidState] {
+            assert!(!Error::Wgpu(error).is_recoverable_rejection());
+        }
+    }
+
+    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[test]
+    fn rejection_classification_separates_native_limits_from_device_failure() {
+        use sgfx_backend_scarlet_virgl::{HandleError, IrSubmitError as E};
+        for error in [
+            E::SubmissionTooLarge,
+            E::OutOfMemory,
+            E::Backend(HandleError::OutOfResources),
+        ] {
+            assert!(Error::ScarletVirglIr(error).is_recoverable_rejection());
+        }
+        for error in [
+            E::SubmissionFailed,
+            E::CompletionUnavailable,
+            E::CompletionFailed(1),
+            E::Backend(HandleError::SystemError(-1)),
+        ] {
+            assert!(!Error::ScarletVirglIr(error).is_recoverable_rejection());
+        }
+    }
 
     #[test]
     fn parses_stable_backend_names() {
