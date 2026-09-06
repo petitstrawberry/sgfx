@@ -3,8 +3,9 @@
 Status: the user approved including portable completion tracking **and actual
 asynchronous Scarlet GPU submission** in the 1.0 scope. The detailed interface
 below is the implementation design for that agreed direction, not a claim
-that all backends already support it. Other policies in the
-[1.0 contract draft](1.0-contract.md) still require release review.
+that all backends already support it. The
+[1.0 execution contract](1.0-contract.md) also records the approved coordinated
+Rust update policy; remaining rendering and lifecycle clauses require review.
 
 ## Boundary
 

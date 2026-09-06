@@ -5,8 +5,9 @@ declare the whole IR stable or introduce a new graphics API. Frontends record
 portable commands; the backend owns validation of its supported subset,
 resource materialization, lowering, transport limits, and submission.
 The [1.0 API inventory](1.0-api-scope.md) records the current exported surface
-and feature configurations. The [1.0 contract draft](1.0-contract.md) records
-proposals; the user-approved [completion scope](completion-contract.md) adds
+and feature configurations. The [1.0 execution contract](1.0-contract.md) records
+the approved coordinated Rust policy and remaining semantic review targets;
+the user-approved [completion scope](completion-contract.md) adds
 tracked submission and actual asynchronous Scarlet GPU execution as 1.0 gates.
 
 The common Rust boundary is

@@ -10,26 +10,40 @@ public API or execution behavior. The [architecture](docs/architecture.md)
 maps [issue #1](https://github.com/petitstrawberry/sgfx/issues/1) onto the current
 IR, execution backends and platform adapters, including native tracked submission.
 
-The [1.0 contract draft](docs/1.0-contract.md) proposes the target API
-extension rules, rendering and execution semantics, imported-image retirement,
-and runtime feature policy. The agreed [completion scope](docs/completion-contract.md)
+The [1.0 execution contract](docs/1.0-contract.md) records the approved
+architecture and coordinated Rust update policy, together with the remaining
+rendering and lifecycle review targets. The agreed [completion scope](docs/completion-contract.md)
 includes portable submission tracking and actual asynchronous Scarlet GPU
 submission; implementation conformance is still required.
 The [execution contract](docs/execution-contract.md) distinguishes today's
 queue acceptance, GPU completion, upload lifetimes, and presentation.
 The [1.0 API inventory](docs/1.0-api-scope.md) lists the actual IR subset,
-public backend/facade surfaces, feature composition, and unfinished review.
+Rust backend/facade interfaces, feature composition, and unfinished review.
 
 ## Workspace
 
 - `sgfx-core`: backend-neutral resource descriptions, command IR, and backend contracts
-- `sgfx`: compatibility facade and platform backend selection
+- `sgfx`: execution facade and platform backend selection
 - `sgfx-backend-wgpu`: host WGPU execution backend
 - `sgfx-backend-scarlet-virgl`: Scarlet VirGL execution backend
 - `sgfx-codegen-virgl`: platform-neutral VirGL command encoding helpers
 
 `scarlet-ui-renderer-sgfx` remains in the ScarletUI repository because it is a
 frontend. Scarlet GPU ABI crates such as `gpu-raw` remain in Scarlet.
+
+## Compatibility and linking
+
+All SGFX crates above, including their Rust `pub` interfaces and the external
+Adreno backend/codegen, are components of a coordinated driver/renderer build.
+Their Rust APIs can evolve with the frontend and backend consumers; SGFX 1.x
+does not promise unchanged Rust signatures across releases. Direct Rust users
+must select a compatible revision/lockfile set and rebuild its components.
+
+The intended application-facing graphics boundary is the Vulkan C ABI. A
+future `vulkan-sgfx` frontend, SGFX core and the chosen backend/codegen can be
+linked into one ICD/library. Independently loading SGFX Rust components is not
+planned. Resource ownership, ordering, completion and failure semantics still
+form the common backend contract. See the [approved policy](docs/1.0-contract.md#2-coordinated-rust-implementation-policy).
 
 ## Dependency
 

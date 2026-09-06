@@ -2,22 +2,43 @@
 
 SGFX connects renderer/API frontends to complete GPU execution backends. This
 document maps the direction in [issue #1](https://github.com/petitstrawberry/sgfx/issues/1)
-to the current code. It does not approve the remaining [1.0 contract proposals](1.0-contract.md).
+to the current code. The user approved the architecture and coordinated Rust
+implementation policy on 2026-09-06. Other rendering and lifecycle clauses in
+the [1.0 execution contract](1.0-contract.md) still require review.
 
 ## Recording and execution
 
 ```text
-ScarletUI PaintCommand             future Vulkan frontend
-          |                         (Vulkan object/state rules)
-          v                                  |
-scarlet-ui-renderer-sgfx                      |
+     Application                         ScarletUI
+          |                                  |
+     Vulkan C ABI                       PaintCommand
+  (stable app boundary)                      |
+          |                                  |
+          v                                  v
+     vulkan-sgfx                 scarlet-ui-renderer-sgfx
+          |                                  |
           +----------------+-----------------+
                            v
-          sgfx-core::ir + backend contracts
+                        SGFX IR
                            |
-                 selected execution backend
-                           |
-                GPU / host graphics API
+          +----------------+--------------+--------------+
+          v                v              v              v
+     WGPU backend    VirGL backend   AGX backend   A6xx backend
+          |            + codegen      + codegen     + codegen
+          v                |              |              |
+     Host GPU API          +--------------+--------------+
+          |                               v
+          |                     Scarlet GPU ABI / kernel
+          v                               v
+       Host GPU                       Target GPU
+```
+
+This is the intended logical architecture, including future Vulkan and AGX
+work. Each build links the components it uses; the branches are not independent
+SGFX plugin-loading interfaces. A Vulkan driver can package:
+
+```text
+one ICD/library = vulkan-sgfx + sgfx-core + selected backend + needed codegen
 ```
 
 ScarletUI is a renderer and can lower directly into SGFX. A future Vulkan
@@ -48,7 +69,7 @@ The facade's existing `Instance`, window, device and mapped-target helpers are
 composition APIs. Their presence does not put Vulkan device-enumeration policy
 or WSI into `sgfx-core`. Likewise, the public direct VirGL/composition API is an
 existing backend-specific surface, not an additional portable frontend contract.
-Both surfaces remain exported and included in the compatibility review.
+Both surfaces remain exported as coordinated Rust integration interfaces.
 
 ## Native scheduling is backend work
 
@@ -85,16 +106,21 @@ New GPU support should fit behind the same recorder/executor boundary. Extract
 more `sgfx-codegen-*` helpers when packet generation has an actual independent
 consumer; a codegen crate alone does not satisfy the execution contract.
 
-## Architecture and Rust compatibility are separate decisions
+## Approved compatibility boundary
 
-Being a driver IR does not by itself choose a Rust API stability policy. A
-future Vulkan ICD can expose the Vulkan C ABI while linking its Rust components
-as implementation details. That does not automatically make this workspace's
-currently exported Rust APIs private or permit breaking existing Rust consumers.
+The application-facing graphics boundary is the Vulkan C ABI. SGFX's IR/traits,
+facade, direct backend/codegen APIs, exposed Rust dependency types and feature
+recipes are internal integration interfaces whose consumers are updated and
+rebuilt together. There is no planned independently loaded SGFX Rust ABI, and
+no blanket 1.x source freeze of these interfaces.
 
-Before RC1, the remaining review must choose the supported Rust surface and
-its extension rules: the IR/traits, facade, direct backend/codegen APIs, exposed
-dependency types, and feature bundles. The inventory describes what exists;
-the draft proposes 1.x preservation rules. Neither document records blanket
-approval of those proposals. Owned completion and safe rejection are already
-agreed and are not reopened by that review.
+An internal signature change requires migrating affected components in the
+same compatible revision set. It does not require changing the application's
+Vulkan ABI. Direct SGFX Rust users participate in that source-level integration;
+ScarletUI can continue its direct renderer path under the same arrangement.
+The [change policy](1.0-contract.md#2-coordinated-rust-implementation-policy)
+supersedes the earlier all-exports freeze and mandatory enum migration proposal.
+
+The shared execution semantics remain the contract: resource identity and
+ownership, ordering, bounded acceptance, completion, and safe failure handling.
+Backend portability depends on implementing those semantics consistently.
