@@ -25,16 +25,37 @@ The agreed native boundary permits **synchronous first-use physical resource
 creation**. Scarlet/VirGL materializes all new buffers/images needed by a stream
 before sending any of that stream's uploads, copies, or draws. These existing
 resource-creation calls can drain earlier GPU work. They are not repeated for
-cached resources. After cold setup, all uploads/copies/draws and checkpoints
-use the async transport; no completion wait or capacity-wait fallback is allowed.
+cached resources. After cold setup, uploads/copies/draws and checkpoints use the
+async transport. Submit does not wait for GPU completion or admission capacity;
+only the independent dispatcher may wait before sending another native packet.
 
-VirGL stages a logical stream's native packets and admits them in a single
-owned queue request (currently bounded by the advertised 2 MiB async limit).
-Contention therefore returns `Busy` before any packet is accepted. CPU object
-initialization and buffer revision bookkeeping are restored on rejection.
-Exceeding the bound rejects the stream before GPU submission; consumers split
-large independent uploads explicitly. Transport/adoption failures still retain
-the conservative `Failed` contract and must never be blindly replayed.
+VirGL separates **logical acceptance** from **native dispatch**. A context-owned
+worker accepts a fully validated/lowered, owned logical stream into a FIFO
+bounded to 16 streams and 64 MiB of retained command bytes. Insufficient logical
+capacity returns `Busy` before accepting any work; a single stream exceeding
+64 MiB is explicitly `Rejected(SubmissionTooLarge)`. CPU initialization and
+buffer revisions are restored on rejection. The advertised 2 MiB native request
+limit is a packetization detail, not a mesh, texture, or UI frame-size limit.
+
+The worker splits only at complete native packet boundaries, keeps up to 16
+native requests in flight, and resumes the exact next packet after native Busy
+or staging-arena pressure. It never replays an accepted prefix. Later logical
+streams cannot overtake an undispatched prefix. Queue wrappers of the same
+VirGL context share this dispatcher; native synchronous execution, transfer,
+readback, and explicit detach drain preceding logical work first.
+
+An accepted stream's receipt stays Pending until **all** its packets and its
+ordered prefix complete. Later transport/adoption/observation failure fails the
+receipt and poisons the dispatcher, including queued successors. Such errors do
+not certify quiescence and must never be blindly replayed. The worker progresses
+without receipt polling and drains accepted work after all frontend owners drop.
+Scarlet's owning queue capability retains the context and attached resources
+for packets not yet dispatched; kernel-owned requests retain dispatched work.
+
+ScarletUI/SWS own frame boundaries, presentation, and lease release. They do not
+split native uploads, subdivide persistent meshes, or run timed GPU admission
+retry loops. At logical capacity pressure a frame may retire its own oldest
+accepted receipt; it does not schedule another context's native work.
 
 A receipt covers the complete logical command stream, including all backend
 chunks and uploads, and the preceding work ordered on its queue. It does not
@@ -103,8 +124,8 @@ codes and their result/layout meanings remain unchanged.
 4. Preserve upload/copy/draw ordering and snapshot the resource authority for
    each accepted submission. Concurrent detach, handle close, process exit,
    timeout, fault and reset must not free in-flight resources prematurely.
-5. Move SGFX's native packets onto the new path, with one bounded admission per
-   logical stream. Retain any possibly accepted work on transport/adoption
+5. Move SGFX's native packets onto the new path, with one bounded logical admission
+   and backend-owned dispatch per stream. Retain possibly accepted work on transport/adoption
    failure. Adapt SWS/UI buffer retirement so they do not immediately wait after
    every submission or signal frame release too early.
 
@@ -165,10 +186,13 @@ The local repair writes disjoint ranges of a private upload arena and issues
 ordered GPU buffer copies into vertex storage. Each arena retains its native
 completion independently of caller receipts and is recycled only after
 explicit successful completion; an unobservable/failed arena is never reused.
-The pool is bounded to 16 arenas of 2 MiB per resource cache, allocated lazily
-through the already documented synchronous first-use resource setup. Steady
-state submission does not wait for an arena or GPU completion; pool pressure
-is Busy. One logical stream still has exactly one atomic native admission.
+The dispatcher uses a fixed ring of four 2 MiB arenas per resource cache,
+allocated lazily through the documented synchronous first-use resource setup.
+Native chunks use disjoint source ranges; the worker reuses an arena only after
+its previous native fence completes. Consecutive logical streams rotate their
+starting arena. Arbitrarily many chunks can therefore traverse the same bounded
+ring within the logical byte budget, without allocating per-mesh staging or
+waiting in submit. Staging pressure is internal worker scheduling, not caller Busy.
 
 A seventh diagnostic now checks every strip of 32 differently colored draws,
 both scratch-buffer reuse within one admission and persistent-buffer updates
@@ -179,14 +203,23 @@ rendering regression; the seventh diagnostic's individual runtime results were
 not separately reported. Runtime verification remains user-operated.
 
 ScarletUI's tracked frame executor retains bounded receipts and observes the
-whole frame at the SWS handoff. Large texture uploads are split explicitly.
+whole frame at the SWS handoff. Native upload partitioning belongs to SGFX.
 SWS observes composition before presentation/release; producer image reuse
 still requires the exact, separate SWS release token. A failed frame is not
 published or reused. This does not add cross-process fence transfer or make the
-entire render loop nonblocking. Renderer tests pass (35); the platform checks
+entire render loop nonblocking. Renderer tests pass (37); the platform checks
 on both normal Scarlet targets and AArch64 legacy std. The user confirmed the
 repaired consumer rendering; fault/reset and other hardware remain separate
 release evidence requirements.
+
+The later Boxcraft failure exposed the old native-byte limit leaking into logical
+admission: its 60,000-vertex update is 2.4 MB before command overhead. The worker
+repair is covered by deterministic host dispatch/packet tests and a ScarletUI
+test preserving one 60,000-vertex mesh and persistent buffer. The native diagnostic
+now uploads a >2 MiB texture without consumer splitting, uploads a 9.6 MB vertex
+buffer through arena-ring reuse, and rejects >64 MiB before initialization changes
+are accepted. These revised native runtime cases remain user-operated; the earlier
+normal-rendering confirmation does not certify this new dispatcher revision.
 
 **A618 still advertises zero async capacity** and retains its explicit legacy
 synchronous consumer path. Its staging/fence ownership and mapping retention
