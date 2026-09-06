@@ -87,7 +87,8 @@ pub(crate) fn monotonic_time_ns() -> u64 {
 #[cfg(not(feature = "std"))]
 pub(crate) fn monotonic_time_ns() -> u64 {
     use std::syscall::{Syscall, syscall0};
-    syscall0(Syscall::MonotonicTime) as u64
+    // SAFETY: This fixed clock query has no arguments or userspace memory effects.
+    (unsafe { syscall0(Syscall::MonotonicTime) }) as u64
 }
 
 /// Per-call state, never a mode stored on a shared queue or connection.
