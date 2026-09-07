@@ -5,6 +5,11 @@ frontends record backend-neutral resources and commands, while complete
 backends materialize resources, lower commands, and submit work to a GPU or
 host graphics API.
 
+Start with the [SGFX reference](docs/reference.md) for dependencies, backend
+selection, device/window setup, execution and completion. The
+[IR syntax reference](docs/ir-reference.md) documents descriptors, every command
+and its arguments, recording rules, and an upload-and-draw example.
+
 SGFX was initially migrated from the Scarlet repository without changing its
 public API or execution behavior. The [architecture](docs/architecture.md)
 maps [issue #1](https://github.com/petitstrawberry/sgfx/issues/1) onto the current
@@ -55,6 +60,9 @@ sgfx = { git = "https://github.com/petitstrawberry/sgfx" }
 The resolved revisions are recorded in `Cargo.lock`; the manifests do not pin
 SGFX or Adreno to a `rev`. Consumers do not need a compatibility patch for
 SGFX's former Scarlet source.
+
+See [dependencies and locked revisions](docs/reference.md#dependencies-and-locked-revisions)
+for the native source set, shared Rust type identity and workspace patch policy.
 
 ## Development
 
