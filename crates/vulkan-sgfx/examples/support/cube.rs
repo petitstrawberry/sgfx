@@ -27,7 +27,7 @@ pub fn shader_words(
     )?)
 }
 
-fn memory_type(
+pub(crate) fn memory_type(
     properties: &vk::PhysicalDeviceMemoryProperties,
     requirements: vk::MemoryRequirements,
     flags: vk::MemoryPropertyFlags,
@@ -70,7 +70,7 @@ impl Default for Options {
     }
 }
 
-fn cube_vertices() -> Vec<u8> {
+pub(crate) fn cube_vertices() -> Vec<u8> {
     // Independent face vertices keep the colors flat across each cube face.
     let faces = [
         (
@@ -124,7 +124,7 @@ fn cube_vertices() -> Vec<u8> {
     bytes
 }
 
-fn cube_indices(options: Options) -> Vec<u8> {
+pub(crate) fn cube_indices(options: Options) -> Vec<u8> {
     let mut triangles = Vec::with_capacity(12);
     for face in 0..6 {
         let base = face * 4;
@@ -145,7 +145,7 @@ fn cube_indices(options: Options) -> Vec<u8> {
     bytes
 }
 
-fn transform(options: Options) -> Vec<u8> {
+pub(crate) fn transform(options: Options) -> Vec<u8> {
     let (sy, cy) = options.angle.sin_cos();
     let (sx, cx) = (-0.42f32).sin_cos();
     let aspect = options.size[0] as f32 / options.size[1] as f32;

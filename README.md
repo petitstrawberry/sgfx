@@ -32,7 +32,8 @@ Rust backend/facade interfaces, feature composition, and unfinished review.
 - `sgfx-backend-wgpu`: host WGPU execution backend
 - `sgfx-backend-scarlet-virgl`: Scarlet VirGL execution backend
 - `sgfx-codegen-virgl`: platform-neutral VirGL command encoding helpers
-- `vulkan-sgfx`: experimental headless Vulkan ICD using the programmable IR
+- `vulkan-sgfx`: experimental Vulkan ICD using the programmable IR, with
+  offscreen execution and macOS Metal WSI
 
 The IR includes shader modules, programmable render/compute pipelines, resource
 bind groups, buffer copies and explicit same-queue resource dependencies. The

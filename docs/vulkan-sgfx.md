@@ -1,12 +1,13 @@
 # Experimental Vulkan frontend
 
 `vulkan-sgfx` is a loader-discoverable, **non-conformant development ICD**. It
-implements a bounded headless subset to exercise Vulkan → SGFX portable IR →
-backend execution. Its manifest and physical device use the Vulkan 1.0 ABI
-version. This is not a claim of Vulkan 1.0 conformance: substantial mandatory
-core functionality is absent. Do not select it as a general application driver.
-Native loader integration, resource reclamation with long-lived objects,
-broader API coverage, and conformance work remain incomplete.
+implements a bounded executable subset to exercise Vulkan → SGFX portable IR →
+backend execution and, on macOS, presentation through Metal. Its manifest and
+physical device use the Vulkan 1.0 ABI version. This is not a claim of Vulkan
+1.0 conformance: substantial mandatory core functionality is absent. Do not
+select it as a general application driver. Cross-platform WSI, resource
+reclamation with long-lived objects, broader API coverage and conformance work
+remain incomplete.
 
 ## Implemented path
 
@@ -18,8 +19,8 @@ broader API coverage, and conformance work remain incomplete.
 - SGFX discovers actual adapters and reports one `VkPhysicalDevice` for each.
   `vkCreateDevice` opens the selected adapter, rather than probing or choosing a
   backend again inside the Vulkan frontend. One graphics/compute/transfer queue
-  is exposed according to that adapter's SGFX capabilities. No extensions or
-  optional physical-device features are advertised.
+  is exposed according to that adapter's SGFX capabilities. Optional core
+  physical-device features are not advertised.
 - SPIR-V shader modules, compute pipelines, and vertex/fragment pipelines.
   Naga validates and normalizes Vulkan coordinate conventions before SGFX
   shader definition; backend shader/pipeline validation occurs at creation.
@@ -32,12 +33,17 @@ broader API coverage, and conformance work remain incomplete.
 - Primary command buffers and pools, pipeline/set binding, compute dispatch,
   single-color render passes, non-indexed and indexed drawing, vertex buffers,
   buffer copies, whole-image RGBA8 readback, supported whole-resource barriers,
-  D32 depth testing, front-face/back-face culling, and fences.
-- Offscreen graphics: RGBA8_UNORM color, optional D32_SFLOAT depth, optimal 2D
-  images, one mip/layer/sample, at most 2048×2048, one color attachment,
-  triangle lists, one vertex binding, four vertex formats, and one instance per
-  draw. Blending, stencil, multisampling, indirect drawing, sampled images, and
-  general dynamic state are absent.
+  D32 depth testing, front-face/back-face culling, fences, and binary semaphores.
+- Offscreen graphics: RGBA8_UNORM or BGRA8_UNORM color, optional D32_SFLOAT
+  depth, optimal 2D images, one mip/layer/sample, at most 2048×2048, one color
+  attachment, triangle lists, one vertex binding, four vertex formats, and one
+  instance per draw. Blending, stencil, multisampling, indirect drawing,
+  sampled images, and general dynamic state are absent.
+- macOS WSI exposes `VK_KHR_surface`, `VK_EXT_metal_surface`,
+  `VK_KHR_portability_enumeration`, and `VK_KHR_swapchain`. It implements Metal
+  surface creation, surface capability/format/mode queries, FIFO swapchains,
+  acquire, and queue present. Swapchain images are SGFX `PRESENT` textures on
+  the exact WGPU/Metal device selected by `vkCreateDevice`.
 
 Each `vkCmd*` records into command-buffer-local owned storage on the calling
 thread. Submit resolves the Vulkan handles and descriptor state into
@@ -67,12 +73,13 @@ readback, and GPU-written mapped buffers are read back before submit returns.
 This is a known transfer/memory-model limitation, rather than the normal path
 for draw-only submissions.
 
-Fence status and finite/zero-timeout waits use shared atomic state outside the
+Fence and binary-semaphore state use shared atomics outside the
 device worker. They therefore remain observable while another thread is
 blocked submitting work. A deterministic test covers an intentionally
 unserviced worker channel. `vkQueueWaitIdle`/`vkDeviceWaitIdle` serialize behind
-prior queue work. No semaphores are implemented; submits containing semaphore
-waits or signals are rejected.
+prior queue work. Acquire signals a semaphore or fence, queue submission consumes
+wait semaphores and signals completion semaphores, and queue present consumes
+its waits. Timeline semaphores are not implemented.
 
 Vulkan 1.0 descriptor update rules apply: updating a set already bound in a
 recording or executable command buffer invalidates that buffer. Reset and
@@ -117,6 +124,50 @@ is an ordinary Vulkan application and contains no SGFX-specific loader or ICD
 selection. The runner selects the freshly built ICD externally with the standard
 `VK_DRIVER_FILES` loader setting.
 
+## Present a Vulkan cube on macOS
+
+From the repository root, run:
+
+```sh
+scripts/run-vulkan-windowed.sh
+```
+
+Use `--frames 120` for a finite automated run. The runner builds the ICD and
+the `windowed` example, writes an absolute ICD manifest, finds an installed
+Khronos loader, sets only the standard loader and dynamic-library search
+variables, and starts the application. The application itself calls
+`ash::Entry::load`, enables the platform extensions returned by `ash-window`,
+creates a `VK_EXT_metal_surface`, enables `VK_KHR_swapchain`, and uses a normal
+acquire → submit → present loop with binary semaphores and a fence.
+
+The presented scene is a rotating indexed cube using SPIR-V vertex and fragment
+shaders, a uniform transform, vertex/index buffers, and D32 depth testing. The
+application has no dependency on `vulkan_sgfx`, no alternate Vulkan-shaped API,
+and no direct ICD entry-point lookup. At runtime the Khronos loader discovers
+`libvulkan_sgfx.dylib` from `VK_DRIVER_FILES`; the ICD then executes through
+`vulkan-sgfx → sgfx → sgfx-backend-wgpu → WGPU Metal`.
+
+The runtime dependency chains are:
+
+```text
+render_demo / windowed (ordinary Vulkan applications using ash)
+  → Khronos libvulkan loader
+  → libvulkan_sgfx ICD, selected by its standard JSON manifest
+  → vulkan-sgfx frontend and Vulkan object state
+  → sgfx driver facade and canonical SGFX IR
+  → sgfx-backend-wgpu → WGPU → Metal
+
+vulkan-cube (current Scarlet executable test path)
+  → vulkan-sgfx frontend linked into the test executable
+  → sgfx driver facade and the same canonical SGFX IR
+  → sgfx-backend-scarlet-virgl → scarlet-os /dev/gpu0
+  → VirtIO-GPU / VirGL → host renderer
+```
+
+The Scarlet toolchain currently drops `cdylib` output, so its checked path is a
+linked executable rather than loader-discovered `.so` integration. This
+packaging difference is below the Vulkan calls exercised by the test program.
+
 ## Run the examples
 
 From the repository root:
@@ -129,8 +180,9 @@ cargo test -p vulkan-sgfx --lib
 cargo test -p vulkan-sgfx --test contracts -- --ignored
 ```
 
-The examples load the freshly built ICD directly by default. An optional first
-argument or `SGFX_ICD_LIBRARY` selects another ICD library. `headless` compiles a
+The diagnostic `headless` and `offscreen` examples load the freshly built ICD
+directly by default. An optional first argument or `SGFX_ICD_LIBRARY` selects
+another ICD library. `headless` compiles a
 compute shader, verifies all 256 output words, and reports CPU recording and
 submit durations. `offscreen` compiles vertex/fragment SPIR-V, renders a 64×64
 triangle, and checks center, corner, and asymmetric pixels after readback.
@@ -157,11 +209,20 @@ exercising loader dispatch for resource, command, and submission APIs as well.
 The ICD accepts the loader's private device creation records while rejecting
 unsupported application feature chains.
 
+`SGFX_VULKAN_LOADER` belongs only to these repository diagnostics: it tells a
+test harness which loader dynamic library to open with `libloading`. It is not
+read by the ICD, is not required by Vulkan applications, and is not used by
+`render_demo` or `windowed`. Those applications use `ash::Entry::load()` and the
+operating system's normal Vulkan loader; ICD selection is external through the
+standard manifest mechanism.
+
 The host backend mask is fixed: Metal on macOS, GL on other host platforms.
 The ICD never enables WGPU's Vulkan backend or reads WGPU backend-selection
 configuration. Execution is verified on macOS Metal and Linux aarch64 with Mesa
 26.1.3 llvmpipe (LLVM 21.1.8), surfaceless EGL 1.5/OpenGL ES 3.2, and the real
-Khronos Vulkan Loader 1.4.341. The Linux check passed loader discovery and device
+Khronos Vulkan Loader 1.4.341. The macOS check passed ordinary loader discovery,
+a Metal surface and three-image FIFO swapchain, and 60 presented frames of the
+SPIR-V indexed cube. The Linux check passed loader discovery and device
 creation, 16 compute iterations checking all 256 output words, and a 64×64
 offscreen triangle checking 112 center, corner, and asymmetric orientation
 pixels. Linux GL must use a native GL driver or Mesa llvmpipe: Mesa Zink
@@ -175,10 +236,12 @@ and verify the chosen Mesa driver. The Linux check also used
 
 ## Limits and remaining work
 
-- **Not Vulkan conformant.** The ICD exposes 83 procedure names, including 12
-  `vkCmd*` operations, but this is only a bounded executable subset. There are
-  no surfaces/swapchains, presentation, semaphores,
-  secondary command buffers, descriptor indexing, push constants, pipeline
+- **Not Vulkan conformant.** The ICD exposes 96 procedure names on macOS,
+  including 12 `vkCmd*` operations, but this is only a bounded executable
+  subset. WSI currently covers macOS Metal, FIFO mode, opaque composition, and
+  fixed-size swapchains. Other platform surfaces, window-resize handling in the
+  example, timeline semaphores, secondary command buffers, descriptor indexing,
+  push constants, pipeline
   caches, queries, events, sparse resources, external memory, multisampling,
   complex render passes, indirect operations, sampled images, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
