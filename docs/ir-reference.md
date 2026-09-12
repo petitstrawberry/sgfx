@@ -265,7 +265,8 @@ to prove which vertices they address; device-specific validation is backend work
 
 ## Recording rules and limits
 
-A stream is uploads/copies and non-nested render passes in recorded order.
+Fixed drawing streams contain uploads/copies and non-nested render passes in
+recorded order. The programmable extension below also adds compute passes.
 Each new pass starts without a pipeline, buffer or uniform binding; state does
 not carry from a previous pass. Before each draw, set the bindings required by
 its pipeline. Within a pass, accepted bindings persist until changed.
@@ -293,15 +294,17 @@ the table and upload slices; backend execution must consume/copy any upload
 data needed by pending work before returning.
 
 Backend support can be narrower than valid IR. For example, WGPU requires
-buffer upload offsets and lengths to be multiples of four and uploads to
-precede the first copy/pass. It also requires pass/pipeline depth-state presence
-to agree and rejects partial rectangular depth clears. Such restrictions must
-return errors, not silently change command meanings.
+buffer upload offsets and lengths to be multiples of four. Encoder-owned staging
+copies preserve upload order between copies and render/compute passes. Fixed
+render pipelines require pass/pipeline depth-state presence to agree, and WGPU
+rejects partial rectangular depth clears. Such restrictions must return errors,
+not silently change command meanings.
 
-The current IR has no arbitrary shader modules, compute dispatch, instancing,
-multiple color attachments, mip/array/3D textures, explicit barriers or
-cross-queue semaphore commands. Presentation and completion observation are
-outside the command enum.
+Shader modules, compute dispatch and explicit same-queue resource dependencies
+are part of the [programmable extension](#programmable-graphics-and-compute).
+Instancing, multiple color attachments, mip/array/3D textures and cross-queue
+semaphore commands remain outside the implemented subset. Presentation and
+completion observation are outside the command enum.
 
 ## Example: upload and draw a triangle
 
