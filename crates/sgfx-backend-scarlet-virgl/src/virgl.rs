@@ -820,7 +820,6 @@ impl Context {
             || texture.width != image.width
             || texture.height != image.height
             || !texture.render_attachment
-            || !texture.present
         {
             return Err(HandleError::InvalidParameter);
         }
@@ -1013,6 +1012,37 @@ pub(crate) struct IrStateSnapshot {
 }
 
 impl IrResources {
+    pub(crate) fn unmap_ir_image(
+        &mut self,
+        texture: IrTextureSpec,
+        image: &Image,
+    ) -> HandleResult<()> {
+        if self.context_handle != image.context_handle || texture.slot >= self.textures.len() {
+            return Err(HandleError::InvalidParameter);
+        }
+        let slot = self
+            .textures
+            .get_mut(texture.slot)
+            .ok_or(HandleError::InvalidParameter)?;
+        let Some(IrTexture::Mapped(mapped)) = slot.as_ref() else {
+            return Err(HandleError::InvalidParameter);
+        };
+        if mapped.resource_id != image.resource_id
+            || mapped.width != image.width
+            || mapped.height != image.height
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+        image
+            .ir_surface_initialized
+            .set(mapped.surface_initialized.get());
+        *slot = None;
+        if let Some(spec) = self.texture_specs.get_mut(texture.slot) {
+            *spec = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn snapshot(&self) -> HandleResult<IrStateSnapshot> {
         fn collect<T>(length: usize, values: impl Iterator<Item = T>) -> HandleResult<Vec<T>> {
             let mut result = Vec::new();

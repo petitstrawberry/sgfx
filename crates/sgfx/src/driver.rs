@@ -338,22 +338,40 @@ impl Device {
     }
 
     /// Create a presentable image on this device.
-    #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+    #[cfg(any(
+        all(target_os = "macos", feature = "backend-wgpu"),
+        all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+    ))]
     pub fn create_presentation_image(
         &self,
         width: u32,
         height: u32,
         format: ir::TextureFormat,
     ) -> Result<PresentationImage> {
-        let DeviceBackend::Wgpu(device) = &self.backend;
-        device
-            .context
-            .create_image(width, height, format)
-            .map(|image| PresentationImage {
-                device_id: self.id,
-                image,
-            })
-            .map_err(Error::Wgpu)
+        match &self.backend {
+            #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+            DeviceBackend::Wgpu(device) => device
+                .context
+                .create_image(width, height, format)
+                .map(|image| PresentationImage {
+                    device_id: self.id,
+                    backend: PresentationImageBackend::Wgpu(image),
+                })
+                .map_err(Error::Wgpu),
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            DeviceBackend::ScarletVirgl(context) => {
+                if format != ir::TextureFormat::Bgra8Unorm {
+                    return Err(Error::ScarletBackendUnsupported);
+                }
+                context
+                    .create_shared_image(width, height)
+                    .map(|image| PresentationImage {
+                        device_id: self.id,
+                        backend: PresentationImageBackend::ScarletVirgl(Rc::new(image)),
+                    })
+                    .map_err(Error::ScarletVirglHandle)
+            }
+        }
     }
 
     /// Bind an existing CAMetalLayer to this Vulkan-selected device.
@@ -391,24 +409,66 @@ impl Device {
 }
 
 /// Device-local image used by a platform presentation context.
-#[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "backend-wgpu"),
+    all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+))]
 pub struct PresentationImage {
     device_id: usize,
-    image: alloc::sync::Arc<sgfx_backend_wgpu::Image>,
+    backend: PresentationImageBackend,
 }
 
-#[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "backend-wgpu"),
+    all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+))]
+enum PresentationImageBackend {
+    #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+    Wgpu(alloc::sync::Arc<sgfx_backend_wgpu::Image>),
+    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    ScarletVirgl(Rc<sgfx_backend_scarlet_virgl::Image>),
+}
+
+#[cfg(any(
+    all(target_os = "macos", feature = "backend-wgpu"),
+    all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+))]
 impl PresentationImage {
     pub fn width(&self) -> u32 {
-        self.image.width()
+        match &self.backend {
+            #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+            PresentationImageBackend::Wgpu(image) => image.width(),
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            PresentationImageBackend::ScarletVirgl(image) => image.width(),
+        }
     }
 
     pub fn height(&self) -> u32 {
-        self.image.height()
+        match &self.backend {
+            #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+            PresentationImageBackend::Wgpu(image) => image.height(),
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            PresentationImageBackend::ScarletVirgl(image) => image.height(),
+        }
     }
 
     pub fn image_format(&self) -> ir::TextureFormat {
-        self.image.format()
+        match &self.backend {
+            #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+            PresentationImageBackend::Wgpu(image) => image.format(),
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            PresentationImageBackend::ScarletVirgl(_) => ir::TextureFormat::Bgra8Unorm,
+        }
+    }
+
+    /// Duplicate the Scarlet GPU image capability for another context or process.
+    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    pub fn duplicate_shared_handle(&self) -> Result<crate::Handle> {
+        let PresentationImageBackend::ScarletVirgl(image) = &self.backend;
+        image
+            .shared_handle()
+            .duplicate()
+            .map_err(Error::ScarletVirglHandle)
     }
 }
 
@@ -426,8 +486,9 @@ impl WindowContext {
         if self.device_id != image.device_id {
             return Err(Error::ResourceDeviceMismatch);
         }
+        let PresentationImageBackend::Wgpu(image) = &image.backend;
         self.context
-            .present_image(image.image.as_ref())
+            .present_image(image.as_ref())
             .map_err(Error::Wgpu)
     }
 
@@ -451,8 +512,11 @@ enum ResourcesBackend {
 }
 
 impl Resources {
-    /// Map a logical PRESENT texture to a device-local presentation image.
-    #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+    /// Map a logical render target to a device-local shareable image.
+    #[cfg(any(
+        all(target_os = "macos", feature = "backend-wgpu"),
+        all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+    ))]
     pub fn map_presentation_image(
         &mut self,
         texture: ir::TextureId,
@@ -461,17 +525,35 @@ impl Resources {
         if self.device_id != image.device_id {
             return Err(Error::ResourceDeviceMismatch);
         }
-        let ResourcesBackend::Wgpu(resources) = &mut self.backend;
-        resources
-            .map_image(texture, alloc::sync::Arc::clone(&image.image))
-            .map_err(Error::Wgpu)
+        match (&mut self.backend, &image.backend) {
+            #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+            (ResourcesBackend::Wgpu(resources), PresentationImageBackend::Wgpu(image)) => resources
+                .map_image(texture, alloc::sync::Arc::clone(image))
+                .map_err(Error::Wgpu),
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            (
+                ResourcesBackend::ScarletVirgl(resources),
+                PresentationImageBackend::ScarletVirgl(image),
+            ) => resources
+                .map_image(texture, Rc::clone(image))
+                .map_err(Error::ScarletVirglIr),
+        }
     }
 
     /// Remove a logical PRESENT texture mapping.
-    #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+    #[cfg(any(
+        all(target_os = "macos", feature = "backend-wgpu"),
+        all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+    ))]
     pub fn unmap_presentation_image(&mut self, texture: ir::TextureId) {
-        let ResourcesBackend::Wgpu(resources) = &mut self.backend;
-        resources.unmap_image(texture);
+        match &mut self.backend {
+            #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+            ResourcesBackend::Wgpu(resources) => resources.unmap_image(texture),
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            ResourcesBackend::ScarletVirgl(resources) => {
+                let _ = resources.unmap_image(texture);
+            }
+        }
     }
 
     pub fn validate_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<()> {

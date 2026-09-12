@@ -10,8 +10,12 @@ pub(crate) struct Image {
     pub id: ir::TextureId,
     pub format: vk::Format,
     pub extent: vk::Extent3D,
+    #[cfg(target_os = "scarlet")]
+    pub usage: vk::ImageUsageFlags,
     pub bound: Option<(vk::DeviceMemory, u64)>,
     pub swapchain: Option<vk::SwapchainKHR>,
+    #[cfg(target_os = "scarlet")]
+    pub shared: Option<sgfx::driver::PresentationImage>,
 }
 
 impl Image {
@@ -112,6 +116,8 @@ unsafe extern "system" fn create_image(
     }
     let extent = info.extent;
     let format = info.format;
+    #[cfg(target_os = "scarlet")]
+    let image_usage = info.usage;
     let mut usage = ir::TextureUsage::empty();
     if info.usage.intersects(
         vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
@@ -140,8 +146,12 @@ unsafe extern "system" fn create_image(
                 id,
                 format,
                 extent,
+                #[cfg(target_os = "scarlet")]
+                usage: image_usage,
                 bound: None,
                 swapchain: None,
+                #[cfg(target_os = "scarlet")]
+                shared: None,
             },
         );
         Ok(handle)
@@ -161,13 +171,16 @@ unsafe extern "system" fn destroy_image(
 ) {
     if image != vk::Image::null() {
         let _ = with_device(device, move |runtime| {
-            if runtime
+            let removable = runtime
                 .resources
                 .images
                 .get(&image)
-                .is_some_and(|image| image.swapchain.is_none())
-            {
-                runtime.resources.images.remove(&image);
+                .is_some_and(|image| image.swapchain.is_none());
+            if removable && let Some(_data) = runtime.resources.images.remove(&image) {
+                #[cfg(target_os = "scarlet")]
+                if _data.shared.is_some() {
+                    runtime.cache.unmap_presentation_image(_data.id);
+                }
             }
             Ok(())
         });

@@ -209,7 +209,7 @@ impl IrResources {
         self.resources.as_ref()
     }
 
-    /// Map a logical presentation texture to a physical render-target image.
+    /// Map a logical render target to a physical image.
     ///
     /// # Arguments
     ///
@@ -232,8 +232,9 @@ impl IrResources {
                 UnsupportedIrFeature::TargetFormat,
             ));
         }
-        let required_usage = TextureUsage::RENDER_ATTACHMENT | TextureUsage::PRESENT;
+        let required_usage = TextureUsage::RENDER_ATTACHMENT;
         let allowed_usage = required_usage
+            | TextureUsage::PRESENT
             | TextureUsage::SAMPLED
             | TextureUsage::COPY_SRC
             | TextureUsage::COPY_DST;
@@ -263,6 +264,26 @@ impl IrResources {
             image,
             backend_registered: false,
         });
+        Ok(())
+    }
+
+    /// Remove a logical presentation mapping and release the cache's image owner.
+    pub fn unmap_image(&mut self, texture: TextureId) -> Result<(), IrSubmitError> {
+        let index = self
+            .images
+            .iter()
+            .position(|mapping| mapping.texture == texture)
+            .ok_or(IrSubmitError::ImageNotMapped)?;
+        let texture_ref = self.resources.texture_ref(texture)?;
+        let descriptor = self.resources.texture(texture_ref)?;
+        let image = Rc::clone(&self.images[index].image);
+        if self.images[index].backend_registered {
+            self.backend.unmap_ir_image(
+                texture_spec(texture_ref, descriptor),
+                &image.as_ref().backend,
+            )?;
+        }
+        self.images.remove(index);
         Ok(())
     }
 

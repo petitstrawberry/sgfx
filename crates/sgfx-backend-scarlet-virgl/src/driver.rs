@@ -723,6 +723,18 @@ pub(crate) enum IrResources {
 }
 
 impl IrResources {
+    pub(crate) fn unmap_ir_image(
+        &mut self,
+        texture: IrTextureSpec,
+        image: &Image,
+    ) -> HandleResult<()> {
+        match (self, image) {
+            (Self::Virgl(resources), Image::Virgl(image)) => {
+                resources.unmap_ir_image(texture, image)
+            }
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> HandleResult<virgl::IrStateSnapshot> {
         match self {
             Self::Virgl(resources) => resources.snapshot(),

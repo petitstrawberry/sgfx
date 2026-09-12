@@ -226,8 +226,15 @@ unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = name;
-                false
+                #[cfg(target_os = "scarlet")]
+                {
+                    name == crate::scarlet_image::DEVICE_EXTENSION_NAME
+                }
+                #[cfg(not(target_os = "scarlet"))]
+                {
+                    let _ = name;
+                    false
+                }
             }
         }
     })
@@ -2949,6 +2956,10 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkAcquireNextImageKHR" => entry!(crate::wsi::acquire_next_image),
         #[cfg(target_os = "macos")]
         b"vkQueuePresentKHR" => entry!(crate::wsi::queue_present),
+        #[cfg(target_os = "scarlet")]
+        b"vkGetImageScarletHandleSGFX" => {
+            entry!(crate::scarlet_image::vkGetImageScarletHandleSGFX)
+        }
         _ => crate::resources::lookup(name).or_else(|| crate::images::lookup(name)),
     }
 }

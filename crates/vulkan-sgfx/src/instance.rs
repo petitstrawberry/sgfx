@@ -409,7 +409,11 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
     {
         &[(vk::KHR_SWAPCHAIN_NAME, vk::KHR_SWAPCHAIN_SPEC_VERSION)]
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "scarlet")]
+    {
+        &[(crate::scarlet_image::DEVICE_EXTENSION_NAME, 1)]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "scarlet")))]
     &[]
 }
 

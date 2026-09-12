@@ -10,6 +10,8 @@ mod images;
 mod instance;
 mod resources;
 mod runtime;
+#[cfg(target_os = "scarlet")]
+pub mod scarlet_image;
 #[cfg(target_os = "macos")]
 mod wsi;
 
