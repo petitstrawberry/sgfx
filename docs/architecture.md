@@ -95,8 +95,8 @@ The legacy VirGL and Adreno `execute`/direct paths remain synchronous. The
 Adreno tracked path uses the companion backend's bounded logical dispatcher
 and the A618 driver's asynchronous queue. It retains staging and physical
 resource owners until accepted work retires, and rejects a driver without
-asynchronous capacity explicitly. Build against the matching source set using
-the [native integration check](../scripts/check-native-integration.sh).
+asynchronous capacity explicitly. Build against the matching published source
+set selected by `Cargo.lock`.
 A618 hardware and fault/reset evidence remain separate verification work.
 Current boundaries are recorded in the [execution contract](execution-contract.md).
 

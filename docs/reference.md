@@ -210,9 +210,8 @@ WGPU, Scarlet VirGL and the matching Adreno source set implement tracked
 submission. Native backends may synchronize during first-use physical resource
 creation; accepted uploads/copies/draws use asynchronous dispatch. Adreno
 requires an A618 driver advertising asynchronous capacity and retains its
-separate synchronous execution path. Use the
-[native integration check](../scripts/check-native-integration.sh) with a
-companion checkout. Hardware verification remains separate from these build
+separate synchronous execution path. Check both Scarlet targets with the
+published revisions in `Cargo.lock`. Hardware verification remains separate from these build
 interfaces. See [execution details](execution-contract.md)
 and the [completion interface](../crates/sgfx-core/src/backend/completion.rs).
 

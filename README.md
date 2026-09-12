@@ -79,17 +79,9 @@ so the external Adreno backend uses the same IR types as the local crates.
 This is a development-only override: Git consumers resolve the core from the
 same repository naturally and do not inherit or need the workspace patch.
 
-For coordinated local Adreno changes, check both Scarlet targets against the
-companion checkout with:
-
-```bash
-scripts/check-native-integration.sh /path/to/scarlet-project-chromebook
-```
-
-The script checks that the graph contains one `sgfx-core` and uses a separate
-lockfile under `target/native-integration`. It preserves the workspace lockfile
-and release manifest selectors. Use matching backend/driver revisions before
-testing the native asynchronous path on hardware.
+Use the published Adreno and Scarlet revisions selected in `Cargo.lock`.
+Update dependencies with `cargo update --precise <commit>` when selecting a
+new compatible source set, then run the locked target checks below.
 
 CI runs the portable suite on both `scarlet-rust-toolchain` (the integration
 baseline) and upstream Rust (the portability check). The two compilers use

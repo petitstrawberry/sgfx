@@ -253,11 +253,8 @@ Portable tests and cross-compilation do not establish A618 hardware behavior.
 DMA/IRQ completion, multiple outstanding hardware requests, fault/reset and
 repeated teardown still need CoachZ evidence.
 
-Use compatible kernel, Adreno backend and SGFX revisions together. For local
-development, `scripts/check-native-integration.sh` selects a companion
-Chromebook checkout and checks both Scarlet userspace targets. The Chromebook
-repository's `scripts/check-a618-kernel-integration.sh` checks its driver
-against a selected Scarlet kernel. Older A618 drivers still expose only the
+Use compatible kernel, Adreno backend and SGFX revisions together, selected
+by the checked-in Cargo lockfiles. Older A618 drivers still expose only the
 previous synchronous path. A raw control or handle-adoption failure can lose
 the current receipt; adapters report an unobservable failure rather than
 certifying unknown accepted work using an older successful receipt.

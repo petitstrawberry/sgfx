@@ -44,10 +44,9 @@ backend scheduling and platform ownership. Both normal Scarlet targets support
 Rust std; that runtime choice does not select synchronous execution.
 
 The Adreno path requires the corresponding backend and A618 driver changes.
-The [native integration script](../scripts/check-native-integration.sh) checks
-the two userspace architectures against a companion checkout without replacing
-the release lockfile. A successful cross-build does not establish A618 hardware
-retirement, fault recovery or presentation conformance.
+The checked-in lockfile selects the published userspace dependencies for both
+Scarlet architectures. A successful cross-build does not establish A618
+hardware retirement, fault recovery or presentation conformance.
 
 WGPU records uploads as encoder-owned staging copies, so uploads interleaved
 with render/compute passes and buffer copies preserve command order. Shader
