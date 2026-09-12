@@ -494,6 +494,9 @@ pub enum Submission {
     /// Completion of all VirGL chunks in one logical submission.
     #[cfg(feature = "backend-scarlet-virgl")]
     Virgl(sgfx_backend_scarlet_virgl::Submission),
+    /// Completion of every Adreno chunk and its ordered queue prefix.
+    #[cfg(feature = "backend-scarlet-adreno")]
+    Adreno(sgfx_backend_scarlet_adreno::Submission),
 }
 
 impl Completion for Submission {
@@ -508,6 +511,8 @@ impl Completion for Submission {
         match *self {
             #[cfg(feature = "backend-scarlet-virgl")]
             Self::Virgl(ref receipt) => receipt.poll().map_err(Error::ScarletVirglIr),
+            #[cfg(feature = "backend-scarlet-adreno")]
+            Self::Adreno(ref receipt) => receipt.poll().map_err(Error::ScarletAdrenoIr),
         }
     }
 
@@ -522,11 +527,13 @@ impl Completion for Submission {
     /// Complete, pending on timeout, or a backend error. Timeout never cancels
     /// work or grants permission to recycle an externally shared buffer.
     fn wait(&self, timeout: Option<Duration>) -> Result<CompletionStatus> {
-        #[cfg(not(feature = "backend-scarlet-virgl"))]
+        #[cfg(not(any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")))]
         let _ = timeout;
         match *self {
             #[cfg(feature = "backend-scarlet-virgl")]
             Self::Virgl(ref receipt) => receipt.wait(timeout).map_err(Error::ScarletVirglIr),
+            #[cfg(feature = "backend-scarlet-adreno")]
+            Self::Adreno(ref receipt) => receipt.wait(timeout).map_err(Error::ScarletAdrenoIr),
         }
     }
 }
@@ -542,16 +549,16 @@ impl CommandSubmitter for Executor<'_> {
     ///
     /// # Returns
     ///
-    /// An owned receipt or a classified rejection/partial failure. VirGL may
+    /// An owned receipt or a classified rejection/partial failure. Native backends may
     /// synchronize during first-use resource creation, but uploads, copies,
     /// and drawing use the async transport without waiting for completion or
-    /// capacity. Adreno currently rejects this operation as unsupported;
-    /// there is no synchronous fallback disguised as a completed receipt.
+    /// capacity. The receipt covers all native chunks and their ordered queue
+    /// prefix, independently of the lifetime of the executor or upload data.
     fn submit<'r, 'data>(
         &mut self,
         commands: &ir::CommandBuffer<'r, 'data>,
     ) -> core::result::Result<Submission, SubmitError<Error, Submission>> {
-        #[cfg(not(feature = "backend-scarlet-virgl"))]
+        #[cfg(not(any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")))]
         let _ = commands;
         match self {
             #[cfg(feature = "backend-scarlet-virgl")]
@@ -560,9 +567,10 @@ impl CommandSubmitter for Executor<'_> {
                 .map(Submission::Virgl)
                 .map_err(|error| error.map(Error::ScarletVirglIr, Submission::Virgl)),
             #[cfg(feature = "backend-scarlet-adreno")]
-            Self::Adreno(_) => Err(SubmitError::Rejected(Error::ScarletAdrenoHandle(
-                sgfx_backend_scarlet_adreno::HandleError::Unsupported,
-            ))),
+            Self::Adreno(executor) => executor
+                .submit(commands)
+                .map(Submission::Adreno)
+                .map_err(|error| error.map(Error::ScarletAdrenoIr, Submission::Adreno)),
         }
     }
 }

@@ -8,6 +8,16 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum Error {
     /// A value was non-finite, zero where non-zero is required, or otherwise malformed.
     InvalidValue,
+    /// Shader resources do not match the bound pipeline layout.
+    BindingLayoutMismatch,
+    /// A required descriptor set has not been bound.
+    BindGroupNotSet,
+    /// Simultaneous accesses alias a writable resource.
+    ResourceAccessConflict,
+    /// A shader write requires an explicit dependency before the next access.
+    MissingBarrier,
+    /// A barrier does not match the preceding shader-write access.
+    InvalidResourceAccess,
     /// A descriptor does not describe a portable logical graphics object.
     InvalidDescriptor,
     /// A resource's required usage flag is absent.

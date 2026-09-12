@@ -60,6 +60,9 @@ jobs:
           cargo test --locked -p sgfx-codegen-virgl
           cargo test --locked -p sgfx-backend-wgpu
           cargo test --locked -p sgfx
+          cargo test --locked -p vulkan-sgfx
+      - name: Build the experimental Vulkan ICD and examples
+        run: cargo build --locked -p vulkan-sgfx --examples
       - name: Test native dispatch policy without GPU syscalls
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
@@ -68,7 +71,7 @@ jobs:
           rustc --edition=2024 --test crates/sgfx-backend-scarlet-virgl/src/packets.rs -o "$CARGO_TARGET_DIR/native-packet-tests"
           "$CARGO_TARGET_DIR/native-packet-tests"
       - name: Lint portable crates
-        run: cargo-clippy clippy --locked -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx --all-targets --no-deps -- -D warnings
+        run: cargo-clippy clippy --locked -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx -p vulkan-sgfx --all-targets --no-deps -- -D warnings
       - name: Test and lint facade feature boundaries
         run: |
           cargo test --locked -p sgfx --no-default-features
@@ -79,7 +82,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --locked --no-deps -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx
+          cargo doc --locked --no-deps -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx -p vulkan-sgfx
           cargo doc --locked --no-deps -p sgfx --no-default-features
 
   scarlet:

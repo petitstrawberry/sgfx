@@ -32,6 +32,13 @@ Rust backend/facade interfaces, feature composition, and unfinished review.
 - `sgfx-backend-wgpu`: host WGPU execution backend
 - `sgfx-backend-scarlet-virgl`: Scarlet VirGL execution backend
 - `sgfx-codegen-virgl`: platform-neutral VirGL command encoding helpers
+- `vulkan-sgfx`: experimental headless Vulkan ICD using the programmable IR
+
+The IR includes shader modules, programmable render/compute pipelines, resource
+bind groups, buffer copies and explicit same-queue resource dependencies. The
+WGPU backend executes this subset; native backends explicitly reject the
+programmable operations they cannot lower. See the [IR reference](docs/ir-reference.md)
+and [Vulkan frontend scope](docs/vulkan-sgfx.md) for the supported operations.
 
 `scarlet-ui-renderer-sgfx` remains in the ScarletUI repository because it is a
 frontend. Scarlet GPU ABI crates such as `gpu-raw` remain in Scarlet.
@@ -44,9 +51,10 @@ Their Rust APIs can evolve with the frontend and backend consumers; SGFX 1.x
 does not promise unchanged Rust signatures across releases. Direct Rust users
 must select a compatible revision/lockfile set and rebuild its components.
 
-The intended application-facing graphics boundary is the Vulkan C ABI. A
-future `vulkan-sgfx` frontend, SGFX core and the chosen backend/codegen can be
-linked into one ICD/library. Independently loading SGFX Rust components is not
+The intended application-facing graphics boundary is the Vulkan C ABI. The
+experimental `vulkan-sgfx` frontend links SGFX core and WGPU execution into one
+ICD/library. Native frontend support and Vulkan conformance remain future work.
+Independently loading SGFX Rust components is not
 planned. Resource ownership, ordering, completion and failure semantics still
 form the common backend contract. See the [approved policy](docs/1.0-contract.md#2-coordinated-rust-implementation-policy).
 
@@ -71,6 +79,18 @@ so the external Adreno backend uses the same IR types as the local crates.
 This is a development-only override: Git consumers resolve the core from the
 same repository naturally and do not inherit or need the workspace patch.
 
+For coordinated local Adreno changes, check both Scarlet targets against the
+companion checkout with:
+
+```bash
+scripts/check-native-integration.sh /path/to/scarlet-project-chromebook
+```
+
+The script checks that the graph contains one `sgfx-core` and uses a separate
+lockfile under `target/native-integration`. It preserves the workspace lockfile
+and release manifest selectors. Use matching backend/driver revisions before
+testing the native asynchronous path on hardware.
+
 CI runs the portable suite on both `scarlet-rust-toolchain` (the integration
 baseline) and upstream Rust (the portability check). The two compilers use
 separate target directories. Scarlet target checks always use the Scarlet
@@ -85,6 +105,7 @@ cargo test --locked -p sgfx-core
 cargo test --locked -p sgfx-codegen-virgl
 cargo test --locked -p sgfx-backend-wgpu
 cargo test --locked -p sgfx
+cargo test --locked -p vulkan-sgfx
 ```
 
 For the additional upstream check, use a separate target directory:

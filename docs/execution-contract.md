@@ -26,7 +26,8 @@ An empty stream is a no-op, not a portable wait for earlier work. A backend may
 complete work synchronously; portable callers must rely only on the common
 acceptance guarantee. The additional `CommandSubmitter` and `Completion`
 interfaces now expose owned receipts, nonblocking observation and timed waits
-on host WGPU and native VirGL. Adreno tracked submission remains unsupported.
+on host WGPU, native VirGL and the matching asynchronous Adreno source set.
+A driver without Adreno asynchronous capacity is explicitly unsupported.
 There is no common cross-queue GPU semaphore API.
 
 | Backend | Current success boundary | Observation / presentation |
@@ -34,13 +35,25 @@ There is no common cross-queue GPU semaphore API.
 | WGPU | Uploads are copied into WGPU-owned staging and the encoded commands are queued. GPU execution remains asynchronous. | Same-queue operations retain ordering. Host surface presentation is separate; CPU readback must wait for the appropriate copy/map completion. |
 | Scarlet VirGL tracked `submit` | One logical stream is accepted into the context-owned dispatcher. Its worker schedules native chunks using the asynchronous Scarlet GPU ABI. First-use resource creation can still synchronize. | The owned receipt covers all chunks and their ordered prefix. Observation is not required to drive dispatch. Readback and explicit detach drain preceding logical work. SWS leases remain separate. |
 | Scarlet VirGL legacy `execute` / direct submit | Ordered backend operations retain the synchronous Scarlet GPU ABI path after draining preceding tracked work. Opaque submissions return after fenced backend completion; buffer-only updates may remain in the persistent shadow cache until needed. | Session BGRA readback is synchronous. Sharing an image with SWS still follows the SWS frame lifecycle. |
-| Scarlet Adreno | Ordered chunks use the synchronous Scarlet GPU ABI; earlier chunks are drained before direct CPU-visible uploads. The facade rejects tracked `submit` as unsupported. | Session BGRA readback is synchronous. A618 asynchronous completion and staging retention remain required work. SWS presentation and buffer reuse remain separate from command execution. |
+| Scarlet Adreno tracked `submit` | A bounded logical dispatcher owns commands, staging and physical resource references. It schedules native chunks through the A618 asynchronous queue, resuming after native capacity pressure without replaying accepted work. | The receipt covers every chunk and its ordered prefix. Legacy synchronous execution, readback and explicit release drain preceding work. A618 hardware verification remains outstanding; SWS leases remain separate. |
 
 The Scarlet ABI retains synchronous `GpuQueue::submit` and adds tracked
 asynchronous submission with authoritative completion observation in `gpu-raw`.
 The [architecture](architecture.md) describes the division between IR,
 backend scheduling and platform ownership. Both normal Scarlet targets support
 Rust std; that runtime choice does not select synchronous execution.
+
+The Adreno path requires the corresponding backend and A618 driver changes.
+The [native integration script](../scripts/check-native-integration.sh) checks
+the two userspace architectures against a companion checkout without replacing
+the release lockfile. A successful cross-build does not establish A618 hardware
+retirement, fault recovery or presentation conformance.
+
+WGPU records uploads as encoder-owned staging copies, so uploads interleaved
+with render/compute passes and buffer copies preserve command order. Shader
+write dependencies use the core's explicit resource barriers; ordinary ordered
+accesses and physical transitions are handled by WGPU. VirGL and Adreno reject
+the programmable commands they cannot lower before native submission.
 
 VirGL admits up to 16 logical streams and 64 MiB of retained command bytes.
 Native packet splitting, FIFO progress and upload-arena reuse belong to the
@@ -104,9 +117,9 @@ without a GPU in [`sgfx-core`'s validation suite](../crates/sgfx-core/tests/vali
 The core checks logical descriptors and recording rules. Each backend also
 validates its representable subset and context mappings. Unsupported commands
 must return an explicit error; they must not be silently skipped or replaced
-with a rendering approximation. For example, WGPU currently rejects uploads
-after the first copy or render pass, while Scarlet backends own their own
-ordered upload and transport-chunking rules.
+with a rendering approximation. For example, the native backends reject the
+programmable shader/compute subset. WGPU supports ordered uploads between
+passes; Scarlet backends own their upload and transport-chunking rules.
 
 WGPU buffer upload offsets and byte lengths must be multiples of four. The
 backend reports `Unsupported(BufferWriteAlignment)` for other valid IR byte
@@ -116,9 +129,9 @@ or upload validation; they do not narrow the portable IR. Real-device tests
 check both the returned error and the absence of a raw WGPU validation error,
 then verify valid operations still work after rejection.
 
-Execution is not a transaction. VirGL preflights its command plan, but later
-backend failures can follow completed uploads or earlier passes. Adreno can
-submit a prefix before encountering a later unsupported operation. WGPU can
+Execution is not a transaction. Native tracked submission preflights its
+logical command plan, but later backend failures can follow accepted uploads
+or earlier passes. WGPU can
 report validation or device failures asynchronously after queue acceptance.
 Neither an `Err` nor the absence of an immediate error proves that no work ran.
 Do not blindly replay a failed command buffer. Backend-specific recovery must
@@ -150,4 +163,6 @@ on the exact frame identity and all consumer uses, independently of unmapping.
 This is the target guarantee, not a claim that native failure/teardown paths
 have passed review. Audit those paths and rendering/backend-subset behavior
 against the agreed completion scope and reviewed lifecycle rules before RC1.
-No Vulkan frontend is added to the release scope.
+The experimental Vulkan frontend is documented separately; its presence does
+not certify a conformant Vulkan implementation or expand the approved release
+subset automatically.

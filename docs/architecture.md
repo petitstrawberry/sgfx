@@ -33,31 +33,35 @@ the [1.0 execution contract](1.0-contract.md) still require review.
        Host GPU                       Target GPU
 ```
 
-This is the intended logical architecture, including future Vulkan and AGX
-work. Each build links the components it uses; the branches are not independent
+This is the intended logical architecture, including the experimental host
+Vulkan frontend and future native Vulkan/AGX work. Each build links the
+components it uses; the branches are not independent
 SGFX plugin-loading interfaces. A Vulkan driver can package:
 
 ```text
 one ICD/library = vulkan-sgfx + sgfx-core + selected backend + needed codegen
 ```
 
-ScarletUI is a renderer and can lower directly into SGFX. A future Vulkan
-frontend would own Vulkan object semantics, loader/ICD integration, extension
-negotiation and WSI. Those concerns do not belong in the common IR. No Vulkan
-frontend is implemented by this workspace or required for its current release
-subset.
+ScarletUI is a renderer and can lower directly into SGFX. The experimental
+[`vulkan-sgfx`](vulkan-sgfx.md) frontend owns Vulkan object semantics and
+loader/ICD integration. Extension negotiation and any future WSI also belong
+to that frontend. The initial ICD implements a documented headless subset
+through WGPU and does not establish Vulkan conformance or native Scarlet
+programmable execution.
 
-The current IR supports logical resources, fixed fragment programs, render
-passes, uploads, copies and draws. Recording state belongs to a command encoder
-and its resource table. There is no process-global implicit graphics context.
-The [inventory](1.0-api-scope.md#the-implemented-portable-ir) lists the precise
-subset and missing extensions, including arbitrary shaders and compute.
+The IR supports logical resources, fixed fragment programs, programmable
+render/compute pipelines, bind groups, uploads, copies, draws, dispatches and
+explicit same-queue resource dependencies. Recording state belongs to a
+command encoder and its resource table. There is no process-global implicit
+graphics context. The [inventory](1.0-api-scope.md#the-implemented-portable-ir)
+distinguishes the WGPU programmable subset from native fixed rendering.
 
 ## Where responsibilities live
 
 | Layer | Existing implementation | Responsibility |
 | --- | --- | --- |
 | Renderer frontend | External `scarlet-ui-renderer-sgfx` | Translate paint/scene data into logical SGFX resources and commands; choose frame contents and damage. |
+| API frontend | Experimental [`vulkan-sgfx`](../crates/vulkan-sgfx) | Own Vulkan objects, loader dispatch and API recording rules; record canonical owned SGFX commands for backend execution. |
 | Canonical IR | [`sgfx-core::ir`](../crates/sgfx-core/src/ir) | Resource identity, immutable definitions, command-local bindings and portable recording validation. |
 | Execution boundary | [`sgfx-core::backend`](../crates/sgfx-core/src/backend.rs) | Acceptance, ordering, borrowed-upload lifetime and optional tracked submission/completion. |
 | Backend selection facade | [`sgfx`](../crates/sgfx/src/lib.rs) | Choose a compiled backend at the composition root and delegate its operations/errors. It is not another command IR. |
@@ -87,11 +91,14 @@ Recoverable rejection drains accepted work before discarding the frame; GPU
 failure does not authorize image reuse. The [completion contract](completion-contract.md)
 defines these ownership and failure rules, including finite admission limits.
 
-The legacy VirGL `execute`/direct path remains synchronous. Adreno still uses
-synchronous execution and the facade rejects tracked submission as unsupported.
-A618 asynchronous enqueue, completion and staging retention remain release work;
-the facade does not manufacture completed receipts for it. Current boundaries
-are recorded in the [execution contract](execution-contract.md).
+The legacy VirGL and Adreno `execute`/direct paths remain synchronous. The
+Adreno tracked path uses the companion backend's bounded logical dispatcher
+and the A618 driver's asynchronous queue. It retains staging and physical
+resource owners until accepted work retires, and rejects a driver without
+asynchronous capacity explicitly. Build against the matching source set using
+the [native integration check](../scripts/check-native-integration.sh).
+A618 hardware and fault/reset evidence remain separate verification work.
+Current boundaries are recorded in the [execution contract](execution-contract.md).
 
 ## Extending this boundary
 

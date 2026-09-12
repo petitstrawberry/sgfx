@@ -74,8 +74,8 @@ The source identities used by the current native integration are:
 | Adreno backend/codegen | `https://github.com/petitstrawberry/scarlet-project-chromebook.git`, no selector | `0.1.0` |
 
 The SGFX workspace's [Cargo.lock](../Cargo.lock) selects Scarlet revision
-`c0f334b76abeac27b5d02ad6ae07593498e7b8ae` and Adreno revision
-`fcff35b4b01ef71631f163d44302460abb3a4f00` for this source set. These are lockfile
+`d8a199815249c784a04c9dec60b6efedbb79d84e` and Adreno revision
+`debc765f80ac7a582150b397bc8dd9cb52b4be89` for this source set. These are lockfile
 resolutions, not changes to the manifest selectors above. The Chromebook
 project and its userspace drivers do not need to share SGFX's version number.
 
@@ -206,11 +206,14 @@ borrows end. Receipts do not borrow the executor/table/upload data; dropping
 one does not wait or cancel work. Backend retention of in-flight resources is
 independent of receipt ownership.
 
-WGPU and Scarlet VirGL implement tracked submission. VirGL may synchronize
-during first-use physical resource creation; accepted uploads/copies/draws use
-asynchronous dispatch. The Adreno facade explicitly rejects tracked submission
-as unsupported; it retains its separate synchronous execution path. This is not
-an A618 hardware-support certification. See [execution details](execution-contract.md)
+WGPU, Scarlet VirGL and the matching Adreno source set implement tracked
+submission. Native backends may synchronize during first-use physical resource
+creation; accepted uploads/copies/draws use asynchronous dispatch. Adreno
+requires an A618 driver advertising asynchronous capacity and retains its
+separate synchronous execution path. Use the
+[native integration check](../scripts/check-native-integration.sh) with a
+companion checkout. Hardware verification remains separate from these build
+interfaces. See [execution details](execution-contract.md)
 and the [completion interface](../crates/sgfx-core/src/backend/completion.rs).
 
 ## Images, presentation and reuse

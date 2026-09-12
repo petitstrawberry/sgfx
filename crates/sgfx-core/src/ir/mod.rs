@@ -11,8 +11,8 @@ pub(crate) mod resource;
 mod types;
 
 pub use command::{
-    Command, CommandBuffer, CommandEncoder, DepthAttachment, DepthLoadOp, LoadOp, MAX_COMMANDS,
-    RenderPassDesc, RenderPassEncoder, StoreOp,
+    Command, CommandBuffer, CommandEncoder, ComputePassEncoder, DepthAttachment, DepthLoadOp,
+    LoadOp, MAX_COMMANDS, RenderPassDesc, RenderPassEncoder, StoreOp,
 };
 pub use pipeline::{
     BlendComponent, BlendFactor, BlendOp, BlendState, CompareFunction, CullMode, DepthState,
@@ -27,3 +27,17 @@ pub use resource::{
     TextureRef, TextureUsage, TextureWrite,
 };
 pub use types::{Color, Error, Extent2D, PixelRect, Result, Transform};
+
+mod programmable;
+mod shader;
+pub use programmable::*;
+pub use resource::{
+    BindGroupId, BindGroupRef, ComputePipelineId, ComputePipelineRef, ProgrammableRenderPipelineId,
+    ProgrammableRenderPipelineRef, ShaderModuleId, ShaderModuleRef,
+};
+pub use shader::*;
+mod owned;
+pub use owned::{
+    OwnedCommand, OwnedCommandBuffer, OwnedDepthAttachment, OwnedRenderPassDesc,
+    OwnedResourceBarrier,
+};

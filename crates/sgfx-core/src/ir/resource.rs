@@ -7,7 +7,10 @@ use core::ops::{BitOr, BitOrAssign};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::pipeline::RenderPipelineDesc;
-use super::{Error, Extent2D, PixelRect, Result};
+use super::{
+    BindGroupDesc, ComputePipelineDesc, Error, Extent2D, PixelRect, ProgrammableRenderPipelineDesc,
+    Result, ShaderModuleDesc,
+};
 
 /// Maximum textures held by one [`ResourceTable`].
 pub const MAX_TEXTURES: usize = 1_024;
@@ -62,6 +65,8 @@ impl TextureUsage {
     pub const COPY_DST: Self = Self(1 << 3);
     /// Allow eventual presentation by a backend.
     pub const PRESENT: Self = Self(1 << 4);
+    /// Allow write-only shader storage access to RGBA8 texels.
+    pub const STORAGE: Self = Self(1 << 5);
 
     /// Return no usage flags.
     ///
@@ -134,6 +139,8 @@ impl TextureDesc {
     /// depth format carrying anything except `RENDER_ATTACHMENT` usage.
     pub const fn new(format: TextureFormat, extent: Extent2D, usage: TextureUsage) -> Result<Self> {
         if usage.0 == 0
+            || (usage.contains(TextureUsage::STORAGE)
+                && !matches!(format, TextureFormat::Rgba8Unorm))
             || (matches!(format, TextureFormat::Depth32Float)
                 && usage.0 != TextureUsage::RENDER_ATTACHMENT.0)
         {
@@ -183,6 +190,10 @@ impl BufferUsage {
     pub const COPY_SRC: Self = Self(1 << 2);
     /// Allow writes through upload commands.
     pub const COPY_DST: Self = Self(1 << 3);
+    /// Allow shader uniform reads.
+    pub const UNIFORM: Self = Self(1 << 4);
+    /// Allow shader storage reads and writes.
+    pub const STORAGE: Self = Self(1 << 5);
     /// Return no usage flags.
     ///
     /// # Returns
@@ -414,6 +425,10 @@ pub struct ResourceTable {
     buffers: RefCell<Vec<BufferDesc>>,
     samplers: RefCell<Vec<SamplerDesc>>,
     pipelines: RefCell<Vec<RenderPipelineDesc>>,
+    shader_modules: RefCell<Vec<ShaderModuleDesc>>,
+    bind_groups: RefCell<Vec<BindGroupDesc>>,
+    compute_pipelines: RefCell<Vec<ComputePipelineDesc>>,
+    programmable_pipelines: RefCell<Vec<ProgrammableRenderPipelineDesc>>,
 }
 
 impl ResourceTable {
@@ -428,6 +443,10 @@ impl ResourceTable {
             buffers: RefCell::new(Vec::new()),
             samplers: RefCell::new(Vec::new()),
             pipelines: RefCell::new(Vec::new()),
+            shader_modules: RefCell::new(Vec::new()),
+            bind_groups: RefCell::new(Vec::new()),
+            compute_pipelines: RefCell::new(Vec::new()),
+            programmable_pipelines: RefCell::new(Vec::new()),
         }
     }
 
@@ -553,6 +572,122 @@ impl ResourceTable {
             owner: self,
             index: id.index,
         })
+    }
+
+    /// Define an immutable shader module and return its branded reference.
+    pub fn define_shader_module(&self, desc: ShaderModuleDesc) -> Result<ShaderModuleRef<'_>> {
+        let index = Self::push(&self.shader_modules, desc, 256)?;
+        Ok(ShaderModuleRef { owner: self, index })
+    }
+    /// Resolve a persistent shader module identity in its owning table.
+    pub fn shader_module_ref(&self, id: ShaderModuleId) -> Result<ShaderModuleRef<'_>> {
+        self.validate_id(id.owner, id.index, &self.shader_modules)?;
+        Ok(ShaderModuleRef {
+            owner: self,
+            index: id.index,
+        })
+    }
+    /// Return an owned copy of a validated shader module descriptor.
+    pub fn shader_module(&self, reference: ShaderModuleRef<'_>) -> Result<ShaderModuleDesc> {
+        if !core::ptr::eq(reference.owner, self) {
+            return Err(Error::ResourceTableMismatch);
+        }
+        self.shader_modules
+            .borrow()
+            .get(reference.index)
+            .cloned()
+            .ok_or(Error::InvalidDescriptor)
+    }
+    /// Define an immutable bind group and return its branded reference.
+    pub fn define_bind_group(&self, desc: BindGroupDesc) -> Result<BindGroupRef<'_>> {
+        desc.validate(self)?;
+        let index = Self::push(&self.bind_groups, desc, 256)?;
+        Ok(BindGroupRef { owner: self, index })
+    }
+    /// Resolve a persistent bind group identity in its owning table.
+    pub fn bind_group_ref(&self, id: BindGroupId) -> Result<BindGroupRef<'_>> {
+        self.validate_id(id.owner, id.index, &self.bind_groups)?;
+        Ok(BindGroupRef {
+            owner: self,
+            index: id.index,
+        })
+    }
+    /// Return an owned copy of a validated bind group descriptor.
+    pub fn bind_group(&self, reference: BindGroupRef<'_>) -> Result<BindGroupDesc> {
+        if !core::ptr::eq(reference.owner, self) {
+            return Err(Error::ResourceTableMismatch);
+        }
+        self.bind_groups
+            .borrow()
+            .get(reference.index)
+            .cloned()
+            .ok_or(Error::InvalidDescriptor)
+    }
+    /// Define an immutable compute pipeline and return its branded reference.
+    pub fn define_compute_pipeline(
+        &self,
+        desc: ComputePipelineDesc,
+    ) -> Result<ComputePipelineRef<'_>> {
+        self.shader_module_ref(desc.shader().module())?;
+        let index = Self::push(&self.compute_pipelines, desc, 256)?;
+        Ok(ComputePipelineRef { owner: self, index })
+    }
+    /// Resolve a persistent compute pipeline identity in its owning table.
+    pub fn compute_pipeline_ref(&self, id: ComputePipelineId) -> Result<ComputePipelineRef<'_>> {
+        self.validate_id(id.owner, id.index, &self.compute_pipelines)?;
+        Ok(ComputePipelineRef {
+            owner: self,
+            index: id.index,
+        })
+    }
+    /// Return an owned copy of a validated compute pipeline descriptor.
+    pub fn compute_pipeline(
+        &self,
+        reference: ComputePipelineRef<'_>,
+    ) -> Result<ComputePipelineDesc> {
+        if !core::ptr::eq(reference.owner, self) {
+            return Err(Error::ResourceTableMismatch);
+        }
+        self.compute_pipelines
+            .borrow()
+            .get(reference.index)
+            .cloned()
+            .ok_or(Error::InvalidDescriptor)
+    }
+    /// Define an immutable programmable render pipeline and return its branded reference.
+    pub fn define_programmable_render_pipeline(
+        &self,
+        desc: ProgrammableRenderPipelineDesc,
+    ) -> Result<ProgrammableRenderPipelineRef<'_>> {
+        self.shader_module_ref(desc.vertex().module())?;
+        self.shader_module_ref(desc.fragment().module())?;
+        let index = Self::push(&self.programmable_pipelines, desc, 256)?;
+        Ok(ProgrammableRenderPipelineRef { owner: self, index })
+    }
+    /// Resolve a persistent programmable render pipeline identity in its owning table.
+    pub fn programmable_render_pipeline_ref(
+        &self,
+        id: ProgrammableRenderPipelineId,
+    ) -> Result<ProgrammableRenderPipelineRef<'_>> {
+        self.validate_id(id.owner, id.index, &self.programmable_pipelines)?;
+        Ok(ProgrammableRenderPipelineRef {
+            owner: self,
+            index: id.index,
+        })
+    }
+    /// Return an owned copy of a validated programmable render pipeline descriptor.
+    pub fn programmable_render_pipeline(
+        &self,
+        reference: ProgrammableRenderPipelineRef<'_>,
+    ) -> Result<ProgrammableRenderPipelineDesc> {
+        if !core::ptr::eq(reference.owner, self) {
+            return Err(Error::ResourceTableMismatch);
+        }
+        self.programmable_pipelines
+            .borrow()
+            .get(reference.index)
+            .cloned()
+            .ok_or(Error::InvalidDescriptor)
     }
 
     fn push<T>(items: &RefCell<Vec<T>>, value: T, maximum: usize) -> Result<usize> {
@@ -862,3 +997,111 @@ impl_resource_ref_traits!(TextureRef);
 impl_resource_ref_traits!(BufferRef);
 impl_resource_ref_traits!(SamplerRef);
 impl_resource_ref_traits!(RenderPipelineRef);
+
+/// Borrowed reference to an immutable shader module.
+#[derive(Clone, Copy)]
+pub struct ShaderModuleRef<'r> {
+    pub(crate) owner: &'r ResourceTable,
+    pub(crate) index: usize,
+}
+/// Persistent table-qualified shader module identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShaderModuleId {
+    owner: usize,
+    index: usize,
+}
+impl ShaderModuleRef<'_> {
+    /// Return the stable table-local backend slot.
+    pub const fn slot(self) -> usize {
+        self.index
+    }
+    /// Return a persistent identity for later resolution by the owning table.
+    pub const fn id(self) -> ShaderModuleId {
+        ShaderModuleId {
+            owner: self.owner.id,
+            index: self.index,
+        }
+    }
+}
+impl_resource_ref_traits!(ShaderModuleRef);
+
+/// Borrowed reference to an immutable bind group.
+#[derive(Clone, Copy)]
+pub struct BindGroupRef<'r> {
+    pub(crate) owner: &'r ResourceTable,
+    pub(crate) index: usize,
+}
+/// Persistent table-qualified bind group identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindGroupId {
+    owner: usize,
+    index: usize,
+}
+impl BindGroupRef<'_> {
+    /// Return the stable table-local backend slot.
+    pub const fn slot(self) -> usize {
+        self.index
+    }
+    /// Return a persistent identity for later resolution by the owning table.
+    pub const fn id(self) -> BindGroupId {
+        BindGroupId {
+            owner: self.owner.id,
+            index: self.index,
+        }
+    }
+}
+impl_resource_ref_traits!(BindGroupRef);
+
+/// Borrowed reference to an immutable compute pipeline.
+#[derive(Clone, Copy)]
+pub struct ComputePipelineRef<'r> {
+    pub(crate) owner: &'r ResourceTable,
+    pub(crate) index: usize,
+}
+/// Persistent table-qualified compute pipeline identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ComputePipelineId {
+    owner: usize,
+    index: usize,
+}
+impl ComputePipelineRef<'_> {
+    /// Return the stable table-local backend slot.
+    pub const fn slot(self) -> usize {
+        self.index
+    }
+    /// Return a persistent identity for later resolution by the owning table.
+    pub const fn id(self) -> ComputePipelineId {
+        ComputePipelineId {
+            owner: self.owner.id,
+            index: self.index,
+        }
+    }
+}
+impl_resource_ref_traits!(ComputePipelineRef);
+
+/// Borrowed reference to an immutable programmable render pipeline.
+#[derive(Clone, Copy)]
+pub struct ProgrammableRenderPipelineRef<'r> {
+    pub(crate) owner: &'r ResourceTable,
+    pub(crate) index: usize,
+}
+/// Persistent table-qualified programmable render pipeline identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProgrammableRenderPipelineId {
+    owner: usize,
+    index: usize,
+}
+impl ProgrammableRenderPipelineRef<'_> {
+    /// Return the stable table-local backend slot.
+    pub const fn slot(self) -> usize {
+        self.index
+    }
+    /// Return a persistent identity for later resolution by the owning table.
+    pub const fn id(self) -> ProgrammableRenderPipelineId {
+        ProgrammableRenderPipelineId {
+            owner: self.owner.id,
+            index: self.index,
+        }
+    }
+}
+impl_resource_ref_traits!(ProgrammableRenderPipelineRef);

@@ -223,6 +223,29 @@ impl Error {
                         )
                 )
             }
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+            Self::ScarletAdrenoIr(error) => {
+                use sgfx_backend_scarlet_adreno::{HandleError, IrSubmitError as E};
+                matches!(
+                    error,
+                    E::InvalidIr(_)
+                        | E::ResourceTableMismatch
+                        | E::ContextMismatch
+                        | E::TargetExtentMismatch
+                        | E::ImageNotMapped
+                        | E::TextureAlreadyMapped
+                        | E::ImageAlreadyMapped
+                        | E::Unsupported(_)
+                        | E::OutOfMemory
+                        | E::SubmissionTooLarge
+                        | E::AsyncUnsupported
+                        | E::Backend(
+                            HandleError::InvalidParameter
+                                | HandleError::Unsupported
+                                | HandleError::OutOfResources
+                        )
+                )
+            }
             _ => false,
         }
     }

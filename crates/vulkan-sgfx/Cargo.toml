@@ -1,0 +1,23 @@
+[package]
+name = "vulkan-sgfx"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Experimental non-conformant headless Vulkan frontend for SGFX"
+
+[lib]
+name = "vulkan_sgfx"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+naga = { version = "24", features = ["spv-in", "spv-out"] }
+ash = { version = "0.38", default-features = false, features = ["debug", "std"] }
+pollster = "0.4"
+sgfx-core = { path = "../sgfx-core" }
+sgfx-backend-wgpu = { path = "../sgfx-backend-wgpu" }
+wgpu = "24"
+
+[dev-dependencies]
+png = "0.18"
+libloading = "0.8"
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }

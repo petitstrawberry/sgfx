@@ -6,12 +6,14 @@ members = [
     "crates/sgfx-codegen-virgl",
     "crates/sgfx-backend-wgpu",
     "crates/sgfx-backend-scarlet-virgl",
+    "crates/vulkan-sgfx",
 ]
 default-members = [
     "crates/sgfx",
     "crates/sgfx-core",
     "crates/sgfx-codegen-virgl",
     "crates/sgfx-backend-wgpu",
+    "crates/vulkan-sgfx",
 ]
 
 # Only for development in this workspace: the external Adreno backend imports

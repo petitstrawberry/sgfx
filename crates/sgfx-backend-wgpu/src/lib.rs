@@ -19,6 +19,8 @@ use wgpu as raw;
 use sgfx_core::backend::{CommandSubmitter, SubmitError};
 
 mod completion;
+mod programmable;
+mod readback;
 pub use completion::Submission;
 
 use sgfx_core::ir::{
@@ -59,6 +61,8 @@ pub enum Error {
     DeviceLost,
     /// Submission retirement could not be established by the private marker.
     CompletionObservation,
+    /// WGPU rejected a programmable shader, pipeline, or binding.
+    Validation(String),
 }
 
 impl From<ir::Error> for Error {
@@ -83,6 +87,7 @@ impl fmt::Display for Error {
             Self::DeviceRequest => formatter.write_str("WGPU device creation failed"),
             Self::SurfaceAcquire => formatter.write_str("WGPU surface acquisition failed"),
             Self::DeviceLost => formatter.write_str("WGPU device was lost or destroyed"),
+            Self::Validation(message) => write!(formatter, "WGPU validation failed: {message}"),
             Self::CompletionObservation => {
                 formatter.write_str("WGPU completion observation failed")
             }
@@ -93,7 +98,7 @@ impl fmt::Display for Error {
 /// Logical SGFX features that are not yet represented by this backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedFeature {
-    /// A write command appeared after a copy or render pass had been encoded.
+    /// Reserved for compatibility; ordered uploads are now supported.
     LateUpload,
     /// A buffer upload offset or byte length is not a multiple of WGPU's
     /// four-byte copy alignment. The portable IR permits byte-granular writes.
@@ -114,6 +119,12 @@ pub enum UnsupportedFeature {
     SurfaceFormat,
     /// Blocking waits are unavailable in a browser; use nonblocking observation.
     BlockingWait,
+    /// Programmable execution needs native synchronous validation scopes.
+    ProgrammableOnWeb,
+    /// A buffer binding violates this WGPU device's offset alignment or size limits.
+    BindingLimits,
+    /// Dispatch dimensions exceed the device workgroup-count limit.
+    DispatchLimits,
 }
 
 /// WGPU device and queue pair used by the SGFX backend.
@@ -123,6 +134,7 @@ pub struct Device {
     queue: Arc<raw::Queue>,
     identity: Arc<()>,
     tracker: Arc<completion::Tracker>,
+    validation: Arc<std::sync::Mutex<()>>,
 }
 
 impl Device {
@@ -140,6 +152,8 @@ impl Device {
     /// This installs SGFX's device-lost callback for completion observation.
     /// Do not replace it or wrap another alias of this raw device while using
     /// SGFX completion receipts. Other raw WGPU error handlers are unchanged.
+    /// Do not concurrently interleave raw WGPU error scopes with SGFX calls:
+    /// WGPU validation scopes belong to the device, not the calling thread.
     pub fn new(device: raw::Device, queue: raw::Queue) -> Self {
         let tracker = Arc::new(completion::Tracker::default());
         let loss_tracker = Arc::clone(&tracker);
@@ -153,6 +167,7 @@ impl Device {
             queue: Arc::new(queue),
             identity: Arc::new(()),
             tracker,
+            validation: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -274,6 +289,7 @@ impl Context {
             pipelines: Vec::new(),
             clear_pipelines: Vec::new(),
             mapped_images: Vec::new(),
+            programmable: programmable::Cache::default(),
         }
     }
 
@@ -691,6 +707,7 @@ pub struct Resources {
     )>,
     clear_pipelines: Vec<(raw::TextureFormat, bool, Arc<GpuClearPipeline>)>,
     mapped_images: Vec<(TextureId, Arc<GpuTexture>)>,
+    programmable: programmable::Cache,
 }
 
 impl Resources {
@@ -788,6 +805,12 @@ impl Resources {
         let mut usage = raw::BufferUsages::empty();
         if descriptor.usage().contains(BufferUsage::VERTEX) {
             usage |= raw::BufferUsages::VERTEX;
+        }
+        if descriptor.usage().contains(BufferUsage::UNIFORM) {
+            usage |= raw::BufferUsages::UNIFORM;
+        }
+        if descriptor.usage().contains(BufferUsage::STORAGE) {
+            usage |= raw::BufferUsages::STORAGE;
         }
         if descriptor.usage().contains(BufferUsage::INDEX) {
             usage |= raw::BufferUsages::INDEX;
@@ -926,8 +949,8 @@ impl Queue {
 
     /// Submit one validated SGFX command buffer.
     ///
-    /// Upload commands are expected before the first texture copy or render
-    /// pass. The command buffer is translated into one WGPU submission, and
+    /// Upload bytes are copied to backend-owned staging buffers and encoded
+    /// in command order. The stream becomes one WGPU submission, and
     /// this method returns after it has been queued; WGPU GPU completion
     /// remains asynchronous.
     ///
@@ -984,12 +1007,21 @@ impl Queue {
             return Err(SubmitError::Rejected(Error::DeviceLost));
         }
         let slot = device.tracker.reserve().ok_or(SubmitError::Busy)?;
-        let marker = device.raw_device().create_buffer(&raw::BufferDescriptor {
-            label: Some("sgfx submission completion marker"),
-            size: 4,
-            usage: raw::BufferUsages::COPY_DST | raw::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let marker = {
+            let _guard = device
+                .validation
+                .lock()
+                .map_err(|_| SubmitError::Rejected(Error::InvalidState))?;
+            programmable::validated(device.raw_device(), || {
+                Ok(device.raw_device().create_buffer(&raw::BufferDescriptor {
+                    label: Some("sgfx submission completion marker"),
+                    size: 4,
+                    usage: raw::BufferUsages::COPY_DST | raw::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }))
+            })
+            .map_err(SubmitError::Rejected)?
+        };
         match self.submit_inner(resources, commands, Some(&marker)) {
             Ok(index) => Ok(Submission::new(device.clone(), index, marker, slot)),
             Err(error) => {
@@ -1027,14 +1059,41 @@ impl Queue {
         if !core::ptr::eq(resources.resources.as_ref(), commands.resources()) {
             return Err(Error::ResourceTableMismatch);
         }
+        let _ = self.context.raw_device().poll(raw::Maintain::Poll);
+        if self
+            .context
+            .device
+            .tracker
+            .lost
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::DeviceLost);
+        }
+        let _scope_guard = self
+            .context
+            .device
+            .validation
+            .lock()
+            .map_err(|_| Error::InvalidState)?;
+        let encoded = programmable::validated(self.context.raw_device(), || {
+            self.encode_commands(resources, commands, marker)
+        })?;
+        programmable::validated(self.context.raw_device(), || {
+            Ok(self.context.raw_queue().submit([encoded]))
+        })
+    }
+
+    fn encode_commands<'r, 'data>(
+        &self,
+        resources: &mut Resources,
+        commands: &CommandBuffer<'r, 'data>,
+        marker: Option<&raw::Buffer>,
+    ) -> Result<raw::CommandBuffer> {
         let mut encoder = self.context.device.raw_device().create_command_encoder(
             &raw::CommandEncoderDescriptor {
                 label: Some("sgfx wgpu command encoder"),
             },
         );
-        let mut buffer_writes = Vec::new();
-        let mut texture_writes = Vec::new();
-        let mut upload_phase = true;
         let mut index = 0;
         while index < commands.commands().len() {
             match commands.commands().get(index).ok_or(Error::InvalidState)? {
@@ -1043,9 +1102,6 @@ impl Queue {
                     offset,
                     data,
                 } => {
-                    if !upload_phase {
-                        return Err(Error::Unsupported(UnsupportedFeature::LateUpload));
-                    }
                     if !offset.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
                         || !data
                             .len()
@@ -1054,19 +1110,48 @@ impl Queue {
                         return Err(Error::Unsupported(UnsupportedFeature::BufferWriteAlignment));
                     }
                     let buffer = resources.buffer(*buffer)?;
-                    buffer_writes.push((buffer, *offset, *data));
+                    if !data.is_empty() {
+                        let staging = create_staging_buffer(self.context.raw_device(), data)?;
+                        encoder.copy_buffer_to_buffer(
+                            &staging,
+                            0,
+                            &buffer.buffer,
+                            *offset,
+                            data.len() as u64,
+                        );
+                    }
                 }
                 Command::WriteTexture { texture, write } => {
-                    if !upload_phase {
-                        return Err(Error::Unsupported(UnsupportedFeature::LateUpload));
-                    }
                     let texture_resource = resources.texture(*texture)?;
-                    texture_writes.push((
-                        texture_resource,
-                        write.destination(),
-                        write.bytes_per_row(),
-                        write.data(),
-                    ));
+                    encode_texture_upload(
+                        self.context.raw_device(),
+                        &mut encoder,
+                        &texture_resource,
+                        *write,
+                    )?;
+                }
+                Command::CopyBufferToBuffer {
+                    source,
+                    source_offset,
+                    destination,
+                    destination_offset,
+                    size,
+                } => {
+                    if !source_offset.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
+                        || !destination_offset.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
+                        || !size.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
+                    {
+                        return Err(Error::Unsupported(UnsupportedFeature::BufferWriteAlignment));
+                    }
+                    let source = resources.buffer(*source)?;
+                    let destination = resources.buffer(*destination)?;
+                    encoder.copy_buffer_to_buffer(
+                        &source.buffer,
+                        *source_offset,
+                        &destination.buffer,
+                        *destination_offset,
+                        *size,
+                    );
                 }
                 Command::CopyTextureToTexture {
                     source,
@@ -1074,7 +1159,6 @@ impl Queue {
                     destination,
                     destination_rect,
                 } => {
-                    upload_phase = false;
                     let source = resources.texture(*source)?;
                     let destination = resources.texture(*destination)?;
                     encoder.copy_texture_to_texture(
@@ -1106,7 +1190,6 @@ impl Queue {
                     );
                 }
                 Command::BeginRenderPass(desc) => {
-                    upload_phase = false;
                     let end = commands.commands()[index + 1..]
                         .iter()
                         .position(|command| matches!(command, Command::EndRenderPass))
@@ -1120,51 +1203,31 @@ impl Queue {
                     )?;
                     index = end;
                 }
+                Command::BeginComputePass => {
+                    let end = commands.commands()[index + 1..]
+                        .iter()
+                        .position(|command| matches!(command, Command::EndComputePass))
+                        .map(|relative| index + 1 + relative)
+                        .ok_or(Error::InvalidState)?;
+                    self.encode_compute_pass(
+                        resources,
+                        &mut encoder,
+                        &commands.commands()[index + 1..end],
+                    )?;
+                    index = end;
+                }
+                // IR validates this single-queue barrier's usage and pass scope.
+                // WGPU inserts resource transitions between ordered encoder operations.
+                Command::ResourceBarrier(_) => {}
                 Command::EndRenderPass => return Err(Error::InvalidState),
                 _ => return Err(Error::InvalidState),
             }
             index += 1;
         }
-        for (buffer, offset, data) in buffer_writes {
-            self.context
-                .device
-                .raw_queue()
-                .write_buffer(&buffer.buffer, offset, data);
-        }
-        for (texture, destination, bytes_per_row, data) in texture_writes {
-            self.context.device.raw_queue().write_texture(
-                raw::TexelCopyTextureInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: raw::Origin3d {
-                        x: destination.x(),
-                        y: destination.y(),
-                        z: 0,
-                    },
-                    aspect: raw::TextureAspect::All,
-                },
-                data,
-                raw::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(destination.height()),
-                },
-                raw::Extent3d {
-                    width: destination.width(),
-                    height: destination.height(),
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
         if let Some(marker) = marker {
             encoder.clear_buffer(marker, 0, None);
         }
-        let index = self
-            .context
-            .device
-            .raw_queue()
-            .submit(core::iter::once(encoder.finish()));
-        Ok(index)
+        Ok(encoder.finish())
     }
 
     fn encode_render_pass<'r, 'data>(
@@ -1258,10 +1321,13 @@ impl Queue {
             sampler: None,
             uniforms: None,
             has_depth_attachment: depth.is_some(),
+            programmable: None,
+            bind_groups: Vec::new(),
         };
         for command in commands {
             match command {
                 Command::SetPipeline(pipeline) => {
+                    state.programmable = None;
                     let sample_format =
                         state.texture.as_ref().map(|texture| texture.logical_format);
                     state.pipeline_id = Some(pipeline.id());
@@ -1272,6 +1338,30 @@ impl Queue {
                         return Err(Error::InvalidState);
                     }
                     render_pass.set_pipeline(&pipeline.pipeline);
+                }
+                Command::SetProgrammablePipeline(pipeline) => {
+                    let pipeline = resources.programmable_pipeline(
+                        pipeline.id(),
+                        target.format,
+                        state.has_depth_attachment,
+                    )?;
+                    if pipeline.has_depth != state.has_depth_attachment {
+                        return Err(Error::InvalidState);
+                    }
+                    render_pass.set_pipeline(&pipeline.pipeline);
+                    state.programmable = Some(pipeline);
+                    state.pipeline = None;
+                    state.pipeline_id = None;
+                }
+                Command::SetBindGroup { index, bind_group } => {
+                    let group = resources.programmable_bind_group(*bind_group)?;
+                    if let Some((_, current)) =
+                        state.bind_groups.iter_mut().find(|(slot, _)| slot == index)
+                    {
+                        *current = group;
+                    } else {
+                        state.bind_groups.push((*index, group));
+                    }
                 }
                 Command::SetVertexBuffer { buffer, offset } => {
                     state.vertex_buffer = Some((resources.buffer(*buffer)?, *offset));
@@ -1337,11 +1427,7 @@ impl Queue {
                         *base_vertex,
                     )?;
                 }
-                Command::BeginRenderPass(_)
-                | Command::EndRenderPass
-                | Command::WriteBuffer { .. }
-                | Command::WriteTexture { .. }
-                | Command::CopyTextureToTexture { .. } => return Err(Error::InvalidState),
+                _ => return Err(Error::InvalidState),
             }
         }
         Ok(())
@@ -1399,6 +1485,11 @@ impl Queue {
         vertex_count: u32,
         first_vertex: u32,
     ) -> Result<()> {
+        if let Some(pipeline) = &state.programmable {
+            self.prepare_programmable_draw(render_pass, state, pipeline)?;
+            render_pass.draw(first_vertex..first_vertex + vertex_count, 0..1);
+            return Ok(());
+        }
         let pipeline = state.pipeline.as_ref().ok_or(Error::InvalidState)?;
         let (vertex_buffer, offset) = state.vertex_buffer.as_ref().ok_or(Error::InvalidState)?;
         let uniforms = state.uniforms.ok_or(Error::InvalidState)?;
@@ -1417,6 +1508,14 @@ impl Queue {
         first_index: u32,
         base_vertex: i32,
     ) -> Result<()> {
+        if let Some(pipeline) = &state.programmable {
+            self.prepare_programmable_draw(render_pass, state, pipeline)?;
+            let (buffer, offset, format) =
+                state.index_buffer.as_ref().ok_or(Error::InvalidState)?;
+            render_pass.set_index_buffer(buffer.buffer.slice(*offset..), index_format(*format));
+            render_pass.draw_indexed(first_index..first_index + index_count, base_vertex, 0..1);
+            return Ok(());
+        }
         let pipeline = state.pipeline.as_ref().ok_or(Error::InvalidState)?;
         let (vertex_buffer, vertex_offset) =
             state.vertex_buffer.as_ref().ok_or(Error::InvalidState)?;
@@ -1431,6 +1530,29 @@ impl Queue {
             index_format(*index_kind),
         );
         render_pass.draw_indexed(first_index..first_index + index_count, base_vertex, 0..1);
+        Ok(())
+    }
+
+    fn prepare_programmable_draw(
+        &self,
+        pass: &mut raw::RenderPass<'_>,
+        state: &PassState,
+        pipeline: &programmable::RenderPipeline,
+    ) -> Result<()> {
+        if pipeline.has_vertex_buffer {
+            let (buffer, offset) = state.vertex_buffer.as_ref().ok_or(Error::InvalidState)?;
+            pass.set_vertex_buffer(0, buffer.buffer.slice(*offset..));
+        }
+        for (index, empty) in pipeline.empty_groups.iter().enumerate() {
+            let group = state
+                .bind_groups
+                .iter()
+                .find(|(slot, _)| *slot == index as u32)
+                .map(|(_, group)| group)
+                .or(empty.as_ref())
+                .ok_or(Error::InvalidState)?;
+            pass.set_bind_group(index as u32, group.as_ref(), &[]);
+        }
         Ok(())
     }
 
@@ -1533,6 +1655,8 @@ struct PassState {
     sampler: Option<Arc<raw::Sampler>>,
     uniforms: Option<DrawUniforms>,
     has_depth_attachment: bool,
+    programmable: Option<Arc<programmable::RenderPipeline>>,
+    bind_groups: Vec<(u32, Arc<raw::BindGroup>)>,
 }
 
 #[repr(C)]
@@ -1589,6 +1713,86 @@ struct GpuClearPipeline {
     bind_group_layout: raw::BindGroupLayout,
 }
 
+// Mapped-at-creation staging owns borrowed upload data immediately. WGPU's
+// encoder retains the staging resource until the submitted copy retires.
+fn create_staging_buffer(device: &raw::Device, data: &[u8]) -> Result<raw::Buffer> {
+    let buffer = programmable::validated(device, || {
+        Ok(device.create_buffer(&raw::BufferDescriptor {
+            label: Some("sgfx ordered upload staging"),
+            size: (data.len() as u64).next_multiple_of(raw::COPY_BUFFER_ALIGNMENT),
+            usage: raw::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        }))
+    })?;
+    buffer.slice(..).get_mapped_range_mut()[..data.len()].copy_from_slice(data);
+    buffer.unmap();
+    Ok(buffer)
+}
+
+fn encode_texture_upload(
+    device: &raw::Device,
+    encoder: &mut raw::CommandEncoder,
+    texture: &GpuTexture,
+    write: ir::TextureWrite<'_>,
+) -> Result<()> {
+    let area = write.destination();
+    let row_size = area
+        .width()
+        .checked_mul(texture.logical_format.bytes_per_pixel())
+        .ok_or(Error::Unsupported(UnsupportedFeature::ResourceSize))?;
+    let stride = row_size
+        .checked_next_multiple_of(raw::COPY_BYTES_PER_ROW_ALIGNMENT)
+        .ok_or(Error::Unsupported(UnsupportedFeature::ResourceSize))?;
+    let size = u64::from(stride) * u64::from(area.height());
+    if size > device.limits().max_buffer_size {
+        return Err(Error::Unsupported(UnsupportedFeature::ResourceSize));
+    }
+    let staging = programmable::validated(device, || {
+        Ok(device.create_buffer(&raw::BufferDescriptor {
+            label: Some("sgfx ordered texture upload staging"),
+            size,
+            usage: raw::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        }))
+    })?;
+    {
+        let mut destination = staging.slice(..).get_mapped_range_mut();
+        for row in 0..area.height() as usize {
+            let source_start = row * write.bytes_per_row() as usize;
+            let target_start = row * stride as usize;
+            destination[target_start..target_start + row_size as usize]
+                .copy_from_slice(&write.data()[source_start..source_start + row_size as usize]);
+        }
+    }
+    staging.unmap();
+    encoder.copy_buffer_to_texture(
+        raw::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: raw::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(area.height()),
+            },
+        },
+        raw::TexelCopyTextureInfo {
+            texture: &texture.texture,
+            mip_level: 0,
+            origin: raw::Origin3d {
+                x: area.x(),
+                y: area.y(),
+                z: 0,
+            },
+            aspect: raw::TextureAspect::All,
+        },
+        raw::Extent3d {
+            width: area.width(),
+            height: area.height(),
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
+}
+
 fn create_gpu_texture(
     device: &raw::Device,
     width: u32,
@@ -1629,6 +1833,9 @@ fn create_gpu_texture(
 
 fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
     let mut usage = raw::TextureUsages::empty();
+    if descriptor.usage().contains(TextureUsage::STORAGE) {
+        usage |= raw::TextureUsages::STORAGE_BINDING;
+    }
     if descriptor.usage().contains(TextureUsage::SAMPLED) {
         usage |= raw::TextureUsages::TEXTURE_BINDING;
     }
@@ -2351,6 +2558,7 @@ fn sampled_alpha(sample: &str, sample_format: Option<TextureFormat>) -> String {
 mod tests {
     mod completion;
     mod execution;
+    mod programmable;
 
     use alloc::rc::Rc;
     use alloc::vec;
@@ -2362,7 +2570,7 @@ mod tests {
         StoreOp, TextureWrite, Transform, VertexBufferLayout,
     };
 
-    static HEADLESS_WGPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static HEADLESS_WGPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn request_headless_adapter(instance: &raw::Instance) -> Option<raw::Adapter> {
         pollster::block_on(instance.request_adapter(&raw::RequestAdapterOptions {

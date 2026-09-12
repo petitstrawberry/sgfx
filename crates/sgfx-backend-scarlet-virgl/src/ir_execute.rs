@@ -69,6 +69,14 @@ pub enum UnsupportedIrFeature {
     VertexBuffer,
     /// Draw uniforms are unsupported.
     DrawUniforms,
+    /// Arbitrary shader programs and compute execution are not implemented.
+    ProgrammableExecution,
+    /// Programmable resource bind groups are not implemented.
+    ResourceBindings,
+    /// Explicit programmable resource dependencies are not implemented.
+    ExplicitBarrier,
+    /// Logical buffer-to-buffer copies are not implemented.
+    BufferCopy,
 }
 
 /// Failure while mapping or submitting a logical IR command buffer.
@@ -868,6 +876,23 @@ impl ExecutionPlan {
         resources: &IrResources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<Self, IrSubmitError> {
+        // Reject the complete unsupported stream before resolving images,
+        // building buffer shadows, materializing resources, or submitting work.
+        // A valid programmable stream is not malformed fixed-function IR.
+        for command in commands.commands() {
+            let unsupported = match command {
+                Command::SetProgrammablePipeline(_)
+                | Command::BeginComputePass
+                | Command::EndComputePass
+                | Command::SetComputePipeline(_)
+                | Command::Dispatch { .. } => UnsupportedIrFeature::ProgrammableExecution,
+                Command::SetBindGroup { .. } => UnsupportedIrFeature::ResourceBindings,
+                Command::ResourceBarrier(_) => UnsupportedIrFeature::ExplicitBarrier,
+                Command::CopyBufferToBuffer { .. } => UnsupportedIrFeature::BufferCopy,
+                _ => continue,
+            };
+            return Err(IrSubmitError::Unsupported(unsupported));
+        }
         let mut pending_buffers = PendingBuffers::new();
         let mut events = Vec::new();
         let mut active = None;

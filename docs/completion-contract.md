@@ -145,7 +145,8 @@ codes and their result/layout meanings remain unchanged.
 - [x] WGPU tracked submission, bounded tracking, failure receipts and host facade.
 - [x] Additive Scarlet async ABI and authoritative completion objects.
 - [x] VirtIO/VirGL asynchronous enqueue/completion with retained resources.
-- [ ] A618 asynchronous enqueue/completion and safe staging reuse.
+- [x] A618 asynchronous enqueue/completion and safe staging reuse in the
+  coordinated implementation source set; hardware conformance remains open.
 - [x] Native VirGL SGFX/facade tracked submission and rejection rollback.
 - [x] SWS/ScarletUI frame-level observation and shared-image handoff integration.
 - [ ] Both architectures' tests/builds, real host rendering, and A618 hardware
@@ -233,9 +234,30 @@ buffer through arena-ring reuse, and rejects >64 MiB before initialization chang
 are accepted. These revised native runtime cases remain user-operated; the earlier
 normal-rendering confirmation does not certify this new dispatcher revision.
 
-**A618 still advertises zero async capacity** and retains its explicit legacy
-synchronous consumer path. Its staging/fence ownership and mapping retention
-remain to be implemented. A raw control or handle-adoption failure can lose
-the current receipt; the VirGL adapter reports an unobservable failure rather
-than certifying unknown accepted work using only an older successful receipt.
-Fault/reset, repeated native teardown and A618 hardware evidence remain open.
+The coordinated A618 implementation now advertises eight native requests and
+progresses a device-wide FIFO through an independent worker. Its SGFX adapter
+owns a bounded logical dispatcher (16 streams / 64 MiB) and four 8 MiB upload
+arenas. Arena reuse requires successful native retirement; native Busy resumes
+the exact next chunk without replay. Logical receipts retain physical backing
+and mappings through every chunk, including work not yet dispatched, and survive
+dropped frontend owners. The facade delegates tracked submit and completion to
+this adapter.
+
+Raw CPU upload/readback acquires a device-wide reservation before touching
+backing memory and holds it through cache maintenance and the backend callback.
+The companion Scarlet kernel also retains image/buffer attachment locks across
+legacy synchronous submission. A failed quiescence proof keeps the synchronous
+caller and backing retained; an error does not authorize early resource reuse.
+
+Portable tests and cross-compilation do not establish A618 hardware behavior.
+DMA/IRQ completion, multiple outstanding hardware requests, fault/reset and
+repeated teardown still need CoachZ evidence.
+
+Use compatible kernel, Adreno backend and SGFX revisions together. For local
+development, `scripts/check-native-integration.sh` selects a companion
+Chromebook checkout and checks both Scarlet userspace targets. The Chromebook
+repository's `scripts/check-a618-kernel-integration.sh` checks its driver
+against a selected Scarlet kernel. Older A618 drivers still expose only the
+previous synchronous path. A raw control or handle-adoption failure can lose
+the current receipt; adapters report an unobservable failure rather than
+certifying unknown accepted work using an older successful receipt.

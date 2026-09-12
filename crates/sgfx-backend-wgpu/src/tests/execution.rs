@@ -176,7 +176,7 @@ fn executor_rejects_a_different_resource_table_even_when_empty() {
 }
 
 #[test]
-fn executor_rejects_late_upload_instead_of_silently_reordering_it() {
+fn executor_keeps_interleaved_uploads_and_copies_in_command_order() {
     let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
     let Some(device) = headless_device() else {
         return;
@@ -190,27 +190,43 @@ fn executor_rejects_late_upload_instead_of_silently_reordering_it() {
     )
     .expect("descriptor");
     let source = table.define_texture(descriptor).expect("source");
-    let target = table.define_texture(descriptor).expect("target");
+    let first_target = table.define_texture(descriptor).expect("first target");
+    let second_target = table.define_texture(descriptor).expect("second target");
     let area = PixelRect::new(0, 0, 1, 1).expect("area");
+    let first_color = [19, 43, 131, 255];
+    let second_color = [207, 71, 23, 255];
     let mut encoder = CommandEncoder::new(table.as_ref());
-    encoder
-        .copy_texture_to_texture(source, area, target, area)
-        .expect("copy");
     encoder
         .write_texture(
             source,
-            TextureWrite::new(area, 4, &[0, 0, 255, 255]).expect("upload"),
+            TextureWrite::new(area, 4, &first_color).expect("first upload"),
         )
-        .expect("core accepts an ordered late upload");
+        .expect("record first upload");
+    encoder
+        .copy_texture_to_texture(source, area, first_target, area)
+        .expect("copy first color");
+    encoder
+        .write_texture(
+            source,
+            TextureWrite::new(area, 4, &second_color).expect("second upload"),
+        )
+        .expect("record upload after copy");
+    encoder
+        .copy_texture_to_texture(source, area, second_target, area)
+        .expect("copy second color");
     let commands = encoder.finish().expect("finish stream");
     let mut cache = context.create_resources(Rc::clone(&table));
-    assert!(matches!(
-        context
-            .create_queue()
-            .executor(&mut cache)
-            .execute(&commands),
-        Err(Error::Unsupported(UnsupportedFeature::LateUpload))
-    ));
+    context
+        .create_queue()
+        .executor(&mut cache)
+        .execute(&commands)
+        .expect("execute interleaved uploads and copies");
+    assert_eq!(cache.read_texture(first_target.id()).unwrap(), first_color);
+    assert_eq!(
+        cache.read_texture(second_target.id()).unwrap(),
+        second_color
+    );
+    assert_eq!(cache.read_texture(source.id()).unwrap(), second_color);
 }
 
 #[test]
