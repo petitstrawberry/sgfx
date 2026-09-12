@@ -9,15 +9,33 @@ description = "Experimental non-conformant headless Vulkan frontend for SGFX"
 name = "vulkan_sgfx"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+cube-demo = ["dep:png", "dep:libloading", "dep:framebuffer", "naga/wgsl-in"]
+
+[[bin]]
+name = "vulkan-cube"
+path = "src/bin/vulkan_cube.rs"
+required-features = ["cube-demo"]
+
 [dependencies]
 naga = { version = "24", features = ["spv-in", "spv-out"] }
 ash = { version = "0.38", default-features = false, features = ["debug", "std"] }
-pollster = "0.4"
 sgfx-core = { path = "../sgfx-core" }
+png = { version = "0.18", optional = true }
+
+[target.'cfg(not(target_os = "scarlet"))'.dependencies]
+pollster = "0.4"
 sgfx-backend-wgpu = { path = "../sgfx-backend-wgpu" }
 wgpu = "24"
+libloading = { version = "0.8", optional = true }
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl" }
+framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 png = "0.18"
-libloading = "0.8"
 naga = { version = "24", features = ["wgsl-in", "spv-out"] }
+
+[target.'cfg(not(target_os = "scarlet"))'.dev-dependencies]
+libloading = "0.8"

@@ -366,23 +366,48 @@ unsafe extern "system" fn get_physical_device_properties(
             max_image_dimension2_d: MAX_IMAGE_DIMENSION,
             max_image_array_layers: 1,
             max_uniform_buffer_range: 16 * 1024,
-            max_storage_buffer_range: 128 * 1024 * 1024,
+            max_storage_buffer_range: if cfg!(target_os = "scarlet") {
+                0
+            } else {
+                128 * 1024 * 1024
+            },
             max_memory_allocation_count: 1024,
             buffer_image_granularity: 256,
             max_bound_descriptor_sets: 4,
             max_per_stage_descriptor_uniform_buffers: 12,
-            max_per_stage_descriptor_storage_buffers: 4,
+            max_per_stage_descriptor_storage_buffers: if cfg!(target_os = "scarlet") {
+                0
+            } else {
+                4
+            },
             max_per_stage_resources: 16,
             max_descriptor_set_uniform_buffers: 12,
-            max_descriptor_set_storage_buffers: 4,
+            max_descriptor_set_storage_buffers: if cfg!(target_os = "scarlet") { 0 } else { 4 },
+            max_vertex_input_attributes: 16,
+            max_vertex_input_bindings: 1,
+            max_vertex_input_attribute_offset: 2047,
+            max_vertex_input_binding_stride: 2048,
+            max_draw_indexed_index_value: u32::MAX,
             max_vertex_output_components: 60,
             max_fragment_input_components: 60,
             max_fragment_output_attachments: 1,
-            max_fragment_combined_output_resources: 4,
-            max_compute_shared_memory_size: 16 * 1024,
-            max_compute_work_group_count: [65535; 3],
-            max_compute_work_group_invocations: 256,
-            max_compute_work_group_size: [256, 256, 64],
+            max_fragment_combined_output_resources: if cfg!(target_os = "scarlet") { 1 } else { 4 },
+            max_compute_shared_memory_size: if cfg!(target_os = "scarlet") {
+                0
+            } else {
+                16 * 1024
+            },
+            max_compute_work_group_count: if cfg!(target_os = "scarlet") {
+                [0; 3]
+            } else {
+                [65535; 3]
+            },
+            max_compute_work_group_invocations: if cfg!(target_os = "scarlet") { 0 } else { 256 },
+            max_compute_work_group_size: if cfg!(target_os = "scarlet") {
+                [0; 3]
+            } else {
+                [256, 256, 64]
+            },
             sub_pixel_precision_bits: 4,
             sub_texel_precision_bits: 4,
             mipmap_precision_bits: 4,
@@ -396,6 +421,7 @@ unsafe extern "system" fn get_physical_device_properties(
             max_framebuffer_height: MAX_IMAGE_DIMENSION,
             max_framebuffer_layers: 1,
             framebuffer_color_sample_counts: vk::SampleCountFlags::TYPE_1,
+            framebuffer_depth_sample_counts: vk::SampleCountFlags::TYPE_1,
             max_color_attachments: 1,
             max_sample_mask_words: 1,
             discrete_queue_priorities: 1,
@@ -453,7 +479,11 @@ unsafe extern "system" fn get_physical_device_queue_family_properties(
         unsafe {
             *output = vk::QueueFamilyProperties {
                 queue_flags: vk::QueueFlags::GRAPHICS
-                    | vk::QueueFlags::COMPUTE
+                    | if cfg!(target_os = "scarlet") {
+                        vk::QueueFlags::empty()
+                    } else {
+                        vk::QueueFlags::COMPUTE
+                    }
                     | vk::QueueFlags::TRANSFER,
                 queue_count: 1,
                 timestamp_valid_bits: 0,
@@ -482,6 +512,20 @@ unsafe extern "system" fn get_physical_device_format_properties(
         // TRANSFER_SRC/DST format-feature bits belong to maintenance1 / 1.1.
         properties.optimal_tiling_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT;
     }
+    if physical_valid(physical) && format == vk::Format::D32_SFLOAT {
+        properties.optimal_tiling_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT;
+    }
+    if physical_valid(physical)
+        && matches!(
+            format,
+            vk::Format::R32G32_SFLOAT
+                | vk::Format::R32G32B32_SFLOAT
+                | vk::Format::R32G32B32A32_SFLOAT
+                | vk::Format::R8G8B8A8_UNORM
+        )
+    {
+        properties.buffer_features = vk::FormatFeatureFlags::VERTEX_BUFFER;
+    }
     unsafe { *output = properties };
 }
 
@@ -498,11 +542,9 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     unsafe { *output = vk::ImageFormatProperties::default() };
-    let supported_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
-        | vk::ImageUsageFlags::TRANSFER_SRC
-        | vk::ImageUsageFlags::TRANSFER_DST;
+    let supported_usage = crate::images::image_usage(format);
     if !physical_valid(physical)
-        || format != vk::Format::R8G8B8A8_UNORM
+        || supported_usage.is_empty()
         || image_type != vk::ImageType::TYPE_2D
         || tiling != vk::ImageTiling::OPTIMAL
         || !flags.is_empty()
@@ -688,6 +730,43 @@ mod tests {
             assert_eq!(image.max_mip_levels, 0);
             let mut formats = vk::FormatProperties::default();
             get_physical_device_format_properties(physical, vk::Format::D32_SFLOAT, &mut formats);
+            assert_eq!(
+                formats.optimal_tiling_features,
+                vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+            );
+            assert_eq!(
+                get_physical_device_image_format_properties(
+                    physical,
+                    vk::Format::D32_SFLOAT,
+                    vk::ImageType::TYPE_2D,
+                    vk::ImageTiling::OPTIMAL,
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                    vk::ImageCreateFlags::empty(),
+                    &mut image,
+                ),
+                vk::Result::SUCCESS
+            );
+            assert_eq!(
+                get_physical_device_image_format_properties(
+                    physical,
+                    vk::Format::D32_SFLOAT,
+                    vk::ImageType::TYPE_2D,
+                    vk::ImageTiling::OPTIMAL,
+                    vk::ImageUsageFlags::TRANSFER_SRC,
+                    vk::ImageCreateFlags::empty(),
+                    &mut image,
+                ),
+                vk::Result::ERROR_FORMAT_NOT_SUPPORTED
+            );
+            get_physical_device_format_properties(
+                physical,
+                vk::Format::R32G32B32_SFLOAT,
+                &mut formats,
+            );
+            assert_eq!(
+                formats.buffer_features,
+                vk::FormatFeatureFlags::VERTEX_BUFFER
+            );
             assert!(formats.optimal_tiling_features.is_empty());
             count = 10;
             assert_eq!(

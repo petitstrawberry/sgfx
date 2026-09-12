@@ -105,6 +105,17 @@ impl Context {
         }
     }
 
+    pub(crate) fn readback_ir_texture(
+        &self,
+        resources: &mut IrResources,
+        texture: IrTextureSpec,
+    ) -> HandleResult<Vec<u8>> {
+        match (self, resources) {
+            (Self::Virgl(context), IrResources::Virgl(resources)) =>
+                context.readback_ir_texture(resources, texture),
+        }
+    }
+
     pub(crate) fn create_image(&self, width: u32, height: u32) -> HandleResult<Image> {
         match self {
             Self::Virgl(context) => Ok(Image::Virgl(context.create_image(width, height)?)),
@@ -617,6 +628,7 @@ pub(crate) struct IrUniforms {
 /// One private non-indexed draw in an ordered IR submission.
 #[derive(Clone)]
 pub(crate) struct IrDraw {
+    pub(crate) programmable: Option<Rc<IrProgrammableDraw>>,
     pub(crate) start_vertex: usize,
     pub(crate) vertex_count: usize,
     pub(crate) vertex_buffer: Option<IrVertexBufferBinding>,
@@ -625,6 +637,36 @@ pub(crate) struct IrDraw {
     pub(crate) sampler: Option<IrSamplerState>,
     pub(crate) uniforms: IrUniforms,
     pub(crate) scissor: IrRect,
+}
+
+/// Immutable compiled stages and vertex-fetch layout for one programmable pipeline.
+pub(crate) struct IrProgrammablePipeline {
+    pub(crate) slot: usize,
+    pub(crate) vertex: sgfx_codegen_virgl::programmable::CompiledShader,
+    pub(crate) fragment: sgfx_codegen_virgl::programmable::CompiledShader,
+    pub(crate) vertex_buffer: Option<crate::ir::VertexBufferLayout>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IrIndexBufferBinding {
+    pub(crate) buffer: IrBufferSpec,
+    pub(crate) offset: u32,
+    pub(crate) format: crate::ir::IndexFormat,
+    pub(crate) base_vertex: i32,
+}
+
+pub(crate) struct IrConstantBuffer {
+    pub(crate) stage: crate::ir::ShaderStage,
+    pub(crate) slot: u32,
+    pub(crate) buffer: IrBufferSpec,
+    pub(crate) offset: u32,
+    pub(crate) size: u32,
+}
+
+pub(crate) struct IrProgrammableDraw {
+    pub(crate) pipeline: Rc<IrProgrammablePipeline>,
+    pub(crate) index_buffer: Option<IrIndexBufferBinding>,
+    pub(crate) constants: Vec<IrConstantBuffer>,
 }
 
 /// Converted BGRA texture upload retained until all stream validation succeeds.

@@ -2,15 +2,24 @@ use crate::resources::Resources;
 use sgfx_core::ir;
 use std::rc::Rc;
 
+#[cfg(not(target_os = "scarlet"))]
+#[path = "runtime/host.rs"]
+mod backend;
+#[cfg(target_os = "scarlet")]
+#[path = "runtime/scarlet.rs"]
+mod backend;
+
+pub(crate) use backend::{BackendError, backend_failure};
+
 /// All Rc-backed SGFX state remains on the device worker thread. No unsafe
 /// Send/Sync assertion or forged lifetime crosses the FFI/thread boundary.
 pub(crate) struct Runtime {
     pub table: Rc<ir::ResourceTable>,
     pub resources: Resources,
-    context: sgfx_backend_wgpu::Context,
+    context: backend::Context,
 
-    pub cache: sgfx_backend_wgpu::Resources,
-    pub queue: sgfx_backend_wgpu::Queue,
+    pub cache: backend::Cache,
+    pub queue: backend::Queue,
     pub commands: std::collections::HashMap<u64, crate::api::Recording>,
     pub pools: std::collections::HashMap<u64, ash::vk::CommandPoolCreateFlags>,
     pub fences: crate::api::Fences,
@@ -23,40 +32,10 @@ impl Runtime {
         fences: crate::api::Fences,
         device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ash::vk::Result> {
-        // Never use Backends::all(), from_env(), or WGPU's Vulkan backend here:
-        // recursively loading this ICD would deadlock in the Vulkan loader.
-        let backends = if cfg!(target_os = "macos") {
-            wgpu::Backends::METAL
-        } else {
-            wgpu::Backends::GL
-        };
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends,
-            ..Default::default()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("SGFX experimental Vulkan ICD"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    max_compute_workgroup_storage_size: 16384,
-                    ..wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits())
-                },
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-            },
-            None,
-        ))
-        .map_err(|_| ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let context = sgfx_backend_wgpu::Device::new(device, queue).create_context();
+        let context = backend::Context::new()?;
         let table = Rc::new(ir::ResourceTable::new());
-        let cache = context.create_resources(Rc::clone(&table));
-        let queue = context.create_queue();
+        let cache = context.create_resources(Rc::clone(&table))?;
+        let queue = context.create_queue()?;
         Ok(Self {
             table,
             resources: Resources::new(),
@@ -82,7 +61,11 @@ impl Runtime {
         crate::api::invalidate_resource_recordings(self);
         self.resources.clear_ir_cache();
         let table = Rc::new(ir::ResourceTable::new());
-        self.cache = self.context.create_resources(Rc::clone(&table));
+        let Ok(cache) = self.context.create_resources(Rc::clone(&table)) else {
+            self.lost = true;
+            return;
+        };
+        self.cache = cache;
         self.table = table;
     }
 }

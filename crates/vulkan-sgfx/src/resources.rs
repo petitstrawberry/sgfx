@@ -219,12 +219,8 @@ pub(crate) fn memory_available(
             )
         })
 }
-pub(crate) fn backend_failure(error: sgfx_backend_wgpu::Error) -> vk::Result {
-    match error {
-        sgfx_backend_wgpu::Error::DeviceLost => vk::Result::ERROR_DEVICE_LOST,
-        sgfx_backend_wgpu::Error::InvalidIr(error) => failure(error),
-        _ => vk::Result::ERROR_FEATURE_NOT_PRESENT,
-    }
+pub(crate) fn backend_failure(error: crate::runtime::BackendError) -> vk::Result {
+    crate::runtime::backend_failure(error)
 }
 pub(crate) fn failure(error: ir::Error) -> vk::Result {
     match error {

@@ -262,6 +262,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
+name = "framebuffer"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
+dependencies = [
+ "scarlet-os",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -371,7 +379,7 @@ dependencies = [
 [[package]]
 name = "gpu-raw"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
 dependencies = [
  "scarlet-os",
  "scarlet-std",
@@ -760,12 +768,12 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
 
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
 dependencies = [
  "scarlet-abi",
  "scarlet-rt",
@@ -775,7 +783,7 @@ dependencies = [
 [[package]]
 name = "scarlet-rt"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
 dependencies = [
  "lock_api",
  "scarlet-sys",
@@ -786,7 +794,7 @@ dependencies = [
 [[package]]
 name = "scarlet-std"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
 dependencies = [
  "hashbrown 0.15.5",
  "scarlet-abi",
@@ -799,7 +807,7 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#d8a199815249c784a04c9dec60b6efedbb79d84e"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#85f0cead4cb4c9add021360f1b469f08bf0d23a9"
 dependencies = [
  "scarlet-abi",
 ]
@@ -895,6 +903,7 @@ dependencies = [
 name = "sgfx-codegen-virgl"
 version = "1.0.0"
 dependencies = [
+ "naga",
  "sgfx-core",
 ]
 
@@ -1084,10 +1093,12 @@ name = "vulkan-sgfx"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "framebuffer",
  "libloading",
  "naga",
  "png",
  "pollster",
+ "sgfx-backend-scarlet-virgl",
  "sgfx-backend-wgpu",
  "sgfx-core",
  "wgpu",

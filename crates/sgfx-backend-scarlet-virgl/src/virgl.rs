@@ -29,8 +29,8 @@ use crate::dispatch::NativeScheduler;
 use crate::driver::{
     IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrCompareFunction,
     IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram, IrFrontFace, IrPipelineState,
-    IrSamplerState, IrSubmission, IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload,
-    IrVertex, MAX_IR_VERTICES,
+    IrProgrammablePipeline, IrSamplerState, IrSubmission, IrTextureCopy, IrTextureFormat,
+    IrTextureSpec, IrTextureUpload, IrVertex, MAX_IR_VERTICES,
 };
 use crate::packets::UPLOAD_ARENA_COUNT;
 use crate::{
@@ -47,10 +47,12 @@ const VIRGL_CCMD_CLEAR: u32 = 7;
 const VIRGL_CCMD_DRAW_VBO: u32 = 8;
 const VIRGL_CCMD_RESOURCE_INLINE_WRITE: u32 = 9;
 const VIRGL_CCMD_SET_SAMPLER_VIEWS: u32 = 10;
+const VIRGL_CCMD_SET_INDEX_BUFFER: u32 = 11;
 const VIRGL_CCMD_RESOURCE_COPY_REGION: u32 = 17;
 const VIRGL_CCMD_SET_CONSTANT_BUFFER: u32 = 12;
 const VIRGL_CCMD_SET_SCISSOR_STATE: u32 = 15;
 const VIRGL_CCMD_BIND_SAMPLER_STATES: u32 = 18;
+const VIRGL_CCMD_SET_UNIFORM_BUFFER: u32 = 27;
 const VIRGL_CCMD_BIND_SHADER: u32 = 31;
 const VIRGL_CCMD_CLEAR_SURFACE: u32 = 62;
 
@@ -67,6 +69,8 @@ const VIRGL_FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const VIRGL_FORMAT_Z32_FLOAT: u32 = 18;
 const VIRGL_FORMAT_R32G32B32A32_FLOAT: u32 = 31;
 const VIRGL_FORMAT_R32G32_FLOAT: u32 = 29;
+const VIRGL_FORMAT_R32G32B32_FLOAT: u32 = 30;
+const VIRGL_FORMAT_R8G8B8A8_UNORM: u32 = 67;
 const PIPE_SHADER_VERTEX: u32 = 0;
 const PIPE_SHADER_FRAGMENT: u32 = 1;
 const VIRGL_SHADER_TOKEN_COUNT_HINT: u32 = 300;
@@ -122,7 +126,8 @@ const IR_VERTEX_BUFFER_BYTES: usize = MAX_IR_VERTICES * 10 * core::mem::size_of:
 const IR_BUFFER_SLOTS: usize = 1_024;
 const IR_TEXTURE_SLOTS: usize = 1_024;
 const IR_SAMPLER_SLOTS: usize = 256;
-const IR_PIPELINE_SLOTS: usize = 256;
+const IR_PIPELINE_SLOTS: usize = 512;
+const IR_PROGRAMMABLE_PIPELINE_SLOTS: usize = 256;
 
 type SharedScheduler = Rc<RefCell<Option<Arc<NativeScheduler>>>>;
 
@@ -572,6 +577,8 @@ impl Context {
         }
         if matches!(spec.format, IrTextureFormat::Depth32Float) {
             usage = GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT;
+        } else {
+            usage |= GPU_IMAGE_USAGE_TRANSFER_SRC;
         }
         if usage == 0 {
             return Err(HandleError::InvalidParameter);
@@ -659,6 +666,55 @@ impl Context {
         Ok(())
     }
 
+    pub(crate) fn readback_ir_texture(
+        &self,
+        resources: &mut IrResources,
+        spec: IrTextureSpec,
+    ) -> HandleResult<Vec<u8>> {
+        if resources.context_handle != self.handle_id()
+            || !matches!(spec.format, IrTextureFormat::Bgra8 | IrTextureFormat::Rgba8)
+            || !self.device.capabilities.supports_image_readback()
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+        // Flush accepted asynchronous work before transferring from the image's
+        // device backing. A raw readback alone cannot order scheduler batches.
+        wait_scheduled(&self.scheduler)?;
+        let texture = ir_texture(self, resources, spec)?;
+        let IrTexture::Internal(texture) = texture else {
+            return Err(HandleError::InvalidParameter);
+        };
+        let stride = spec
+            .width
+            .checked_mul(4)
+            .ok_or(HandleError::InvalidParameter)?;
+        let length = usize::try_from(stride)
+            .ok()
+            .and_then(|stride| stride.checked_mul(spec.height as usize))
+            .ok_or(HandleError::InvalidParameter)?;
+        let rows = GPU_MAX_IMAGE_UPLOAD_SIZE
+            .checked_div(stride)
+            .filter(|rows| *rows != 0)
+            .ok_or(HandleError::InvalidParameter)?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(length)
+            .map_err(|_| HandleError::OutOfResources)?;
+        pixels.resize(length, 0);
+        let mut y = 0;
+        while y < spec.height {
+            let height = (spec.height - y).min(rows);
+            self.raw.readback_image_bgra(
+                &texture.raw,
+                &mut pixels,
+                stride,
+                GpuImageBgraRect::new(0, y, spec.width, height),
+            )?;
+            y += height;
+        }
+        Ok(pixels)
+    }
+
     pub(crate) fn release_texture(&self, texture: Texture) -> HandleResult<()> {
         if texture.context_handle != self.handle_id() {
             return Err(HandleError::InvalidParameter);
@@ -743,6 +799,7 @@ impl Context {
             texture_specs: empty_slots(IR_TEXTURE_SLOTS)?,
             samplers: empty_slots(IR_SAMPLER_SLOTS)?,
             pipelines: empty_slots(IR_PIPELINE_SLOTS)?,
+            programmable_pipelines: empty_slots(IR_PROGRAMMABLE_PIPELINE_SLOTS)?,
             vertex_shader_handle: self.allocate_object_handle()?,
             solid_fragment_shader_handle: self.allocate_object_handle()?,
             vertex_color_fragment_shader_handle: self.allocate_object_handle()?,
@@ -923,6 +980,7 @@ pub(crate) struct IrResources {
     texture_specs: Vec<Option<IrTextureSpec>>,
     samplers: Vec<Option<IrSampler>>,
     pipelines: Vec<Option<IrPipeline>>,
+    programmable_pipelines: Vec<Option<IrNativeProgrammablePipeline>>,
     vertex_shader_handle: u32,
     solid_fragment_shader_handle: u32,
     vertex_color_fragment_shader_handle: u32,
@@ -959,6 +1017,7 @@ pub(crate) struct IrStateSnapshot {
     textures: Vec<(bool, bool)>,
     samplers: Vec<bool>,
     pipelines: Vec<bool>,
+    programmable_pipelines: Vec<bool>,
 }
 
 impl IrResources {
@@ -1006,6 +1065,14 @@ impl IrResources {
                         .is_some_and(|pipeline| pipeline.initialized.get())
                 }),
             )?,
+            programmable_pipelines: collect(
+                self.programmable_pipelines.len(),
+                self.programmable_pipelines.iter().map(|value| {
+                    value
+                        .as_ref()
+                        .is_some_and(|pipeline| pipeline.initialized.get())
+                }),
+            )?,
         })
     }
 
@@ -1044,6 +1111,17 @@ impl IrResources {
                     .set(snapshot.pipelines.get(index).copied().unwrap_or(false));
             }
         }
+        for (index, pipeline) in self.programmable_pipelines.iter().enumerate() {
+            if let Some(pipeline) = pipeline {
+                pipeline.initialized.set(
+                    snapshot
+                        .programmable_pipelines
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false),
+                );
+            }
+        }
     }
 }
 
@@ -1058,6 +1136,14 @@ struct IrPipeline {
     rasterizer_handle: u32,
     dsa_handle: Option<u32>,
     state: IrPipelineState,
+    initialized: Cell<bool>,
+}
+
+struct IrNativeProgrammablePipeline {
+    description: Rc<IrProgrammablePipeline>,
+    vertex_shader_handle: u32,
+    fragment_shader_handle: u32,
+    vertex_elements_handle: u32,
     initialized: Cell<bool>,
 }
 
@@ -1244,6 +1330,14 @@ impl Queue {
         for draw in &submission.draws {
             if let Some(binding) = draw.vertex_buffer {
                 ir_buffer(context, resources, binding.buffer)?;
+            }
+            if let Some(programmable) = &draw.programmable {
+                if let Some(binding) = programmable.index_buffer {
+                    ir_buffer(context, resources, binding.buffer)?;
+                }
+                for constant in &programmable.constants {
+                    ir_buffer(context, resources, constant.buffer)?;
+                }
             }
             if let Some(texture) = draw.texture {
                 ir_texture(context, resources, texture)?;
@@ -1564,6 +1658,7 @@ impl Queue {
             .map_err(|_| HandleError::OutOfResources)?;
         let mut initialized_samplers = Vec::new();
         let mut initialized_pipelines = Vec::new();
+        let mut initialized_programmable_pipelines = Vec::new();
         let mut initialized_views = Vec::new();
         if !resources.initialized.get() {
             push_ir_setup(&mut commands, resources);
@@ -1611,6 +1706,15 @@ impl Queue {
             if !pipeline.initialized.get() && !pipeline_is_pending {
                 push_ir_pipeline(&mut commands, pipeline);
                 initialized_pipelines.push(draw.pipeline.slot);
+            }
+            if let Some(programmable) = &draw.programmable {
+                let native = ir_programmable_pipeline(context, resources, &programmable.pipeline)?;
+                let slot = programmable.pipeline.slot;
+                if !native.initialized.get() && !initialized_programmable_pipelines.contains(&slot)
+                {
+                    push_programmable_pipeline(&mut commands, native)?;
+                    initialized_programmable_pipelines.push(slot);
+                }
             }
             if let (Some(texture_spec), Some(sampler)) = (draw.texture, draw.sampler) {
                 let texture = ir_texture(context, resources, texture_spec)?;
@@ -1697,6 +1801,7 @@ impl Queue {
         let mut bound_sampler_view = None;
         let mut bound_sampler_state = None;
         let mut bound_vertex_buffer = Some((resources.vertex_resource_id, 0));
+        let mut bound_programmable = false;
         let mut bound_scissor = Some((
             pass_scissor.x(),
             pass_scissor.y(),
@@ -1709,6 +1814,34 @@ impl Queue {
                 .get(draw.pipeline.slot)
                 .and_then(Option::as_ref)
                 .ok_or(HandleError::InvalidParameter)?;
+            if let Some(programmable) = &draw.programmable {
+                let native = resources
+                    .programmable_pipelines
+                    .get(programmable.pipeline.slot)
+                    .and_then(Option::as_ref)
+                    .ok_or(HandleError::InvalidParameter)?;
+                push_programmable_draw(&mut commands, resources, native, pipeline, draw)?;
+                // The fixed path must restore all state after a programmable draw.
+                bound_programmable = true;
+                bound_blend = None;
+                bound_fragment_shader = None;
+                bound_vertex_buffer = None;
+                bound_scissor = None;
+                continue;
+            }
+            if bound_programmable {
+                push_bind_shader(
+                    &mut commands,
+                    PIPE_SHADER_VERTEX,
+                    resources.vertex_shader_handle,
+                );
+                push_bind_object(
+                    &mut commands,
+                    VIRGL_OBJECT_VERTEX_ELEMENTS,
+                    resources.vertex_elements_handle,
+                );
+                bound_programmable = false;
+            }
             let vertex_buffer = if let Some(binding) = draw.vertex_buffer {
                 let buffer = resources
                     .buffers
@@ -1736,9 +1869,11 @@ impl Queue {
                 VIRGL_OBJECT_RASTERIZER,
                 pipeline.rasterizer_handle,
             );
-            if let Some(dsa_handle) = pipeline.dsa_handle {
-                push_bind_object(&mut commands, VIRGL_OBJECT_DSA, dsa_handle);
-            }
+            push_bind_object(
+                &mut commands,
+                VIRGL_OBJECT_DSA,
+                pipeline.dsa_handle.unwrap_or(0),
+            );
             let fragment_shader = ir_fragment_shader_handle(resources, draw.pipeline.fragment);
             if bound_fragment_shader != Some(fragment_shader) {
                 push_fragment_shader(&mut commands, fragment_shader);
@@ -1793,6 +1928,11 @@ impl Queue {
         }
         for slot in initialized_pipelines {
             if let Some(Some(pipeline)) = resources.pipelines.get(slot) {
+                pipeline.initialized.set(true);
+            }
+        }
+        for slot in initialized_programmable_pipelines {
+            if let Some(Some(pipeline)) = resources.programmable_pipelines.get(slot) {
                 pipeline.initialized.set(true);
             }
         }
@@ -2257,6 +2397,107 @@ fn ir_sampler_states_equal(left: IrSamplerState, right: IrSamplerState) -> bool 
         && ir_address_modes_equal(left.address_v, right.address_v)
 }
 
+fn ir_programmable_pipeline<'resources>(
+    context: &Context,
+    resources: &'resources mut IrResources,
+    description: &Rc<IrProgrammablePipeline>,
+) -> HandleResult<&'resources IrNativeProgrammablePipeline> {
+    let slot = resources
+        .programmable_pipelines
+        .get_mut(description.slot)
+        .ok_or(HandleError::InvalidParameter)?;
+    if slot.is_none() {
+        *slot = Some(IrNativeProgrammablePipeline {
+            description: description.clone(),
+            vertex_shader_handle: context.allocate_object_handle()?,
+            fragment_shader_handle: context.allocate_object_handle()?,
+            vertex_elements_handle: context.allocate_object_handle()?,
+            initialized: Cell::new(false),
+        });
+    }
+    let pipeline = slot.as_ref().ok_or(HandleError::InvalidParameter)?;
+    if !Rc::ptr_eq(&pipeline.description, description) {
+        return Err(HandleError::InvalidParameter);
+    }
+    Ok(pipeline)
+}
+
+fn uploaded_ir_buffer(resources: &IrResources, spec: IrBufferSpec) -> HandleResult<&IrBuffer> {
+    resources
+        .buffers
+        .get(spec.slot)
+        .and_then(Option::as_ref)
+        .filter(|buffer| {
+            buffer.size == spec.size && buffer.uploaded_revision == Some(spec.revision)
+        })
+        .ok_or(HandleError::InvalidParameter)
+}
+
+fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleResult<()> {
+    let programmable = draw
+        .programmable
+        .as_ref()
+        .ok_or(HandleError::InvalidParameter)?;
+    if programmable.pipeline.slot >= resources.programmable_pipelines.len()
+        || draw.pipeline.slot != programmable.pipeline.slot + IR_PROGRAMMABLE_PIPELINE_SLOTS
+        || draw.texture.is_some()
+        || draw.sampler.is_some()
+    {
+        return Err(HandleError::InvalidParameter);
+    }
+    let end = draw
+        .start_vertex
+        .checked_add(draw.vertex_count)
+        .ok_or(HandleError::InvalidParameter)?;
+    match (&programmable.pipeline.vertex_buffer, draw.vertex_buffer) {
+        (Some(layout), Some(binding)) => {
+            uploaded_ir_buffer(resources, binding.buffer)?;
+            let byte_end = if programmable.index_buffer.is_some() {
+                u64::from(binding.offset).checked_add(u64::from(layout.stride()))
+            } else {
+                (end as u64)
+                    .checked_mul(u64::from(layout.stride()))
+                    .and_then(|size| size.checked_add(u64::from(binding.offset)))
+            };
+            if byte_end.is_none_or(|end| end > binding.buffer.size) {
+                return Err(HandleError::InvalidParameter);
+            }
+        }
+        (None, None) => {}
+        _ => return Err(HandleError::InvalidParameter),
+    }
+    if let Some(binding) = programmable.index_buffer {
+        uploaded_ir_buffer(resources, binding.buffer)?;
+        let index_size = binding.format.byte_size();
+        if u64::from(binding.offset) % index_size != 0
+            || (end as u64)
+                .checked_mul(index_size)
+                .and_then(|size| size.checked_add(u64::from(binding.offset)))
+                .is_none_or(|end| end > binding.buffer.size)
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+    }
+    for constant in &programmable.constants {
+        uploaded_ir_buffer(resources, constant.buffer)?;
+        if !matches!(
+            constant.stage,
+            crate::ir::ShaderStage::Vertex | crate::ir::ShaderStage::Fragment
+        ) || constant.slot == 0
+            || constant.slot >= 16
+            || constant.offset % 256 != 0
+            || constant.size == 0
+            || constant.size % 16 != 0
+            || u64::from(constant.offset)
+                .checked_add(u64::from(constant.size))
+                .is_none_or(|end| end > constant.buffer.size)
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+    }
+    Ok(())
+}
+
 fn ir_pipeline_states_equal(left: IrPipelineState, right: IrPipelineState) -> bool {
     left.slot == right.slot
         && ir_fragment_programs_equal(left.fragment, right.fragment)
@@ -2347,6 +2588,16 @@ fn validate_ir_draw(
     draw: &IrDraw,
     vertices_len: usize,
 ) -> HandleResult<()> {
+    if draw.programmable.is_some() {
+        if draw.vertex_count == 0
+            || !draw.vertex_count.is_multiple_of(3)
+            || draw.pipeline.slot >= resources.pipelines.len()
+            || !ir_rect_is_within(draw.scissor, target_width, target_height)
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+        return validate_programmable_draw(resources, draw);
+    }
     let end = draw
         .start_vertex
         .checked_add(draw.vertex_count)
@@ -2540,9 +2791,13 @@ fn push_bind_object(commands: &mut Vec<u8>, object: u32, handle: u32) {
 }
 
 fn push_fragment_shader(commands: &mut Vec<u8>, handle: u32) {
+    push_bind_shader(commands, PIPE_SHADER_FRAGMENT, handle);
+}
+
+fn push_bind_shader(commands: &mut Vec<u8>, stage: u32, handle: u32) {
     push_dword(commands, command_header(VIRGL_CCMD_BIND_SHADER, 0, 2));
     push_dword(commands, handle);
-    push_dword(commands, PIPE_SHADER_FRAGMENT);
+    push_dword(commands, stage);
 }
 
 fn push_surface(commands: &mut Vec<u8>, handle: u32, resource_id: u32) {
@@ -2894,6 +3149,196 @@ fn push_ir_setup(commands: &mut Vec<u8>, resources: &IrResources) {
     push_dword(commands, 0);
     push_dword(commands, 0);
     push_dword(commands, VIRGL_FORMAT_R32G32_FLOAT);
+}
+
+fn push_programmable_pipeline(
+    commands: &mut Vec<u8>,
+    pipeline: &IrNativeProgrammablePipeline,
+) -> HandleResult<()> {
+    let description = &pipeline.description;
+    push_programmable_shader(
+        commands,
+        pipeline.vertex_shader_handle,
+        PIPE_SHADER_VERTEX,
+        &description.vertex.tgsi,
+    )?;
+    push_programmable_shader(
+        commands,
+        pipeline.fragment_shader_handle,
+        PIPE_SHADER_FRAGMENT,
+        &description.fragment.tgsi,
+    )?;
+    push_programmable_vertex_elements(
+        commands,
+        pipeline.vertex_elements_handle,
+        description.vertex_buffer.as_ref(),
+    )
+}
+
+fn push_programmable_shader(
+    commands: &mut Vec<u8>,
+    handle: u32,
+    stage: u32,
+    source: &str,
+) -> HandleResult<()> {
+    if source.is_empty() || source.len() > 32 * 1024 || source.as_bytes().contains(&0) {
+        return Err(HandleError::InvalidParameter);
+    }
+    // TGSI text is translated into binary tokens by the renderer. The fixed
+    // shader's 300-token allocation is too small for arbitrary compiled code;
+    // text byte length conservatively bounds the compiler's token count.
+    push_shader_with_token_count(commands, handle, stage, source, source.len() as u32);
+    Ok(())
+}
+
+fn push_programmable_vertex_elements(
+    commands: &mut Vec<u8>,
+    handle: u32,
+    layout: Option<&crate::ir::VertexBufferLayout>,
+) -> HandleResult<()> {
+    let attributes = layout.map_or(&[][..], crate::ir::VertexBufferLayout::attributes);
+    let count = attributes
+        .iter()
+        .map(|attribute| attribute.location() + 1)
+        .max()
+        .unwrap_or(0);
+    if count > 16 {
+        return Err(HandleError::InvalidParameter);
+    }
+    push_dword(
+        commands,
+        command_header(
+            VIRGL_CCMD_CREATE_OBJECT,
+            VIRGL_OBJECT_VERTEX_ELEMENTS,
+            1 + 4 * count,
+        ),
+    );
+    push_dword(commands, handle);
+    for location in 0..count {
+        // Shader IN numbers correspond to locations, independently of the
+        // application's attribute order. Fill unused holes with a valid fetch.
+        let attribute = attributes
+            .iter()
+            .find(|attribute| attribute.location() == location)
+            .or_else(|| attributes.first())
+            .ok_or(HandleError::InvalidParameter)?;
+        push_dword(commands, attribute.offset());
+        push_dword(commands, 0);
+        push_dword(commands, 0);
+        push_dword(
+            commands,
+            match attribute.format() {
+                crate::ir::VertexFormat::Float32x2 => VIRGL_FORMAT_R32G32_FLOAT,
+                crate::ir::VertexFormat::Float32x3 => VIRGL_FORMAT_R32G32B32_FLOAT,
+                crate::ir::VertexFormat::Float32x4 => VIRGL_FORMAT_R32G32B32A32_FLOAT,
+                crate::ir::VertexFormat::Unorm8x4 => VIRGL_FORMAT_R8G8B8A8_UNORM,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn push_programmable_draw(
+    commands: &mut Vec<u8>,
+    resources: &IrResources,
+    native: &IrNativeProgrammablePipeline,
+    state: &IrPipeline,
+    draw: &IrDraw,
+) -> HandleResult<()> {
+    let programmable = draw
+        .programmable
+        .as_ref()
+        .ok_or(HandleError::InvalidParameter)?;
+    push_bind_shader(commands, PIPE_SHADER_VERTEX, native.vertex_shader_handle);
+    push_bind_shader(
+        commands,
+        PIPE_SHADER_FRAGMENT,
+        native.fragment_shader_handle,
+    );
+    push_bind_object(
+        commands,
+        VIRGL_OBJECT_VERTEX_ELEMENTS,
+        native.vertex_elements_handle,
+    );
+    push_bind_object(commands, VIRGL_OBJECT_BLEND, state.blend_handle);
+    push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
+    push_bind_object(commands, VIRGL_OBJECT_DSA, state.dsa_handle.unwrap_or(0));
+    if let (Some(layout), Some(binding)) =
+        (&programmable.pipeline.vertex_buffer, draw.vertex_buffer)
+    {
+        let buffer = uploaded_ir_buffer(resources, binding.buffer)?;
+        push_dword(
+            commands,
+            command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3),
+        );
+        push_dword(commands, layout.stride());
+        push_dword(commands, binding.offset);
+        push_dword(commands, buffer.resource_id);
+    } else {
+        push_dword(
+            commands,
+            command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 0),
+        );
+    }
+    for constant in &programmable.constants {
+        let buffer = uploaded_ir_buffer(resources, constant.buffer)?;
+        let stage = match constant.stage {
+            crate::ir::ShaderStage::Vertex => PIPE_SHADER_VERTEX,
+            crate::ir::ShaderStage::Fragment => PIPE_SHADER_FRAGMENT,
+            _ => return Err(HandleError::InvalidParameter),
+        };
+        push_uniform_buffer(
+            commands,
+            stage,
+            constant.slot,
+            constant.offset,
+            constant.size,
+            buffer.resource_id,
+        );
+    }
+    push_ir_scissor(commands, ir_rect_to_pixel_rect(draw.scissor)?)?;
+    if let Some(binding) = programmable.index_buffer {
+        let buffer = uploaded_ir_buffer(resources, binding.buffer)?;
+        push_index_buffer(
+            commands,
+            buffer.resource_id,
+            binding.format.byte_size() as u32,
+            binding.offset,
+        );
+        push_draw_parameters(
+            commands,
+            draw.start_vertex,
+            draw.vertex_count,
+            true,
+            binding.base_vertex,
+        )
+    } else {
+        push_draw(commands, draw.start_vertex, draw.vertex_count)
+    }
+}
+
+fn push_uniform_buffer(
+    commands: &mut Vec<u8>,
+    stage: u32,
+    slot: u32,
+    offset: u32,
+    size: u32,
+    resource_id: u32,
+) {
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_SET_UNIFORM_BUFFER, 0, 5),
+    );
+    for word in [stage, slot, offset, size, resource_id] {
+        push_dword(commands, word);
+    }
+}
+
+fn push_index_buffer(commands: &mut Vec<u8>, resource_id: u32, index_size: u32, offset: u32) {
+    push_dword(commands, command_header(VIRGL_CCMD_SET_INDEX_BUFFER, 0, 3));
+    for word in [resource_id, index_size, offset] {
+        push_dword(commands, word);
+    }
 }
 
 fn push_ir_pipeline(commands: &mut Vec<u8>, pipeline: &IrPipeline) {
@@ -3483,6 +3928,16 @@ fn push_composition_inline_write(
 }
 
 fn push_draw(commands: &mut Vec<u8>, start_vertex: usize, vertex_count: usize) -> HandleResult<()> {
+    push_draw_parameters(commands, start_vertex, vertex_count, false, 0)
+}
+
+fn push_draw_parameters(
+    commands: &mut Vec<u8>,
+    start_vertex: usize,
+    vertex_count: usize,
+    indexed: bool,
+    base_vertex: i32,
+) -> HandleResult<()> {
     let start_vertex = u32::try_from(start_vertex).map_err(|_| HandleError::InvalidParameter)?;
     let vertex_count = u32::try_from(vertex_count).map_err(|_| HandleError::InvalidParameter)?;
     if vertex_count == 0 || vertex_count % 3 != 0 {
@@ -3492,9 +3947,9 @@ fn push_draw(commands: &mut Vec<u8>, start_vertex: usize, vertex_count: usize) -
     push_dword(commands, start_vertex);
     push_dword(commands, vertex_count);
     push_dword(commands, PIPE_PRIM_TRIANGLES);
-    push_dword(commands, 0);
+    push_dword(commands, u32::from(indexed));
     push_dword(commands, 1);
-    push_dword(commands, 0);
+    push_dword(commands, base_vertex as u32);
     push_dword(commands, 0);
     push_dword(commands, 0);
     push_dword(commands, 0);
@@ -3505,6 +3960,22 @@ fn push_draw(commands: &mut Vec<u8>, start_vertex: usize, vertex_count: usize) -
 }
 
 fn push_shader(commands: &mut Vec<u8>, handle: u32, shader_type: u32, source: &str) {
+    push_shader_with_token_count(
+        commands,
+        handle,
+        shader_type,
+        source,
+        VIRGL_SHADER_TOKEN_COUNT_HINT,
+    );
+}
+
+fn push_shader_with_token_count(
+    commands: &mut Vec<u8>,
+    handle: u32,
+    shader_type: u32,
+    source: &str,
+    token_count: u32,
+) {
     let source_bytes = source.as_bytes();
     let source_words = (source_bytes.len() + 1).div_ceil(core::mem::size_of::<u32>());
     push_dword(
@@ -3518,7 +3989,7 @@ fn push_shader(commands: &mut Vec<u8>, handle: u32, shader_type: u32, source: &s
     push_dword(commands, handle);
     push_dword(commands, shader_type);
     push_dword(commands, (source_bytes.len() + 1) as u32);
-    push_dword(commands, VIRGL_SHADER_TOKEN_COUNT_HINT);
+    push_dword(commands, token_count);
     push_dword(commands, 0);
     commands.extend_from_slice(source_bytes);
     commands.resize(commands.len() + (source_words * 4 - source_bytes.len()), 0);
@@ -3602,6 +4073,129 @@ mod tests {
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte command word")))
             .collect()
+    }
+
+    #[test]
+    fn programmable_vertex_fetch_uses_locations_and_preserves_packed_formats() {
+        use crate::ir::{VertexAttribute, VertexBufferLayout, VertexFormat};
+        let layout = VertexBufferLayout::new(
+            20,
+            alloc::vec![
+                VertexAttribute::new(2, VertexFormat::Unorm8x4, 12),
+                VertexAttribute::new(0, VertexFormat::Float32x3, 0),
+            ],
+        )
+        .unwrap();
+        let mut commands = Vec::new();
+        push_programmable_vertex_elements(&mut commands, 67, Some(&layout)).unwrap();
+        let words = dwords(&commands);
+        assert_eq!(
+            words[0],
+            command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 13)
+        );
+        assert_eq!(words[1], 67);
+        assert_eq!(&words[2..6], &[0, 0, 0, VIRGL_FORMAT_R32G32B32_FLOAT]);
+        // The undeclared location has a safe fetch, while location 2 retains
+        // its true byte offset and normalized format despite the input order.
+        assert_eq!(&words[6..10], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
+        assert_eq!(&words[10..14], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
+        commands.clear();
+        push_programmable_vertex_elements(&mut commands, 68, None).unwrap();
+        assert_eq!(
+            dwords(&commands),
+            alloc::vec![
+                command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 1),
+                68,
+            ]
+        );
+    }
+
+    #[test]
+    fn native_indexed_draw_keeps_index_offset_first_index_and_signed_base_vertex() {
+        let mut commands = Vec::new();
+        push_index_buffer(&mut commands, 23, 2, 128);
+        push_draw_parameters(&mut commands, 6, 36, true, -4).unwrap();
+        let words = dwords(&commands);
+        assert_eq!(
+            &words[..4],
+            &[
+                command_header(VIRGL_CCMD_SET_INDEX_BUFFER, 0, 3),
+                23,
+                2,
+                128,
+            ]
+        );
+        assert_eq!(
+            &words[4..],
+            &[
+                command_header(VIRGL_CCMD_DRAW_VBO, 0, 12),
+                6,
+                36,
+                PIPE_PRIM_TRIANGLES,
+                1,
+                1,
+                (-4i32) as u32,
+                0,
+                0,
+                0,
+                0,
+                u32::MAX,
+                0,
+            ]
+        );
+        commands.clear();
+        push_draw(&mut commands, 3, 6).unwrap();
+        assert_eq!(dwords(&commands)[4], 0);
+        assert_eq!(dwords(&commands)[6], 0);
+    }
+
+    #[test]
+    fn programmable_uniform_bindings_keep_stage_slot_offset_and_range() {
+        let mut commands = Vec::new();
+        push_uniform_buffer(&mut commands, PIPE_SHADER_VERTEX, 2, 256, 64, 19);
+        push_uniform_buffer(&mut commands, PIPE_SHADER_FRAGMENT, 1, 0, 16, 20);
+        assert_eq!(
+            dwords(&commands),
+            alloc::vec![
+                command_header(VIRGL_CCMD_SET_UNIFORM_BUFFER, 0, 5),
+                0,
+                2,
+                256,
+                64,
+                19,
+                command_header(VIRGL_CCMD_SET_UNIFORM_BUFFER, 0, 5),
+                1,
+                1,
+                0,
+                16,
+                20,
+            ]
+        );
+    }
+
+    #[test]
+    fn programmable_shader_packet_bounds_translation_and_terminates_text() {
+        let source =
+            "VERT\nDCL OUT[0], POSITION\nIMM[0] FLT32 {0, 0, 0, 1}\nMOV OUT[0], IMM[0]\nEND\n";
+        let mut commands = Vec::new();
+        push_programmable_shader(&mut commands, 71, PIPE_SHADER_VERTEX, source).unwrap();
+        let words = dwords(&commands);
+        assert_eq!(words[3], source.len() as u32 + 1);
+        assert_eq!(words[4], source.len() as u32);
+        assert_eq!(&commands[24..24 + source.len()], source.as_bytes());
+        assert!(commands[24 + source.len()..].iter().all(|byte| *byte == 0));
+        assert_eq!(commands.len(), 4 * (1 + (words[0] >> 16)) as usize);
+        for invalid in [
+            alloc::string::String::new(),
+            "VERT\0END".into(),
+            "x".repeat(32 * 1024 + 1),
+        ] {
+            let mut rejected = Vec::new();
+            assert!(
+                push_programmable_shader(&mut rejected, 71, PIPE_SHADER_VERTEX, &invalid).is_err()
+            );
+            assert!(rejected.is_empty());
+        }
     }
 
     #[test]

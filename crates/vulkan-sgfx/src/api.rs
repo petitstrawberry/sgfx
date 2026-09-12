@@ -364,6 +364,8 @@ pub(crate) struct Recording {
     written_sets: Vec<vk::DescriptorSet>,
     compute: Option<vk::Pipeline>,
     graphics: Option<vk::Pipeline>,
+    vertex_buffer: Option<(vk::Buffer, u64)>,
+    index_buffer: Option<(vk::Buffer, u64, ir::IndexFormat)>,
     bound_sets: Vec<vk::DescriptorSet>,
     compute_sets: BTreeMap<u32, vk::DescriptorSet>,
     graphics_sets: BTreeMap<u32, vk::DescriptorSet>,
@@ -388,6 +390,8 @@ impl Recording {
             written_sets: Vec::new(),
             compute: None,
             graphics: None,
+            vertex_buffer: None,
+            index_buffer: None,
             bound_sets: Vec::new(),
             compute_sets: BTreeMap::new(),
             graphics_sets: BTreeMap::new(),
@@ -815,6 +819,45 @@ unsafe extern "system" fn cmd_begin_render_pass(
             }
             _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
         };
+        let depth = if let Some(load_op) = pass.depth_load_op {
+            let (_, handle) = fb.depth.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            let image = rt
+                .resources
+                .images
+                .get(&handle)
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            if image.bound.is_none() {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            let load = match load_op {
+                vk::AttachmentLoadOp::LOAD => ir::DepthLoadOp::Load,
+                vk::AttachmentLoadOp::DONT_CARE => ir::DepthLoadOp::DontCare,
+                vk::AttachmentLoadOp::CLEAR => {
+                    let value = clears
+                        .get(1)
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                        .depth_stencil
+                        .depth;
+                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                    ir::DepthLoadOp::Clear(value)
+                }
+                _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+            };
+            rec.used_images.push(handle);
+            Some(ir::OwnedDepthAttachment {
+                target: image.id,
+                load,
+                store: if pass.depth_store_op == vk::AttachmentStoreOp::STORE {
+                    ir::StoreOp::Store
+                } else {
+                    ir::StoreOp::DontCare
+                },
+            })
+        } else {
+            None
+        };
         let area =
             ir::PixelRect::new(0, 0, fb.width, fb.height).map_err(crate::resources::failure)?;
         rec.ops
@@ -823,7 +866,7 @@ unsafe extern "system" fn cmd_begin_render_pass(
                 area,
                 load,
                 store: ir::StoreOp::Store,
-                depth: None,
+                depth,
             }));
         rec.render = Some((fb.width, fb.height));
         rec.used_images.push(fb.image);
@@ -841,6 +884,125 @@ unsafe extern "system" fn cmd_end_render_pass(command: vk::CommandBuffer) {
         Ok(())
     })
 }
+unsafe extern "system" fn cmd_bind_vertex_buffers(
+    command: vk::CommandBuffer,
+    first: u32,
+    count: u32,
+    buffers: *const vk::Buffer,
+    offsets: *const vk::DeviceSize,
+) {
+    if first != 0 || count != 1 || buffers.is_null() || offsets.is_null() {
+        record(command, |_, _| Err(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        return;
+    }
+    let (buffer, offset) = (*buffers, *offsets);
+    record(command, move |rt, rec| {
+        let data = rt
+            .resources
+            .buffers
+            .get(&buffer)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        if data.bound.is_none()
+            || !data.usage.contains(vk::BufferUsageFlags::VERTEX_BUFFER)
+            || offset >= data.size
+            || !offset.is_multiple_of(4)
+        {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        rec.vertex_buffer = Some((buffer, offset));
+        rec.used_buffers.push(buffer);
+        Ok(())
+    })
+}
+
+unsafe extern "system" fn cmd_bind_index_buffer(
+    command: vk::CommandBuffer,
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+    index_type: vk::IndexType,
+) {
+    record(command, move |rt, rec| {
+        let format = match index_type {
+            vk::IndexType::UINT16 => ir::IndexFormat::Uint16,
+            vk::IndexType::UINT32 => ir::IndexFormat::Uint32,
+            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+        };
+        let data = rt
+            .resources
+            .buffers
+            .get(&buffer)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        if data.bound.is_none()
+            || !data.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER)
+            || offset >= data.size
+            || !offset.is_multiple_of(u64::from(format.byte_size()))
+        {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        rec.index_buffer = Some((buffer, offset, format));
+        rec.used_buffers.push(buffer);
+        Ok(())
+    })
+}
+
+fn graphics_bindings(rt: &Runtime, rec: &mut Recording) -> VkResult<()> {
+    let extent = rec.render.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+    let pipeline = rec
+        .graphics
+        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+    let Some(crate::resources::Pipeline::Graphics(id)) = rt.resources.pipelines.get(&pipeline)
+    else {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    };
+    if rt
+        .resources
+        .graphics_extents
+        .get(&pipeline)
+        .map(|s| (s.width, s.height))
+        != Some(extent)
+    {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    let desc = rt
+        .table
+        .programmable_render_pipeline(
+            rt.table
+                .programmable_render_pipeline_ref(*id)
+                .map_err(crate::resources::failure)?,
+        )
+        .map_err(crate::resources::failure)?;
+    rec.ops.push(ir::OwnedCommand::SetProgrammablePipeline(*id));
+    if desc.vertex_buffer().is_some() {
+        let (handle, offset) = rec
+            .vertex_buffer
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let buffer = rt
+            .resources
+            .buffers
+            .get(&handle)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        rec.ops.push(ir::OwnedCommand::SetVertexBuffer {
+            buffer: buffer.id,
+            offset,
+        });
+    }
+    let active_sets = active_sets(
+        rt,
+        crate::resources::Pipeline::Graphics(*id),
+        &rec.graphics_sets,
+    )?;
+    for &(index, set) in &active_sets {
+        rec.descriptors.push(DescriptorInsertion {
+            position: rec.ops.len(),
+            index,
+            set,
+        });
+    }
+    rec.written_sets
+        .extend(active_sets.into_iter().map(|(_, set)| set));
+    Ok(())
+}
+
 unsafe extern "system" fn cmd_draw(
     command: vk::CommandBuffer,
     vertices: u32,
@@ -849,45 +1011,51 @@ unsafe extern "system" fn cmd_draw(
     first_instance: u32,
 ) {
     record(command, move |rt, rec| {
-        let extent = rec.render.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         if instances > 1 || first_instance != 0 {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let pipeline = rec
-            .graphics
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let Some(crate::resources::Pipeline::Graphics(id)) = rt.resources.pipelines.get(&pipeline)
-        else {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        };
-        if rt
-            .resources
-            .graphics_extents
-            .get(&pipeline)
-            .map(|s| (s.width, s.height))
-            != Some(extent)
-        {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        rec.ops.push(ir::OwnedCommand::SetProgrammablePipeline(*id));
-        let active_sets = active_sets(
-            rt,
-            crate::resources::Pipeline::Graphics(*id),
-            &rec.graphics_sets,
-        )?;
-        for &(index, set) in &active_sets {
-            rec.descriptors.push(DescriptorInsertion {
-                position: rec.ops.len(),
-                index,
-                set,
-            });
-        }
-        rec.written_sets
-            .extend(active_sets.into_iter().map(|(_, set)| set));
+        graphics_bindings(rt, rec)?;
         if vertices != 0 && instances != 0 {
             rec.ops.push(ir::OwnedCommand::Draw {
                 vertex_count: vertices,
                 first_vertex: first,
+            });
+        }
+        Ok(())
+    })
+}
+
+unsafe extern "system" fn cmd_draw_indexed(
+    command: vk::CommandBuffer,
+    indices: u32,
+    instances: u32,
+    first: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) {
+    record(command, move |rt, rec| {
+        if instances > 1 || first_instance != 0 {
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
+        graphics_bindings(rt, rec)?;
+        let (handle, offset, format) = rec
+            .index_buffer
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let buffer = rt
+            .resources
+            .buffers
+            .get(&handle)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        rec.ops.push(ir::OwnedCommand::SetIndexBuffer {
+            buffer: buffer.id,
+            offset,
+            format,
+        });
+        if indices != 0 && instances != 0 {
+            rec.ops.push(ir::OwnedCommand::DrawIndexed {
+                index_count: indices,
+                first_index: first,
+                base_vertex,
             });
         }
         Ok(())
@@ -928,6 +1096,7 @@ unsafe extern "system" fn cmd_copy_image_to_buffer(
         if img.bound.is_none()
             || buf.bound.is_none()
             || !buf.usage.contains(vk::BufferUsageFlags::TRANSFER_DST)
+            || img.format != vk::Format::R8G8B8A8_UNORM
         {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
@@ -1087,6 +1256,9 @@ unsafe extern "system" fn cmd_pipeline_barrier(
             | vk::PipelineStageFlags::VERTEX_SHADER
             | vk::PipelineStageFlags::FRAGMENT_SHADER
             | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            | vk::PipelineStageFlags::VERTEX_INPUT
+            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
             | vk::PipelineStageFlags::ALL_COMMANDS
             | vk::PipelineStageFlags::ALL_GRAPHICS;
         if rec.render.is_some()
@@ -1142,7 +1314,6 @@ unsafe extern "system" fn cmd_pipeline_barrier(
         for (extended, _src, _dst, sq, dq, image, old, new, range) in i {
             if extended
                 || !(sq == vk::QUEUE_FAMILY_IGNORED && dq == vk::QUEUE_FAMILY_IGNORED)
-                || range.aspect_mask != vk::ImageAspectFlags::COLOR
                 || range.base_mip_level != 0
                 || range.level_count != 1
                 || range.base_array_layer != 0
@@ -1155,6 +1326,9 @@ unsafe extern "system" fn cmd_pipeline_barrier(
                 .images
                 .get(&image)
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            if range.aspect_mask != crate::images::image_aspect(image_obj.format) {
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
             let after = texture_access(new)?;
             if old != vk::ImageLayout::UNDEFINED {
                 rec.ops.push(ir::OwnedCommand::ResourceBarrier(
@@ -1181,7 +1355,11 @@ fn supported_access(access: vk::AccessFlags) -> bool {
         | vk::AccessFlags::MEMORY_READ
         | vk::AccessFlags::MEMORY_WRITE
         | vk::AccessFlags::COLOR_ATTACHMENT_READ
-        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+        | vk::AccessFlags::VERTEX_ATTRIBUTE_READ
+        | vk::AccessFlags::INDEX_READ)
         .contains(access)
 }
 fn buffer_access(access: vk::AccessFlags) -> VkResult<ir::BufferAccess> {
@@ -1192,6 +1370,10 @@ fn buffer_access(access: vk::AccessFlags) -> VkResult<ir::BufferAccess> {
         Ok(ir::BufferAccess::StorageReadWrite)
     } else if access.contains(vk::AccessFlags::SHADER_READ) {
         Ok(ir::BufferAccess::StorageRead)
+    } else if access.contains(vk::AccessFlags::VERTEX_ATTRIBUTE_READ) {
+        Ok(ir::BufferAccess::Vertex)
+    } else if access.contains(vk::AccessFlags::INDEX_READ) {
+        Ok(ir::BufferAccess::Index)
     } else if access.contains(vk::AccessFlags::UNIFORM_READ) {
         Ok(ir::BufferAccess::Uniform)
     } else if access.intersects(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE) {
@@ -1206,7 +1388,10 @@ fn buffer_access(access: vk::AccessFlags) -> VkResult<ir::BufferAccess> {
 }
 fn texture_access(layout: vk::ImageLayout) -> VkResult<ir::TextureAccess> {
     match layout {
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => Ok(ir::TextureAccess::RenderAttachment),
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        | vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => {
+            Ok(ir::TextureAccess::RenderAttachment)
+        }
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL => Ok(ir::TextureAccess::CopySource),
         vk::ImageLayout::TRANSFER_DST_OPTIMAL => Ok(ir::TextureAccess::CopyDestination),
         _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
@@ -1445,10 +1630,12 @@ fn validate_objects(rt: &Runtime, rec: &Recording) -> VkResult<()> {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
     if rec.used_framebuffers.iter().any(|f| {
-        rt.resources
-            .framebuffers
-            .get(f)
-            .is_none_or(|fb| !rt.resources.views.contains_key(&fb.view))
+        rt.resources.framebuffers.get(f).is_none_or(|fb| {
+            !rt.resources.views.contains_key(&fb.view)
+                || fb
+                    .depth
+                    .is_some_and(|(view, _)| !rt.resources.views.contains_key(&view))
+        })
     }) || rec
         .used_render_passes
         .iter()
@@ -1693,6 +1880,9 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdBindDescriptorSets" => entry!(cmd_bind_descriptor_sets),
         b"vkCmdDispatch" => entry!(cmd_dispatch),
         b"vkCmdDraw" => entry!(cmd_draw),
+        b"vkCmdDrawIndexed" => entry!(cmd_draw_indexed),
+        b"vkCmdBindVertexBuffers" => entry!(cmd_bind_vertex_buffers),
+        b"vkCmdBindIndexBuffer" => entry!(cmd_bind_index_buffer),
         b"vkCmdBeginRenderPass" => entry!(cmd_begin_render_pass),
         b"vkCmdEndRenderPass" => entry!(cmd_end_render_pass),
         b"vkCmdCopyImageToBuffer" => entry!(cmd_copy_image_to_buffer),

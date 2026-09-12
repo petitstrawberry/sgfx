@@ -15,7 +15,7 @@ scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev
 scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", optional = true }
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", default-features = false }
 sgfx-core = { path = "../sgfx-core", default-features = false }
-sgfx-codegen-virgl = { path = "../sgfx-codegen-virgl" }
+sgfx-codegen-virgl = { path = "../sgfx-codegen-virgl", features = ["programmable"] }
 
 [lib]
 name = "sgfx_backend_scarlet_virgl"

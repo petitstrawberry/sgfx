@@ -7,6 +7,14 @@ repository = "https://github.com/petitstrawberry/sgfx"
 
 [dependencies]
 sgfx-core = { path = "../sgfx-core", default-features = false }
+naga = { version = "24", optional = true, features = ["wgsl-in", "spv-in"] }
+
+[features]
+default = []
+programmable = ["dep:naga"]
+
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }
 
 [lib]
 name = "sgfx_codegen_virgl"
