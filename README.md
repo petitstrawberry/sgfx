@@ -80,8 +80,9 @@ This is a development-only override: Git consumers resolve the core from the
 same repository naturally and do not inherit or need the workspace patch.
 
 Use the published Adreno and Scarlet revisions selected in `Cargo.lock`.
-Update dependencies with `cargo update --precise <commit>` when selecting a
-new compatible source set, then run the locked target checks below.
+Update dependencies with `cargo update -p <package> --precise <commit>` when
+selecting a new compatible source set. Review all affected Git revisions in
+`Cargo.lock`, then run the locked target checks below.
 
 CI runs the portable suite on both `scarlet-rust-toolchain` (the integration
 baseline) and upstream Rust (the portability check). The two compilers use
