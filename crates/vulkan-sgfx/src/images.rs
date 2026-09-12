@@ -11,6 +11,13 @@ pub(crate) struct Image {
     pub format: vk::Format,
     pub extent: vk::Extent3D,
     pub bound: Option<(vk::DeviceMemory, u64)>,
+    pub swapchain: Option<vk::SwapchainKHR>,
+}
+
+impl Image {
+    pub(crate) fn usable(&self) -> bool {
+        self.bound.is_some() || self.swapchain.is_some()
+    }
 }
 
 pub(crate) struct RenderPass {
@@ -34,13 +41,22 @@ const INVALID: vk::Result = vk::Result::ERROR_INITIALIZATION_FAILED;
 
 pub(crate) fn image_usage(format: vk::Format) -> vk::ImageUsageFlags {
     match format {
-        vk::Format::R8G8B8A8_UNORM => {
+        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM => {
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST
         }
         vk::Format::D32_SFLOAT => vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
         _ => vk::ImageUsageFlags::empty(),
+    }
+}
+
+pub(crate) fn texture_format(format: vk::Format) -> Option<ir::TextureFormat> {
+    match format {
+        vk::Format::R8G8B8A8_UNORM => Some(ir::TextureFormat::Rgba8Unorm),
+        vk::Format::B8G8R8A8_UNORM => Some(ir::TextureFormat::Bgra8Unorm),
+        vk::Format::D32_SFLOAT => Some(ir::TextureFormat::Depth32Float),
+        _ => None,
     }
 }
 
@@ -110,11 +126,7 @@ unsafe extern "system" fn create_image(
     }
     match with_device(device, move |runtime| {
         let size = ir::Extent2D::new(extent.width, extent.height).map_err(|_| INVALID)?;
-        let ir_format = if format == vk::Format::D32_SFLOAT {
-            ir::TextureFormat::Depth32Float
-        } else {
-            ir::TextureFormat::Rgba8Unorm
-        };
+        let ir_format = texture_format(format).ok_or(UNSUPPORTED)?;
         let desc = ir::TextureDesc::new(ir_format, size, usage).map_err(|_| INVALID)?;
         let id = runtime
             .table
@@ -129,6 +141,7 @@ unsafe extern "system" fn create_image(
                 format,
                 extent,
                 bound: None,
+                swapchain: None,
             },
         );
         Ok(handle)
@@ -148,7 +161,14 @@ unsafe extern "system" fn destroy_image(
 ) {
     if image != vk::Image::null() {
         let _ = with_device(device, move |runtime| {
-            runtime.resources.images.remove(&image);
+            if runtime
+                .resources
+                .images
+                .get(&image)
+                .is_some_and(|image| image.swapchain.is_none())
+            {
+                runtime.resources.images.remove(&image);
+            }
             Ok(())
         });
     }
@@ -189,7 +209,7 @@ unsafe extern "system" fn bind_image_memory(
             return Err(INVALID);
         }
         let image = runtime.resources.images.get_mut(&image).ok_or(INVALID)?;
-        if image.bound.is_some() {
+        if image.bound.is_some() || image.swapchain.is_some() {
             return Err(INVALID);
         }
         image.bound = Some((memory, offset));
@@ -235,7 +255,7 @@ unsafe extern "system" fn create_image_view(
     let format = info.format;
     match with_device(device, move |runtime| {
         let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
-        if data.bound.is_none() || data.format != format {
+        if !data.usable() || data.format != format {
             return Err(INVALID);
         }
         let handle = vk::ImageView::from_raw(next_id());
@@ -288,7 +308,10 @@ unsafe extern "system" fn create_render_pass(
     let attachment = &*info.p_attachments;
     let subpass = &*info.p_subpasses;
     if !attachment.flags.is_empty()
-        || attachment.format != vk::Format::R8G8B8A8_UNORM
+        || !matches!(
+            attachment.format,
+            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+        )
         || attachment.samples != vk::SampleCountFlags::TYPE_1
         || !matches!(
             attachment.load_op,
@@ -309,6 +332,7 @@ unsafe extern "system" fn create_render_pass(
             attachment.final_layout,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
                 | vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                | vk::ImageLayout::PRESENT_SRC_KHR
                 | vk::ImageLayout::GENERAL
         )
         || !subpass.flags.is_empty()
@@ -476,7 +500,7 @@ unsafe extern "system" fn create_framebuffer(
             .map(|view| {
                 let image = *runtime.resources.views.get(&view).ok_or(INVALID)?;
                 let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
-                if data.bound.is_none()
+                if !data.usable()
                     || data.format != vk::Format::D32_SFLOAT
                     || data.extent.width != width
                     || data.extent.height != height
@@ -491,7 +515,7 @@ unsafe extern "system" fn create_framebuffer(
             .table
             .texture(runtime.table.texture_ref(data.id).map_err(|_| INVALID)?)
             .map_err(|_| INVALID)?;
-        if data.bound.is_none()
+        if !data.usable()
             || data.format != pass.format
             || data.extent.width != width
             || data.extent.height != height
@@ -845,9 +869,7 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .render_passes
                 .get(&render_pass)
                 .ok_or(INVALID)?;
-            if pass.format != vk::Format::R8G8B8A8_UNORM {
-                return Err(UNSUPPORTED);
-            }
+            let target_format = texture_format(pass.format).ok_or(UNSUPPORTED)?;
             let layout = runtime
                 .resources
                 .pipeline_layouts
@@ -886,7 +908,7 @@ unsafe extern "system" fn create_graphics_pipelines(
                 vertex,
                 fragment,
                 layout,
-                ir::TextureFormat::Rgba8Unorm,
+                target_format,
                 state.vertex,
                 ir::PrimitiveTopology::TriangleList,
                 ir::BlendState::REPLACE,

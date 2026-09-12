@@ -25,10 +25,12 @@ enum CompletionRequest {
     Observe {
         submissions: Vec<sgfx::driver::Submission>,
         fence: Option<Arc<AtomicU8>>,
+        signals: Vec<Arc<AtomicU8>>,
     },
     Stop,
 }
 pub(crate) type Fences = Arc<Mutex<HashMap<u64, Arc<AtomicU8>>>>;
+pub(crate) type Semaphores = Arc<Mutex<HashMap<u64, Arc<AtomicU8>>>>;
 pub(crate) type Recordings = Arc<Mutex<CommandRegistry>>;
 type RecordingCell = Arc<Mutex<Recording>>;
 
@@ -84,6 +86,7 @@ struct Driver {
     completion_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     queue: AtomicU64,
     fences: Fences,
+    semaphores: Semaphores,
     recordings: Recordings,
     in_flight: Arc<InFlight>,
     lost: Arc<AtomicBool>,
@@ -169,6 +172,14 @@ pub(crate) fn with_device<T: Send + 'static>(
 ) -> VkResult<T> {
     call(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) fn with_queue<T: Send + 'static>(
+    queue: vk::Queue,
+    op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
+) -> VkResult<T> {
+    call(driver(queue.as_raw(), Kind::Queue)?.as_ref(), op)
+}
 fn status(value: VkResult<()>) -> vk::Result {
     value.map_or_else(|e| e, |_| vk::Result::SUCCESS)
 }
@@ -199,6 +210,29 @@ unsafe fn device_chain_supported(mut next: *const std::ffi::c_void) -> bool {
     false
 }
 
+unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
+    let Ok(names) = slice(
+        info.pp_enabled_extension_names,
+        info.enabled_extension_count,
+    ) else {
+        return false;
+    };
+    names.iter().all(|&name| {
+        !name.is_null() && {
+            let name = unsafe { CStr::from_ptr(name) };
+            #[cfg(target_os = "macos")]
+            {
+                name == vk::KHR_SWAPCHAIN_NAME
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = name;
+                false
+            }
+        }
+    })
+}
+
 pub(crate) unsafe extern "system" fn create_device(
     physical: vk::PhysicalDevice,
     info: *const vk::DeviceCreateInfo<'_>,
@@ -216,7 +250,7 @@ pub(crate) unsafe extern "system" fn create_device(
     if !allocator.is_null()
         || !device_chain_supported(info.p_next)
         || !info.flags.is_empty()
-        || info.enabled_extension_count != 0
+        || !device_extensions_supported(info)
     {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
@@ -248,6 +282,7 @@ pub(crate) unsafe extern "system" fn create_device(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let fences: Fences = Default::default();
+    let semaphores: Semaphores = Default::default();
     let recordings: Recordings = Default::default();
     let in_flight = Arc::new(InFlight::default());
     let lost = Arc::new(AtomicBool::new(false));
@@ -306,9 +341,14 @@ pub(crate) unsafe extern "system" fn create_device(
         .spawn(move || {
             while let Ok(request) = completion_rx.recv() {
                 match request {
-                    CompletionRequest::Observe { submissions, fence } => finish_submissions(
+                    CompletionRequest::Observe {
+                        submissions,
+                        fence,
+                        signals,
+                    } => finish_submissions(
                         &submissions,
                         fence.as_ref(),
+                        &signals,
                         &completion_in_flight,
                         &completion_lost,
                     ),
@@ -330,6 +370,7 @@ pub(crate) unsafe extern "system" fn create_device(
         completion_thread: Mutex::new(Some(completion_thread)),
         queue: AtomicU64::new(0),
         fences,
+        semaphores,
         recordings,
         in_flight,
         lost,
@@ -798,7 +839,7 @@ impl RecordedCommand {
                     .images
                     .get(&framebuffer_data.image)
                     .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                if image.bound.is_none() {
+                if !image.usable() {
                     return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                 }
                 let load = match pass.load_op {
@@ -825,7 +866,7 @@ impl RecordedCommand {
                         .images
                         .get(&handle)
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    if depth_image.bound.is_none() {
+                    if !depth_image.usable() {
                         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                     }
                     let load = match load_op {
@@ -995,7 +1036,7 @@ impl RecordedCommand {
                     .buffers
                     .get(buffer)
                     .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                if image_data.bound.is_none()
+                if !image_data.usable()
                     || buffer_data.bound.is_none()
                     || !buffer_data
                         .usage
@@ -2208,6 +2249,130 @@ unsafe extern "system" fn wait_for_fences(
     }
 }
 
+unsafe extern "system" fn create_semaphore(
+    device: vk::Device,
+    info: *const vk::SemaphoreCreateInfo<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    out: *mut vk::Semaphore,
+) -> vk::Result {
+    if info.is_null() || out.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    *out = vk::Semaphore::null();
+    let info = &*info;
+    if info.s_type != vk::StructureType::SEMAPHORE_CREATE_INFO
+        || !info.p_next.is_null()
+        || !info.flags.is_empty()
+        || !allocator.is_null()
+    {
+        return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    }
+    let d = match driver(device.as_raw(), Kind::Device) {
+        Ok(d) => d,
+        Err(error) => return error,
+    };
+    let mut semaphores = d.semaphores.lock().unwrap_or_else(|e| e.into_inner());
+    if semaphores.len() >= 4096 {
+        return vk::Result::ERROR_TOO_MANY_OBJECTS;
+    }
+    let id = next_id();
+    semaphores.insert(id, Arc::new(AtomicU8::new(0)));
+    *out = vk::Semaphore::from_raw(id);
+    vk::Result::SUCCESS
+}
+
+unsafe extern "system" fn destroy_semaphore(
+    device: vk::Device,
+    semaphore: vk::Semaphore,
+    _: *const vk::AllocationCallbacks<'_>,
+) {
+    if let Ok(d) = driver(device.as_raw(), Kind::Device) {
+        d.semaphores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&semaphore.as_raw());
+    }
+}
+
+fn semaphore_refs(d: &Driver, handles: &[vk::Semaphore]) -> VkResult<Vec<Arc<AtomicU8>>> {
+    if d.lost.load(Ordering::Acquire) {
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    let semaphores = d.semaphores.lock().unwrap_or_else(|e| e.into_inner());
+    handles
+        .iter()
+        .map(|semaphore| {
+            semaphores
+                .get(&semaphore.as_raw())
+                .cloned()
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+        })
+        .collect()
+}
+
+fn wait_and_consume_semaphores(d: &Driver, semaphores: &[Arc<AtomicU8>]) -> VkResult<()> {
+    for semaphore in semaphores {
+        loop {
+            if d.lost.load(Ordering::Acquire) {
+                return Err(vk::Result::ERROR_DEVICE_LOST);
+            }
+            if semaphore
+                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn signal_acquire_sync(
+    device: vk::Device,
+    semaphore: vk::Semaphore,
+    fence: vk::Fence,
+) -> VkResult<()> {
+    let d = driver(device.as_raw(), Kind::Device)?;
+    if semaphore == vk::Semaphore::null() && fence == vk::Fence::null() {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    let semaphore = if semaphore == vk::Semaphore::null() {
+        None
+    } else {
+        Some(semaphore_refs(&d, &[semaphore])?.remove(0))
+    };
+    let fence = if fence == vk::Fence::null() {
+        None
+    } else {
+        Some(fence_refs(&d, &[fence])?.remove(0))
+    };
+    if semaphore
+        .as_ref()
+        .is_some_and(|state| state.load(Ordering::Acquire) != 0)
+        || fence
+            .as_ref()
+            .is_some_and(|state| state.load(Ordering::Acquire) != 0)
+    {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    if let Some(state) = semaphore {
+        state.store(1, Ordering::Release);
+    }
+    if let Some(state) = fence {
+        state.store(1, Ordering::Release);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn wait_queue_semaphores(queue: vk::Queue, handles: &[vk::Semaphore]) -> VkResult<()> {
+    let d = driver(queue.as_raw(), Kind::Queue)?;
+    let semaphores = semaphore_refs(&d, handles)?;
+    wait_and_consume_semaphores(&d, &semaphores)
+}
+
 unsafe extern "system" fn queue_submit(
     queue: vk::Queue,
     count: u32,
@@ -2219,13 +2384,31 @@ unsafe extern "system" fn queue_submit(
         Err(e) => return e,
     };
     let mut commands = Vec::new();
+    let mut wait_handles = Vec::new();
+    let mut signal_handles = Vec::new();
     for submit in submits {
-        if !submit.p_next.is_null()
-            || submit.wait_semaphore_count != 0
-            || submit.signal_semaphore_count != 0
-        {
+        if !submit.p_next.is_null() {
             return vk::Result::ERROR_FEATURE_NOT_PRESENT;
         }
+        let waits = match slice(submit.p_wait_semaphores, submit.wait_semaphore_count) {
+            Ok(v) => v,
+            Err(error) => return error,
+        };
+        let signals = match slice(submit.p_signal_semaphores, submit.signal_semaphore_count) {
+            Ok(v) => v,
+            Err(error) => return error,
+        };
+        if !waits.is_empty() {
+            let stages = match slice(submit.p_wait_dst_stage_mask, submit.wait_semaphore_count) {
+                Ok(v) => v,
+                Err(error) => return error,
+            };
+            if stages.iter().any(|stage| stage.is_empty()) {
+                return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+            }
+        }
+        wait_handles.extend_from_slice(waits);
+        signal_handles.extend_from_slice(signals);
         let c = match slice(submit.p_command_buffers, submit.command_buffer_count) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2235,6 +2418,23 @@ unsafe extern "system" fn queue_submit(
     let d = match driver(queue.as_raw(), Kind::Queue) {
         Ok(d) => d,
         Err(e) => return e,
+    };
+    let mut unique = wait_handles
+        .iter()
+        .chain(&signal_handles)
+        .map(|handle| handle.as_raw())
+        .collect::<Vec<_>>();
+    unique.sort_unstable();
+    if unique.windows(2).any(|pair| pair[0] == pair[1]) {
+        return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    }
+    let wait_semaphores = match semaphore_refs(&d, &wait_handles) {
+        Ok(semaphores) => semaphores,
+        Err(error) => return error,
+    };
+    let signal_semaphores = match semaphore_refs(&d, &signal_handles) {
+        Ok(semaphores) => semaphores,
+        Err(error) => return error,
     };
     for &id in &commands {
         if !driver(id, Kind::Command).is_ok_and(|v| Arc::ptr_eq(&v, &d)) {
@@ -2276,6 +2476,9 @@ unsafe extern "system" fn queue_submit(
         Ok(recorded) => recorded,
         Err(error) => return error,
     };
+    if let Err(error) = wait_and_consume_semaphores(&d, &wait_semaphores) {
+        return error;
+    }
     let accepted = call(&d, move |rt| {
         if rt.lost {
             return Err(vk::Result::ERROR_DEVICE_LOST);
@@ -2301,6 +2504,20 @@ unsafe extern "system" fn queue_submit(
         for rec in &recordings {
             validate_objects(rt, rec)?;
         }
+        for state in &signal_semaphores {
+            if state
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                for reserved in &signal_semaphores {
+                    if Arc::ptr_eq(reserved, state) {
+                        break;
+                    }
+                    reserved.store(0, Ordering::Release);
+                }
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+        }
         if let Some(state) = &fence_state {
             state.store(2, Ordering::Release);
         }
@@ -2316,6 +2533,9 @@ unsafe extern "system" fn queue_submit(
                         rt.lost = true;
                     }
                     if let Some(state) = &fence_state {
+                        state.store(0, Ordering::Release);
+                    }
+                    for state in &signal_semaphores {
                         state.store(0, Ordering::Release);
                     }
                     return Err(error);
@@ -2344,12 +2564,15 @@ unsafe extern "system" fn queue_submit(
             if let Some(state) = &fence_state {
                 state.store(1, Ordering::Release);
             }
+            for state in &signal_semaphores {
+                state.store(1, Ordering::Release);
+            }
         } else {
             rt.in_flight.begin();
         }
-        Ok((submissions, fence_state))
+        Ok((submissions, fence_state, signal_semaphores))
     });
-    let (submissions, fence_state) = match accepted {
+    let (submissions, fence_state, signal_semaphores) = match accepted {
         Ok(accepted) => accepted,
         Err(error) => return error,
     };
@@ -2359,11 +2582,23 @@ unsafe extern "system" fn queue_submit(
     if let Err(error) = d.completion_sender.send(CompletionRequest::Observe {
         submissions,
         fence: fence_state,
+        signals: signal_semaphores,
     }) {
-        let CompletionRequest::Observe { submissions, fence } = error.0 else {
+        let CompletionRequest::Observe {
+            submissions,
+            fence,
+            signals,
+        } = error.0
+        else {
             unreachable!();
         };
-        finish_submissions(&submissions, fence.as_ref(), &d.in_flight, &d.lost);
+        finish_submissions(
+            &submissions,
+            fence.as_ref(),
+            &signals,
+            &d.in_flight,
+            &d.lost,
+        );
     }
     vk::Result::SUCCESS
 }
@@ -2371,6 +2606,7 @@ unsafe extern "system" fn queue_submit(
 fn finish_submissions(
     submissions: &[sgfx::driver::Submission],
     fence: Option<&Arc<AtomicU8>>,
+    signals: &[Arc<AtomicU8>],
     in_flight: &InFlight,
     lost: &AtomicBool,
 ) {
@@ -2381,9 +2617,15 @@ fn finish_submissions(
         if let Some(state) = fence {
             state.store(1, Ordering::Release);
         }
+        for state in signals {
+            state.store(1, Ordering::Release);
+        }
     } else {
         lost.store(true, Ordering::Release);
         if let Some(state) = fence {
+            state.store(0, Ordering::Release);
+        }
+        for state in signals {
             state.store(0, Ordering::Release);
         }
     }
@@ -2421,7 +2663,7 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
         || rec
             .used_images
             .iter()
-            .any(|i| rt.resources.images.get(i).is_none_or(|i| i.bound.is_none()))
+            .any(|i| rt.resources.images.get(i).is_none_or(|i| !i.usable()))
     {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
@@ -2654,7 +2896,7 @@ pub(crate) unsafe extern "system" fn get_device_proc_addr(
 }
 pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
     macro_rules! entry {
-        ($function:ident) => {
+        ($function:path) => {
             Some(unsafe {
                 std::mem::transmute::<*const (), unsafe extern "system" fn()>(
                     $function as *const (),
@@ -2695,6 +2937,18 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkResetFences" => entry!(reset_fences),
         b"vkGetFenceStatus" => entry!(get_fence_status),
         b"vkWaitForFences" => entry!(wait_for_fences),
+        b"vkCreateSemaphore" => entry!(create_semaphore),
+        b"vkDestroySemaphore" => entry!(destroy_semaphore),
+        #[cfg(target_os = "macos")]
+        b"vkCreateSwapchainKHR" => entry!(crate::wsi::create_swapchain),
+        #[cfg(target_os = "macos")]
+        b"vkDestroySwapchainKHR" => entry!(crate::wsi::destroy_swapchain),
+        #[cfg(target_os = "macos")]
+        b"vkGetSwapchainImagesKHR" => entry!(crate::wsi::get_swapchain_images),
+        #[cfg(target_os = "macos")]
+        b"vkAcquireNextImageKHR" => entry!(crate::wsi::acquire_next_image),
+        #[cfg(target_os = "macos")]
+        b"vkQueuePresentKHR" => entry!(crate::wsi::queue_present),
         _ => crate::resources::lookup(name).or_else(|| crate::images::lookup(name)),
     }
 }
@@ -2811,6 +3065,7 @@ mod tests {
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
             fences: Default::default(),
+            semaphores: Default::default(),
             recordings: Default::default(),
             in_flight: Default::default(),
             lost: Arc::new(AtomicBool::new(false)),
@@ -2852,6 +3107,7 @@ mod tests {
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
             fences: Default::default(),
+            semaphores: Default::default(),
             recordings: Default::default(),
             in_flight: Default::default(),
             lost: Arc::new(AtomicBool::new(false)),
@@ -2887,6 +3143,57 @@ mod tests {
         }
         remove_handle(device.as_raw());
     }
+
+    #[test]
+    fn binary_semaphore_can_bridge_acquire_submit_and_present() {
+        let (sender, _intentionally_unserviced_receiver) = mpsc::channel();
+        let (completion_sender, _intentionally_unserviced_completion_receiver) = mpsc::channel();
+        let d = Arc::new(Driver {
+            sender,
+            thread: Mutex::new(None),
+            completion_sender,
+            completion_thread: Mutex::new(None),
+            queue: AtomicU64::new(0),
+            fences: Default::default(),
+            semaphores: Default::default(),
+            recordings: Default::default(),
+            in_flight: Default::default(),
+            lost: Arc::new(AtomicBool::new(false)),
+        });
+        let device = vk::Device::from_raw(add_handle(Kind::Device, &d));
+        let queue = vk::Queue::from_raw(add_handle(Kind::Queue, &d));
+        let mut semaphore = vk::Semaphore::null();
+        unsafe {
+            assert_eq!(
+                create_semaphore(
+                    device,
+                    &vk::SemaphoreCreateInfo::default(),
+                    std::ptr::null(),
+                    &mut semaphore,
+                ),
+                vk::Result::SUCCESS
+            );
+        }
+        let state = d
+            .semaphores
+            .lock()
+            .unwrap()
+            .get(&semaphore.as_raw())
+            .cloned()
+            .unwrap();
+        assert_eq!(state.load(Ordering::Acquire), 0);
+        assert_eq!(
+            signal_acquire_sync(device, semaphore, vk::Fence::null()),
+            Ok(())
+        );
+        assert_eq!(state.load(Ordering::Acquire), 1);
+        assert_eq!(wait_queue_semaphores(queue, &[semaphore]), Ok(()));
+        assert_eq!(state.load(Ordering::Acquire), 0);
+        unsafe { destroy_semaphore(device, semaphore, std::ptr::null()) };
+        remove_handle(queue.as_raw());
+        remove_handle(device.as_raw());
+    }
+
     #[test]
     fn loader_device_chain_accepts_only_transport_records() {
         let mut base = vk::BaseInStructure {

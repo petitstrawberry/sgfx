@@ -1,4 +1,4 @@
-//! Experimental, non-conformant headless Vulkan frontend for SGFX.
+//! Experimental, non-conformant Vulkan frontend and ICD for SGFX.
 //!
 //! This crate implements a deliberately bounded development subset. It is not
 //! a Vulkan-conformant implementation. See `docs/vulkan-sgfx.md` for the supported
@@ -10,6 +10,8 @@ mod images;
 mod instance;
 mod resources;
 mod runtime;
+#[cfg(target_os = "macos")]
+mod wsi;
 
 /// Construct a Vulkan entry table for the ICD linked into this executable.
 ///

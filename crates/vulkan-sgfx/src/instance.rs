@@ -1,4 +1,4 @@
-//! Loader-facing instance and physical-device ABI for the experimental headless ICD.
+//! Loader-facing instance and physical-device ABI for the experimental SGFX ICD.
 //!
 //! The API version describes the entry-point ABI, not Vulkan conformance. Unsupported
 //! features, extensions, formats, and image configurations are never advertised.
@@ -44,6 +44,7 @@ impl PhysicalRecord {
 struct Instances {
     instances: HashMap<usize, InstanceRecord>,
     physical_devices: HashMap<usize, Adapter>,
+    physical_owners: HashMap<usize, usize>,
 }
 
 fn instances() -> MutexGuard<'static, Instances> {
@@ -68,6 +69,20 @@ pub(crate) fn physical_adapter(physical: vk::PhysicalDevice) -> Option<Adapter> 
         .physical_devices
         .get(&(physical.as_raw() as usize))
         .cloned()
+}
+
+pub(crate) fn instance_valid(instance: vk::Instance) -> bool {
+    instances()
+        .instances
+        .contains_key(&(instance.as_raw() as usize))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn physical_instance(physical: vk::PhysicalDevice) -> Option<usize> {
+    instances()
+        .physical_owners
+        .get(&(physical.as_raw() as usize))
+        .copied()
 }
 
 /// Negotiate a loader interface with dispatchable-object initialization support.
@@ -102,15 +117,23 @@ pub unsafe extern "system" fn vk_icdGetInstanceProcAddr(
     unsafe { get_instance_proc_addr(instance, name) }
 }
 
-/// This ICD does not expose physical-device extension entry points.
+/// Return physical-device extension entry points supported by this ICD.
 ///
 /// # Safety
 /// The arguments follow the Vulkan loader's physical-device lookup ABI.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn vk_icdGetPhysicalDeviceProcAddr(
-    _instance: vk::Instance,
-    _name: *const c_char,
+    instance: vk::Instance,
+    name: *const c_char,
 ) -> vk::PFN_vkVoidFunction {
+    if name.is_null() || !instance_valid(instance) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::wsi::lookup_physical(unsafe { CStr::from_ptr(name) })
+    }
+    #[cfg(not(target_os = "macos"))]
     None
 }
 
@@ -200,6 +223,37 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             enumerate_device_layer_properties,
             vk::PFN_vkEnumerateDeviceLayerProperties
         ),
+        #[cfg(target_os = "macos")]
+        b"vkCreateMetalSurfaceEXT" => {
+            procedure!(
+                crate::wsi::create_metal_surface,
+                vk::PFN_vkCreateMetalSurfaceEXT
+            )
+        }
+        #[cfg(target_os = "macos")]
+        b"vkDestroySurfaceKHR" => {
+            procedure!(crate::wsi::destroy_surface, vk::PFN_vkDestroySurfaceKHR)
+        }
+        #[cfg(target_os = "macos")]
+        b"vkGetPhysicalDeviceSurfaceSupportKHR" => procedure!(
+            crate::wsi::get_physical_device_surface_support,
+            vk::PFN_vkGetPhysicalDeviceSurfaceSupportKHR
+        ),
+        #[cfg(target_os = "macos")]
+        b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" => procedure!(
+            crate::wsi::get_physical_device_surface_capabilities,
+            vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+        ),
+        #[cfg(target_os = "macos")]
+        b"vkGetPhysicalDeviceSurfaceFormatsKHR" => procedure!(
+            crate::wsi::get_physical_device_surface_formats,
+            vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR
+        ),
+        #[cfg(target_os = "macos")]
+        b"vkGetPhysicalDeviceSurfacePresentModesKHR" => procedure!(
+            crate::wsi::get_physical_device_surface_present_modes,
+            vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
+        ),
         _ => crate::api::lookup_device(name),
     }
 }
@@ -217,17 +271,27 @@ pub(crate) unsafe extern "system" fn create_instance(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let info = unsafe { &*info };
-    if info.s_type != vk::StructureType::INSTANCE_CREATE_INFO || !info.flags.is_empty() {
+    if info.s_type != vk::StructureType::INSTANCE_CREATE_INFO {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     if info.enabled_layer_count != 0 {
         return vk::Result::ERROR_LAYER_NOT_PRESENT;
     }
-    if info.enabled_extension_count != 0 {
+    let extensions = match enabled_instance_extensions(info) {
+        Ok(extensions) => extensions,
+        Err(error) => return error,
+    };
+    let portability = extensions.contains(&vk::KHR_PORTABILITY_ENUMERATION_NAME);
+    let allowed_flags = if portability {
+        vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+    } else {
+        vk::InstanceCreateFlags::empty()
+    };
+    if !allowed_flags.contains(info.flags) {
         return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
     }
-    // Loader-owned pNext structures may accompany creation. No application
-    // extension is enabled, so this ICD does not consume the chain.
+    // Loader-owned pNext structures may accompany creation. The supported
+    // instance extensions do not add application records consumed here.
     if !info.p_application_info.is_null() && LOADER_INTERFACE.load(Ordering::Relaxed) < 5 {
         let version = unsafe { (*info.p_application_info).api_version };
         if version != 0
@@ -266,6 +330,7 @@ pub(crate) unsafe extern "system" fn create_instance(
         .zip(sgfx_instance.adapters().iter().cloned())
     {
         registry.physical_devices.insert(physical.id(), adapter);
+        registry.physical_owners.insert(physical.id(), instance_id);
     }
     registry.instances.insert(instance_id, record);
     unsafe { *output = vk::Instance::from_raw(instance_id as u64) };
@@ -280,8 +345,11 @@ pub(crate) unsafe extern "system" fn destroy_instance(
     if let Some(record) = registry.instances.remove(&(instance.as_raw() as usize)) {
         for physical in &record.physical_devices {
             registry.physical_devices.remove(&physical.id());
+            registry.physical_owners.remove(&physical.id());
         }
     }
+    #[cfg(target_os = "macos")]
+    crate::wsi::destroy_instance_surfaces(instance);
 }
 
 pub(crate) unsafe extern "system" fn enumerate_physical_devices(
@@ -317,19 +385,114 @@ pub(crate) unsafe extern "system" fn enumerate_physical_devices(
     }
 }
 
-unsafe extern "system" fn enumerate_instance_extension_properties(
-    layer: *const c_char,
+fn instance_extensions() -> &'static [(&'static CStr, u32)] {
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            (vk::KHR_SURFACE_NAME, vk::KHR_SURFACE_SPEC_VERSION),
+            (
+                vk::EXT_METAL_SURFACE_NAME,
+                vk::EXT_METAL_SURFACE_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_PORTABILITY_ENUMERATION_NAME,
+                vk::KHR_PORTABILITY_ENUMERATION_SPEC_VERSION,
+            ),
+        ]
+    }
+    #[cfg(not(target_os = "macos"))]
+    &[]
+}
+
+fn device_extensions() -> &'static [(&'static CStr, u32)] {
+    #[cfg(target_os = "macos")]
+    {
+        &[(vk::KHR_SWAPCHAIN_NAME, vk::KHR_SWAPCHAIN_SPEC_VERSION)]
+    }
+    #[cfg(not(target_os = "macos"))]
+    &[]
+}
+
+unsafe fn enabled_instance_extensions<'a>(
+    info: &'a vk::InstanceCreateInfo<'_>,
+) -> Result<Vec<&'a CStr>, vk::Result> {
+    if info.enabled_extension_count > 64
+        || (info.enabled_extension_count != 0 && info.pp_enabled_extension_names.is_null())
+    {
+        return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+    }
+    let names = if info.enabled_extension_count == 0 {
+        &[][..]
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(
+                info.pp_enabled_extension_names,
+                info.enabled_extension_count as usize,
+            )
+        }
+    };
+    let mut extensions = Vec::with_capacity(names.len());
+    for &name in names {
+        if name.is_null() {
+            return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+        }
+        let name = unsafe { CStr::from_ptr(name) };
+        if !instance_extensions()
+            .iter()
+            .any(|(supported, _)| *supported == name)
+        {
+            return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+        }
+        extensions.push(name);
+    }
+    Ok(extensions)
+}
+
+unsafe fn enumerate_extensions(
+    extensions: &[(&CStr, u32)],
     count: *mut u32,
-    _output: *mut vk::ExtensionProperties,
+    output: *mut vk::ExtensionProperties,
 ) -> vk::Result {
     if count.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    unsafe { *count = 0 };
+    if output.is_null() {
+        unsafe { *count = extensions.len() as u32 };
+        return vk::Result::SUCCESS;
+    }
+    let capacity = unsafe { *count } as usize;
+    let written = capacity.min(extensions.len());
+    for (index, (name, version)) in extensions.iter().take(written).enumerate() {
+        let mut property = vk::ExtensionProperties {
+            spec_version: *version,
+            ..Default::default()
+        };
+        let bytes = name.to_bytes_with_nul();
+        for (slot, byte) in property.extension_name.iter_mut().zip(bytes) {
+            *slot = *byte as c_char;
+        }
+        unsafe { *output.add(index) = property };
+    }
+    unsafe { *count = written as u32 };
+    if written < extensions.len() {
+        vk::Result::INCOMPLETE
+    } else {
+        vk::Result::SUCCESS
+    }
+}
+
+unsafe extern "system" fn enumerate_instance_extension_properties(
+    layer: *const c_char,
+    count: *mut u32,
+    output: *mut vk::ExtensionProperties,
+) -> vk::Result {
     if !layer.is_null() {
+        if !count.is_null() {
+            unsafe { *count = 0 };
+        }
         return vk::Result::ERROR_LAYER_NOT_PRESENT;
     }
-    vk::Result::SUCCESS
+    unsafe { enumerate_extensions(instance_extensions(), count, output) }
 }
 
 unsafe extern "system" fn enumerate_instance_layer_properties(
@@ -352,7 +515,13 @@ unsafe extern "system" fn enumerate_device_extension_properties(
     if !physical_valid(physical) {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    unsafe { enumerate_instance_extension_properties(layer, count, output) }
+    if !layer.is_null() {
+        if !count.is_null() {
+            unsafe { *count = 0 };
+        }
+        return vk::Result::ERROR_LAYER_NOT_PRESENT;
+    }
+    unsafe { enumerate_extensions(device_extensions(), count, output) }
 }
 
 unsafe extern "system" fn enumerate_device_layer_properties(
@@ -596,7 +765,9 @@ unsafe extern "system" fn get_physical_device_format_properties(
         return;
     };
     let capabilities = adapter.capabilities();
-    if capabilities.supports_rgba8_color_attachment() && format == vk::Format::R8G8B8A8_UNORM {
+    if (capabilities.supports_rgba8_color_attachment() && format == vk::Format::R8G8B8A8_UNORM)
+        || (capabilities.supports_bgra8_color_attachment() && format == vk::Format::B8G8R8A8_UNORM)
+    {
         // In Vulkan 1.0, transfer support follows image-format support; the
         // TRANSFER_SRC/DST format-feature bits belong to maintenance1 / 1.1.
         properties.optimal_tiling_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT;
@@ -636,8 +807,16 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
     };
     let capabilities = adapter.capabilities();
     let mut supported_usage = crate::images::image_usage(format);
-    if format == vk::Format::R8G8B8A8_UNORM {
-        if !capabilities.supports_rgba8_color_attachment() {
+    if matches!(
+        format,
+        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+    ) {
+        let color_attachment = match format {
+            vk::Format::R8G8B8A8_UNORM => capabilities.supports_rgba8_color_attachment(),
+            vk::Format::B8G8R8A8_UNORM => capabilities.supports_bgra8_color_attachment(),
+            _ => false,
+        };
+        if !color_attachment {
             supported_usage &= !vk::ImageUsageFlags::COLOR_ATTACHMENT;
         }
         if !capabilities.supports_image_readback() {
@@ -740,6 +919,9 @@ mod tests {
                     "{name:?}"
                 );
             }
+            #[cfg(target_os = "macos")]
+            assert!(get_instance_proc_addr(instance, c"vkCreateSwapchainKHR".as_ptr()).is_some());
+            #[cfg(not(target_os = "macos"))]
             assert!(get_instance_proc_addr(instance, c"vkCreateSwapchainKHR".as_ptr()).is_none());
             assert!(
                 get_instance_proc_addr(instance, c"vkGetPhysicalDeviceFeatures2".as_ptr())
@@ -802,7 +984,7 @@ mod tests {
     #[test]
     fn unsupported_extensions_and_image_configuration_are_rejected() {
         unsafe {
-            let extensions = [c"VK_KHR_surface".as_ptr()];
+            let extensions = [c"VK_EXT_not_supported".as_ptr()];
             let info = vk::InstanceCreateInfo::default().enabled_extension_names(&extensions);
             let mut output = vk::Instance::from_raw(0x1234);
             assert_eq!(
@@ -903,7 +1085,7 @@ mod tests {
                 ),
                 vk::Result::SUCCESS
             );
-            assert_eq!(count, 0);
+            assert_eq!(count, usize::from(cfg!(target_os = "macos")) as u32);
             destroy_instance(instance, ptr::null());
         }
     }

@@ -213,9 +213,16 @@ impl Adapter {
 #[derive(Clone)]
 enum AdapterBackend {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
-    Wgpu(wgpu::Adapter),
+    Wgpu(WgpuAdapter),
     #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
     ScarletVirgl(ScarletAdapter),
+}
+
+#[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+#[derive(Clone)]
+struct WgpuAdapter {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
 }
 
 /// A snapshot of adapters available to the configured SGFX backend set.
@@ -276,9 +283,16 @@ pub struct Device {
 
 enum DeviceBackend {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
-    Wgpu(Rc<sgfx_backend_wgpu::Context>),
+    Wgpu(WgpuDevice),
     #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
     ScarletVirgl(Rc<sgfx_backend_scarlet_virgl::Context>),
+}
+
+#[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+struct WgpuDevice {
+    context: Rc<sgfx_backend_wgpu::Context>,
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
 }
 
 impl Device {
@@ -286,9 +300,9 @@ impl Device {
     pub fn create_resources(&self, table: Rc<ir::ResourceTable>) -> Result<Resources> {
         match &self.backend {
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
-            DeviceBackend::Wgpu(context) => Ok(Resources {
+            DeviceBackend::Wgpu(device) => Ok(Resources {
                 device_id: self.id,
-                backend: ResourcesBackend::Wgpu(context.create_resources(table)),
+                backend: ResourcesBackend::Wgpu(device.context.create_resources(table)),
             }),
             #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
             DeviceBackend::ScarletVirgl(context) => context
@@ -305,9 +319,9 @@ impl Device {
     pub fn create_queue(&self) -> Result<Queue> {
         match &self.backend {
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
-            DeviceBackend::Wgpu(context) => Ok(Queue {
+            DeviceBackend::Wgpu(device) => Ok(Queue {
                 device_id: self.id,
-                backend: QueueBackend::Wgpu(context.create_queue()),
+                backend: QueueBackend::Wgpu(device.context.create_queue()),
             }),
             #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
             DeviceBackend::ScarletVirgl(context) => context
@@ -321,6 +335,105 @@ impl Device {
                 })
                 .map_err(Error::ScarletVirglHandle),
         }
+    }
+
+    /// Create a presentable image on this device.
+    #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+    pub fn create_presentation_image(
+        &self,
+        width: u32,
+        height: u32,
+        format: ir::TextureFormat,
+    ) -> Result<PresentationImage> {
+        let DeviceBackend::Wgpu(device) = &self.backend;
+        device
+            .context
+            .create_image(width, height, format)
+            .map(|image| PresentationImage {
+                device_id: self.id,
+                image,
+            })
+            .map_err(Error::Wgpu)
+    }
+
+    /// Bind an existing CAMetalLayer to this Vulkan-selected device.
+    ///
+    /// # Safety
+    ///
+    /// `layer` must remain valid until the returned context is dropped.
+    #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+    pub unsafe fn create_metal_window_context(
+        &self,
+        layer: *mut core::ffi::c_void,
+        width: u32,
+        height: u32,
+        transparent: bool,
+    ) -> Result<WindowContext> {
+        let DeviceBackend::Wgpu(device) = &self.backend;
+        // SAFETY: forwarded from this method's contract.
+        unsafe {
+            sgfx_backend_wgpu::WindowContext::from_core_animation_layer(
+                device.instance.clone(),
+                &device.adapter,
+                device.context.as_ref().clone(),
+                layer,
+                width,
+                height,
+                transparent,
+            )
+        }
+        .map(|context| WindowContext {
+            device_id: self.id,
+            context,
+        })
+        .map_err(Error::Wgpu)
+    }
+}
+
+/// Device-local image used by a platform presentation context.
+#[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+pub struct PresentationImage {
+    device_id: usize,
+    image: alloc::sync::Arc<sgfx_backend_wgpu::Image>,
+}
+
+#[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+impl PresentationImage {
+    pub fn width(&self) -> u32 {
+        self.image.width()
+    }
+
+    pub fn height(&self) -> u32 {
+        self.image.height()
+    }
+
+    pub fn image_format(&self) -> ir::TextureFormat {
+        self.image.format()
+    }
+}
+
+/// Backend-neutral owner of a native presentation surface.
+#[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+pub struct WindowContext {
+    device_id: usize,
+    context: sgfx_backend_wgpu::WindowContext,
+}
+
+#[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+impl WindowContext {
+    /// Present one image created by the same logical device.
+    pub fn present(&mut self, image: &PresentationImage) -> Result<()> {
+        if self.device_id != image.device_id {
+            return Err(Error::ResourceDeviceMismatch);
+        }
+        self.context
+            .present_image(image.image.as_ref())
+            .map_err(Error::Wgpu)
+    }
+
+    /// Reconfigure the drawable extent.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.context.resize(width, height);
     }
 }
 
@@ -338,6 +451,29 @@ enum ResourcesBackend {
 }
 
 impl Resources {
+    /// Map a logical PRESENT texture to a device-local presentation image.
+    #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+    pub fn map_presentation_image(
+        &mut self,
+        texture: ir::TextureId,
+        image: &PresentationImage,
+    ) -> Result<()> {
+        if self.device_id != image.device_id {
+            return Err(Error::ResourceDeviceMismatch);
+        }
+        let ResourcesBackend::Wgpu(resources) = &mut self.backend;
+        resources
+            .map_image(texture, alloc::sync::Arc::clone(&image.image))
+            .map_err(Error::Wgpu)
+    }
+
+    /// Remove a logical PRESENT texture mapping.
+    #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
+    pub fn unmap_presentation_image(&mut self, texture: ir::TextureId) {
+        let ResourcesBackend::Wgpu(resources) = &mut self.backend;
+        resources.unmap_image(texture);
+    }
+
     pub fn validate_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<()> {
         match &mut self.backend {
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
@@ -592,7 +728,10 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                     image_readback: true,
                     limits: runtime,
                 },
-                backend: AdapterBackend::Wgpu(adapter),
+                backend: AdapterBackend::Wgpu(WgpuAdapter {
+                    instance: instance.clone(),
+                    adapter,
+                }),
             }
         })
         .collect()
@@ -628,7 +767,8 @@ fn wgpu_runtime_limits(adapter: wgpu::Limits) -> Limits {
 }
 
 #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
-fn create_wgpu_device(adapter: &wgpu::Adapter) -> Result<Device> {
+fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
+    let adapter = &wgpu_adapter.adapter;
     let adapter_limits = adapter.limits();
     let mut required_limits =
         wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
@@ -648,7 +788,11 @@ fn create_wgpu_device(adapter: &wgpu::Adapter) -> Result<Device> {
     let context = sgfx_backend_wgpu::Device::new(device, queue).create_context();
     Ok(Device {
         id: next_device_id(),
-        backend: DeviceBackend::Wgpu(Rc::new(context)),
+        backend: DeviceBackend::Wgpu(WgpuDevice {
+            context: Rc::new(context),
+            instance: wgpu_adapter.instance.clone(),
+            adapter: adapter.clone(),
+        }),
     })
 }
 

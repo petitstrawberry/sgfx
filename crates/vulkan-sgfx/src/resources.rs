@@ -94,6 +94,8 @@ pub(crate) struct Resources {
     pub views: HashMap<vk::ImageView, vk::Image>,
     pub render_passes: HashMap<vk::RenderPass, crate::images::RenderPass>,
     pub framebuffers: HashMap<vk::Framebuffer, crate::images::Framebuffer>,
+    #[cfg(target_os = "macos")]
+    pub swapchains: HashMap<vk::SwapchainKHR, crate::wsi::Swapchain>,
 }
 impl Resources {
     pub fn new() -> Self {
@@ -110,6 +112,16 @@ impl Resources {
             || !self.set_layouts.is_empty()
             || !self.pipeline_layouts.is_empty()
             || !self.descriptor_sets.is_empty()
+            || {
+                #[cfg(target_os = "macos")]
+                {
+                    !self.swapchains.is_empty()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    false
+                }
+            }
     }
 
     /// Forget every cached identity before swapping to a fresh IR table.

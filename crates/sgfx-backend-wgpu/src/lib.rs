@@ -492,7 +492,69 @@ impl WindowContext {
         device.on_uncaptured_error(Box::new(|error| {
             eprintln!("[SGFX/WGPU] uncaptured error: {error}");
         }));
-        let capabilities = surface.get_capabilities(&adapter);
+        let device = Device::new(device, queue);
+        let context = device.create_context();
+        Self::from_parts(
+            instance,
+            &adapter,
+            context,
+            surface,
+            width,
+            height,
+            transparent,
+        )
+    }
+
+    /// Create presentation state for an existing WGPU device and CAMetalLayer.
+    ///
+    /// This is used by API frontends whose device was selected before the
+    /// native surface was created, including Vulkan's instance/device split.
+    /// The supplied instance and adapter must be the ones used to create the
+    /// context's device.
+    ///
+    /// # Safety
+    ///
+    /// `layer` must point to a live CAMetalLayer until this context is dropped.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn from_core_animation_layer(
+        instance: raw::Instance,
+        adapter: &raw::Adapter,
+        context: Context,
+        layer: *mut core::ffi::c_void,
+        width: u32,
+        height: u32,
+        transparent: bool,
+    ) -> Result<Self> {
+        if layer.is_null() {
+            return Err(Error::SurfaceCreation);
+        }
+        // SAFETY: the caller keeps the CAMetalLayer alive for the returned
+        // context's lifetime.
+        let surface = unsafe {
+            instance.create_surface_unsafe(raw::SurfaceTargetUnsafe::CoreAnimationLayer(layer))
+        }
+        .map_err(|_| Error::SurfaceCreation)?;
+        Self::from_parts(
+            instance,
+            adapter,
+            context,
+            surface,
+            width,
+            height,
+            transparent,
+        )
+    }
+
+    fn from_parts(
+        instance: raw::Instance,
+        adapter: &raw::Adapter,
+        context: Context,
+        surface: raw::Surface<'static>,
+        width: u32,
+        height: u32,
+        transparent: bool,
+    ) -> Result<Self> {
+        let capabilities = surface.get_capabilities(adapter);
         let format = select_surface_format(&capabilities.formats).ok_or(Error::SurfaceCreation)?;
         let alpha_mode = select_surface_alpha_mode(&capabilities.alpha_modes, transparent)
             .ok_or(Error::SurfaceCreation)?;
@@ -506,8 +568,6 @@ impl WindowContext {
             alpha_mode,
             view_formats: Vec::new(),
         };
-        let device = Device::new(device, queue);
-        let context = device.create_context();
         surface.configure(context.raw_device(), &config);
         let sampler = context
             .raw_device()
@@ -580,6 +640,17 @@ impl WindowContext {
     /// Success after the surface frame is submitted and presented.
     pub fn present(&mut self, session: &MappedTargetSession, target: TextureId) -> Result<()> {
         let image = session.image(target)?;
+        self.present_image(image)
+    }
+
+    /// Present a physical SGFX image created by this context.
+    pub fn present_image(&mut self, image: &Image) -> Result<()> {
+        if !Arc::ptr_eq(&self.context.device.identity, &image.device_identity)
+            || image.width() != self.config.width
+            || image.height() != self.config.height
+        {
+            return Err(Error::InvalidState);
+        }
         let frame = self
             .surface
             .get_current_texture()
@@ -763,6 +834,12 @@ impl Resources {
             self.mapped_images.push((texture, Arc::clone(&image.gpu)));
         }
         Ok(())
+    }
+
+    /// Remove a physical presentation mapping for a logical texture.
+    pub fn unmap_image(&mut self, texture: TextureId) {
+        self.mapped_images
+            .retain(|(candidate, _)| *candidate != texture);
     }
 
     fn texture(&mut self, reference: TextureRef<'_>) -> Result<Arc<GpuTexture>> {

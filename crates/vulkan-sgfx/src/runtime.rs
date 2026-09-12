@@ -21,7 +21,7 @@ pub(crate) fn backend_failure(error: BackendError) -> ash::vk::Result {
 pub(crate) struct Runtime {
     pub table: Rc<ir::ResourceTable>,
     pub resources: Resources,
-    device: driver::Device,
+    pub(crate) device: driver::Device,
 
     pub cache: driver::Resources,
     pub queue: driver::Queue,
