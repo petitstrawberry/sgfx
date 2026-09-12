@@ -67,7 +67,9 @@ const VIRGL_FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const VIRGL_FORMAT_Z32_FLOAT: u32 = 18;
 const VIRGL_FORMAT_R32G32B32A32_FLOAT: u32 = 31;
 const VIRGL_FORMAT_R32G32_FLOAT: u32 = 29;
+#[cfg(feature = "programmable")]
 const VIRGL_FORMAT_R32G32B32_FLOAT: u32 = 30;
+#[cfg(feature = "programmable")]
 const VIRGL_FORMAT_R8G8B8A8_UNORM: u32 = 67;
 const PIPE_SHADER_VERTEX: u32 = 0;
 const PIPE_SHADER_FRAGMENT: u32 = 1;
@@ -3193,26 +3195,35 @@ fn push_programmable_pipeline(
     commands: &mut Vec<u8>,
     pipeline: &IrNativeProgrammablePipeline,
 ) -> HandleResult<()> {
-    let description = &pipeline.description;
-    push_programmable_shader(
-        commands,
-        pipeline.vertex_shader_handle,
-        PIPE_SHADER_VERTEX,
-        &description.vertex.tgsi,
-    )?;
-    push_programmable_shader(
-        commands,
-        pipeline.fragment_shader_handle,
-        PIPE_SHADER_FRAGMENT,
-        &description.fragment.tgsi,
-    )?;
-    push_programmable_vertex_elements(
-        commands,
-        pipeline.vertex_elements_handle,
-        description.vertex_buffer.as_ref(),
-    )
+    #[cfg(not(feature = "programmable"))]
+    {
+        let _ = (commands, pipeline);
+        return Err(HandleError::Unsupported);
+    }
+    #[cfg(feature = "programmable")]
+    {
+        let description = &pipeline.description;
+        push_programmable_shader(
+            commands,
+            pipeline.vertex_shader_handle,
+            PIPE_SHADER_VERTEX,
+            &description.vertex.tgsi,
+        )?;
+        push_programmable_shader(
+            commands,
+            pipeline.fragment_shader_handle,
+            PIPE_SHADER_FRAGMENT,
+            &description.fragment.tgsi,
+        )?;
+        push_programmable_vertex_elements(
+            commands,
+            pipeline.vertex_elements_handle,
+            description.vertex_buffer.as_ref(),
+        )
+    }
 }
 
+#[cfg(feature = "programmable")]
 fn push_programmable_shader(
     commands: &mut Vec<u8>,
     handle: u32,
@@ -3229,6 +3240,7 @@ fn push_programmable_shader(
     Ok(())
 }
 
+#[cfg(feature = "programmable")]
 fn push_programmable_vertex_elements(
     commands: &mut Vec<u8>,
     handle: u32,

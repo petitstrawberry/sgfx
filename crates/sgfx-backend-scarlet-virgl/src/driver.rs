@@ -643,7 +643,9 @@ pub(crate) struct IrDraw {
 /// Immutable compiled stages and vertex-fetch layout for one programmable pipeline.
 pub(crate) struct IrProgrammablePipeline {
     pub(crate) slot: usize,
+    #[cfg(feature = "programmable")]
     pub(crate) vertex: sgfx_codegen_virgl::programmable::CompiledShader,
+    #[cfg(feature = "programmable")]
     pub(crate) fragment: sgfx_codegen_virgl::programmable::CompiledShader,
     pub(crate) vertex_buffer: Option<crate::ir::VertexBufferLayout>,
 }

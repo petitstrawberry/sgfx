@@ -58,7 +58,7 @@ mod scheduler;
 mod virgl;
 
 pub use completion::Submission;
-pub use ir_execute::{IrResources, IrSubmitError, UnsupportedIrFeature};
+pub use ir_execute::{IrResources, IrSubmitError, ShaderCompileError, UnsupportedIrFeature};
 
 /// Device capabilities expressed in application rendering terms.
 #[derive(Debug, Clone, Copy)]
@@ -105,7 +105,7 @@ impl Capabilities {
     /// Return whether the compiled VirGL backend can lower programmable
     /// vertex and fragment stages for this device.
     pub const fn supports_programmable_graphics(&self) -> bool {
-        self.rendering
+        self.rendering && cfg!(feature = "programmable")
     }
 
     /// Return whether render-target images can be presented to a display.

@@ -1,10 +1,19 @@
 //! Validation and lowering for the native programmable graphics subset.
 
 use super::*;
+#[cfg(feature = "programmable")]
 use sgfx_codegen_virgl::programmable::{compile_shader, validate_shader_module};
+
+#[cfg(feature = "programmable")]
+pub use sgfx_codegen_virgl::programmable::ShaderCompileError;
+
+#[cfg(not(feature = "programmable"))]
+#[derive(Debug)]
+pub enum ShaderCompileError {}
 
 impl IrResources {
     /// Parse and semantically validate a shader before admitting its handle.
+    #[cfg(feature = "programmable")]
     pub fn validate_shader_module(&self, id: ir::ShaderModuleId) -> Result<(), IrSubmitError> {
         let module = self
             .resources
@@ -12,12 +21,36 @@ impl IrResources {
         validate_shader_module(&module).map_err(IrSubmitError::ShaderCompile)
     }
 
+    /// Reject programmable shader modules when runtime translation is omitted.
+    #[cfg(not(feature = "programmable"))]
+    pub fn validate_shader_module(&self, id: ir::ShaderModuleId) -> Result<(), IrSubmitError> {
+        self.resources
+            .shader_module(self.resources.shader_module_ref(id)?)?;
+        Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::ProgrammableExecution,
+        ))
+    }
+
     /// Compile both stages and validate the supported native graphics state.
+    #[cfg(feature = "programmable")]
     pub fn validate_programmable_render_pipeline(
         &self,
         id: ir::ProgrammableRenderPipelineId,
     ) -> Result<(), IrSubmitError> {
         self.compiled_pipeline(id).map(|_| ())
+    }
+
+    /// Reject programmable pipelines when runtime translation is omitted.
+    #[cfg(not(feature = "programmable"))]
+    pub fn validate_programmable_render_pipeline(
+        &self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.resources
+            .programmable_render_pipeline(self.resources.programmable_render_pipeline_ref(id)?)?;
+        Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::ProgrammableExecution,
+        ))
     }
 
     /// Compute execution is not implemented by this native backend.
@@ -63,6 +96,7 @@ impl IrResources {
         Ok(output)
     }
 
+    #[cfg(feature = "programmable")]
     pub(super) fn compiled_pipeline(
         &self,
         id: ir::ProgrammableRenderPipelineId,
@@ -83,8 +117,21 @@ impl IrResources {
         cache.push((id, Rc::clone(&compiled)));
         Ok(compiled)
     }
+
+    #[cfg(not(feature = "programmable"))]
+    pub(super) fn compiled_pipeline(
+        &self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
+        self.resources
+            .programmable_render_pipeline(self.resources.programmable_render_pipeline_ref(id)?)?;
+        Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::ProgrammableExecution,
+        ))
+    }
 }
 
+#[cfg(feature = "programmable")]
 fn compile_pipeline(
     resources: &ResourceTable,
     id: ir::ProgrammableRenderPipelineId,
@@ -300,6 +347,7 @@ pub(super) fn validate_barrier(barrier: ir::ResourceBarrier<'_>) -> Result<(), I
     }
 }
 
+#[cfg(feature = "programmable")]
 fn buffer_spec(
     resources: &IrResources,
     pending: &PendingBuffers,
@@ -322,6 +370,7 @@ fn buffer_spec(
     })
 }
 
+#[cfg(feature = "programmable")]
 pub(super) fn decode_draw(
     resources: &IrResources,
     pending: &PendingBuffers,
@@ -519,7 +568,21 @@ pub(super) fn decode_draw(
     })
 }
 
-#[cfg(test)]
+#[cfg(not(feature = "programmable"))]
+pub(super) fn decode_draw(
+    _resources: &IrResources,
+    _pending: &PendingBuffers,
+    _pass: &ActivePass<'_>,
+    _first: u32,
+    _count: u32,
+    _base_vertex: Option<i32>,
+) -> Result<IrDraw, IrSubmitError> {
+    Err(IrSubmitError::Unsupported(
+        UnsupportedIrFeature::ProgrammableExecution,
+    ))
+}
+
+#[cfg(all(test, feature = "programmable"))]
 mod tests {
     use super::*;
     use alloc::vec;

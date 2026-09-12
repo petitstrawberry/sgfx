@@ -1,9 +1,11 @@
 //! Ordered lowering of portable logical IR to the Scarlet VirGL adapter.
 
 use alloc::{rc::Rc, vec::Vec};
+#[cfg(feature = "programmable")]
 use core::cell::RefCell;
 #[path = "programmable.rs"]
 mod programmable;
+pub use programmable::ShaderCompileError;
 use sgfx_core::backend::SubmitError;
 
 use crate::completion::SubmitMode;
@@ -88,7 +90,7 @@ pub enum IrSubmitError {
     /// A logical resource reference or descriptor failed validation.
     InvalidIr(ir::Error),
     /// A shader could not be validated or lowered to the supported native subset.
-    ShaderCompile(sgfx_codegen_virgl::programmable::ShaderCompileError),
+    ShaderCompile(ShaderCompileError),
     /// The command buffer and resource cache use different resource tables.
     ResourceTableMismatch,
     /// A context or queue differs from the context that created the resource cache.
@@ -147,6 +149,7 @@ pub struct IrResources {
     buffer_revisions: Vec<u64>,
     canonical_buffer_revisions: Vec<Option<u64>>,
     submission_failed: bool,
+    #[cfg(feature = "programmable")]
     programmable_pipelines: RefCell<
         Vec<(
             ir::ProgrammableRenderPipelineId,
@@ -196,6 +199,7 @@ impl IrResources {
             buffer_revisions,
             canonical_buffer_revisions,
             submission_failed: false,
+            #[cfg(feature = "programmable")]
             programmable_pipelines: RefCell::new(Vec::new()),
         })
     }
