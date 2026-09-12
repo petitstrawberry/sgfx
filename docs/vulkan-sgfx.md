@@ -104,16 +104,18 @@ hundreds of distinct colors, and both bright and dark regions before saving.
 The script requires a repository-compatible Rust toolchain (`cargo` and
 `rustc`), Python 3, and an installed Vulkan loader. It searches ordinary system,
 Homebrew, Vulkan SDK, and installed Nix loader paths without installing anything.
-Set `SGFX_VULKAN_LOADER=/absolute/path/to/libvulkan` to override discovery.
+Use the platform dynamic-library search path when the loader is installed in a
+nonstandard location.
 The script selects the Rust host target explicitly so a Scarlet cross-target
 configuration does not affect the demo. On Linux it selects Mesa llvmpipe with
 surfaceless EGL to avoid GL-to-Vulkan recursion through Zink.
 
-The console identifies the loader, manifest, selected SGFX physical device,
-readback checks, and absolute PNG path. The example refuses another ICD. The
-PNG encoder performs lossless encoding only; no image generator, CPU renderer,
-or composited visual overlay is involved. `render_demo` also accepts an explicit
-PNG path when run directly with `SGFX_VULKAN_LOADER` and `VK_DRIVER_FILES` set.
+The console identifies the selected physical device, readback checks, and
+absolute PNG path. The PNG encoder performs lossless encoding only; no image
+generator, CPU renderer, or composited visual overlay is involved. `render_demo`
+is an ordinary Vulkan application and contains no SGFX-specific loader or ICD
+selection. The runner selects the freshly built ICD externally with the standard
+`VK_DRIVER_FILES` loader setting.
 
 ## Run the examples
 

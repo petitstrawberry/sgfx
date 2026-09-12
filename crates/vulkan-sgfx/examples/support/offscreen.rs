@@ -57,7 +57,7 @@ pub fn render(
     let buffer_bytes = width as vk::DeviceSize * height as vk::DeviceSize * 4;
     unsafe {
         let application = vk::ApplicationInfo::default()
-            .application_name(c"sgfx-offscreen-smoke")
+            .application_name(c"Vulkan offscreen demo")
             .api_version(vk::API_VERSION_1_0);
         let instance = entry.create_instance(
             &vk::InstanceCreateInfo::default().application_info(&application),
@@ -80,12 +80,6 @@ pub fn render(
             .ok_or("no Vulkan graphics queue is available")?;
         let properties = instance.get_physical_device_properties(physical_device);
         let name = std::ffi::CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy();
-        if !name.starts_with("SGFX Vulkan (") {
-            instance.destroy_instance(None);
-            return Err(
-                format!("expected the SGFX ICD, selected {name}; check VK_DRIVER_FILES").into(),
-            );
-        }
         println!("Vulkan physical device: {name}");
         let queue_priorities = [1.0];
         let queue_info = [vk::DeviceQueueCreateInfo::default()

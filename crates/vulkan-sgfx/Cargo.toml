@@ -35,6 +35,7 @@ png = "0.18"
 naga = { version = "24", features = ["wgsl-in", "spv-out"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dev-dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
 libloading = "0.8"
 
 [lints.rust]

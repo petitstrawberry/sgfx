@@ -19,7 +19,7 @@ done
 case $(uname -s) in
     Darwin)
         library_name=libvulkan_sgfx.dylib
-        loader_name=libvulkan.1.dylib
+        loader_name=libvulkan.dylib
         candidates="/opt/homebrew/lib/$loader_name /usr/local/lib/$loader_name"
         ;;
     Linux)
@@ -31,24 +31,27 @@ case $(uname -s) in
         ;;
     *) echo "This demo runner supports macOS and Linux." >&2; exit 1 ;;
 esac
-if [ -z "${SGFX_VULKAN_LOADER:-}" ]; then
-    if [ -n "${VULKAN_SDK:-}" ] && [ -f "$VULKAN_SDK/lib/$loader_name" ]; then
-        SGFX_VULKAN_LOADER=$VULKAN_SDK/lib/$loader_name
-    else
-        # Ordinary system paths above contain no whitespace; quote every use.
-        for candidate in $candidates /nix/store/*-vulkan-loader-*/lib/"$loader_name"; do
-            if [ -f "$candidate" ]; then
-                SGFX_VULKAN_LOADER=$candidate
-                break
-            fi
-        done
-    fi
+loader_path=
+if [ -n "${VULKAN_SDK:-}" ] && [ -f "$VULKAN_SDK/lib/$loader_name" ]; then
+    loader_path=$VULKAN_SDK/lib/$loader_name
+else
+    # Ordinary system paths above contain no whitespace; quote every use.
+    for candidate in $candidates /nix/store/*-vulkan-loader-*/lib/"$loader_name"; do
+        if [ -f "$candidate" ]; then
+            loader_path=$candidate
+            break
+        fi
+    done
 fi
-if [ -z "${SGFX_VULKAN_LOADER:-}" ] || [ ! -f "$SGFX_VULKAN_LOADER" ]; then
-    echo "A Vulkan loader was not found. Set SGFX_VULKAN_LOADER to its library path." >&2
+if [ -z "$loader_path" ]; then
+    echo "A Vulkan loader was not found on the standard paths or in VULKAN_SDK." >&2
     exit 1
 fi
-export SGFX_VULKAN_LOADER
+loader_dir=$(dirname "$loader_path")
+case $(uname -s) in
+    Darwin) export DYLD_LIBRARY_PATH="$loader_dir${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
+    Linux) export LD_LIBRARY_PATH="$loader_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+esac
 host_target=$(rustc -vV | sed -n 's/^host: //p')
 if [ -z "$host_target" ]; then
     echo "Could not determine the Rust host target." >&2

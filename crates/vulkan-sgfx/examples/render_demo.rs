@@ -1,8 +1,9 @@
-//! Save actual SGFX Vulkan rendering to an explicitly selected PNG path.
+//! Save Vulkan offscreen rendering to an explicitly selected PNG path.
 //!
 //! `scripts/run-vulkan-demo.sh target/vulkan-demo.png` builds a fresh ICD,
-//! discovers a real Khronos loader and configures its driver manifest.
-use ash::{Entry, vk};
+//! then configures the standard Vulkan loader externally through its driver
+//! manifest. This application only uses the public Vulkan API.
+use ash::Entry;
 use std::{collections::HashSet, error::Error, fs::File, io::BufWriter, path::PathBuf};
 
 #[path = "support/offscreen.rs"]
@@ -22,11 +23,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         std::env::current_dir()?.join(output)
     };
-    let loader = PathBuf::from(std::env::var_os("SGFX_VULKAN_LOADER").ok_or(
-        "SGFX_VULKAN_LOADER must select a real Vulkan loader; use scripts/run-vulkan-demo.sh",
-    )?);
-    let manifest = std::env::var_os("VK_DRIVER_FILES")
-        .ok_or("VK_DRIVER_FILES must select the freshly built SGFX ICD manifest")?;
     let vertex = render::shader_words(
         include_str!("assets/demo.wgsl"),
         naga::ShaderStage::Vertex,
@@ -38,17 +34,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         "fs_main",
     )?;
 
-    // The loader and its dispatch tables outlive every Vulkan object below.
-    let library = unsafe { libloading::Library::new(&loader)? };
-    let get_instance_proc_addr =
-        unsafe { *library.get::<vk::PFN_vkGetInstanceProcAddr>(b"vkGetInstanceProcAddr\0")? };
-    let entry = unsafe {
-        Entry::from_static_fn(ash::StaticFn {
-            get_instance_proc_addr,
-        })
-    };
-    println!("Vulkan loader: {}", loader.display());
-    println!("ICD manifest: {}", PathBuf::from(manifest).display());
+    // This is the same platform Vulkan-loader lookup used by an ordinary Ash
+    // application. Driver selection, when needed, is external to this process.
+    let entry = unsafe { Entry::load()? };
     let pixels = render::render(
         &entry,
         &vertex,
@@ -66,10 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
-    encoder.add_text_chunk(
-        "Software".into(),
-        "vulkan-sgfx / actual GPU readback".into(),
-    )?;
+    encoder.add_text_chunk("Software".into(), "Vulkan offscreen render demo".into())?;
     let mut writer = encoder.write_header()?;
     writer.write_image_data(&pixels)?;
     writer.finish()?;
