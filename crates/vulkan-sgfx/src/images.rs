@@ -1,7 +1,7 @@
 //! Bounded offscreen color/depth attachments and graphics pipeline state.
 
 use ash::vk::{self, Handle};
-use sgfx_core::ir;
+use sgfx::ir;
 use std::ffi::CStr;
 
 use crate::api::{next_id, with_device};

@@ -22,6 +22,13 @@ use core::fmt;
 
 pub use sgfx_core::{backend, ir};
 
+/// Backend-neutral adapter, device, resource, queue, and completion facade.
+#[cfg(any(
+    all(not(target_os = "scarlet"), feature = "backend-wgpu"),
+    all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+))]
+pub mod driver;
+
 #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
 mod host;
 #[cfg(all(
@@ -140,6 +147,8 @@ pub enum Error {
     InvalidBackendPreference,
     /// The requested backend was not compiled for this target.
     BackendUnavailable(BackendKind),
+    /// A resource cache and queue were created by different devices.
+    ResourceDeviceMismatch,
     /// WGPU initialization, materialization, execution, or presentation failed.
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     Wgpu(sgfx_backend_wgpu::Error),
@@ -175,7 +184,107 @@ pub enum Error {
     ScarletAdrenoIr(sgfx_backend_scarlet_adreno::IrSubmitError),
 }
 
+/// Backend-neutral failure category for API frontends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// A descriptor, handle relationship, or command was invalid.
+    InvalidInput,
+    /// The selected complete backend cannot represent the requested feature.
+    Unsupported,
+    /// Host-side allocation failed.
+    OutOfHostMemory,
+    /// A device limit or device-side allocation was exhausted.
+    OutOfDeviceMemory,
+    /// Adapter or device initialization could not be completed.
+    InitializationFailed,
+    /// Accepted work or completion can no longer be trusted.
+    DeviceLost,
+}
+
 impl Error {
+    /// Classify this failure without exposing a concrete backend to a frontend.
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::InvalidBackendPreference | Self::ResourceDeviceMismatch => {
+                ErrorKind::InvalidInput
+            }
+            Self::BackendUnavailable(_) => ErrorKind::InitializationFailed,
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            Self::Wgpu(error) => {
+                use sgfx_backend_wgpu::Error as E;
+                match error {
+                    E::InvalidIr(error) => ir_error_kind(*error),
+                    E::ResourceTableMismatch | E::ImageNotMapped | E::ImageAlreadyMapped => {
+                        ErrorKind::InvalidInput
+                    }
+                    E::Unsupported(_) | E::Validation(_) => ErrorKind::Unsupported,
+                    E::AdapterUnavailable | E::DeviceRequest | E::SurfaceCreation => {
+                        ErrorKind::InitializationFailed
+                    }
+                    E::InvalidState
+                    | E::SurfaceAcquire
+                    | E::DeviceLost
+                    | E::CompletionObservation => ErrorKind::DeviceLost,
+                }
+            }
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            Self::ScarletVirglHandle(error) => virgl_handle_error_kind(*error),
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            Self::ScarletVirglIr(error) => {
+                use sgfx_backend_scarlet_virgl::IrSubmitError as E;
+                match error {
+                    E::InvalidIr(error) => ir_error_kind(*error),
+                    E::ResourceTableMismatch
+                    | E::ContextMismatch
+                    | E::TargetExtentMismatch
+                    | E::ImageNotMapped
+                    | E::TextureAlreadyMapped
+                    | E::ImageAlreadyMapped
+                    | E::InvalidVertexData => ErrorKind::InvalidInput,
+                    E::OutOfMemory => ErrorKind::OutOfHostMemory,
+                    E::SubmissionTooLarge => ErrorKind::OutOfDeviceMemory,
+                    E::Unsupported(_) | E::ShaderCompile(_) => ErrorKind::Unsupported,
+                    E::Backend(error) => virgl_handle_error_kind(*error),
+                    E::CompletionFailed(_) | E::CompletionUnavailable | E::SubmissionFailed => {
+                        ErrorKind::DeviceLost
+                    }
+                }
+            }
+            #[cfg(all(
+                target_os = "scarlet",
+                any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
+            ))]
+            Self::ScarletGpu | Self::BackendDeviceMismatch(_) => ErrorKind::InitializationFailed,
+            #[cfg(all(
+                target_os = "scarlet",
+                any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
+            ))]
+            Self::ScarletBackendUnsupported => ErrorKind::Unsupported,
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+            Self::ScarletAdrenoHandle(error) => adreno_handle_error_kind(*error),
+            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+            Self::ScarletAdrenoIr(error) => {
+                use sgfx_backend_scarlet_adreno::IrSubmitError as E;
+                match error {
+                    E::InvalidIr(error) => ir_error_kind(*error),
+                    E::ResourceTableMismatch
+                    | E::ContextMismatch
+                    | E::TargetExtentMismatch
+                    | E::ImageNotMapped
+                    | E::TextureAlreadyMapped
+                    | E::ImageAlreadyMapped => ErrorKind::InvalidInput,
+                    E::OutOfMemory => ErrorKind::OutOfHostMemory,
+                    E::SubmissionTooLarge => ErrorKind::OutOfDeviceMemory,
+                    E::Unsupported(_) | E::Codegen(_) | E::SubmitWire(_) | E::AsyncUnsupported => {
+                        ErrorKind::Unsupported
+                    }
+                    E::Backend(error) => adreno_handle_error_kind(*error),
+                    E::CompletionUnavailable | E::CompletionFailed(_) => ErrorKind::DeviceLost,
+                }
+            }
+        }
+    }
+
     /// Whether a side-effect-free rejection permits continued use of the executor.
     ///
     /// # Returns
@@ -251,6 +360,40 @@ impl Error {
     }
 }
 
+fn ir_error_kind(error: ir::Error) -> ErrorKind {
+    match error {
+        ir::Error::OutOfMemory => ErrorKind::OutOfHostMemory,
+        ir::Error::ResourceLimitExceeded | ir::Error::CommandLimitExceeded => {
+            ErrorKind::OutOfDeviceMemory
+        }
+        _ => ErrorKind::InvalidInput,
+    }
+}
+
+#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+fn virgl_handle_error_kind(error: sgfx_backend_scarlet_virgl::HandleError) -> ErrorKind {
+    use sgfx_backend_scarlet_virgl::HandleError as E;
+    match error {
+        E::InvalidParameter | E::InvalidHandle => ErrorKind::InvalidInput,
+        E::Unsupported => ErrorKind::Unsupported,
+        E::OutOfResources => ErrorKind::OutOfDeviceMemory,
+        E::NotFound => ErrorKind::InitializationFailed,
+        E::PermissionDenied | E::SystemError(_) => ErrorKind::DeviceLost,
+    }
+}
+
+#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+fn adreno_handle_error_kind(error: sgfx_backend_scarlet_adreno::HandleError) -> ErrorKind {
+    use sgfx_backend_scarlet_adreno::HandleError as E;
+    match error {
+        E::InvalidParameter | E::InvalidHandle => ErrorKind::InvalidInput,
+        E::Unsupported => ErrorKind::Unsupported,
+        E::OutOfResources => ErrorKind::OutOfDeviceMemory,
+        E::NotFound => ErrorKind::InitializationFailed,
+        E::PermissionDenied | E::SystemError(_) => ErrorKind::DeviceLost,
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -259,6 +402,9 @@ impl fmt::Display for Error {
             }
             Self::BackendUnavailable(backend) => {
                 write!(formatter, "SGFX backend {backend} is unavailable")
+            }
+            Self::ResourceDeviceMismatch => {
+                formatter.write_str("SGFX resource cache and queue belong to different devices")
             }
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
             Self::Wgpu(error) => write!(formatter, "SGFX WGPU backend failed: {error}"),

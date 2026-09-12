@@ -15,10 +15,3 @@ default-members = [
     "crates/sgfx-backend-wgpu",
     "crates/vulkan-sgfx",
 ]
-
-# Only for development in this workspace: the external Adreno backend imports
-# our core through Git, while workspace crates use path dependencies. Both must
-# use this checkout's IR types. Consumers use the Git source throughout and do
-# not need this override (dependency-level patches are not inherited).
-[patch."https://github.com/petitstrawberry/sgfx"]
-sgfx-core = { path = "crates/sgfx-core" }

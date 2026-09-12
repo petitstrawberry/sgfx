@@ -1,6 +1,6 @@
 //! Host-visible Vulkan resources and their portable SGFX identities.
 use ash::vk::{self, Handle};
-use sgfx_core::ir;
+use sgfx::ir;
 use std::{
     collections::HashMap,
     ffi::{CStr, c_void},

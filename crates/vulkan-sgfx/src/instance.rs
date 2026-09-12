@@ -4,14 +4,14 @@
 //! features, extensions, formats, and image configurations are never advertised.
 
 use ash::vk::{self, Handle};
+use sgfx::driver::{Adapter, DeviceType};
 use std::cell::UnsafeCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const LOADER_MAGIC: usize = 0x01cd_c0de;
-const MAX_IMAGE_DIMENSION: u32 = 2048;
 const MEMORY_HEAP_SIZE: u64 = 256 * 1024 * 1024;
 
 // The loader replaces this first word with its own dispatch table pointer.
@@ -27,19 +27,23 @@ struct PhysicalObject {
 
 struct InstanceRecord {
     _instance: Box<InstanceObject>,
-    physical: Box<PhysicalObject>,
+    physical_devices: Vec<PhysicalRecord>,
 }
 
-impl InstanceRecord {
-    fn physical_id(&self) -> usize {
-        std::ptr::from_ref(self.physical.as_ref()) as usize
+struct PhysicalRecord {
+    object: Box<PhysicalObject>,
+}
+
+impl PhysicalRecord {
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self.object.as_ref()) as usize
     }
 }
 
 #[derive(Default)]
 struct Instances {
     instances: HashMap<usize, InstanceRecord>,
-    physical_devices: HashSet<usize>,
+    physical_devices: HashMap<usize, Adapter>,
 }
 
 fn instances() -> MutexGuard<'static, Instances> {
@@ -56,7 +60,14 @@ static LOADER_INTERFACE: AtomicU32 = AtomicU32::new(1);
 pub(crate) fn physical_valid(physical: vk::PhysicalDevice) -> bool {
     instances()
         .physical_devices
-        .contains(&(physical.as_raw() as usize))
+        .contains_key(&(physical.as_raw() as usize))
+}
+
+pub(crate) fn physical_adapter(physical: vk::PhysicalDevice) -> Option<Adapter> {
+    instances()
+        .physical_devices
+        .get(&(physical.as_raw() as usize))
+        .cloned()
 }
 
 /// Negotiate a loader interface with dispatchable-object initialization support.
@@ -227,19 +238,35 @@ pub(crate) unsafe extern "system" fn create_instance(
             return vk::Result::ERROR_INCOMPATIBLE_DRIVER;
         }
     }
+    let sgfx_instance = match sgfx::driver::Instance::new() {
+        Ok(instance) => instance,
+        Err(_) => return vk::Result::ERROR_INITIALIZATION_FAILED,
+    };
     let instance = Box::new(InstanceObject {
         loader_word: UnsafeCell::new(LOADER_MAGIC),
     });
-    let physical = Box::new(PhysicalObject {
-        loader_word: UnsafeCell::new(LOADER_MAGIC),
-    });
     let instance_id = std::ptr::from_ref(instance.as_ref()) as usize;
+    let physical_devices: Vec<_> = sgfx_instance
+        .adapters()
+        .iter()
+        .map(|_| PhysicalRecord {
+            object: Box::new(PhysicalObject {
+                loader_word: UnsafeCell::new(LOADER_MAGIC),
+            }),
+        })
+        .collect();
     let record = InstanceRecord {
         _instance: instance,
-        physical,
+        physical_devices,
     };
     let mut registry = instances();
-    registry.physical_devices.insert(record.physical_id());
+    for (physical, adapter) in record
+        .physical_devices
+        .iter()
+        .zip(sgfx_instance.adapters().iter().cloned())
+    {
+        registry.physical_devices.insert(physical.id(), adapter);
+    }
     registry.instances.insert(instance_id, record);
     unsafe { *output = vk::Instance::from_raw(instance_id as u64) };
     vk::Result::SUCCESS
@@ -251,7 +278,9 @@ pub(crate) unsafe extern "system" fn destroy_instance(
 ) {
     let mut registry = instances();
     if let Some(record) = registry.instances.remove(&(instance.as_raw() as usize)) {
-        registry.physical_devices.remove(&record.physical_id());
+        for physical in &record.physical_devices {
+            registry.physical_devices.remove(&physical.id());
+        }
     }
 }
 
@@ -268,18 +297,24 @@ pub(crate) unsafe extern "system" fn enumerate_physical_devices(
         unsafe { *count = 0 };
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
+    let available = record.physical_devices.len();
     if output.is_null() {
-        unsafe { *count = 1 };
+        unsafe { *count = available as u32 };
         return vk::Result::SUCCESS;
     }
-    if unsafe { *count } == 0 {
-        return vk::Result::INCOMPLETE;
+    let capacity = unsafe { *count } as usize;
+    let written = capacity.min(available);
+    for (index, physical) in record.physical_devices.iter().take(written).enumerate() {
+        unsafe {
+            *output.add(index) = vk::PhysicalDevice::from_raw(physical.id() as u64);
+        }
     }
-    unsafe {
-        *output = vk::PhysicalDevice::from_raw(record.physical_id() as u64);
-        *count = 1;
+    unsafe { *count = written as u32 };
+    if written < available {
+        vk::Result::INCOMPLETE
+    } else {
+        vk::Result::SUCCESS
     }
-    vk::Result::SUCCESS
 }
 
 unsafe extern "system" fn enumerate_instance_extension_properties(
@@ -348,81 +383,125 @@ unsafe extern "system" fn get_physical_device_properties(
         return;
     }
     let mut properties = vk::PhysicalDeviceProperties::default();
-    if physical_valid(physical) {
+    if let Some(adapter) = physical_adapter(physical) {
+        let info = adapter.info();
+        let capabilities = adapter.capabilities();
+        let limits = capabilities.limits();
         properties.api_version = vk::API_VERSION_1_0;
         properties.driver_version = vk::make_api_version(0, 0, 1, 0);
-        properties.device_type = vk::PhysicalDeviceType::VIRTUAL_GPU;
-        for (slot, byte) in properties.device_name.iter_mut().zip(
-            b"SGFX headless (experimental, non-conformant)\0"
-                .iter()
-                .copied(),
-        ) {
+        properties.vendor_id = info.vendor_id();
+        properties.device_id = info.device_id();
+        properties.device_type = match info.device_type() {
+            DeviceType::Integrated => vk::PhysicalDeviceType::INTEGRATED_GPU,
+            DeviceType::Discrete => vk::PhysicalDeviceType::DISCRETE_GPU,
+            DeviceType::Cpu => vk::PhysicalDeviceType::CPU,
+            DeviceType::Virtual => vk::PhysicalDeviceType::VIRTUAL_GPU,
+            DeviceType::Other => vk::PhysicalDeviceType::OTHER,
+        };
+        let name = format!("SGFX Vulkan ({})", info.name());
+        let name_capacity = properties.device_name.len().saturating_sub(1);
+        for (slot, byte) in properties
+            .device_name
+            .iter_mut()
+            .take(name_capacity)
+            .zip(name.bytes())
+        {
             *slot = byte as c_char;
         }
         properties.pipeline_cache_uuid = *b"sgfx-headless-v1";
-        // Limits are for the implemented subset. Unsupported core facilities
-        // retain zero limits; this device deliberately does not claim conformance.
+        let storage_buffers = capabilities.supports_storage_buffers();
+        let compute = capabilities.supports_compute();
+        let graphics = capabilities.supports_graphics();
         properties.limits = vk::PhysicalDeviceLimits {
-            max_image_dimension2_d: MAX_IMAGE_DIMENSION,
+            max_image_dimension2_d: limits.max_image_dimension_2d,
             max_image_array_layers: 1,
-            max_uniform_buffer_range: 16 * 1024,
-            max_storage_buffer_range: if cfg!(target_os = "scarlet") {
-                0
+            max_uniform_buffer_range: limits.max_uniform_buffer_range,
+            max_storage_buffer_range: if storage_buffers {
+                limits.max_storage_buffer_range
             } else {
-                128 * 1024 * 1024
+                0
             },
             max_memory_allocation_count: 1024,
             buffer_image_granularity: 256,
-            max_bound_descriptor_sets: 4,
-            max_per_stage_descriptor_uniform_buffers: 12,
-            max_per_stage_descriptor_storage_buffers: if cfg!(target_os = "scarlet") {
-                0
+            max_bound_descriptor_sets: limits.max_bound_descriptor_sets,
+            max_per_stage_descriptor_uniform_buffers: limits.max_uniform_buffers_per_stage,
+            max_per_stage_descriptor_storage_buffers: if storage_buffers {
+                limits.max_storage_buffers_per_stage
             } else {
-                4
+                0
             },
-            max_per_stage_resources: 16,
-            max_descriptor_set_uniform_buffers: 12,
-            max_descriptor_set_storage_buffers: if cfg!(target_os = "scarlet") { 0 } else { 4 },
-            max_vertex_input_attributes: 16,
-            max_vertex_input_bindings: 1,
-            max_vertex_input_attribute_offset: 2047,
-            max_vertex_input_binding_stride: 2048,
+            max_per_stage_resources: limits
+                .max_uniform_buffers_per_stage
+                .saturating_add(limits.max_storage_buffers_per_stage)
+                .saturating_add(limits.max_color_attachments),
+            max_descriptor_set_uniform_buffers: limits.max_uniform_buffers_per_stage,
+            max_descriptor_set_storage_buffers: if storage_buffers {
+                limits.max_storage_buffers_per_stage
+            } else {
+                0
+            },
+            max_vertex_input_attributes: if graphics {
+                limits.max_vertex_attributes
+            } else {
+                0
+            },
+            max_vertex_input_bindings: if capabilities.supports_vertex_buffers() {
+                limits.max_vertex_buffers
+            } else {
+                0
+            },
+            max_vertex_input_attribute_offset: limits.max_vertex_buffer_stride.saturating_sub(1),
+            max_vertex_input_binding_stride: limits.max_vertex_buffer_stride,
             max_draw_indexed_index_value: u32::MAX,
-            max_vertex_output_components: 60,
-            max_fragment_input_components: 60,
-            max_fragment_output_attachments: 1,
-            max_fragment_combined_output_resources: if cfg!(target_os = "scarlet") { 1 } else { 4 },
-            max_compute_shared_memory_size: if cfg!(target_os = "scarlet") {
+            max_vertex_output_components: limits.max_inter_stage_components,
+            max_fragment_input_components: limits.max_inter_stage_components,
+            max_fragment_output_attachments: limits.max_color_attachments,
+            max_fragment_combined_output_resources: limits.max_color_attachments.saturating_add(
+                if storage_buffers {
+                    limits.max_storage_buffers_per_stage
+                } else {
+                    0
+                },
+            ),
+            max_compute_shared_memory_size: if compute {
+                limits.max_compute_shared_memory_size
+            } else {
                 0
-            } else {
-                16 * 1024
             },
-            max_compute_work_group_count: if cfg!(target_os = "scarlet") {
-                [0; 3]
+            max_compute_work_group_count: if compute {
+                limits.max_compute_work_group_count
             } else {
-                [65535; 3]
+                [0; 3]
             },
-            max_compute_work_group_invocations: if cfg!(target_os = "scarlet") { 0 } else { 256 },
-            max_compute_work_group_size: if cfg!(target_os = "scarlet") {
-                [0; 3]
+            max_compute_work_group_invocations: if compute {
+                limits.max_compute_work_group_invocations
             } else {
-                [256, 256, 64]
+                0
+            },
+            max_compute_work_group_size: if compute {
+                limits.max_compute_work_group_size
+            } else {
+                [0; 3]
             },
             sub_pixel_precision_bits: 4,
             sub_texel_precision_bits: 4,
             mipmap_precision_bits: 4,
             max_viewports: 1,
-            max_viewport_dimensions: [MAX_IMAGE_DIMENSION; 2],
+            max_viewport_dimensions: [limits.max_image_dimension_2d; 2],
             viewport_bounds_range: [-8192.0, 8191.0],
             min_memory_map_alignment: 8,
-            min_uniform_buffer_offset_alignment: 256,
-            min_storage_buffer_offset_alignment: 256,
-            max_framebuffer_width: MAX_IMAGE_DIMENSION,
-            max_framebuffer_height: MAX_IMAGE_DIMENSION,
+            min_uniform_buffer_offset_alignment: u64::from(
+                limits.min_uniform_buffer_offset_alignment,
+            ),
+            min_storage_buffer_offset_alignment: u64::from(
+                limits.min_storage_buffer_offset_alignment,
+            ),
+            max_framebuffer_width: limits.max_image_dimension_2d,
+            max_framebuffer_height: limits.max_image_dimension_2d,
             max_framebuffer_layers: 1,
             framebuffer_color_sample_counts: vk::SampleCountFlags::TYPE_1,
             framebuffer_depth_sample_counts: vk::SampleCountFlags::TYPE_1,
-            max_color_attachments: 1,
+            max_color_attachments: limits.max_color_attachments,
             max_sample_mask_words: 1,
             discrete_queue_priorities: 1,
             point_size_range: [1.0, 1.0],
@@ -469,22 +548,27 @@ unsafe extern "system" fn get_physical_device_queue_family_properties(
     if count.is_null() {
         return;
     }
-    if !physical_valid(physical) {
+    let Some(adapter) = physical_adapter(physical) else {
         unsafe { *count = 0 };
         return;
-    }
+    };
     if output.is_null() {
         unsafe { *count = 1 };
     } else if unsafe { *count } != 0 {
+        let capabilities = adapter.capabilities();
+        let mut queue_flags = vk::QueueFlags::empty();
+        if capabilities.supports_graphics() {
+            queue_flags |= vk::QueueFlags::GRAPHICS;
+        }
+        if capabilities.supports_compute() {
+            queue_flags |= vk::QueueFlags::COMPUTE;
+        }
+        if capabilities.supports_transfer() {
+            queue_flags |= vk::QueueFlags::TRANSFER;
+        }
         unsafe {
             *output = vk::QueueFamilyProperties {
-                queue_flags: vk::QueueFlags::GRAPHICS
-                    | if cfg!(target_os = "scarlet") {
-                        vk::QueueFlags::empty()
-                    } else {
-                        vk::QueueFlags::COMPUTE
-                    }
-                    | vk::QueueFlags::TRANSFER,
+                queue_flags,
                 queue_count: 1,
                 timestamp_valid_bits: 0,
                 min_image_transfer_granularity: vk::Extent3D {
@@ -507,15 +591,20 @@ unsafe extern "system" fn get_physical_device_format_properties(
         return;
     }
     let mut properties = vk::FormatProperties::default();
-    if physical_valid(physical) && format == vk::Format::R8G8B8A8_UNORM {
+    let Some(adapter) = physical_adapter(physical) else {
+        unsafe { *output = properties };
+        return;
+    };
+    let capabilities = adapter.capabilities();
+    if capabilities.supports_rgba8_color_attachment() && format == vk::Format::R8G8B8A8_UNORM {
         // In Vulkan 1.0, transfer support follows image-format support; the
         // TRANSFER_SRC/DST format-feature bits belong to maintenance1 / 1.1.
         properties.optimal_tiling_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT;
     }
-    if physical_valid(physical) && format == vk::Format::D32_SFLOAT {
+    if capabilities.supports_depth32_attachment() && format == vk::Format::D32_SFLOAT {
         properties.optimal_tiling_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT;
     }
-    if physical_valid(physical)
+    if capabilities.supports_vertex_buffers()
         && matches!(
             format,
             vk::Format::R32G32_SFLOAT
@@ -542,9 +631,26 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     unsafe { *output = vk::ImageFormatProperties::default() };
-    let supported_usage = crate::images::image_usage(format);
-    if !physical_valid(physical)
-        || supported_usage.is_empty()
+    let Some(adapter) = physical_adapter(physical) else {
+        return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
+    };
+    let capabilities = adapter.capabilities();
+    let mut supported_usage = crate::images::image_usage(format);
+    if format == vk::Format::R8G8B8A8_UNORM {
+        if !capabilities.supports_rgba8_color_attachment() {
+            supported_usage &= !vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if !capabilities.supports_image_readback() {
+            supported_usage &= !vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        if !capabilities.supports_transfer() {
+            supported_usage &=
+                !(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST);
+        }
+    } else if format == vk::Format::D32_SFLOAT && !capabilities.supports_depth32_attachment() {
+        supported_usage = vk::ImageUsageFlags::empty();
+    }
+    if supported_usage.is_empty()
         || image_type != vk::ImageType::TYPE_2D
         || tiling != vk::ImageTiling::OPTIMAL
         || !flags.is_empty()
@@ -554,16 +660,17 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
     }
     unsafe {
+        let max_dimension = capabilities.limits().max_image_dimension_2d;
         *output = vk::ImageFormatProperties {
             max_extent: vk::Extent3D {
-                width: MAX_IMAGE_DIMENSION,
-                height: MAX_IMAGE_DIMENSION,
+                width: max_dimension,
+                height: max_dimension,
                 depth: 1,
             },
             max_mip_levels: 1,
             max_array_layers: 1,
             sample_counts: vk::SampleCountFlags::TYPE_1,
-            max_resource_size: u64::from(MAX_IMAGE_DIMENSION).pow(2) * 4,
+            max_resource_size: u64::from(max_dimension).pow(2) * 4,
         }
     };
     vk::Result::SUCCESS
@@ -653,27 +760,36 @@ mod tests {
                 enumerate_physical_devices(instance, &mut count, ptr::null_mut()),
                 vk::Result::SUCCESS
             );
-            assert_eq!(count, 1);
+            let available = count;
             count = 0;
             let mut physical = vk::PhysicalDevice::null();
             assert_eq!(
                 enumerate_physical_devices(instance, &mut count, &mut physical),
-                vk::Result::INCOMPLETE
+                if available == 0 {
+                    vk::Result::SUCCESS
+                } else {
+                    vk::Result::INCOMPLETE
+                }
             );
             assert_eq!(physical, vk::PhysicalDevice::null());
-            count = 2;
             let sentinel = vk::PhysicalDevice::from_raw(0x1234);
-            let mut devices = [vk::PhysicalDevice::null(), sentinel];
+            let mut devices = vec![vk::PhysicalDevice::null(); available as usize + 1];
+            devices[available as usize] = sentinel;
+            count = available + 1;
             assert_eq!(
                 enumerate_physical_devices(instance, &mut count, devices.as_mut_ptr()),
                 vk::Result::SUCCESS
             );
-            assert_eq!(count, 1);
-            assert_eq!(devices[1], sentinel);
-            assert!(physical_valid(devices[0]));
-            assert_eq!(*(devices[0].as_raw() as *const usize), LOADER_MAGIC);
+            assert_eq!(count, available);
+            assert_eq!(devices[available as usize], sentinel);
+            for &device in &devices[..available as usize] {
+                assert!(physical_valid(device));
+                assert_eq!(*(device.as_raw() as *const usize), LOADER_MAGIC);
+            }
             destroy_instance(instance, ptr::null());
-            assert!(!physical_valid(devices[0]));
+            for &device in &devices[..available as usize] {
+                assert!(!physical_valid(device));
+            }
             assert!(!physical_valid(sentinel));
             assert_eq!(
                 enumerate_physical_devices(instance, &mut count, ptr::null_mut()),
@@ -695,7 +811,16 @@ mod tests {
             );
             assert_eq!(output, vk::Instance::null());
             let instance = new_instance();
-            let mut count = 1;
+            let mut count = 0;
+            assert_eq!(
+                enumerate_physical_devices(instance, &mut count, ptr::null_mut()),
+                vk::Result::SUCCESS
+            );
+            if count == 0 {
+                destroy_instance(instance, ptr::null());
+                return;
+            }
+            count = 1;
             let mut physical = vk::PhysicalDevice::null();
             assert_eq!(
                 enumerate_physical_devices(instance, &mut count, &mut physical),

@@ -111,8 +111,9 @@ impl Context {
         texture: IrTextureSpec,
     ) -> HandleResult<Vec<u8>> {
         match (self, resources) {
-            (Self::Virgl(context), IrResources::Virgl(resources)) =>
-                context.readback_ir_texture(resources, texture),
+            (Self::Virgl(context), IrResources::Virgl(resources)) => {
+                context.readback_ir_texture(resources, texture)
+            }
         }
     }
 
@@ -657,10 +658,8 @@ pub(crate) struct IrIndexBufferBinding {
 
 pub(crate) struct IrConstantBuffer {
     pub(crate) stage: crate::ir::ShaderStage,
-    pub(crate) slot: u32,
-    pub(crate) buffer: IrBufferSpec,
-    pub(crate) offset: u32,
-    pub(crate) size: u32,
+    pub(crate) first_register: u32,
+    pub(crate) words: Vec<u32>,
 }
 
 pub(crate) struct IrProgrammableDraw {

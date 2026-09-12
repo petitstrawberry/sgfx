@@ -13,9 +13,7 @@ default = [
     "backend-scarlet-adreno",
 ]
 std = [
-    "backend-wgpu",
-    "backend-scarlet-virgl",
-    "backend-scarlet-adreno",
+    "sgfx-core/std",
     "gpu-raw?/std",
     "sgfx-backend-scarlet-adreno?/std",
     "sgfx-backend-scarlet-virgl?/std",
@@ -32,21 +30,28 @@ legacy-scarlet-std = [
 # Compatibility alias for consumers that previously selected Scarlet's
 # no_std support directly on the `sgfx` package.
 scarlet-std = ["legacy-scarlet-std"]
-backend-wgpu = ["dep:raw-window-handle", "dep:sgfx-backend-wgpu"]
+backend-wgpu = [
+    "dep:pollster",
+    "dep:raw-window-handle",
+    "dep:sgfx-backend-wgpu",
+    "dep:wgpu",
+]
 backend-scarlet-virgl = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl"]
 backend-scarlet-adreno = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
 
 [dependencies]
-sgfx-core = { path = "../sgfx-core", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "0b4cf0984d9b17bd0646612428c44bf1505393a8", default-features = false }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
+pollster = { version = "0.4", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 sgfx-backend-wgpu = { path = "../sgfx-backend-wgpu", optional = true }
+wgpu = { version = "24", features = ["spirv"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", optional = true }
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", default-features = false, optional = true }
-sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "85f0cead4cb4c9add021360f1b469f08bf0d23a9", optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "85f0cead4cb4c9add021360f1b469f08bf0d23a9", default-features = false, optional = true }
+sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "e7029d2f34edb5362115637dea27bd2fea497a3f", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
 sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-features = false, optional = true }
 
 [lib]

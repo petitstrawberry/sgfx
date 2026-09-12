@@ -49,9 +49,9 @@ unsafe fn probe_instance(instance: &ash::Instance) -> Result<(), Box<dyn std::er
         .find(|&physical| {
             let properties = unsafe { instance.get_physical_device_properties(physical) };
             let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) };
-            name.to_bytes().starts_with(b"SGFX headless")
+            name.to_bytes().starts_with(b"SGFX Vulkan (")
         })
-        .ok_or("the Vulkan loader did not enumerate the SGFX headless physical device")?;
+        .ok_or("the Vulkan loader did not enumerate an SGFX Vulkan physical device")?;
     let properties = unsafe { instance.get_physical_device_properties(physical) };
     let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) };
     println!("Device: {}", name.to_string_lossy());

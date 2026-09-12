@@ -354,7 +354,7 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             .ok_or("no Vulkan graphics queue is available")?;
         let properties = instance.get_physical_device_properties(physical_device);
         let name = std::ffi::CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy();
-        if !name.starts_with("SGFX headless") {
+        if !name.starts_with("SGFX Vulkan (") {
             return Err(
                 format!("expected the SGFX ICD, selected {name}; check VK_DRIVER_FILES").into(),
             );

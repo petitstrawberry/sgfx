@@ -13,7 +13,11 @@ extern crate alloc;
 extern crate scarlet_std as std;
 
 use alloc::{rc::Rc, vec::Vec};
-use gpu_raw::{Gpu, GpuQueryInfo};
+use gpu_raw::{
+    GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_DEPTH, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
+    GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD, GPU_EXECUTION_SUPPORT_PRESENTATION,
+    GPU_EXECUTION_SUPPORT_QUEUE, GPU_RESULT_SUCCESS, Gpu, GpuQueryInfo,
+};
 #[cfg(feature = "std")]
 pub use scarlet_os::handle::{Handle, HandleError, HandleResult};
 #[cfg(feature = "std")]
@@ -67,12 +71,40 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// Derive the public execution capabilities from one GPU query response.
+    ///
+    /// An invalid or incompatible response yields an all-disabled capability
+    /// set. Device adoption performs the same compatibility check before any
+    /// context is created.
+    pub fn from_query_info(info: &GpuQueryInfo) -> Self {
+        let rendering = info.result == GPU_RESULT_SUCCESS
+            && info.device_state == GPU_DEVICE_STATE_READY
+            && matches_backend_id(info.backend_id_bytes())
+            && info.execution_support & GPU_EXECUTION_SUPPORT_QUEUE != 0;
+        Self {
+            rendering,
+            presentation: rendering
+                && info.execution_support & GPU_EXECUTION_SUPPORT_PRESENTATION != 0,
+            image_upload: rendering
+                && info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD != 0,
+            image_readback: rendering
+                && info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_READBACK != 0,
+            depth: rendering && info.execution_support & GPU_EXECUTION_SUPPORT_DEPTH != 0,
+        }
+    }
+
     /// Return whether the device can execute the built-in rendering pipeline.
     ///
     /// # Returns
     ///
     /// `true` when rendering commands are available.
     pub const fn supports_rendering(&self) -> bool {
+        self.rendering
+    }
+
+    /// Return whether the compiled VirGL backend can lower programmable
+    /// vertex and fragment stages for this device.
+    pub const fn supports_programmable_graphics(&self) -> bool {
         self.rendering
     }
 

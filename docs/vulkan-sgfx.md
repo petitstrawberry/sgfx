@@ -5,8 +5,8 @@ implements a bounded headless subset to exercise Vulkan → SGFX portable IR →
 backend execution. Its manifest and physical device use the Vulkan 1.0 ABI
 version. This is not a claim of Vulkan 1.0 conformance: substantial mandatory
 core functionality is absent. Do not select it as a general application driver.
-Issue #4 remains open for native Scarlet integration, resource reclamation with
-long-lived objects, broader API coverage, and conformance work.
+Native loader integration, resource reclamation with long-lived objects,
+broader API coverage, and conformance work remain incomplete.
 
 ## Implemented path
 
@@ -15,8 +15,11 @@ long-lived objects, broader API coverage, and conformance work.
   dispatchable handles with the loader's required first word, and checked
   object ownership. Only the three `vk_icd*` entrypoints are exported as unmangled
   symbols; ordinary Vulkan commands are returned through procedure lookup.
-- One device and one graphics/compute/transfer queue per logical device. No
-  extensions or optional physical-device features are advertised.
+- SGFX discovers actual adapters and reports one `VkPhysicalDevice` for each.
+  `vkCreateDevice` opens the selected adapter, rather than probing or choosing a
+  backend again inside the Vulkan frontend. One graphics/compute/transfer queue
+  is exposed according to that adapter's SGFX capabilities. No extensions or
+  optional physical-device features are advertised.
 - SPIR-V shader modules, compute pipelines, and vertex/fragment pipelines.
   Naga validates and normalizes Vulkan coordinate conventions before SGFX
   shader definition; backend shader/pipeline validation occurs at creation.
@@ -27,32 +30,42 @@ long-lived objects, broader API coverage, and conformance work.
   four-byte sizes; binding offsets use the reported alignment. Uniform ranges
   are limited to 16 KiB and storage ranges to 128 MiB.
 - Primary command buffers and pools, pipeline/set binding, compute dispatch,
-  single-color render passes, drawing with vertex-index shaders, buffer copies,
-  whole-image RGBA8 readback, supported whole-resource barriers, and fences.
-- Offscreen graphics: RGBA8_UNORM, optimal 2D images, one mip/layer/sample, at
-  most 2048×2048, a single full-size color attachment, triangle lists, fixed
-  full-frame viewport/scissor, no vertex buffers, no depth, no blending or
-  culling, and at most one instance per draw.
+  single-color render passes, non-indexed and indexed drawing, vertex buffers,
+  buffer copies, whole-image RGBA8 readback, supported whole-resource barriers,
+  D32 depth testing, front-face/back-face culling, and fences.
+- Offscreen graphics: RGBA8_UNORM color, optional D32_SFLOAT depth, optimal 2D
+  images, one mip/layer/sample, at most 2048×2048, one color attachment,
+  triangle lists, one vertex binding, four vertex formats, and one instance per
+  draw. Blending, stencil, multisampling, indirect drawing, sampled images, and
+  general dynamic state are absent.
 
-The ICD translates calls into the canonical `sgfx-core::ir::OwnedCommand`
-recording. It retains IDs, owned upload data, and Vulkan descriptor references;
-validated borrowed IR is reconstructed for execution. Image-to-buffer copies
-currently split SGFX submissions and use backend image readback followed by an
-ordered buffer write. This preserves command order without inventing a native
-SGFX texture-to-buffer command.
+Each `vkCmd*` records into command-buffer-local owned storage on the calling
+thread. Submit resolves the Vulkan handles and descriptor state into
+`sgfx-core::ir::OwnedCommand`, then reconstructs validated borrowed IR for the
+backend. This is a transitional representation: the local Vulkan command enum,
+submit-time stream reconstruction, and append-only SGFX resource table still
+need to be replaced by a reusable canonical owned program and generational
+resource identities. Image-to-buffer copies currently split SGFX submissions
+and use backend image readback followed by an ordered buffer write.
 
 All `Rc`-backed core/backend state stays on one dedicated device worker. Vulkan
-callers send owned requests; no `unsafe Send` assertion or forged resource
-lifetime crosses threads. CPU recording currently includes worker round trips.
+callers record commands without a worker round trip; resource creation,
+submit-time resolution, and backend queue access use the worker. No `unsafe
+Send` assertion or forged resource lifetime crosses threads.
 
 ## Completion and memory
 
-`vkQueueSubmit` is deliberately synchronous. Every accepted SGFX batch obtains
-an owned completion receipt and waits for actual retirement. Referenced buffer
-readback then updates the exact allocation returned by `vkMapMemory`. A fence
-signals only after both steps succeed. GPU acceptance, readback, and retirement
-errors do not manufacture successful completion; uncertain backend failures
-mark the device lost.
+Ordinary `vkQueueSubmit` returns after SGFX accepts the work. One completion
+observer thread per Vulkan device waits on owned SGFX receipts, signals the
+fence, and retires in-flight work. GPU acceptance and retirement errors do not
+manufacture successful completion; uncertain backend failures mark the device
+lost.
+
+Commands that require the current CPU-shadow path remain synchronous. In
+particular, image-to-buffer copy waits for image completion and performs backend
+readback, and GPU-written mapped buffers are read back before submit returns.
+This is a known transfer/memory-model limitation, rather than the normal path
+for draw-only submissions.
 
 Fence status and finite/zero-timeout waits use shared atomic state outside the
 device worker. They therefore remain observable while another thread is
@@ -160,10 +173,12 @@ and verify the chosen Mesa driver. The Linux check also used
 
 ## Limits and remaining work
 
-- **Not Vulkan conformant.** No surfaces/swapchains, presentation, semaphores,
+- **Not Vulkan conformant.** The ICD exposes 83 procedure names, including 12
+  `vkCmd*` operations, but this is only a bounded executable subset. There are
+  no surfaces/swapchains, presentation, semaphores,
   secondary command buffers, descriptor indexing, push constants, pipeline
   caches, queries, events, sparse resources, external memory, multisampling,
-  complex render passes, vertex/index inputs, indirect operations, or arbitrary
+  complex render passes, indirect operations, sampled images, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent
   append-only IDs. When no live Vulkan objects retain an epoch's IDs, the ICD
@@ -175,15 +190,17 @@ and verify the chosen Mesa driver. The Linux check also used
   descriptor configurations reuse definitions. Exhaustion returns an allocation
   error. General reclamation requires generational core/backend slots or a safe
   migration of live resources; this remains a blocker for a general driver.
-- **Host execution only.** There is no Scarlet-target ICD build/loader integration
-  yet. Native VirGL/A618 backends currently reject programmable IR. Their
-  existing fixed-program execution must not be mistaken for a Vulkan shader
-  backend. Native executable shader lowering and target loader/platform glue
-  are separate remaining requirements.
-- **Conservative synchronization and transfer costs.** Queue submission waits;
-  referenced buffers are uploaded/read back and image copies use host staging.
-  This establishes functional ordering and observable output, not a performance
-  result for a native Vulkan driver.
+- **Scarlet VirGL is executable through the linked test path.** The
+  `aarch64-unknown-scarlet` cube uses the same Vulkan frontend, SGFX facade,
+  SPIR-V-to-TGSI lowering, `/dev/gpu0`, VirGL submit/completion, GPU readback,
+  and `DisplaySurface`. The Scarlet toolchain currently drops the requested
+  `cdylib`, so this result is not native `.so` loader integration. A618 still
+  rejects programmable execution and is not advertised as a Vulkan adapter.
+- **Conservative memory and transfer costs.** Referenced host-visible buffers
+  are uploaded from CPU shadow storage. GPU-written mapped buffers and
+  image-to-buffer copies use blocking readback. This establishes functional
+  ordering and observable output, not a performance result for a native Vulkan
+  driver.
 
 ## ABI references
 

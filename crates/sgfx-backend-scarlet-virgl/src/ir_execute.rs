@@ -147,7 +147,12 @@ pub struct IrResources {
     buffer_revisions: Vec<u64>,
     canonical_buffer_revisions: Vec<Option<u64>>,
     submission_failed: bool,
-    programmable_pipelines: RefCell<Vec<(ir::ProgrammableRenderPipelineId, Rc<driver::IrProgrammablePipeline>)>>,
+    programmable_pipelines: RefCell<
+        Vec<(
+            ir::ProgrammableRenderPipelineId,
+            Rc<driver::IrProgrammablePipeline>,
+        )>,
+    >,
 }
 
 struct ImageMapping {
@@ -452,14 +457,26 @@ impl PendingBuffers {
         Ok(())
     }
 
-    fn copy(&mut self, resources: &IrResources, source: BufferRef<'_>, source_offset: u64,
-        destination: BufferRef<'_>, destination_offset: u64, size: u64) -> Result<(), IrSubmitError> {
+    fn copy(
+        &mut self,
+        resources: &IrResources,
+        source: BufferRef<'_>,
+        source_offset: u64,
+        destination: BufferRef<'_>,
+        destination_offset: u64,
+        size: u64,
+    ) -> Result<(), IrSubmitError> {
         let descriptor = resources.resources().buffer(source)?;
-        if !descriptor.usage().contains(BufferUsage::COPY_SRC) { return Err(ir::Error::InvalidUsage.into()); }
+        if !descriptor.usage().contains(BufferUsage::COPY_SRC) {
+            return Err(ir::Error::InvalidUsage.into());
+        }
         let end = source_offset.checked_add(size).ok_or(ir::Error::Overflow)?;
-        if end > descriptor.size() { return Err(ir::Error::OutOfBounds.into()); }
+        if end > descriptor.size() {
+            return Err(ir::Error::OutOfBounds.into());
+        }
         let mut copied = Vec::new();
-        copied.try_reserve_exact(usize::try_from(size).map_err(|_| ir::Error::Overflow)?)
+        copied
+            .try_reserve_exact(usize::try_from(size).map_err(|_| ir::Error::Overflow)?)
             .map_err(|_| IrSubmitError::OutOfMemory)?;
         copied.resize(size as usize, 0);
         if let Ok(source_bytes) = self.bytes(resources, source) {
@@ -748,20 +765,40 @@ impl Queue {
             };
             for draw in &pass.submission.draws {
                 let mut bindings = Vec::new();
-                if let Some(binding) = draw.vertex_buffer { bindings.push(binding.buffer); }
-                if let Some(programmable) = &draw.programmable {
-                    if let Some(binding) = programmable.index_buffer { bindings.push(binding.buffer); }
-                    bindings.extend(programmable.constants.iter().map(|binding| binding.buffer));
+                if let Some(binding) = draw.vertex_buffer {
+                    bindings.push(binding.buffer);
+                }
+                if let Some(programmable) = &draw.programmable
+                    && let Some(binding) = programmable.index_buffer
+                {
+                    bindings.push(binding.buffer);
                 }
                 for binding in bindings {
-                    if prepared_buffers.contains(&binding.slot) { continue; }
-                    let bytes = plan.buffer_updates.iter()
+                    if prepared_buffers.contains(&binding.slot) {
+                        continue;
+                    }
+                    let bytes = plan
+                        .buffer_updates
+                        .iter()
                         .find(|update| update.slot == binding.slot)
                         .map(|update| update.bytes.as_slice())
-                        .or_else(|| resources.buffer_shadows.get(binding.slot).and_then(Option::as_deref))
+                        .or_else(|| {
+                            resources
+                                .buffer_shadows
+                                .get(binding.slot)
+                                .and_then(Option::as_deref)
+                        })
                         .ok_or(IrSubmitError::InvalidVertexData)?;
-                    self.backend.prepare_ir_buffer(&context.backend, &mut resources.backend, binding, bytes, mode)?;
-                    prepared_buffers.try_reserve(1).map_err(|_| IrSubmitError::OutOfMemory)?;
+                    self.backend.prepare_ir_buffer(
+                        &context.backend,
+                        &mut resources.backend,
+                        binding,
+                        bytes,
+                        mode,
+                    )?;
+                    prepared_buffers
+                        .try_reserve(1)
+                        .map_err(|_| IrSubmitError::OutOfMemory)?;
                     prepared_buffers.push(binding.slot);
                 }
             }
@@ -877,7 +914,8 @@ impl ExecutionPlan {
                 if draw.vertex_count == 0 || !draw.vertex_count.is_multiple_of(3) {
                     return Err(IrSubmitError::InvalidVertexData);
                 }
-                if draw.programmable.is_none() && draw.vertex_buffer.is_none()
+                if draw.programmable.is_none()
+                    && draw.vertex_buffer.is_none()
                     && draw
                         .start_vertex
                         .checked_add(draw.vertex_count)
@@ -988,7 +1026,10 @@ impl ExecutionPlan {
                 }
                 Command::BeginRenderPass(desc) if active.is_none() => {
                     let descriptor = resources.resources().texture(desc.target())?;
-                    if !matches!(descriptor.format(), TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm) {
+                    if !matches!(
+                        descriptor.format(),
+                        TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+                    ) {
                         return Err(IrSubmitError::Unsupported(
                             UnsupportedIrFeature::TargetFormat,
                         ));
@@ -1090,9 +1131,21 @@ impl ExecutionPlan {
                 Command::ResourceBarrier(barrier) if active.is_none() => {
                     programmable::validate_barrier(*barrier)?;
                 }
-                Command::CopyBufferToBuffer { source, source_offset, destination, destination_offset, size }
-                    if !seen_pass && active.is_none() => {
-                    pending_buffers.copy(resources, *source, *source_offset, *destination, *destination_offset, *size)?;
+                Command::CopyBufferToBuffer {
+                    source,
+                    source_offset,
+                    destination,
+                    destination_offset,
+                    size,
+                } if !seen_pass && active.is_none() => {
+                    pending_buffers.copy(
+                        resources,
+                        *source,
+                        *source_offset,
+                        *destination,
+                        *destination_offset,
+                        *size,
+                    )?;
                 }
                 Command::SetVertexBuffer { buffer, offset } => {
                     active_pass_mut(&mut active)?.vertex_buffer = Some((*buffer, *offset));
@@ -1128,7 +1181,14 @@ impl ExecutionPlan {
                 } => {
                     let pass = active_pass_mut(&mut active)?;
                     if pass.programmable.is_some() {
-                        let draw = programmable::decode_draw(resources, &pending_buffers, pass, *first_vertex, *vertex_count, None)?;
+                        let draw = programmable::decode_draw(
+                            resources,
+                            &pending_buffers,
+                            pass,
+                            *first_vertex,
+                            *vertex_count,
+                            None,
+                        )?;
                         pass.submission.draws.push(draw);
                         continue;
                     }
@@ -1148,7 +1208,14 @@ impl ExecutionPlan {
                 } => {
                     let pass = active_pass_mut(&mut active)?;
                     if pass.programmable.is_some() {
-                        let draw = programmable::decode_draw(resources, &pending_buffers, pass, *first_index, *index_count, Some(*base_vertex))?;
+                        let draw = programmable::decode_draw(
+                            resources,
+                            &pending_buffers,
+                            pass,
+                            *first_index,
+                            *index_count,
+                            Some(*base_vertex),
+                        )?;
                         pass.submission.draws.push(draw);
                         continue;
                     }
@@ -1601,10 +1668,40 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
     for draw in draws {
         if draw.programmable.is_some() {
             if !chunk_draws.is_empty() {
-                push_pass_chunk(&mut chunks, &pass.target, clear_color, depth_attachment, clear_depth, render_area, core::mem::take(&mut chunk_vertices), core::mem::take(&mut chunk_draws), if first_chunk { texture_uploads.clone() } else { Vec::new() }, first_chunk)?;
+                push_pass_chunk(
+                    &mut chunks,
+                    &pass.target,
+                    clear_color,
+                    depth_attachment,
+                    clear_depth,
+                    render_area,
+                    core::mem::take(&mut chunk_vertices),
+                    core::mem::take(&mut chunk_draws),
+                    if first_chunk {
+                        texture_uploads.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    first_chunk,
+                )?;
                 first_chunk = false;
             }
-            push_pass_chunk(&mut chunks, &pass.target, clear_color, depth_attachment, clear_depth, render_area, Vec::new(), alloc::vec![draw], if first_chunk { texture_uploads.clone() } else { Vec::new() }, first_chunk)?;
+            push_pass_chunk(
+                &mut chunks,
+                &pass.target,
+                clear_color,
+                depth_attachment,
+                clear_depth,
+                render_area,
+                Vec::new(),
+                alloc::vec![draw],
+                if first_chunk {
+                    texture_uploads.clone()
+                } else {
+                    Vec::new()
+                },
+                first_chunk,
+            )?;
             first_chunk = false;
         } else if draw.vertex_buffer.is_none() {
             let end = draw
@@ -1702,7 +1799,9 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
             chunk_draws.push(draw);
         }
     }
-    if !first_chunk && chunk_vertices.is_empty() && chunk_draws.is_empty() { return Ok(chunks); }
+    if !first_chunk && chunk_vertices.is_empty() && chunk_draws.is_empty() {
+        return Ok(chunks);
+    }
     push_pass_chunk(
         &mut chunks,
         &pass.target,

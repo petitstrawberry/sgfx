@@ -252,19 +252,23 @@ fn vertex_and_index_bindings_reject_wrong_usage_alignment_and_dead_handles() {
     let command = context.command;
     let begin = vk::CommandBufferBeginInfo::default();
     unsafe {
-        for (buffer, offset) in [
-            (index.buffer, 0),
-            (vertex.buffer, 2),
-            (vertex.buffer, super::BYTES),
-        ] {
+        for (buffer, offset) in [(index.buffer, 0), (vertex.buffer, super::BYTES)] {
             context.reset();
             device.begin_command_buffer(command, &begin).unwrap();
             device.cmd_bind_vertex_buffers(command, 0, &[buffer], &[offset]);
+            device.end_command_buffer(command).unwrap();
             assert_eq!(
-                device.end_command_buffer(command),
+                context.submit(vk::Fence::null()),
                 Err(vk::Result::ERROR_INITIALIZATION_FAILED)
             );
         }
+        context.reset();
+        device.begin_command_buffer(command, &begin).unwrap();
+        device.cmd_bind_vertex_buffers(command, 0, &[vertex.buffer], &[2]);
+        assert_eq!(
+            device.end_command_buffer(command),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
         context.reset();
         device.begin_command_buffer(command, &begin).unwrap();
         device.cmd_bind_vertex_buffers(command, 1, &[vertex.buffer], &[0]);
@@ -272,14 +276,18 @@ fn vertex_and_index_bindings_reject_wrong_usage_alignment_and_dead_handles() {
             device.end_command_buffer(command),
             Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
         );
-        for (buffer, offset, format) in [
-            (vertex.buffer, 0, vk::IndexType::UINT16),
-            (index.buffer, 1, vk::IndexType::UINT16),
-            (index.buffer, 2, vk::IndexType::UINT32),
-        ] {
+        context.reset();
+        device.begin_command_buffer(command, &begin).unwrap();
+        device.cmd_bind_index_buffer(command, vertex.buffer, 0, vk::IndexType::UINT16);
+        device.end_command_buffer(command).unwrap();
+        assert_eq!(
+            context.submit(vk::Fence::null()),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        for (offset, format) in [(1, vk::IndexType::UINT16), (2, vk::IndexType::UINT32)] {
             context.reset();
             device.begin_command_buffer(command, &begin).unwrap();
-            device.cmd_bind_index_buffer(command, buffer, offset, format);
+            device.cmd_bind_index_buffer(command, index.buffer, offset, format);
             assert_eq!(
                 device.end_command_buffer(command),
                 Err(vk::Result::ERROR_INITIALIZATION_FAILED)

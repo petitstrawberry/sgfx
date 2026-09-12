@@ -1,14 +1,14 @@
 use crate::runtime::Runtime;
 use ash::vk::{self, Handle};
-use sgfx_core::{
-    backend::{Completion, CompletionStatus},
+use sgfx::{
+    backend::{Completion, CompletionStatus, SubmitError},
     ir,
 };
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{CStr, c_char},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
@@ -20,12 +20,72 @@ enum Request {
     Run(Job),
     Stop,
 }
+
+enum CompletionRequest {
+    Observe {
+        submissions: Vec<sgfx::driver::Submission>,
+        fence: Option<Arc<AtomicU8>>,
+    },
+    Stop,
+}
 pub(crate) type Fences = Arc<Mutex<HashMap<u64, Arc<AtomicU8>>>>;
+pub(crate) type Recordings = Arc<Mutex<CommandRegistry>>;
+type RecordingCell = Arc<Mutex<Recording>>;
+
+#[derive(Default)]
+pub(crate) struct InFlight {
+    count: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl InFlight {
+    fn begin(&self) {
+        let mut count = self
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_add(1);
+    }
+
+    fn finish(&self) {
+        let mut count = self
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_sub(1);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        *self
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            == 0
+    }
+
+    fn wait(&self) {
+        let mut count = self
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *count != 0 {
+            count = self
+                .changed
+                .wait(count)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
 struct Driver {
     sender: mpsc::Sender<Request>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    completion_sender: mpsc::Sender<CompletionRequest>,
+    completion_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     queue: AtomicU64,
     fences: Fences,
+    recordings: Recordings,
+    in_flight: Arc<InFlight>,
     lost: Arc<AtomicBool>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,13 +144,15 @@ fn call<T: Send + 'static>(
     driver
         .sender
         .send(Request::Run(Box::new(move |runtime| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime)));
-            let result = match result {
-                Ok(value) => value,
-                Err(_) => {
-                    runtime.lost = true;
-                    Err(vk::Result::ERROR_DEVICE_LOST)
-                }
+            let result = if runtime.device_lost.load(Ordering::Acquire) {
+                runtime.lost = true;
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            } else {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime)))
+                    .unwrap_or_else(|_| {
+                        runtime.lost = true;
+                        Err(vk::Result::ERROR_DEVICE_LOST)
+                    })
             };
             runtime.reclaim_idle_resources();
             if runtime.lost {
@@ -106,27 +168,6 @@ pub(crate) fn with_device<T: Send + 'static>(
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
 ) -> VkResult<T> {
     call(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
-}
-fn with_command<T: Send + 'static>(
-    command: vk::CommandBuffer,
-    op: impl FnOnce(&mut Runtime, u64) -> VkResult<T> + Send + 'static,
-) -> VkResult<T> {
-    let id = command.as_raw();
-    call(driver(id, Kind::Command)?.as_ref(), move |rt| op(rt, id))
-}
-fn result<T>(value: VkResult<T>, output: *mut T) -> vk::Result {
-    match value {
-        Ok(value) => {
-            if output.is_null() {
-                return vk::Result::ERROR_INITIALIZATION_FAILED;
-            }
-            unsafe {
-                *output = value;
-            }
-            vk::Result::SUCCESS
-        }
-        Err(e) => e,
-    }
 }
 fn status(value: VkResult<()>) -> vk::Result {
     value.map_or_else(|e| e, |_| vk::Result::SUCCESS)
@@ -164,7 +205,10 @@ pub(crate) unsafe extern "system" fn create_device(
     allocator: *const vk::AllocationCallbacks<'_>,
     out: *mut vk::Device,
 ) -> vk::Result {
-    if !crate::instance::physical_valid(physical) || info.is_null() || out.is_null() {
+    let Some(adapter) = crate::instance::physical_adapter(physical) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    if info.is_null() || out.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     *out = vk::Device::null();
@@ -204,8 +248,12 @@ pub(crate) unsafe extern "system" fn create_device(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let fences: Fences = Default::default();
+    let recordings: Recordings = Default::default();
+    let in_flight = Arc::new(InFlight::default());
     let lost = Arc::new(AtomicBool::new(false));
     let worker_fences = Arc::clone(&fences);
+    let worker_recordings = Arc::clone(&recordings);
+    let worker_in_flight = Arc::clone(&in_flight);
     let worker_lost = Arc::clone(&lost);
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -213,7 +261,13 @@ pub(crate) unsafe extern "system" fn create_device(
         .name("sgfx-vulkan-device".into())
         .spawn(move || {
             let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Runtime::new(worker_fences, worker_lost)
+                Runtime::new(
+                    adapter,
+                    worker_recordings,
+                    worker_in_flight,
+                    worker_fences,
+                    worker_lost,
+                )
             }));
             let mut runtime = match init {
                 Ok(Ok(rt)) => rt,
@@ -244,11 +298,40 @@ pub(crate) unsafe extern "system" fn create_device(
         let _ = thread.join();
         return e;
     }
+    let (completion_tx, completion_rx) = mpsc::channel();
+    let completion_in_flight = Arc::clone(&in_flight);
+    let completion_lost = Arc::clone(&lost);
+    let completion_thread = match std::thread::Builder::new()
+        .name("sgfx-vulkan-completion".into())
+        .spawn(move || {
+            while let Ok(request) = completion_rx.recv() {
+                match request {
+                    CompletionRequest::Observe { submissions, fence } => finish_submissions(
+                        &submissions,
+                        fence.as_ref(),
+                        &completion_in_flight,
+                        &completion_lost,
+                    ),
+                    CompletionRequest::Stop => break,
+                }
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(_) => {
+            let _ = tx.send(Request::Stop);
+            let _ = thread.join();
+            return vk::Result::ERROR_OUT_OF_HOST_MEMORY;
+        }
+    };
     let driver = Arc::new(Driver {
         sender: tx,
         thread: Mutex::new(Some(thread)),
+        completion_sender: completion_tx,
+        completion_thread: Mutex::new(Some(completion_thread)),
         queue: AtomicU64::new(0),
         fences,
+        recordings,
+        in_flight,
         lost,
     });
     let device = add_handle(Kind::Device, &driver);
@@ -273,6 +356,16 @@ pub(crate) unsafe extern "system" fn destroy_device(
         .collect();
     for id in ids {
         remove_handle(id);
+    }
+    driver.in_flight.wait();
+    let _ = driver.completion_sender.send(CompletionRequest::Stop);
+    if let Some(thread) = driver
+        .completion_thread
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        let _ = thread.join();
     }
     driver.lost.store(true, Ordering::Release);
     let _ = driver.sender.send(Request::Stop);
@@ -303,24 +396,34 @@ unsafe extern "system" fn get_device_queue(
     }
 }
 unsafe extern "system" fn device_wait_idle(device: vk::Device) -> vk::Result {
-    status(with_device(device, |rt| {
-        if rt.lost {
+    let driver = match driver(device.as_raw(), Kind::Device) {
+        Ok(driver) => driver,
+        Err(error) => return error,
+    };
+    status(wait_idle(&driver))
+}
+unsafe extern "system" fn queue_wait_idle(queue: vk::Queue) -> vk::Result {
+    let driver = match driver(queue.as_raw(), Kind::Queue) {
+        Ok(driver) => driver,
+        Err(error) => return error,
+    };
+    status(wait_idle(&driver))
+}
+
+fn wait_idle(driver: &Driver) -> VkResult<()> {
+    call(driver, |runtime| {
+        if runtime.lost {
             Err(vk::Result::ERROR_DEVICE_LOST)
         } else {
             Ok(())
         }
-    }))
-}
-unsafe extern "system" fn queue_wait_idle(queue: vk::Queue) -> vk::Result {
-    status(driver(queue.as_raw(), Kind::Queue).and_then(|d| {
-        call(&d, |rt| {
-            if rt.lost {
-                Err(vk::Result::ERROR_DEVICE_LOST)
-            } else {
-                Ok(())
-            }
-        })
-    }))
+    })?;
+    driver.in_flight.wait();
+    if driver.lost.load(Ordering::Acquire) {
+        Err(vk::Result::ERROR_DEVICE_LOST)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -351,12 +454,118 @@ struct ReadImage {
     width: u32,
     height: u32,
 }
+
+type RecordedMemoryBarrier = (bool, vk::AccessFlags, vk::AccessFlags);
+type RecordedBufferBarrier = (
+    bool,
+    vk::AccessFlags,
+    vk::AccessFlags,
+    u32,
+    u32,
+    vk::Buffer,
+    u64,
+    u64,
+);
+type RecordedImageBarrier = (
+    bool,
+    vk::AccessFlags,
+    vk::AccessFlags,
+    u32,
+    u32,
+    vk::Image,
+    vk::ImageLayout,
+    vk::ImageLayout,
+    vk::ImageSubresourceRange,
+);
+
 #[derive(Clone)]
-pub(crate) struct Recording {
+struct Recording {
     pool: u64,
     one_time: bool,
     state: RecordingState,
     error: Option<vk::Result>,
+    render_active: bool,
+    commands: Vec<RecordedCommand>,
+}
+
+#[derive(Default)]
+pub(crate) struct CommandRegistry {
+    commands: HashMap<u64, RecordingCell>,
+    pools: HashMap<u64, vk::CommandPoolCreateFlags>,
+}
+
+#[derive(Clone)]
+enum RecordedCommand {
+    BindPipeline {
+        point: vk::PipelineBindPoint,
+        pipeline: vk::Pipeline,
+    },
+    BindDescriptorSets {
+        point: vk::PipelineBindPoint,
+        layout: vk::PipelineLayout,
+        first: u32,
+        sets: Vec<vk::DescriptorSet>,
+        dynamic_count: u32,
+    },
+    Dispatch {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    BeginRenderPass {
+        extended: bool,
+        contents: vk::SubpassContents,
+        render_pass: vk::RenderPass,
+        framebuffer: vk::Framebuffer,
+        area: vk::Rect2D,
+        clears: Vec<vk::ClearValue>,
+    },
+    EndRenderPass,
+    BindVertexBuffer {
+        buffer: vk::Buffer,
+        offset: u64,
+    },
+    BindIndexBuffer {
+        buffer: vk::Buffer,
+        offset: u64,
+        index_type: vk::IndexType,
+    },
+    Draw {
+        vertices: u32,
+        instances: u32,
+        first: u32,
+        first_instance: u32,
+    },
+    DrawIndexed {
+        indices: u32,
+        instances: u32,
+        first: u32,
+        base_vertex: i32,
+        first_instance: u32,
+    },
+    CopyImageToBuffer {
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        buffer: vk::Buffer,
+        regions: Vec<vk::BufferImageCopy>,
+    },
+    CopyBuffer {
+        source: vk::Buffer,
+        destination: vk::Buffer,
+        regions: Vec<vk::BufferCopy>,
+    },
+    PipelineBarrier {
+        source_stage: vk::PipelineStageFlags,
+        destination_stage: vk::PipelineStageFlags,
+        flags: vk::DependencyFlags,
+        memory: Vec<RecordedMemoryBarrier>,
+        buffers: Vec<RecordedBufferBarrier>,
+        images: Vec<RecordedImageBarrier>,
+    },
+}
+
+#[derive(Clone)]
+struct ResolvedRecording {
     ops: Vec<ir::OwnedCommand>,
     descriptors: Vec<DescriptorInsertion>,
     copies: Vec<ReadImage>,
@@ -371,6 +580,7 @@ pub(crate) struct Recording {
     graphics_sets: BTreeMap<u32, vk::DescriptorSet>,
     render: Option<(u32, u32)>,
     used_buffers: Vec<vk::Buffer>,
+    readback_buffers: Vec<vk::Buffer>,
     used_images: Vec<vk::Image>,
     used_pipelines: Vec<vk::Pipeline>,
     used_framebuffers: Vec<vk::Framebuffer>,
@@ -383,6 +593,61 @@ impl Recording {
             one_time: false,
             state: RecordingState::Initial,
             error: None,
+            render_active: false,
+            commands: Vec::new(),
+        }
+    }
+    fn fail(&mut self, e: vk::Result) {
+        self.error.get_or_insert(e);
+    }
+    fn push(&mut self, command: RecordedCommand) -> VkResult<()> {
+        if self.state != RecordingState::Recording {
+            self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        if self.commands.len() >= 4000 {
+            self.fail(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+            return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+        }
+        match command {
+            RecordedCommand::BeginRenderPass { .. } if self.render_active => {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::BeginRenderPass { .. } => self.render_active = true,
+            RecordedCommand::EndRenderPass if !self.render_active => {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::EndRenderPass => self.render_active = false,
+            RecordedCommand::Draw { .. } | RecordedCommand::DrawIndexed { .. }
+                if !self.render_active =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::Dispatch { .. } | RecordedCommand::PipelineBarrier { .. }
+                if self.render_active =>
+            {
+                self.fail(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
+            RecordedCommand::CopyImageToBuffer { .. } | RecordedCommand::CopyBuffer { .. }
+                if self.render_active =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            _ => {}
+        }
+        self.commands.push(command);
+        Ok(())
+    }
+}
+
+impl ResolvedRecording {
+    fn new() -> Self {
+        Self {
             ops: Vec::new(),
             descriptors: Vec::new(),
             copies: Vec::new(),
@@ -397,41 +662,602 @@ impl Recording {
             graphics_sets: BTreeMap::new(),
             render: None,
             used_buffers: Vec::new(),
+            readback_buffers: Vec::new(),
             used_images: Vec::new(),
             used_pipelines: Vec::new(),
             used_framebuffers: Vec::new(),
             used_render_passes: Vec::new(),
         }
     }
-    fn fail(&mut self, e: vk::Result) {
-        self.error.get_or_insert(e);
-    }
-    fn ready(&mut self) -> VkResult<()> {
-        if self.state != RecordingState::Recording {
-            self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        if self.ops.len() > 4000 {
-            return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+}
+
+impl RecordedCommand {
+    fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
+        match self {
+            Self::BindPipeline { point, pipeline } => {
+                match (*point, rt.resources.pipelines.get(pipeline)) {
+                    (
+                        vk::PipelineBindPoint::COMPUTE,
+                        Some(crate::resources::Pipeline::Compute(_)),
+                    ) => rec.compute = Some(*pipeline),
+                    (
+                        vk::PipelineBindPoint::GRAPHICS,
+                        Some(crate::resources::Pipeline::Graphics(_)),
+                    ) => rec.graphics = Some(*pipeline),
+                    _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+                }
+                rec.used_pipelines.push(*pipeline);
+            }
+            Self::BindDescriptorSets {
+                point,
+                layout,
+                first,
+                sets,
+                dynamic_count,
+            } => {
+                if *dynamic_count != 0
+                    || first
+                        .checked_add(sets.len() as u32)
+                        .is_none_or(|count| count > 4)
+                {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                let layout = rt
+                    .resources
+                    .pipeline_layouts
+                    .get(layout)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let target = if *point == vk::PipelineBindPoint::COMPUTE {
+                    &mut rec.compute_sets
+                } else if *point == vk::PipelineBindPoint::GRAPHICS {
+                    &mut rec.graphics_sets
+                } else {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                };
+                for (index, set) in sets.iter().enumerate() {
+                    let descriptor = rt
+                        .resources
+                        .descriptor_sets
+                        .get(set)
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    if layout.bind_groups().get(*first as usize + index) != Some(&descriptor.layout)
+                    {
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                    target.insert(*first + index as u32, *set);
+                    rec.bound_sets.push(*set);
+                }
+            }
+            Self::Dispatch { x, y, z } => {
+                if rec.render.is_some() || *x > 65535 || *y > 65535 || *z > 65535 {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                let pipeline = rec.compute.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let Some(crate::resources::Pipeline::Compute(id)) =
+                    rt.resources.pipelines.get(&pipeline)
+                else {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                };
+                rec.ops.push(ir::OwnedCommand::BeginComputePass);
+                rec.ops.push(ir::OwnedCommand::SetComputePipeline(*id));
+                let active_sets = active_sets(
+                    rt,
+                    crate::resources::Pipeline::Compute(*id),
+                    &rec.compute_sets,
+                )?;
+                for &(index, set) in &active_sets {
+                    rec.descriptors.push(DescriptorInsertion {
+                        position: rec.ops.len(),
+                        index,
+                        set,
+                    });
+                }
+                mark_writable_descriptor_buffers(rt, rec, &active_sets)?;
+                rec.written_sets
+                    .extend(active_sets.into_iter().map(|(_, set)| set));
+                if *x != 0 && *y != 0 && *z != 0 {
+                    rec.ops.push(ir::OwnedCommand::Dispatch {
+                        x: *x,
+                        y: *y,
+                        z: *z,
+                    });
+                }
+                rec.ops.push(ir::OwnedCommand::EndComputePass);
+            }
+            Self::BeginRenderPass {
+                extended,
+                contents,
+                render_pass,
+                framebuffer,
+                area,
+                clears,
+            } => {
+                if *extended || *contents != vk::SubpassContents::INLINE || rec.render.is_some() {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                let pass = rt
+                    .resources
+                    .render_passes
+                    .get(render_pass)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let framebuffer_data = rt
+                    .resources
+                    .framebuffers
+                    .get(framebuffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                if framebuffer_data.render_pass != *render_pass
+                    || area.offset.x != 0
+                    || area.offset.y != 0
+                    || area.extent.width != framebuffer_data.width
+                    || area.extent.height != framebuffer_data.height
+                {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                let image = rt
+                    .resources
+                    .images
+                    .get(&framebuffer_data.image)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                if image.bound.is_none() {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                let load = match pass.load_op {
+                    vk::AttachmentLoadOp::LOAD => ir::LoadOp::Load,
+                    vk::AttachmentLoadOp::DONT_CARE => ir::LoadOp::DontCare,
+                    vk::AttachmentLoadOp::CLEAR => {
+                        let clear = clears
+                            .first()
+                            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                        let color = unsafe { clear.color.float32 };
+                        ir::LoadOp::Clear(
+                            ir::Color::rgba(color[0], color[1], color[2], color[3])
+                                .map_err(crate::resources::failure)?,
+                        )
+                    }
+                    _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+                };
+                let depth = if let Some(load_op) = pass.depth_load_op {
+                    let (_, handle) = framebuffer_data
+                        .depth
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    let depth_image = rt
+                        .resources
+                        .images
+                        .get(&handle)
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    if depth_image.bound.is_none() {
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                    let load = match load_op {
+                        vk::AttachmentLoadOp::LOAD => ir::DepthLoadOp::Load,
+                        vk::AttachmentLoadOp::DONT_CARE => ir::DepthLoadOp::DontCare,
+                        vk::AttachmentLoadOp::CLEAR => {
+                            let value = unsafe {
+                                clears
+                                    .get(1)
+                                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                                    .depth_stencil
+                                    .depth
+                            };
+                            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                            }
+                            ir::DepthLoadOp::Clear(value)
+                        }
+                        _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+                    };
+                    rec.used_images.push(handle);
+                    Some(ir::OwnedDepthAttachment {
+                        target: depth_image.id,
+                        load,
+                        store: if pass.depth_store_op == vk::AttachmentStoreOp::STORE {
+                            ir::StoreOp::Store
+                        } else {
+                            ir::StoreOp::DontCare
+                        },
+                    })
+                } else {
+                    None
+                };
+                let render_area =
+                    ir::PixelRect::new(0, 0, framebuffer_data.width, framebuffer_data.height)
+                        .map_err(crate::resources::failure)?;
+                rec.ops
+                    .push(ir::OwnedCommand::BeginRenderPass(ir::OwnedRenderPassDesc {
+                        target: image.id,
+                        area: render_area,
+                        load,
+                        store: ir::StoreOp::Store,
+                        depth,
+                    }));
+                rec.render = Some((framebuffer_data.width, framebuffer_data.height));
+                rec.used_images.push(framebuffer_data.image);
+                rec.used_framebuffers.push(*framebuffer);
+                rec.used_render_passes.push(*render_pass);
+            }
+            Self::EndRenderPass => {
+                if rec.render.take().is_none() {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                rec.ops.push(ir::OwnedCommand::EndRenderPass);
+            }
+            Self::BindVertexBuffer { buffer, offset } => {
+                let data = rt
+                    .resources
+                    .buffers
+                    .get(buffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                if data.bound.is_none()
+                    || !data.usage.contains(vk::BufferUsageFlags::VERTEX_BUFFER)
+                    || *offset >= data.size
+                    || !offset.is_multiple_of(4)
+                {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                rec.vertex_buffer = Some((*buffer, *offset));
+                rec.used_buffers.push(*buffer);
+            }
+            Self::BindIndexBuffer {
+                buffer,
+                offset,
+                index_type,
+            } => {
+                let format = match *index_type {
+                    vk::IndexType::UINT16 => ir::IndexFormat::Uint16,
+                    vk::IndexType::UINT32 => ir::IndexFormat::Uint32,
+                    _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+                };
+                let data = rt
+                    .resources
+                    .buffers
+                    .get(buffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                if data.bound.is_none()
+                    || !data.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER)
+                    || *offset >= data.size
+                    || !offset.is_multiple_of(format.byte_size())
+                {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                rec.index_buffer = Some((*buffer, *offset, format));
+                rec.used_buffers.push(*buffer);
+            }
+            Self::Draw {
+                vertices,
+                instances,
+                first,
+                first_instance,
+            } => {
+                if *instances > 1 || *first_instance != 0 {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                graphics_bindings(rt, rec)?;
+                if *vertices != 0 && *instances != 0 {
+                    rec.ops.push(ir::OwnedCommand::Draw {
+                        vertex_count: *vertices,
+                        first_vertex: *first,
+                    });
+                }
+            }
+            Self::DrawIndexed {
+                indices,
+                instances,
+                first,
+                base_vertex,
+                first_instance,
+            } => {
+                if *instances > 1 || *first_instance != 0 {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                graphics_bindings(rt, rec)?;
+                let (handle, offset, format) = rec
+                    .index_buffer
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let buffer = rt
+                    .resources
+                    .buffers
+                    .get(&handle)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                rec.ops.push(ir::OwnedCommand::SetIndexBuffer {
+                    buffer: buffer.id,
+                    offset,
+                    format,
+                });
+                if *indices != 0 && *instances != 0 {
+                    rec.ops.push(ir::OwnedCommand::DrawIndexed {
+                        index_count: *indices,
+                        first_index: *first,
+                        base_vertex: *base_vertex,
+                    });
+                }
+            }
+            Self::CopyImageToBuffer {
+                image,
+                layout,
+                buffer,
+                regions,
+            } => {
+                if rec.render.is_some()
+                    || !matches!(
+                        *layout,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL | vk::ImageLayout::GENERAL
+                    )
+                {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                let image_data = rt
+                    .resources
+                    .images
+                    .get(image)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let buffer_data = rt
+                    .resources
+                    .buffers
+                    .get(buffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                if image_data.bound.is_none()
+                    || buffer_data.bound.is_none()
+                    || !buffer_data
+                        .usage
+                        .contains(vk::BufferUsageFlags::TRANSFER_DST)
+                    || image_data.format != vk::Format::R8G8B8A8_UNORM
+                {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                for region in regions {
+                    if region.buffer_row_length != 0
+                        || region.buffer_image_height != 0
+                        || region.image_offset != vk::Offset3D::default()
+                        || region.image_extent != image_data.extent
+                        || region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
+                        || region.image_subresource.mip_level != 0
+                        || region.image_subresource.base_array_layer != 0
+                        || region.image_subresource.layer_count != 1
+                    {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    let size = u64::from(image_data.extent.width)
+                        * u64::from(image_data.extent.height)
+                        * 4;
+                    if region.buffer_offset % 4 != 0
+                        || region
+                            .buffer_offset
+                            .checked_add(size)
+                            .is_none_or(|end| end > buffer_data.size)
+                    {
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                    rec.copies.push(ReadImage {
+                        position: rec.ops.len(),
+                        image: *image,
+                        buffer: *buffer,
+                        offset: region.buffer_offset,
+                        width: image_data.extent.width,
+                        height: image_data.extent.height,
+                    });
+                }
+                rec.used_buffers.push(*buffer);
+                rec.used_images.push(*image);
+                rec.readback_buffers.push(*buffer);
+            }
+            Self::CopyBuffer {
+                source,
+                destination,
+                regions,
+            } => {
+                if rec.render.is_some() {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                let source_data = rt
+                    .resources
+                    .buffers
+                    .get(source)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let destination_data = rt
+                    .resources
+                    .buffers
+                    .get(destination)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                if source_data.bound.is_none()
+                    || destination_data.bound.is_none()
+                    || !source_data
+                        .usage
+                        .contains(vk::BufferUsageFlags::TRANSFER_SRC)
+                    || !destination_data
+                        .usage
+                        .contains(vk::BufferUsageFlags::TRANSFER_DST)
+                {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                for region in regions {
+                    rec.ops.push(ir::OwnedCommand::CopyBufferToBuffer {
+                        source: source_data.id,
+                        source_offset: region.src_offset,
+                        destination: destination_data.id,
+                        destination_offset: region.dst_offset,
+                        size: region.size,
+                    });
+                }
+                rec.used_buffers.extend([*source, *destination]);
+                rec.readback_buffers.push(*destination);
+            }
+            Self::PipelineBarrier {
+                source_stage,
+                destination_stage,
+                flags,
+                memory,
+                buffers,
+                images,
+            } => {
+                if rec.render.is_some()
+                    || validate_pipeline_barrier_header(*source_stage, *destination_stage, *flags)
+                        .is_err()
+                {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                for (extended, source, destination) in memory {
+                    if *extended {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    if source
+                        .intersects(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
+                    {
+                        rec.barriers.push(DeferredBarrier {
+                            position: rec.ops.len(),
+                            sets: rec.written_sets.clone(),
+                            after: buffer_access(*destination)?,
+                        });
+                        rec.written_sets.clear();
+                    } else if !(vk::AccessFlags::TRANSFER_WRITE
+                        | vk::AccessFlags::HOST_WRITE
+                        | vk::AccessFlags::MEMORY_WRITE)
+                        .contains(*source)
+                        || !supported_access(*destination)
+                    {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                }
+                for (
+                    extended,
+                    source,
+                    destination,
+                    source_queue,
+                    destination_queue,
+                    buffer,
+                    offset,
+                    size,
+                ) in buffers
+                {
+                    if *extended
+                        || !(*source_queue == vk::QUEUE_FAMILY_IGNORED
+                            && *destination_queue == vk::QUEUE_FAMILY_IGNORED)
+                    {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    let buffer_data = rt
+                        .resources
+                        .buffers
+                        .get(buffer)
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    if *offset != 0 || (*size != vk::WHOLE_SIZE && *size != buffer_data.size) {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    rec.ops.push(ir::OwnedCommand::ResourceBarrier(
+                        ir::OwnedResourceBarrier::Buffer {
+                            buffer: buffer_data.id,
+                            before: buffer_access(*source)?,
+                            after: buffer_access(*destination)?,
+                        },
+                    ));
+                    rec.used_buffers.push(*buffer);
+                }
+                for (
+                    extended,
+                    _source,
+                    _destination,
+                    source_queue,
+                    destination_queue,
+                    image,
+                    old_layout,
+                    new_layout,
+                    range,
+                ) in images
+                {
+                    if *extended
+                        || !(*source_queue == vk::QUEUE_FAMILY_IGNORED
+                            && *destination_queue == vk::QUEUE_FAMILY_IGNORED)
+                        || range.base_mip_level != 0
+                        || range.level_count != 1
+                        || range.base_array_layer != 0
+                        || range.layer_count != 1
+                    {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    let image_data = rt
+                        .resources
+                        .images
+                        .get(image)
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    if range.aspect_mask != crate::images::image_aspect(image_data.format) {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    let after = texture_access(*new_layout)?;
+                    if *old_layout != vk::ImageLayout::UNDEFINED {
+                        rec.ops.push(ir::OwnedCommand::ResourceBarrier(
+                            ir::OwnedResourceBarrier::Texture {
+                                texture: image_data.id,
+                                before: texture_access(*old_layout)?,
+                                after,
+                            },
+                        ));
+                    }
+                    rec.used_images.push(*image);
+                }
+            }
         }
         Ok(())
+    }
+
+    fn references_descriptor_sets(&self, sets: &[vk::DescriptorSet]) -> bool {
+        matches!(
+            self,
+            Self::BindDescriptorSets {
+                sets: recorded, ..
+            } if recorded.iter().any(|set| sets.contains(set))
+        )
     }
 }
-fn record(
-    command: vk::CommandBuffer,
-    op: impl FnOnce(&mut Runtime, &mut Recording) -> VkResult<()> + Send + 'static,
-) {
-    let _ = with_command(command, move |rt, id| {
-        let Some(mut rec) = rt.commands.remove(&id) else {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        };
-        let res = rec.ready().and_then(|()| op(rt, &mut rec));
-        if let Err(e) = res {
-            rec.fail(e);
-        }
-        rt.commands.insert(id, rec);
-        Ok(())
-    });
+
+fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedRecording> {
+    if source.state != RecordingState::Executable {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    let mut resolved = ResolvedRecording::new();
+    for command in &source.commands {
+        command.apply(rt, &mut resolved)?;
+    }
+    if resolved.render.is_some() {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    Ok(resolved)
+}
+
+fn record(command: vk::CommandBuffer, recorded: RecordedCommand) {
+    let Ok(driver) = driver(command.as_raw(), Kind::Command) else {
+        return;
+    };
+    let recording = driver
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .commands
+        .get(&command.as_raw())
+        .cloned();
+    if let Some(recording) = recording {
+        let _ = recording
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(recorded);
+    }
+}
+
+fn record_error(command: vk::CommandBuffer, error: vk::Result) {
+    let Ok(driver) = driver(command.as_raw(), Kind::Command) else {
+        return;
+    };
+    let recording = driver
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .commands
+        .get(&command.as_raw())
+        .cloned();
+    if let Some(recording) = recording {
+        recording
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fail(error);
+    }
 }
 unsafe extern "system" fn create_command_pool(
     device: vk::Device,
@@ -451,36 +1277,55 @@ unsafe extern "system" fn create_command_pool(
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
     let flags = info.flags;
-    result(
-        with_device(device, move |rt| {
-            let id = next_id();
-            rt.pools.insert(id, flags);
-            Ok(vk::CommandPool::from_raw(id))
-        }),
-        out,
-    )
+    let driver = match driver(device.as_raw(), Kind::Device) {
+        Ok(driver) => driver,
+        Err(error) => return error,
+    };
+    let id = next_id();
+    driver
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pools
+        .insert(id, flags);
+    *out = vk::CommandPool::from_raw(id);
+    vk::Result::SUCCESS
 }
 unsafe extern "system" fn destroy_command_pool(
     device: vk::Device,
     pool: vk::CommandPool,
     _: *const vk::AllocationCallbacks<'_>,
 ) {
-    if let Ok(ids) = with_device(device, move |rt| {
-        rt.pools.remove(&pool.as_raw());
-        let ids: Vec<_> = rt
+    let Ok(driver) = driver(device.as_raw(), Kind::Device) else {
+        return;
+    };
+    let ids = {
+        let mut registry = driver
+            .recordings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.pools.remove(&pool.as_raw()).is_none() {
+            return;
+        }
+        let ids: Vec<_> = registry
             .commands
             .iter()
-            .filter(|(_, r)| r.pool == pool.as_raw())
+            .filter(|(_, recording)| {
+                recording
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pool
+                    == pool.as_raw()
+            })
             .map(|(&i, _)| i)
             .collect();
         for id in &ids {
-            rt.commands.remove(id);
+            registry.commands.remove(id);
         }
-        Ok(ids)
-    }) {
-        for id in ids {
-            remove_handle(id);
-        }
+        ids
+    };
+    for id in ids {
+        remove_handle(id);
     }
 }
 unsafe extern "system" fn allocate_command_buffers(
@@ -505,27 +1350,26 @@ unsafe extern "system" fn allocate_command_buffers(
         Ok(d) => d,
         Err(e) => return e,
     };
-    if let Err(e) = call(&d, move |rt| {
-        if rt.pools.contains_key(&pool) {
-            Ok(())
-        } else {
-            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
-        }
-    }) {
-        return e;
+    if !d
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pools
+        .contains_key(&pool)
+    {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
     let ids: Vec<_> = (0..count).map(|_| add_handle(Kind::Command, &d)).collect();
-    let allocated = ids.clone();
-    if let Err(e) = call(&d, move |rt| {
-        for id in allocated {
-            rt.commands.insert(id, Recording::new(pool));
+    {
+        let mut registry = d
+            .recordings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in &ids {
+            registry
+                .commands
+                .insert(*id, Arc::new(Mutex::new(Recording::new(pool))));
         }
-        Ok(())
-    }) {
-        for id in ids {
-            remove_handle(id);
-        }
-        return e;
     }
     for (i, id) in ids.into_iter().enumerate() {
         *out.add(i) = vk::CommandBuffer::from_raw(id);
@@ -541,19 +1385,34 @@ unsafe extern "system" fn free_command_buffers(
     let Ok(commands) = slice(ptr, count) else {
         return;
     };
+    let Ok(driver) = driver(device.as_raw(), Kind::Device) else {
+        return;
+    };
     let ids: Vec<_> = commands.iter().map(|c| c.as_raw()).collect();
-    let removed = ids.clone();
-    if with_device(device, move |rt| {
-        for id in removed {
-            rt.commands.remove(&id);
+    let removed = {
+        let mut registry = driver
+            .recordings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed: Vec<_> = ids
+            .into_iter()
+            .filter(|id| {
+                registry.commands.get(id).is_some_and(|recording| {
+                    recording
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pool
+                        == _pool.as_raw()
+                })
+            })
+            .collect();
+        for id in &removed {
+            registry.commands.remove(id);
         }
-        Ok(())
-    })
-    .is_ok()
-    {
-        for id in ids {
-            remove_handle(id);
-        }
+        removed
+    };
+    for id in removed {
+        remove_handle(id);
     }
 }
 unsafe extern "system" fn reset_command_pool(
@@ -564,15 +1423,37 @@ unsafe extern "system" fn reset_command_pool(
     if !vk::CommandPoolResetFlags::RELEASE_RESOURCES.contains(flags) {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
-    status(with_device(device, move |rt| {
-        if !rt.pools.contains_key(&pool.as_raw()) {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    let driver = match driver(device.as_raw(), Kind::Device) {
+        Ok(driver) => driver,
+        Err(error) => return error,
+    };
+    let recordings = {
+        let registry = driver
+            .recordings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !registry.pools.contains_key(&pool.as_raw()) {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
         }
-        for rec in rt.commands.values_mut().filter(|r| r.pool == pool.as_raw()) {
-            *rec = Recording::new(rec.pool);
-        }
-        Ok(())
-    }))
+        registry
+            .commands
+            .values()
+            .filter(|recording| {
+                recording
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pool
+                    == pool.as_raw()
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for recording in recordings {
+        *recording
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Recording::new(pool.as_raw());
+    }
+    vk::Result::SUCCESS
 }
 unsafe extern "system" fn reset_command_buffer(
     command: vk::CommandBuffer,
@@ -581,21 +1462,38 @@ unsafe extern "system" fn reset_command_buffer(
     if !vk::CommandBufferResetFlags::RELEASE_RESOURCES.contains(flags) {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
-    status(with_command(command, |rt, id| {
-        let rec = rt
-            .commands
-            .get_mut(&id)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if !rt
-            .pools
-            .get(&rec.pool)
-            .is_some_and(|f| f.contains(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER))
-        {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        *rec = Recording::new(rec.pool);
-        Ok(())
-    }))
+    let driver = match driver(command.as_raw(), Kind::Command) {
+        Ok(driver) => driver,
+        Err(error) => return error,
+    };
+    let recording = driver
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .commands
+        .get(&command.as_raw())
+        .cloned();
+    let Some(recording) = recording else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let pool = recording
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pool;
+    if !driver
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pools
+        .get(&pool)
+        .is_some_and(|flags| flags.contains(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER))
+    {
+        return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    }
+    *recording
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Recording::new(pool);
+    vk::Result::SUCCESS
 }
 unsafe extern "system" fn begin_command_buffer(
     command: vk::CommandBuffer,
@@ -614,64 +1512,91 @@ unsafe extern "system" fn begin_command_buffer(
     let one_time = info
         .flags
         .contains(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    status(with_command(command, move |rt, id| {
-        let rec = rt
-            .commands
-            .get_mut(&id)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if rec.state == RecordingState::Recording {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        if rec.state != RecordingState::Initial
-            && !rt
-                .pools
-                .get(&rec.pool)
-                .is_some_and(|f| f.contains(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER))
-        {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        *rec = Recording::new(rec.pool);
-        rec.state = RecordingState::Recording;
-        rec.one_time = one_time;
-        Ok(())
-    }))
+    let driver = match driver(command.as_raw(), Kind::Command) {
+        Ok(driver) => driver,
+        Err(error) => return error,
+    };
+    let existing = driver
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .commands
+        .get(&command.as_raw())
+        .cloned();
+    let Some(existing) = existing else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let (pool, state) = {
+        let existing = existing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (existing.pool, existing.state)
+    };
+    if state == RecordingState::Recording {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    if state != RecordingState::Initial
+        && !driver
+            .recordings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pools
+            .get(&pool)
+            .is_some_and(|flags| flags.contains(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER))
+    {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let mut recording = Recording::new(pool);
+    recording.state = RecordingState::Recording;
+    recording.one_time = one_time;
+    *existing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = recording;
+    vk::Result::SUCCESS
 }
 unsafe extern "system" fn end_command_buffer(command: vk::CommandBuffer) -> vk::Result {
-    status(with_command(command, |rt, id| {
-        let rec = rt
-            .commands
-            .get_mut(&id)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if rec.state != RecordingState::Recording || rec.render.is_some() {
-            rec.fail(vk::Result::ERROR_INITIALIZATION_FAILED)
-        }
-        if let Some(e) = rec.error {
-            rec.state = RecordingState::Invalid;
-            Err(e)
-        } else {
-            rec.state = RecordingState::Executable;
-            Ok(())
-        }
-    }))
+    let driver = match driver(command.as_raw(), Kind::Command) {
+        Ok(driver) => driver,
+        Err(error) => return error,
+    };
+    let recording = driver
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .commands
+        .get(&command.as_raw())
+        .cloned();
+    let recording = match recording {
+        Some(recording) => recording,
+        None => return vk::Result::ERROR_INITIALIZATION_FAILED,
+    };
+    let mut recording = recording
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if recording.state != RecordingState::Recording || recording.render_active {
+        recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED)
+    }
+    if let Some(error) = recording.error {
+        recording.state = RecordingState::Invalid;
+        error
+    } else {
+        recording.state = RecordingState::Executable;
+        vk::Result::SUCCESS
+    }
 }
 unsafe extern "system" fn cmd_bind_pipeline(
     command: vk::CommandBuffer,
     point: vk::PipelineBindPoint,
     pipeline: vk::Pipeline,
 ) {
-    record(command, move |rt, rec| {
-        match (point, rt.resources.pipelines.get(&pipeline)) {
-            (vk::PipelineBindPoint::COMPUTE, Some(crate::resources::Pipeline::Compute(_))) => {
-                rec.compute = Some(pipeline)
-            }
-            (vk::PipelineBindPoint::GRAPHICS, Some(crate::resources::Pipeline::Graphics(_))) => {
-                rec.graphics = Some(pipeline)
-            }
-            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-        }
-        rec.used_pipelines.push(pipeline);
-        Ok(())
-    })
+    if !matches!(
+        point,
+        vk::PipelineBindPoint::GRAPHICS | vk::PipelineBindPoint::COMPUTE
+    ) {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
+    record(command, RecordedCommand::BindPipeline { point, pipeline })
 }
 unsafe extern "system" fn cmd_bind_descriptor_sets(
     command: vk::CommandBuffer,
@@ -683,76 +1608,39 @@ unsafe extern "system" fn cmd_bind_descriptor_sets(
     dynamic_count: u32,
     _dynamic: *const u32,
 ) {
+    if !matches!(
+        point,
+        vk::PipelineBindPoint::GRAPHICS | vk::PipelineBindPoint::COMPUTE
+    ) || dynamic_count != 0
+        || first.checked_add(count).is_none_or(|bound| bound > 4)
+    {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
     let copied = match slice(sets, count) {
         Ok(s) => s.to_vec(),
         Err(e) => {
-            record(command, move |_, _| Err(e));
+            record_error(command, e);
             return;
         }
     };
-    record(command, move |rt, rec| {
-        if dynamic_count != 0 || first.checked_add(count).is_none_or(|n| n > 4) {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        let l = rt
-            .resources
-            .pipeline_layouts
-            .get(&layout)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let target = if point == vk::PipelineBindPoint::COMPUTE {
-            &mut rec.compute_sets
-        } else if point == vk::PipelineBindPoint::GRAPHICS {
-            &mut rec.graphics_sets
-        } else {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        };
-        for (i, set) in copied.iter().enumerate() {
-            let d = rt
-                .resources
-                .descriptor_sets
-                .get(set)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if l.bind_groups().get(first as usize + i) != Some(&d.layout) {
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
-            target.insert(first + i as u32, *set);
-            rec.bound_sets.push(*set);
-        }
-        Ok(())
-    })
+    record(
+        command,
+        RecordedCommand::BindDescriptorSets {
+            point,
+            layout,
+            first,
+            sets: copied,
+            dynamic_count,
+        },
+    )
 }
 unsafe extern "system" fn cmd_dispatch(command: vk::CommandBuffer, x: u32, y: u32, z: u32) {
-    record(command, move |rt, rec| {
-        if rec.render.is_some() || x > 65535 || y > 65535 || z > 65535 {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        let pipeline = rec.compute.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let Some(crate::resources::Pipeline::Compute(id)) = rt.resources.pipelines.get(&pipeline)
-        else {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        };
-        rec.ops.push(ir::OwnedCommand::BeginComputePass);
-        rec.ops.push(ir::OwnedCommand::SetComputePipeline(*id));
-        let active_sets = active_sets(
-            rt,
-            crate::resources::Pipeline::Compute(*id),
-            &rec.compute_sets,
-        )?;
-        for &(index, set) in &active_sets {
-            rec.descriptors.push(DescriptorInsertion {
-                position: rec.ops.len(),
-                index,
-                set,
-            });
-        }
-        rec.written_sets
-            .extend(active_sets.into_iter().map(|(_, set)| set));
-        if x != 0 && y != 0 && z != 0 {
-            rec.ops.push(ir::OwnedCommand::Dispatch { x, y, z });
-        }
-        rec.ops.push(ir::OwnedCommand::EndComputePass);
-        Ok(())
-    })
+    if x > 65_535 || y > 65_535 || z > 65_535 {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
+    record(command, RecordedCommand::Dispatch { x, y, z })
 }
 unsafe extern "system" fn cmd_begin_render_pass(
     command: vk::CommandBuffer,
@@ -760,14 +1648,14 @@ unsafe extern "system" fn cmd_begin_render_pass(
     contents: vk::SubpassContents,
 ) {
     if info.is_null() {
-        record(command, |_, _| Err(vk::Result::ERROR_INITIALIZATION_FAILED));
+        record_error(command, vk::Result::ERROR_INITIALIZATION_FAILED);
         return;
     }
     let info = &*info;
     let clears = match slice(info.p_clear_values, info.clear_value_count) {
         Ok(v) => v.to_vec(),
         Err(e) => {
-            record(command, move |_, _| Err(e));
+            record_error(command, e);
             return;
         }
     };
@@ -775,114 +1663,24 @@ unsafe extern "system" fn cmd_begin_render_pass(
     let framebuffer = info.framebuffer;
     let area = info.render_area;
     let extended = !info.p_next.is_null();
-    record(command, move |rt, rec| {
-        if extended || contents != vk::SubpassContents::INLINE || rec.render.is_some() {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        let pass = rt
-            .resources
-            .render_passes
-            .get(&render_pass)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let fb = rt
-            .resources
-            .framebuffers
-            .get(&framebuffer)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if fb.render_pass != render_pass
-            || area.offset.x != 0
-            || area.offset.y != 0
-            || area.extent.width != fb.width
-            || area.extent.height != fb.height
-        {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        let image = rt
-            .resources
-            .images
-            .get(&fb.image)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if image.bound.is_none() {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        let load = match pass.load_op {
-            vk::AttachmentLoadOp::LOAD => ir::LoadOp::Load,
-            vk::AttachmentLoadOp::DONT_CARE => ir::LoadOp::DontCare,
-            vk::AttachmentLoadOp::CLEAR => {
-                let clear = clears
-                    .first()
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                let c = clear.color.float32;
-                ir::LoadOp::Clear(
-                    ir::Color::rgba(c[0], c[1], c[2], c[3]).map_err(crate::resources::failure)?,
-                )
-            }
-            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-        };
-        let depth = if let Some(load_op) = pass.depth_load_op {
-            let (_, handle) = fb.depth.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            let image = rt
-                .resources
-                .images
-                .get(&handle)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if image.bound.is_none() {
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
-            let load = match load_op {
-                vk::AttachmentLoadOp::LOAD => ir::DepthLoadOp::Load,
-                vk::AttachmentLoadOp::DONT_CARE => ir::DepthLoadOp::DontCare,
-                vk::AttachmentLoadOp::CLEAR => {
-                    let value = clears
-                        .get(1)
-                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
-                        .depth_stencil
-                        .depth;
-                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                    }
-                    ir::DepthLoadOp::Clear(value)
-                }
-                _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-            };
-            rec.used_images.push(handle);
-            Some(ir::OwnedDepthAttachment {
-                target: image.id,
-                load,
-                store: if pass.depth_store_op == vk::AttachmentStoreOp::STORE {
-                    ir::StoreOp::Store
-                } else {
-                    ir::StoreOp::DontCare
-                },
-            })
-        } else {
-            None
-        };
-        let area =
-            ir::PixelRect::new(0, 0, fb.width, fb.height).map_err(crate::resources::failure)?;
-        rec.ops
-            .push(ir::OwnedCommand::BeginRenderPass(ir::OwnedRenderPassDesc {
-                target: image.id,
-                area,
-                load,
-                store: ir::StoreOp::Store,
-                depth,
-            }));
-        rec.render = Some((fb.width, fb.height));
-        rec.used_images.push(fb.image);
-        rec.used_framebuffers.push(framebuffer);
-        rec.used_render_passes.push(render_pass);
-        Ok(())
-    })
+    if extended || contents != vk::SubpassContents::INLINE {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
+    record(
+        command,
+        RecordedCommand::BeginRenderPass {
+            extended,
+            contents,
+            render_pass,
+            framebuffer,
+            area,
+            clears,
+        },
+    )
 }
 unsafe extern "system" fn cmd_end_render_pass(command: vk::CommandBuffer) {
-    record(command, |_, rec| {
-        if rec.render.take().is_none() {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        rec.ops.push(ir::OwnedCommand::EndRenderPass);
-        Ok(())
-    })
+    record(command, RecordedCommand::EndRenderPass)
 }
 unsafe extern "system" fn cmd_bind_vertex_buffers(
     command: vk::CommandBuffer,
@@ -892,27 +1690,18 @@ unsafe extern "system" fn cmd_bind_vertex_buffers(
     offsets: *const vk::DeviceSize,
 ) {
     if first != 0 || count != 1 || buffers.is_null() || offsets.is_null() {
-        record(command, |_, _| Err(vk::Result::ERROR_FEATURE_NOT_PRESENT));
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
         return;
     }
     let (buffer, offset) = (*buffers, *offsets);
-    record(command, move |rt, rec| {
-        let data = rt
-            .resources
-            .buffers
-            .get(&buffer)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if data.bound.is_none()
-            || !data.usage.contains(vk::BufferUsageFlags::VERTEX_BUFFER)
-            || offset >= data.size
-            || !offset.is_multiple_of(4)
-        {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        rec.vertex_buffer = Some((buffer, offset));
-        rec.used_buffers.push(buffer);
-        Ok(())
-    })
+    if !offset.is_multiple_of(4) {
+        record_error(command, vk::Result::ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    record(
+        command,
+        RecordedCommand::BindVertexBuffer { buffer, offset },
+    )
 }
 
 unsafe extern "system" fn cmd_bind_index_buffer(
@@ -921,31 +1710,29 @@ unsafe extern "system" fn cmd_bind_index_buffer(
     offset: vk::DeviceSize,
     index_type: vk::IndexType,
 ) {
-    record(command, move |rt, rec| {
-        let format = match index_type {
-            vk::IndexType::UINT16 => ir::IndexFormat::Uint16,
-            vk::IndexType::UINT32 => ir::IndexFormat::Uint32,
-            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-        };
-        let data = rt
-            .resources
-            .buffers
-            .get(&buffer)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if data.bound.is_none()
-            || !data.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER)
-            || offset >= data.size
-            || !offset.is_multiple_of(u64::from(format.byte_size()))
-        {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    let format = match index_type {
+        vk::IndexType::UINT16 => ir::IndexFormat::Uint16,
+        vk::IndexType::UINT32 => ir::IndexFormat::Uint32,
+        _ => {
+            record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            return;
         }
-        rec.index_buffer = Some((buffer, offset, format));
-        rec.used_buffers.push(buffer);
-        Ok(())
-    })
+    };
+    if !offset.is_multiple_of(format.byte_size()) {
+        record_error(command, vk::Result::ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    record(
+        command,
+        RecordedCommand::BindIndexBuffer {
+            buffer,
+            offset,
+            index_type,
+        },
+    )
 }
 
-fn graphics_bindings(rt: &Runtime, rec: &mut Recording) -> VkResult<()> {
+fn graphics_bindings(rt: &Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
     let extent = rec.render.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
     let pipeline = rec
         .graphics
@@ -998,8 +1785,39 @@ fn graphics_bindings(rt: &Runtime, rec: &mut Recording) -> VkResult<()> {
             set,
         });
     }
+    mark_writable_descriptor_buffers(rt, rec, &active_sets)?;
     rec.written_sets
         .extend(active_sets.into_iter().map(|(_, set)| set));
+    Ok(())
+}
+
+fn mark_writable_descriptor_buffers(
+    rt: &Runtime,
+    rec: &mut ResolvedRecording,
+    sets: &[(u32, vk::DescriptorSet)],
+) -> VkResult<()> {
+    for (_, handle) in sets {
+        let set = rt
+            .resources
+            .descriptor_sets
+            .get(handle)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        for (&binding, resource) in &set.bindings {
+            let writable = set.layout.entries().iter().any(|entry| {
+                entry.binding() == binding
+                    && matches!(
+                        entry.ty(),
+                        ir::BindingType::StorageBuffer { read_only: false }
+                    )
+            });
+            if writable {
+                let crate::resources::DescriptorBinding::Buffer { buffer, .. } = resource;
+                if !rec.readback_buffers.contains(buffer) {
+                    rec.readback_buffers.push(*buffer);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1010,19 +1828,19 @@ unsafe extern "system" fn cmd_draw(
     first: u32,
     first_instance: u32,
 ) {
-    record(command, move |rt, rec| {
-        if instances > 1 || first_instance != 0 {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        graphics_bindings(rt, rec)?;
-        if vertices != 0 && instances != 0 {
-            rec.ops.push(ir::OwnedCommand::Draw {
-                vertex_count: vertices,
-                first_vertex: first,
-            });
-        }
-        Ok(())
-    })
+    if instances > 1 || first_instance != 0 {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
+    record(
+        command,
+        RecordedCommand::Draw {
+            vertices,
+            instances,
+            first,
+            first_instance,
+        },
+    )
 }
 
 unsafe extern "system" fn cmd_draw_indexed(
@@ -1033,33 +1851,20 @@ unsafe extern "system" fn cmd_draw_indexed(
     base_vertex: i32,
     first_instance: u32,
 ) {
-    record(command, move |rt, rec| {
-        if instances > 1 || first_instance != 0 {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        graphics_bindings(rt, rec)?;
-        let (handle, offset, format) = rec
-            .index_buffer
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let buffer = rt
-            .resources
-            .buffers
-            .get(&handle)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        rec.ops.push(ir::OwnedCommand::SetIndexBuffer {
-            buffer: buffer.id,
-            offset,
-            format,
-        });
-        if indices != 0 && instances != 0 {
-            rec.ops.push(ir::OwnedCommand::DrawIndexed {
-                index_count: indices,
-                first_index: first,
-                base_vertex,
-            });
-        }
-        Ok(())
-    })
+    if instances > 1 || base_vertex != 0 || first_instance != 0 {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
+    record(
+        command,
+        RecordedCommand::DrawIndexed {
+            indices,
+            instances,
+            first,
+            base_vertex,
+            first_instance,
+        },
+    )
 }
 unsafe extern "system" fn cmd_copy_image_to_buffer(
     command: vk::CommandBuffer,
@@ -1072,67 +1877,19 @@ unsafe extern "system" fn cmd_copy_image_to_buffer(
     let regions = match slice(regions, count) {
         Ok(v) => v.to_vec(),
         Err(e) => {
-            record(command, move |_, _| Err(e));
+            record_error(command, e);
             return;
         }
     };
-    record(command, move |rt, rec| {
-        if rec.render.is_some()
-            || !(layout == vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-                || layout == vk::ImageLayout::GENERAL)
-        {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        let img = rt
-            .resources
-            .images
-            .get(&image)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let buf = rt
-            .resources
-            .buffers
-            .get(&buffer)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if img.bound.is_none()
-            || buf.bound.is_none()
-            || !buf.usage.contains(vk::BufferUsageFlags::TRANSFER_DST)
-            || img.format != vk::Format::R8G8B8A8_UNORM
-        {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        for r in regions {
-            if r.buffer_row_length != 0
-                || r.buffer_image_height != 0
-                || r.image_offset != vk::Offset3D::default()
-                || r.image_extent != img.extent
-                || r.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
-                || r.image_subresource.mip_level != 0
-                || r.image_subresource.base_array_layer != 0
-                || r.image_subresource.layer_count != 1
-            {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-            let size = (img.extent.width as u64) * (img.extent.height as u64) * 4;
-            if r.buffer_offset % 4 != 0
-                || r.buffer_offset
-                    .checked_add(size)
-                    .is_none_or(|end| end > buf.size)
-            {
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
-            rec.copies.push(ReadImage {
-                position: rec.ops.len(),
-                image,
-                buffer,
-                offset: r.buffer_offset,
-                width: img.extent.width,
-                height: img.extent.height,
-            });
-        }
-        rec.used_buffers.push(buffer);
-        rec.used_images.push(image);
-        Ok(())
-    })
+    record(
+        command,
+        RecordedCommand::CopyImageToBuffer {
+            image,
+            layout,
+            buffer,
+            regions,
+        },
+    )
 }
 unsafe extern "system" fn cmd_copy_buffer(
     command: vk::CommandBuffer,
@@ -1144,43 +1901,18 @@ unsafe extern "system" fn cmd_copy_buffer(
     let regions = match slice(regions, count) {
         Ok(v) => v.to_vec(),
         Err(e) => {
-            record(command, move |_, _| Err(e));
+            record_error(command, e);
             return;
         }
     };
-    record(command, move |rt, rec| {
-        if rec.render.is_some() {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        let src = rt
-            .resources
-            .buffers
-            .get(&source)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let dst = rt
-            .resources
-            .buffers
-            .get(&destination)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if src.bound.is_none()
-            || dst.bound.is_none()
-            || !src.usage.contains(vk::BufferUsageFlags::TRANSFER_SRC)
-            || !dst.usage.contains(vk::BufferUsageFlags::TRANSFER_DST)
-        {
-            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-        }
-        for r in regions {
-            rec.ops.push(ir::OwnedCommand::CopyBufferToBuffer {
-                source: src.id,
-                source_offset: r.src_offset,
-                destination: dst.id,
-                destination_offset: r.dst_offset,
-                size: r.size,
-            });
-        }
-        rec.used_buffers.extend([source, destination]);
-        Ok(())
-    })
+    record(
+        command,
+        RecordedCommand::CopyBuffer {
+            source,
+            destination,
+            regions,
+        },
+    )
 }
 unsafe extern "system" fn cmd_pipeline_barrier(
     command: vk::CommandBuffer,
@@ -1194,13 +1926,17 @@ unsafe extern "system" fn cmd_pipeline_barrier(
     image_count: u32,
     images: *const vk::ImageMemoryBarrier<'_>,
 ) {
+    if validate_pipeline_barrier_header(source_stage, destination_stage, flags).is_err() {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
     let m = match slice(memory, memory_count) {
         Ok(v) => v
             .iter()
             .map(|x| (!x.p_next.is_null(), x.src_access_mask, x.dst_access_mask))
             .collect::<Vec<_>>(),
         Err(e) => {
-            record(command, move |_, _| Err(e));
+            record_error(command, e);
             return;
         }
     };
@@ -1221,7 +1957,7 @@ unsafe extern "system" fn cmd_pipeline_barrier(
             })
             .collect::<Vec<_>>(),
         Err(e) => {
-            record(command, move |_, _| Err(e));
+            record_error(command, e);
             return;
         }
     };
@@ -1243,106 +1979,50 @@ unsafe extern "system" fn cmd_pipeline_barrier(
             })
             .collect::<Vec<_>>(),
         Err(e) => {
-            record(command, move |_, _| Err(e));
+            record_error(command, e);
             return;
         }
     };
-    record(command, move |rt, rec| {
-        let allowed = vk::PipelineStageFlags::TOP_OF_PIPE
-            | vk::PipelineStageFlags::BOTTOM_OF_PIPE
-            | vk::PipelineStageFlags::HOST
-            | vk::PipelineStageFlags::TRANSFER
-            | vk::PipelineStageFlags::COMPUTE_SHADER
-            | vk::PipelineStageFlags::VERTEX_SHADER
-            | vk::PipelineStageFlags::FRAGMENT_SHADER
-            | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-            | vk::PipelineStageFlags::VERTEX_INPUT
-            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-            | vk::PipelineStageFlags::ALL_COMMANDS
-            | vk::PipelineStageFlags::ALL_GRAPHICS;
-        if rec.render.is_some()
-            || source_stage.is_empty()
-            || destination_stage.is_empty()
-            || !allowed.contains(source_stage | destination_stage)
-            || !vk::DependencyFlags::BY_REGION.contains(flags)
-        {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        for (extended, src, dst) in m {
-            if extended {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-            if src.intersects(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE) {
-                let after = buffer_access(dst)?;
-                rec.barriers.push(DeferredBarrier {
-                    position: rec.ops.len(),
-                    sets: rec.written_sets.clone(),
-                    after,
-                });
-                rec.written_sets.clear();
-            } else if !(vk::AccessFlags::TRANSFER_WRITE
-                | vk::AccessFlags::HOST_WRITE
-                | vk::AccessFlags::MEMORY_WRITE)
-                .contains(src)
-                || !supported_access(dst)
-            {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-        }
-        for (extended, src, dst, sq, dq, buffer, offset, size) in b {
-            if extended || !(sq == vk::QUEUE_FAMILY_IGNORED && dq == vk::QUEUE_FAMILY_IGNORED) {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-            let buf = rt
-                .resources
-                .buffers
-                .get(&buffer)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if offset != 0 || (size != vk::WHOLE_SIZE && size != buf.size) {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-            rec.ops.push(ir::OwnedCommand::ResourceBarrier(
-                ir::OwnedResourceBarrier::Buffer {
-                    buffer: buf.id,
-                    before: buffer_access(src)?,
-                    after: buffer_access(dst)?,
-                },
-            ));
-            rec.used_buffers.push(buffer);
-        }
-        for (extended, _src, _dst, sq, dq, image, old, new, range) in i {
-            if extended
-                || !(sq == vk::QUEUE_FAMILY_IGNORED && dq == vk::QUEUE_FAMILY_IGNORED)
-                || range.base_mip_level != 0
-                || range.level_count != 1
-                || range.base_array_layer != 0
-                || range.layer_count != 1
-            {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-            let image_obj = rt
-                .resources
-                .images
-                .get(&image)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if range.aspect_mask != crate::images::image_aspect(image_obj.format) {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-            let after = texture_access(new)?;
-            if old != vk::ImageLayout::UNDEFINED {
-                rec.ops.push(ir::OwnedCommand::ResourceBarrier(
-                    ir::OwnedResourceBarrier::Texture {
-                        texture: image_obj.id,
-                        before: texture_access(old)?,
-                        after,
-                    },
-                ));
-            }
-            rec.used_images.push(image);
-        }
+    record(
+        command,
+        RecordedCommand::PipelineBarrier {
+            source_stage,
+            destination_stage,
+            flags,
+            memory: m,
+            buffers: b,
+            images: i,
+        },
+    )
+}
+
+fn validate_pipeline_barrier_header(
+    source_stage: vk::PipelineStageFlags,
+    destination_stage: vk::PipelineStageFlags,
+    flags: vk::DependencyFlags,
+) -> VkResult<()> {
+    let allowed = vk::PipelineStageFlags::TOP_OF_PIPE
+        | vk::PipelineStageFlags::BOTTOM_OF_PIPE
+        | vk::PipelineStageFlags::HOST
+        | vk::PipelineStageFlags::TRANSFER
+        | vk::PipelineStageFlags::COMPUTE_SHADER
+        | vk::PipelineStageFlags::VERTEX_SHADER
+        | vk::PipelineStageFlags::FRAGMENT_SHADER
+        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+        | vk::PipelineStageFlags::VERTEX_INPUT
+        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+        | vk::PipelineStageFlags::ALL_COMMANDS
+        | vk::PipelineStageFlags::ALL_GRAPHICS;
+    if source_stage.is_empty()
+        || destination_stage.is_empty()
+        || !allowed.contains(source_stage | destination_stage)
+        || !vk::DependencyFlags::BY_REGION.contains(flags)
+    {
+        Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+    } else {
         Ok(())
-    })
+    }
 }
 fn supported_access(access: vk::AccessFlags) -> bool {
     (vk::AccessFlags::SHADER_READ
@@ -1561,7 +2241,42 @@ unsafe extern "system" fn queue_submit(
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         }
     }
-    status(call(&d, move |rt| {
+    let recorded = {
+        let registry = d
+            .recordings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match commands
+            .iter()
+            .map(|id| {
+                registry
+                    .commands
+                    .get(id)
+                    .cloned()
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })
+            .collect::<VkResult<Vec<RecordingCell>>>()
+        {
+            Ok(recorded) => recorded,
+            Err(error) => return error,
+        }
+    };
+    let recorded = match recorded
+        .iter()
+        .map(|recording| {
+            let recording = recording
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (recording.state == RecordingState::Executable)
+                .then(|| recording.clone())
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+        })
+        .collect::<VkResult<Vec<_>>>()
+    {
+        Ok(recorded) => recorded,
+        Err(error) => return error,
+    };
+    let accepted = call(&d, move |rt| {
         if rt.lost {
             return Err(vk::Result::ERROR_DEVICE_LOST);
         }
@@ -1578,15 +2293,9 @@ unsafe extern "system" fn queue_submit(
             }
             Some(state)
         };
-        let recordings = commands
+        let recordings = recorded
             .iter()
-            .map(|id| {
-                rt.commands
-                    .get(id)
-                    .filter(|r| r.state == RecordingState::Executable)
-                    .cloned()
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
-            })
+            .map(|recording| resolve_recording(rt, recording))
             .collect::<VkResult<Vec<_>>>()?;
         // Validate all object references before any GPU acceptance.
         for rec in &recordings {
@@ -1595,33 +2304,92 @@ unsafe extern "system" fn queue_submit(
         if let Some(state) = &fence_state {
             state.store(2, Ordering::Release);
         }
-        for rec in &recordings {
-            if let Err(error) = execute(rt, rec) {
-                if error == vk::Result::ERROR_DEVICE_LOST {
-                    rt.lost = true;
+        let mut submissions = Vec::new();
+        for recording in &recordings {
+            match execute(rt, recording) {
+                Ok(mut accepted) => submissions.append(&mut accepted),
+                Err(error) => {
+                    for submission in &submissions {
+                        let _ = wait_submission(rt, submission);
+                    }
+                    if error == vk::Result::ERROR_DEVICE_LOST {
+                        rt.lost = true;
+                    }
+                    if let Some(state) = &fence_state {
+                        state.store(0, Ordering::Release);
+                    }
+                    return Err(error);
                 }
-                if let Some(state) = &fence_state {
-                    state.store(0, Ordering::Release);
-                }
-                return Err(error);
             }
         }
-        for id in &commands {
-            if let Some(rec) = rt.commands.get_mut(id)
-                && rec.one_time
-            {
-                rec.state = RecordingState::Invalid;
+        let submitted = {
+            let registry = rt
+                .recordings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            commands
+                .iter()
+                .filter_map(|id| registry.commands.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        for recording in submitted {
+            let mut recording = recording
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if recording.one_time {
+                recording.state = RecordingState::Invalid;
             }
         }
-        // QueueSubmit is deliberately synchronous. Only actual successful SGFX
-        // retirement plus coherent CPU readback permits this transition.
-        if let Some(state) = fence_state {
+        if submissions.is_empty() {
+            if let Some(state) = &fence_state {
+                state.store(1, Ordering::Release);
+            }
+        } else {
+            rt.in_flight.begin();
+        }
+        Ok((submissions, fence_state))
+    });
+    let (submissions, fence_state) = match accepted {
+        Ok(accepted) => accepted,
+        Err(error) => return error,
+    };
+    if submissions.is_empty() {
+        return vk::Result::SUCCESS;
+    }
+    if let Err(error) = d.completion_sender.send(CompletionRequest::Observe {
+        submissions,
+        fence: fence_state,
+    }) {
+        let CompletionRequest::Observe { submissions, fence } = error.0 else {
+            unreachable!();
+        };
+        finish_submissions(&submissions, fence.as_ref(), &d.in_flight, &d.lost);
+    }
+    vk::Result::SUCCESS
+}
+
+fn finish_submissions(
+    submissions: &[sgfx::driver::Submission],
+    fence: Option<&Arc<AtomicU8>>,
+    in_flight: &InFlight,
+    lost: &AtomicBool,
+) {
+    let complete = submissions
+        .iter()
+        .all(|submission| matches!(submission.wait(None), Ok(CompletionStatus::Complete)));
+    if complete {
+        if let Some(state) = fence {
             state.store(1, Ordering::Release);
         }
-        Ok(())
-    }))
+    } else {
+        lost.store(true, Ordering::Release);
+        if let Some(state) = fence {
+            state.store(0, Ordering::Release);
+        }
+    }
+    in_flight.finish();
 }
-fn validate_objects(rt: &Runtime, rec: &Recording) -> VkResult<()> {
+fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
     if rec
         .bound_sets
         .iter()
@@ -1678,27 +2446,49 @@ fn validate_objects(rt: &Runtime, rec: &Recording) -> VkResult<()> {
     }
     Ok(())
 }
-fn submit_owned(rt: &mut Runtime, ops: Vec<ir::OwnedCommand>) -> VkResult<()> {
+fn submit_owned(
+    rt: &mut Runtime,
+    ops: Vec<ir::OwnedCommand>,
+) -> VkResult<Option<sgfx::driver::Submission>> {
     if ops.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let owned = ir::OwnedCommandBuffer::new(ops);
     let commands = owned.record(&rt.table).map_err(crate::resources::failure)?;
-    match rt.queue.submit_tracked(&mut rt.cache, &commands) {
-        Ok(receipt) => match receipt.wait(None) {
-            Ok(CompletionStatus::Complete) => Ok(()),
-            _ => {
-                rt.lost = true;
-                Err(vk::Result::ERROR_DEVICE_LOST)
-            }
-        },
-        Err(_) => {
+    match rt.queue.submit(&mut rt.cache, &commands) {
+        Ok(receipt) => Ok(Some(receipt)),
+        Err(SubmitError::Busy) => Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+        Err(SubmitError::Rejected(error)) => Err(crate::runtime::backend_failure(error)),
+        Err(SubmitError::Failed {
+            error: _,
+            completion,
+        }) => {
+            let _ = completion.wait(None);
             rt.lost = true;
             Err(vk::Result::ERROR_DEVICE_LOST)
         }
+        Err(_) => Err(vk::Result::ERROR_DEVICE_LOST),
     }
 }
-fn execute(rt: &mut Runtime, rec: &Recording) -> VkResult<()> {
+
+fn wait_submission(rt: &mut Runtime, submission: &sgfx::driver::Submission) -> VkResult<()> {
+    match submission.wait(None) {
+        Ok(CompletionStatus::Complete) => Ok(()),
+        Ok(CompletionStatus::Pending) | Ok(_) => {
+            rt.lost = true;
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        }
+        Err(error) => {
+            let result = crate::runtime::backend_failure(error);
+            if result == vk::Result::ERROR_DEVICE_LOST {
+                rt.lost = true;
+            }
+            Err(result)
+        }
+    }
+}
+
+fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
     let mut used = rec.used_buffers.clone();
     for insertion in &rec.descriptors {
         let set = rt
@@ -1716,7 +2506,8 @@ fn execute(rt: &mut Runtime, rec: &Recording) -> VkResult<()> {
     used.sort_unstable_by_key(|b| b.as_raw());
     used.dedup();
     let mut ops = Vec::new();
-    // Coherent host memory is stable until this synchronous call returns.
+    // Every upload is copied into SGFX-owned command storage before submission
+    // returns, so application mappings need not remain borrowed by the backend.
     for handle in &used {
         let buffer = rt
             .resources
@@ -1781,7 +2572,9 @@ fn execute(rt: &mut Runtime, rec: &Recording) -> VkResult<()> {
             }
         }
         for copy in rec.copies.iter().filter(|c| c.position == position) {
-            submit_owned(rt, std::mem::take(&mut ops))?;
+            if let Some(submission) = submit_owned(rt, std::mem::take(&mut ops))? {
+                wait_submission(rt, &submission)?;
+            }
             let image_id = rt
                 .resources
                 .images
@@ -1789,8 +2582,8 @@ fn execute(rt: &mut Runtime, rec: &Recording) -> VkResult<()> {
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
                 .id;
             let bytes = rt
-                .cache
-                .read_texture(image_id)
+                .queue
+                .read_texture(&mut rt.cache, image_id)
                 .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
             if bytes.len() != (copy.width as usize) * (copy.height as usize) * 4 {
                 return Err(vk::Result::ERROR_DEVICE_LOST);
@@ -1810,9 +2603,18 @@ fn execute(rt: &mut Runtime, rec: &Recording) -> VkResult<()> {
             ops.push(op.clone());
         }
     }
-    submit_owned(rt, ops)?;
-    // Stage GPU-written bytes back into the exact allocation returned by MapMemory.
-    for handle in &used {
+    let mut submissions = submit_owned(rt, ops)?.into_iter().collect::<Vec<_>>();
+    let mut readback = rec.readback_buffers.clone();
+    readback.sort_unstable_by_key(|buffer| buffer.as_raw());
+    readback.dedup();
+    if !readback.is_empty() {
+        for submission in &submissions {
+            wait_submission(rt, submission)?;
+        }
+        submissions.clear();
+    }
+    // Stage only GPU-written bytes back into allocations returned by MapMemory.
+    for handle in &readback {
         let buffer = rt
             .resources
             .buffers
@@ -1831,7 +2633,7 @@ fn execute(rt: &mut Runtime, rec: &Recording) -> VkResult<()> {
             memory.bytes[offset as usize..(offset + buffer.size) as usize].copy_from_slice(&bytes);
         }
     }
-    Ok(())
+    Ok(submissions)
 }
 
 pub(crate) unsafe extern "system" fn get_device_proc_addr(
@@ -1900,19 +2702,26 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
 /// Descriptor indexing is not exposed. Updating a referenced set invalidates
 /// every recording or executable command buffer under Vulkan 1.0 rules.
 pub(crate) fn invalidate_descriptor_sets(rt: &mut Runtime, sets: &[vk::DescriptorSet]) {
-    for rec in rt.commands.values_mut() {
-        if sets.iter().any(|s| {
-            rec.bound_sets.contains(s)
-                || rec
-                    .compute_sets
-                    .values()
-                    .chain(rec.graphics_sets.values())
-                    .any(|v| v == s)
-                || rec.descriptors.iter().any(|d| d.set == *s)
-        }) {
-            rec.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
-            if rec.state == RecordingState::Executable {
-                rec.state = RecordingState::Invalid;
+    let recordings = rt
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .commands
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for recording in recordings {
+        let mut recording = recording
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if recording
+            .commands
+            .iter()
+            .any(|command| command.references_descriptor_sets(sets))
+        {
+            recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+            if recording.state == RecordingState::Executable {
+                recording.state = RecordingState::Invalid;
             }
         }
     }
@@ -1967,18 +2776,22 @@ fn active_sets(
 }
 
 pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
-    for rec in rt.commands.values_mut() {
-        if !rec.used_buffers.is_empty()
-            || !rec.used_images.is_empty()
-            || !rec.used_pipelines.is_empty()
-            || !rec.descriptors.is_empty()
-        {
-            rec.state = RecordingState::Invalid;
-            rec.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
-            rec.ops.clear();
-            rec.descriptors.clear();
-            rec.copies.clear();
-            rec.barriers.clear();
+    let recordings = rt
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .commands
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for recording in recordings {
+        let mut recording = recording
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !recording.commands.is_empty() {
+            recording.state = RecordingState::Invalid;
+            recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+            recording.commands.clear();
         }
     }
 }
@@ -1986,14 +2799,61 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn fence_queries_do_not_queue_behind_a_busy_device_worker() {
+    fn command_recording_stays_on_the_calling_thread() {
         let (sender, _intentionally_unserviced_receiver) = mpsc::channel();
+        let (completion_sender, _intentionally_unserviced_completion_receiver) = mpsc::channel();
         let d = Arc::new(Driver {
             sender,
             thread: Mutex::new(None),
+            completion_sender,
+            completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
             fences: Default::default(),
+            recordings: Default::default(),
+            in_flight: Default::default(),
+            lost: Arc::new(AtomicBool::new(false)),
+        });
+        let command = vk::CommandBuffer::from_raw(add_handle(Kind::Command, &d));
+        let mut recording = Recording::new(1);
+        recording.state = RecordingState::Recording;
+        d.recordings
+            .lock()
+            .unwrap()
+            .commands
+            .insert(command.as_raw(), Arc::new(Mutex::new(recording)));
+
+        record(command, RecordedCommand::Dispatch { x: 1, y: 2, z: 3 });
+
+        let recording = d
+            .recordings
+            .lock()
+            .unwrap()
+            .commands
+            .get(&command.as_raw())
+            .cloned()
+            .unwrap();
+        assert!(matches!(
+            recording.lock().unwrap().commands.as_slice(),
+            [RecordedCommand::Dispatch { x: 1, y: 2, z: 3 }]
+        ));
+        remove_handle(command.as_raw());
+    }
+
+    #[test]
+    fn fence_queries_do_not_queue_behind_a_busy_device_worker() {
+        let (sender, _intentionally_unserviced_receiver) = mpsc::channel();
+        let (completion_sender, _intentionally_unserviced_completion_receiver) = mpsc::channel();
+        let d = Arc::new(Driver {
+            sender,
+            thread: Mutex::new(None),
+            completion_sender,
+            completion_thread: Mutex::new(None),
+            queue: AtomicU64::new(0),
+            fences: Default::default(),
+            recordings: Default::default(),
+            in_flight: Default::default(),
             lost: Arc::new(AtomicBool::new(false)),
         });
         let device = vk::Device::from_raw(add_handle(Kind::Device, &d));

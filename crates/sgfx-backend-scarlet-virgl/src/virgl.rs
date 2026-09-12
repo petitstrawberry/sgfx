@@ -5,14 +5,13 @@ use core::cell::{Cell, RefCell};
 use std::sync::Mutex;
 
 use gpu_raw::{
-    GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_DEPTH, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
-    GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD, GPU_EXECUTION_SUPPORT_PRESENTATION,
-    GPU_EXECUTION_SUPPORT_QUEUE, GPU_IMAGE_FORMAT_BGRA8_UNORM, GPU_IMAGE_FORMAT_DEPTH32_FLOAT,
-    GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT, GPU_IMAGE_USAGE_PRESENTABLE,
-    GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED, GPU_IMAGE_USAGE_TRANSFER_DST,
-    GPU_IMAGE_USAGE_TRANSFER_SRC, GPU_MAX_IMAGE_UPLOAD_SIZE, GPU_RESULT_SUCCESS, Gpu as RawGpu,
-    GpuBuffer as RawBuffer, GpuCompletion, GpuContext as RawContext, GpuDialect as RawDialect,
-    GpuImage as RawImage, GpuImageBgraRect, GpuQueryInfo, GpuQueue as RawQueue,
+    GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_QUEUE, GPU_IMAGE_FORMAT_BGRA8_UNORM,
+    GPU_IMAGE_FORMAT_DEPTH32_FLOAT, GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT,
+    GPU_IMAGE_USAGE_PRESENTABLE, GPU_IMAGE_USAGE_RENDER_TARGET, GPU_IMAGE_USAGE_SAMPLED,
+    GPU_IMAGE_USAGE_TRANSFER_DST, GPU_IMAGE_USAGE_TRANSFER_SRC, GPU_MAX_IMAGE_UPLOAD_SIZE,
+    GPU_RESULT_SUCCESS, Gpu as RawGpu, GpuBuffer as RawBuffer, GpuCompletion,
+    GpuContext as RawContext, GpuDialect as RawDialect, GpuImage as RawImage, GpuImageBgraRect,
+    GpuQueryInfo, GpuQueue as RawQueue,
 };
 #[cfg(feature = "std")]
 use scarlet_os::handle::{Handle, HandleError, HandleResult};
@@ -52,7 +51,6 @@ const VIRGL_CCMD_RESOURCE_COPY_REGION: u32 = 17;
 const VIRGL_CCMD_SET_CONSTANT_BUFFER: u32 = 12;
 const VIRGL_CCMD_SET_SCISSOR_STATE: u32 = 15;
 const VIRGL_CCMD_BIND_SAMPLER_STATES: u32 = 18;
-const VIRGL_CCMD_SET_UNIFORM_BUFFER: u32 = 27;
 const VIRGL_CCMD_BIND_SHADER: u32 = 31;
 const VIRGL_CCMD_CLEAR_SURFACE: u32 = 62;
 
@@ -357,13 +355,7 @@ impl Device {
             return Err(HandleError::Unsupported);
         }
 
-        let capabilities = Capabilities {
-            rendering: true,
-            presentation: info.execution_support & GPU_EXECUTION_SUPPORT_PRESENTATION != 0,
-            image_upload: info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD != 0,
-            image_readback: info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_READBACK != 0,
-            depth: info.execution_support & GPU_EXECUTION_SUPPORT_DEPTH != 0,
-        };
+        let capabilities = Capabilities::from_query_info(&info);
         let dialect = raw.query_dialect(0)?;
         Ok(Self {
             raw,
@@ -1331,13 +1323,10 @@ impl Queue {
             if let Some(binding) = draw.vertex_buffer {
                 ir_buffer(context, resources, binding.buffer)?;
             }
-            if let Some(programmable) = &draw.programmable {
-                if let Some(binding) = programmable.index_buffer {
-                    ir_buffer(context, resources, binding.buffer)?;
-                }
-                for constant in &programmable.constants {
-                    ir_buffer(context, resources, constant.buffer)?;
-                }
+            if let Some(programmable) = &draw.programmable
+                && let Some(binding) = programmable.index_buffer
+            {
+                ir_buffer(context, resources, binding.buffer)?;
             }
             if let Some(texture) = draw.texture {
                 ir_texture(context, resources, texture)?;
@@ -2479,18 +2468,16 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
         }
     }
     for constant in &programmable.constants {
-        uploaded_ir_buffer(resources, constant.buffer)?;
         if !matches!(
             constant.stage,
             crate::ir::ShaderStage::Vertex | crate::ir::ShaderStage::Fragment
-        ) || constant.slot == 0
-            || constant.slot >= 16
-            || constant.offset % 256 != 0
-            || constant.size == 0
-            || constant.size % 16 != 0
-            || u64::from(constant.offset)
-                .checked_add(u64::from(constant.size))
-                .is_none_or(|end| end > constant.buffer.size)
+        ) || constant.words.is_empty()
+            || !constant.words.len().is_multiple_of(4)
+            || usize::try_from(constant.first_register)
+                .ok()
+                .and_then(|start| start.checked_mul(4))
+                .and_then(|start| start.checked_add(constant.words.len()))
+                .is_none_or(|end| end > 4096)
         {
             return Err(HandleError::InvalidParameter);
         }
@@ -3077,6 +3064,27 @@ fn push_constant_buffer(
     Ok(())
 }
 
+fn push_constant_words(
+    commands: &mut Vec<u8>,
+    shader_type: u32,
+    values: &[u32],
+) -> HandleResult<()> {
+    let payload = u32::try_from(values.len())
+        .ok()
+        .and_then(|length| length.checked_add(2))
+        .ok_or(HandleError::InvalidParameter)?;
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_SET_CONSTANT_BUFFER, 0, payload),
+    );
+    push_dword(commands, shader_type);
+    push_dword(commands, 0);
+    for value in values {
+        push_dword(commands, *value);
+    }
+    Ok(())
+}
+
 fn push_ir_setup(commands: &mut Vec<u8>, resources: &IrResources) {
     push_shader(
         commands,
@@ -3280,21 +3288,34 @@ fn push_programmable_draw(
             command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 0),
         );
     }
+    let mut vertex_constants = Vec::new();
+    let mut fragment_constants = Vec::new();
     for constant in &programmable.constants {
-        let buffer = uploaded_ir_buffer(resources, constant.buffer)?;
-        let stage = match constant.stage {
-            crate::ir::ShaderStage::Vertex => PIPE_SHADER_VERTEX,
-            crate::ir::ShaderStage::Fragment => PIPE_SHADER_FRAGMENT,
+        let values = match constant.stage {
+            crate::ir::ShaderStage::Vertex => &mut vertex_constants,
+            crate::ir::ShaderStage::Fragment => &mut fragment_constants,
             _ => return Err(HandleError::InvalidParameter),
         };
-        push_uniform_buffer(
-            commands,
-            stage,
-            constant.slot,
-            constant.offset,
-            constant.size,
-            buffer.resource_id,
-        );
+        let start = usize::try_from(constant.first_register)
+            .ok()
+            .and_then(|register| register.checked_mul(4))
+            .ok_or(HandleError::InvalidParameter)?;
+        let end = start
+            .checked_add(constant.words.len())
+            .ok_or(HandleError::InvalidParameter)?;
+        if values.len() < end {
+            values
+                .try_reserve_exact(end - values.len())
+                .map_err(|_| HandleError::OutOfResources)?;
+            values.resize(end, 0);
+        }
+        values[start..end].copy_from_slice(&constant.words);
+    }
+    if !vertex_constants.is_empty() {
+        push_constant_words(commands, PIPE_SHADER_VERTEX, &vertex_constants)?;
+    }
+    if !fragment_constants.is_empty() {
+        push_constant_words(commands, PIPE_SHADER_FRAGMENT, &fragment_constants)?;
     }
     push_ir_scissor(commands, ir_rect_to_pixel_rect(draw.scissor)?)?;
     if let Some(binding) = programmable.index_buffer {
@@ -3314,23 +3335,6 @@ fn push_programmable_draw(
         )
     } else {
         push_draw(commands, draw.start_vertex, draw.vertex_count)
-    }
-}
-
-fn push_uniform_buffer(
-    commands: &mut Vec<u8>,
-    stage: u32,
-    slot: u32,
-    offset: u32,
-    size: u32,
-    resource_id: u32,
-) {
-    push_dword(
-        commands,
-        command_header(VIRGL_CCMD_SET_UNIFORM_BUFFER, 0, 5),
-    );
-    for word in [stage, slot, offset, size, resource_id] {
-        push_dword(commands, word);
     }
 }
 
@@ -4150,25 +4154,25 @@ mod tests {
     }
 
     #[test]
-    fn programmable_uniform_bindings_keep_stage_slot_offset_and_range() {
+    fn programmable_constants_use_the_legacy_inline_constant_bank() {
         let mut commands = Vec::new();
-        push_uniform_buffer(&mut commands, PIPE_SHADER_VERTEX, 2, 256, 64, 19);
-        push_uniform_buffer(&mut commands, PIPE_SHADER_FRAGMENT, 1, 0, 16, 20);
+        push_constant_words(&mut commands, PIPE_SHADER_VERTEX, &[1, 2, 3, 4]).unwrap();
+        push_constant_words(&mut commands, PIPE_SHADER_FRAGMENT, &[5, 6]).unwrap();
         assert_eq!(
             dwords(&commands),
             alloc::vec![
-                command_header(VIRGL_CCMD_SET_UNIFORM_BUFFER, 0, 5),
+                command_header(VIRGL_CCMD_SET_CONSTANT_BUFFER, 0, 6),
                 0,
+                0,
+                1,
                 2,
-                256,
-                64,
-                19,
-                command_header(VIRGL_CCMD_SET_UNIFORM_BUFFER, 0, 5),
-                1,
+                3,
+                4,
+                command_header(VIRGL_CCMD_SET_CONSTANT_BUFFER, 0, 4),
                 1,
                 0,
-                16,
-                20,
+                5,
+                6,
             ]
         );
     }

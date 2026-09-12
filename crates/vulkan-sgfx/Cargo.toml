@@ -20,18 +20,15 @@ required-features = ["cube-demo"]
 [dependencies]
 naga = { version = "24", features = ["spv-in", "spv-out"] }
 ash = { version = "0.38", default-features = false, features = ["debug", "std"] }
-sgfx-core = { path = "../sgfx-core" }
 png = { version = "0.18", optional = true }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
-pollster = "0.4"
-sgfx-backend-wgpu = { path = "../sgfx-backend-wgpu" }
-wgpu = "24"
 libloading = { version = "0.8", optional = true }
+sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-wgpu"] }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl" }
-framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", default-features = false, features = ["std"], optional = true }
+framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "85f0cead4cb4c9add021360f1b469f08bf0d23a9", default-features = false, features = ["std"], optional = true }
+sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-scarlet-virgl"] }
 
 [dev-dependencies]
 png = "0.18"
@@ -39,3 +36,6 @@ naga = { version = "24", features = ["wgsl-in", "spv-out"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dev-dependencies]
 libloading = "0.8"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

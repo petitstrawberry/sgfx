@@ -36,9 +36,10 @@ Rust backend/facade interfaces, feature composition, and unfinished review.
 
 The IR includes shader modules, programmable render/compute pipelines, resource
 bind groups, buffer copies and explicit same-queue resource dependencies. The
-WGPU backend executes this subset; native backends explicitly reject the
-programmable operations they cannot lower. See the [IR reference](docs/ir-reference.md)
-and [Vulkan frontend scope](docs/vulkan-sgfx.md) for the supported operations.
+WGPU executes graphics and compute from this subset. Scarlet VirGL executes the
+bounded programmable graphics subset and rejects compute; Adreno currently
+rejects programmable execution. See the [IR reference](docs/ir-reference.md) and
+[Vulkan frontend scope](docs/vulkan-sgfx.md) for the supported operations.
 
 `scarlet-ui-renderer-sgfx` remains in the ScarletUI repository because it is a
 frontend. Scarlet GPU ABI crates such as `gpu-raw` remain in Scarlet.
@@ -52,11 +53,13 @@ does not promise unchanged Rust signatures across releases. Direct Rust users
 must select a compatible revision/lockfile set and rebuild its components.
 
 The intended application-facing graphics boundary is the Vulkan C ABI. The
-experimental `vulkan-sgfx` frontend links SGFX core and WGPU execution into one
-ICD/library. Native frontend support and Vulkan conformance remain future work.
-Independently loading SGFX Rust components is not
-planned. Resource ownership, ordering, completion and failure semantics still
-form the common backend contract. See the [approved policy](docs/1.0-contract.md#2-coordinated-rust-implementation-policy).
+experimental `vulkan-sgfx` frontend depends only on the SGFX execution facade;
+the product build links that facade, core, and its selected complete backend
+into one ICD/library. The host build uses WGPU and the Scarlet QEMU build uses
+VirGL. Independently loading SGFX Rust components is not planned. Native
+Scarlet dynamic-loader support and Vulkan conformance remain future work.
+Resource ownership, ordering, completion and failure semantics still form the
+common backend contract. See the [approved policy](docs/1.0-contract.md#2-coordinated-rust-implementation-policy).
 
 ## Dependency
 
@@ -65,24 +68,20 @@ form the common backend contract. See the [approved policy](docs/1.0-contract.md
 sgfx = { git = "https://github.com/petitstrawberry/sgfx" }
 ```
 
-The resolved revisions are recorded in `Cargo.lock`; the manifests do not pin
-SGFX or Adreno to a `rev`. Consumers do not need a compatibility patch for
-SGFX's former Scarlet source.
+The workspace pins coordinated Git dependencies such as Scarlet, Adreno, and
+the shared `sgfx-core` type source to exact commits. Downstream applications
+should also retain their resolved revisions in `Cargo.lock`. No workspace
+source patch is required.
 
 See [dependencies and locked revisions](docs/reference.md#dependencies-and-locked-revisions)
 for the native source set, shared Rust type identity and workspace patch policy.
 
 ## Development
 
-This workspace overrides its own Git `sgfx-core` source with `crates/sgfx-core`
-so the external Adreno backend uses the same IR types as the local crates.
-This is a development-only override: Git consumers resolve the core from the
-same repository naturally and do not inherit or need the workspace patch.
-
-Use the published Adreno and Scarlet revisions selected in `Cargo.lock`.
-Update dependencies with `cargo update -p <package> --precise <commit>` when
-selecting a new compatible source set. Review all affected Git revisions in
-`Cargo.lock`, then run the locked target checks below.
+All components that exchange SGFX IR use the same exact `sgfx-core` Git commit.
+Use the Scarlet and Adreno revisions declared in the manifests and selected in
+`Cargo.lock`. Update the manifest `rev` and lockfile together when selecting a
+new compatible source set, then run the locked target checks below.
 
 CI runs the portable suite on both `scarlet-rust-toolchain` (the integration
 baseline) and upstream Rust (the portability check). The two compilers use

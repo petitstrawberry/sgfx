@@ -6,8 +6,8 @@ license = "MIT"
 repository = "https://github.com/petitstrawberry/sgfx"
 
 [dependencies]
-sgfx-core = { path = "../sgfx-core", default-features = false }
 naga = { version = "24", optional = true, features = ["wgsl-in", "spv-in"] }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "0b4cf0984d9b17bd0646612428c44bf1505393a8", default-features = false }
 
 [features]
 default = []
