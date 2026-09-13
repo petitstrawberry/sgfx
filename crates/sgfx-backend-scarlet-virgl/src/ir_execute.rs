@@ -681,6 +681,10 @@ struct ActivePass<'r> {
     pipeline: Option<RenderPipelineRef<'r>>,
     programmable: Option<ir::ProgrammableRenderPipelineRef<'r>>,
     programmable_cache: Option<ProgrammableDrawCache<'r>>,
+    #[cfg(feature = "programmable")]
+    constants_scratch: Vec<driver::IrConstantBuffer>,
+    #[cfg(feature = "programmable")]
+    textures_scratch: Vec<driver::IrTextureBinding>,
     bind_groups: [Option<ir::BindGroupRef<'r>>; ir::MAX_BIND_GROUPS],
     vertex_buffer: Option<(BufferRef<'r>, u64)>,
     index_buffer: Option<(BufferRef<'r>, u64, IndexFormat)>,
@@ -707,6 +711,62 @@ struct ProgrammableDrawCache<'r> {
 impl ProgrammableDrawCache<'_> {
     fn get(&self, key: &ProgrammableDrawKey<'_>) -> Option<Rc<driver::IrProgrammableDraw>> {
         (self.key == *key).then(|| Rc::clone(&self.draw))
+    }
+
+    /// Texture changes need not rebuild uniform banks. Definitions and buffer
+    /// contents are immutable within this pass, so compare the effective
+    /// uniform ranges independently of the descriptor groups containing them.
+    #[cfg(feature = "programmable")]
+    fn constants(
+        &self,
+        resources: &ResourceTable,
+        key: &ProgrammableDrawKey<'_>,
+        layout: &ir::PipelineLayoutDesc,
+    ) -> Result<Option<Rc<[driver::IrConstantBuffer]>>, IrSubmitError> {
+        if self.key.pipeline != key.pipeline || self.key.push_constants != key.push_constants {
+            return Ok(None);
+        }
+        for shader in [&self.draw.pipeline.vertex, &self.draw.pipeline.fragment] {
+            for binding in &shader.uniform_buffers {
+                let group_index = binding.group as usize;
+                let previous = self
+                    .key
+                    .bind_groups
+                    .get(group_index)
+                    .copied()
+                    .flatten()
+                    .ok_or(ir::Error::BindingLayoutMismatch)?;
+                let current = key
+                    .bind_groups
+                    .get(group_index)
+                    .copied()
+                    .flatten()
+                    .ok_or(ir::Error::BindingLayoutMismatch)?;
+                if current == previous {
+                    continue;
+                }
+                let current = resources.bind_group_shared(current)?;
+                if layout.bind_groups().get(group_index) != Some(current.layout()) {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                }
+                let previous = resources.bind_group_shared(previous)?;
+                let entry = |group: &ir::BindGroupDesc| {
+                    group
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.binding() == binding.binding)
+                        .map(|entry| entry.resource())
+                };
+                let current = entry(&current).ok_or(ir::Error::BindingLayoutMismatch)?;
+                if !matches!(current, ir::BindingResource::Buffer { .. }) {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                }
+                if Some(current) != entry(&previous) {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(Rc::clone(&self.draw.constants)))
     }
 }
 
@@ -1270,6 +1330,10 @@ impl ExecutionPlan {
                         pipeline: None,
                         programmable: None,
                         programmable_cache: None,
+                        #[cfg(feature = "programmable")]
+                        constants_scratch: Vec::new(),
+                        #[cfg(feature = "programmable")]
+                        textures_scratch: Vec::new(),
                         push_constants: [[0; 128]; 2],
                         bind_groups: [None; ir::MAX_BIND_GROUPS],
                         vertex_buffer: None,
@@ -3123,7 +3187,7 @@ mod tests {
             constants: vec![driver::IrConstantBuffer {
                 stage: ir::ShaderStage::Vertex,
                 first_register: 0,
-                words: vec![marker as u32, 0, 0, 0],
+                words: vec![marker as u32, 0, 0, 0].into(),
             }]
             .into(),
             textures: Vec::new().into(),
@@ -3271,7 +3335,7 @@ mod tests {
                     .map(|stage| driver::IrConstantBuffer {
                         stage,
                         first_register: 255,
-                        words: vec![marker as u32; 4],
+                        words: vec![marker as u32; 4].into(),
                     })
                     .collect::<Vec<_>>()
                     .into();

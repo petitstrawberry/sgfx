@@ -47,8 +47,9 @@ impl IrResources {
         &self,
         id: ir::ProgrammableRenderPipelineId,
     ) -> Result<(), IrSubmitError> {
-        self.resources
-            .programmable_render_pipeline(self.resources.programmable_render_pipeline_ref(id)?)?;
+        self.resources.programmable_render_pipeline_shared(
+            self.resources.programmable_render_pipeline_ref(id)?,
+        )?;
         Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::ProgrammableExecution,
         ))
@@ -124,8 +125,9 @@ impl IrResources {
         &self,
         id: ir::ProgrammableRenderPipelineId,
     ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
-        self.resources
-            .programmable_render_pipeline(self.resources.programmable_render_pipeline_ref(id)?)?;
+        self.resources.programmable_render_pipeline_shared(
+            self.resources.programmable_render_pipeline_ref(id)?,
+        )?;
         Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::ProgrammableExecution,
         ))
@@ -138,7 +140,7 @@ fn compile_pipeline(
     id: ir::ProgrammableRenderPipelineId,
 ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
     let reference = resources.programmable_render_pipeline_ref(id)?;
-    let pipeline = resources.programmable_render_pipeline(reference)?;
+    let pipeline = resources.programmable_render_pipeline_shared(reference)?;
     if !matches!(
         pipeline.target_format(),
         TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
@@ -448,6 +450,39 @@ fn buffer_spec(
 }
 
 #[cfg(feature = "programmable")]
+fn constant_words(
+    bytes: &[u8],
+    padded_size: usize,
+) -> Result<driver::IrConstantWords, IrSubmitError> {
+    if !bytes.len().is_multiple_of(4)
+        || !padded_size.is_multiple_of(16)
+        || padded_size < bytes.len()
+    {
+        return Err(ir::Error::InvalidValue.into());
+    }
+    let len = padded_size / 4;
+    if len <= 32 {
+        let mut words = [0; 32];
+        for (destination, word) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            *destination = u32::from_ne_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        Ok(driver::IrConstantWords::Inline { words, len })
+    } else {
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(len)
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        words.extend(
+            bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]])),
+        );
+        words.resize(len, 0);
+        Ok(driver::IrConstantWords::Shared(words.into()))
+    }
+}
+
+#[cfg(feature = "programmable")]
 pub(super) fn decode_draw(
     resources: &IrResources,
     pending: &PendingBuffers,
@@ -459,7 +494,7 @@ pub(super) fn decode_draw(
     let reference = pass.programmable.ok_or(ir::Error::PipelineNotSet)?;
     let pipeline = resources
         .resources
-        .programmable_render_pipeline(reference)?;
+        .programmable_render_pipeline_shared(reference)?;
     let valid_count = match pipeline.topology() {
         PrimitiveTopology::TriangleList => count > 0 && count.is_multiple_of(3),
         PrimitiveTopology::TriangleStrip => count >= 3,
@@ -483,8 +518,19 @@ pub(super) fn decode_draw(
         .programmable_cache
         .as_ref()
         .and_then(|cache| cache.get(&key));
-    let mut constants = Vec::new();
-    let mut textures = Vec::new();
+    let cached_constants = if cached.is_none() {
+        pass.programmable_cache
+            .as_ref()
+            .map(|cache| cache.constants(&resources.resources, &key, pipeline.layout()))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let mut constants = core::mem::take(&mut pass.constants_scratch);
+    let mut textures = core::mem::take(&mut pass.textures_scratch);
+    constants.clear();
+    textures.clear();
     if cached.is_none() {
         let resource = |group_index: u32,
                         binding: u32|
@@ -495,7 +541,7 @@ pub(super) fn decode_draw(
                 .copied()
                 .flatten()
                 .ok_or(ir::Error::BindingLayoutMismatch)?;
-            let group = resources.resources.bind_group(group_ref)?;
+            let group = resources.resources.bind_group_shared(group_ref)?;
             if pipeline.layout().bind_groups().get(group_index as usize) != Some(group.layout()) {
                 return Err(ir::Error::BindingLayoutMismatch.into());
             }
@@ -534,17 +580,20 @@ pub(super) fn decode_draw(
                     sampler: sampler_state(resources.resources.sampler(sampler)?, sampler.slot()),
                 });
             }
-            if let Some(push) = &shader.push_constants {
+            if let Some(push) = shader
+                .push_constants
+                .as_ref()
+                .filter(|_| cached_constants.is_none())
+            {
                 let stage = if shader.stage == ir::ShaderStage::Vertex {
                     0
                 } else {
                     1
                 };
-                let mut words: Vec<u32> = pass.push_constants[stage][..push.size as usize]
-                    .chunks_exact(4)
-                    .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
-                    .collect();
-                words.resize(push.size.div_ceil(16) as usize * 4, 0);
+                let words = constant_words(
+                    &pass.push_constants[stage][..push.size as usize],
+                    push.size.div_ceil(16) as usize * 16,
+                )?;
                 constants.push(driver::IrConstantBuffer {
                     stage: shader.stage,
                     first_register: push.first_register,
@@ -552,13 +601,16 @@ pub(super) fn decode_draw(
                 });
             }
             for binding in &shader.uniform_buffers {
+                if cached_constants.is_some() {
+                    continue;
+                }
                 let group_ref = pass
                     .bind_groups
                     .get(binding.group as usize)
                     .copied()
                     .flatten()
                     .ok_or(ir::Error::BindingLayoutMismatch)?;
-                let group = resources.resources.bind_group(group_ref)?;
+                let group = resources.resources.bind_group_shared(group_ref)?;
                 if pipeline.layout().bind_groups().get(binding.group as usize)
                     != Some(group.layout())
                 {
@@ -594,16 +646,7 @@ pub(super) fn decode_draw(
                 }
                 let start = usize::try_from(offset).map_err(|_| ir::Error::Overflow)?;
                 let end = usize::try_from(end).map_err(|_| ir::Error::Overflow)?;
-                let mut words = Vec::new();
-                words
-                    .try_reserve_exact(constant_size as usize / 4)
-                    .map_err(|_| IrSubmitError::OutOfMemory)?;
-                words.extend(
-                    bytes.as_slice()[start..end]
-                        .chunks_exact(4)
-                        .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]])),
-                );
-                words.resize(constant_size as usize / 4, 0);
+                let words = constant_words(&bytes.as_slice()[start..end], constant_size as usize)?;
                 constants
                     .try_reserve(1)
                     .map_err(|_| IrSubmitError::OutOfMemory)?;
@@ -689,10 +732,12 @@ pub(super) fn decode_draw(
         Rc::new(driver::IrProgrammableDraw {
             pipeline: compiled,
             index_buffer,
-            constants: constants.into(),
-            textures: textures.into(),
+            constants: cached_constants.unwrap_or_else(|| Rc::from(constants.as_slice())),
+            textures: Rc::from(textures.as_slice()),
         })
     };
+    pass.constants_scratch = constants;
+    pass.textures_scratch = textures;
     pass.programmable_cache = Some(ProgrammableDrawCache {
         key,
         draw: Rc::clone(&programmable),
@@ -850,6 +895,49 @@ mod tests {
     }
 
     #[test]
+    fn small_constant_snapshots_preserve_words_and_register_padding() {
+        for size in [4_usize, 116, 124, 128] {
+            let expected: Vec<u32> = (0..size / 4).map(|i| 0x8000_0000 | i as u32).collect();
+            let mut bytes: Vec<u8> = expected
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .collect();
+            let snapshot = constant_words(&bytes, size.next_multiple_of(16)).unwrap();
+            assert!(matches!(snapshot, driver::IrConstantWords::Inline { .. }));
+            bytes.fill(0);
+            assert_eq!(&snapshot[..expected.len()], expected.as_slice());
+            assert!(snapshot[expected.len()..].iter().all(|word| *word == 0));
+            let alternate = driver::IrConstantWords::Shared(Rc::from(snapshot.as_slice()));
+            assert_eq!(snapshot, alternate);
+        }
+        assert!(constant_words(&[0; 3], 16).is_err());
+        assert!(constant_words(&[0; 20], 16).is_err());
+        assert!(constant_words(&[0; 16], 20).is_err());
+    }
+
+    #[test]
+    fn larger_constant_snapshots_share_immutable_storage_without_truncation() {
+        for size in [132_usize, 16 * 1024] {
+            let expected: Vec<u32> = (0..size / 4).map(|i| i as u32 + 1).collect();
+            let bytes: Vec<u8> = expected
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .collect();
+            let snapshot = constant_words(&bytes, size.next_multiple_of(16)).unwrap();
+            let retained = snapshot.clone();
+            let (driver::IrConstantWords::Shared(original), driver::IrConstantWords::Shared(copy)) =
+                (&snapshot, &retained)
+            else {
+                panic!("large constant banks must use shared storage");
+            };
+            assert!(Rc::ptr_eq(original, copy));
+            drop(snapshot);
+            assert_eq!(&retained[..expected.len()], expected.as_slice());
+            assert!(retained[expected.len()..].iter().all(|word| *word == 0));
+        }
+    }
+
+    #[test]
     fn shared_draw_state_detects_binding_changes_and_retains_older_snapshots() {
         let table = ResourceTable::new();
         let id = pipeline(
@@ -869,7 +957,7 @@ mod tests {
             .unwrap();
         let pipeline_ref = table.programmable_render_pipeline_ref(id).unwrap();
         let layout = table
-            .programmable_render_pipeline(pipeline_ref)
+            .programmable_render_pipeline_shared(pipeline_ref)
             .unwrap()
             .layout()
             .bind_groups()[0]
@@ -907,7 +995,7 @@ mod tests {
             constants: vec![driver::IrConstantBuffer {
                 stage: ir::ShaderStage::Vertex,
                 first_register: 0,
-                words: vec![42; 16],
+                words: vec![42; 16].into(),
             }]
             .into(),
             textures: Vec::new().into(),
@@ -918,17 +1006,78 @@ mod tests {
         };
         let older = cache.get(&key).unwrap();
         assert!(Rc::ptr_eq(&older, &snapshot));
+        let pipeline_desc = table
+            .programmable_render_pipeline_shared(pipeline_ref)
+            .unwrap();
+        let mut texture_only_change = key;
+        texture_only_change.bind_groups[0] = Some(other_group);
+        let shared_constants = cache
+            .constants(&table, &texture_only_change, pipeline_desc.layout())
+            .unwrap()
+            .unwrap();
+        assert!(Rc::ptr_eq(&shared_constants, &snapshot.constants));
+        let other_buffer = table
+            .define_buffer(ir::BufferDesc::new(64, BufferUsage::UNIFORM).unwrap())
+            .unwrap();
+        let changed_uniform = table
+            .define_bind_group(
+                ir::BindGroupDesc::new(
+                    &table,
+                    layout.clone(),
+                    vec![ir::BindGroupEntry::new(
+                        0,
+                        ir::BindingResource::Buffer {
+                            buffer: other_buffer.id(),
+                            offset: 0,
+                            size: 64,
+                        },
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut changed_key = key;
+        changed_key.bind_groups[0] = Some(changed_uniform);
+        assert!(
+            cache
+                .constants(&table, &changed_key, pipeline_desc.layout())
+                .unwrap()
+                .is_none()
+        );
+        let incompatible = table
+            .define_bind_group(
+                ir::BindGroupDesc::new(
+                    &table,
+                    ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        changed_key.bind_groups[0] = Some(incompatible);
+        assert!(matches!(
+            cache.constants(&table, &changed_key, pipeline_desc.layout()),
+            Err(IrSubmitError::InvalidIr(ir::Error::BindingLayoutMismatch))
+        ));
         let mut changes = [key; 4];
         changes[0].pipeline = table.programmable_render_pipeline_ref(other_id).unwrap();
         changes[1].bind_groups[0] = Some(other_group);
         changes[2].push_constants[0][0] = 1;
         changes[3].push_constants[1][0] = 1;
-        for changed in changes {
+        for (index, changed) in changes.into_iter().enumerate() {
             assert!(cache.get(&changed).is_none());
+            if index != 1 {
+                assert!(
+                    cache
+                        .constants(&table, &changed, pipeline_desc.layout())
+                        .unwrap()
+                        .is_none()
+                );
+            }
         }
         drop(cache);
         drop(snapshot);
-        assert_eq!(older.constants[0].words, [42; 16]);
+        assert_eq!(older.constants[0].words.as_slice(), &[42; 16]);
         let index = driver::IrIndexBufferBinding {
             buffer: IrBufferSpec {
                 slot: buffer.slot(),

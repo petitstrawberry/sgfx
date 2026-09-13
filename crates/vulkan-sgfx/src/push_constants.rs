@@ -25,13 +25,15 @@ impl Default for PushConstants {
     }
 }
 impl PushConstants {
+    /// Validate and update the bytes, returning whether their values or layout
+    /// ownership changed. Repeating an identical update needs no new snapshot.
     pub fn update(
         &mut self,
         layout: &ir::PipelineLayoutDesc,
         stages: ir::ShaderStages,
         offset: u32,
         data: &[u8],
-    ) -> Result<(), vk::Result> {
+    ) -> Result<bool, vk::Result> {
         layout
             .validate_push_constants(stages, offset, data)
             .map_err(crate::resources::failure)?;
@@ -44,13 +46,18 @@ impl PushConstants {
             }
         };
         let range = offset as usize..offset as usize + data.len();
+        let mut changed = false;
         for (index, stage) in STAGES.into_iter().enumerate() {
             if stages.contains(stage) {
+                changed |= self.bytes[index][range.clone()] != *data
+                    || self.owners[index][range.clone()]
+                        .iter()
+                        .any(|previous| *previous != Some(owner));
                 self.bytes[index][range.clone()].copy_from_slice(data);
                 self.owners[index][range.clone()].fill(Some(owner));
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Split overlapping ranges at their boundaries so each update provides
@@ -138,6 +145,21 @@ mod tests {
             })
             .collect()
     }
+    #[test]
+    fn repeated_values_still_track_stage_and_layout_ownership_changes() {
+        let first = layout(&[(STAGES[0], 0, 4)]);
+        let second = layout(&[(STAGES[0], 0, 8)]);
+        let mut state = PushConstants::default();
+        assert!(state.update(&first, STAGES[0], 0, &[0; 4]).unwrap());
+        assert!(!state.update(&first, STAGES[0], 0, &[0; 4]).unwrap());
+        assert!(state.update(&first, STAGES[0], 0, &[7; 4]).unwrap());
+        assert!(!state.update(&first, STAGES[0], 0, &[7; 4]).unwrap());
+        assert!(state.update(&second, STAGES[0], 0, &[7; 4]).unwrap());
+        assert!(state.snapshot(&first).is_err());
+        assert!(state.update(&first, STAGES[0], 0, &[7; 4]).unwrap());
+        assert!(state.snapshot(&first).is_ok());
+    }
+
     #[test]
     fn snapshots_own_incremental_bytes_and_split_overlapping_stage_ranges() {
         let layout = layout(&[(STAGES[0], 0, 32), (STAGES[1], 0, 16)]);

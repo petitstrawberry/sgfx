@@ -681,10 +681,60 @@ pub(crate) struct IrIndexBufferBinding {
     pub(crate) base_vertex: i32,
 }
 
+/// Small constant banks are copied with a draw snapshot without a separate
+/// allocation. Larger uniform blocks keep immutable shared storage.
+#[derive(Clone, Debug)]
+pub(crate) enum IrConstantWords {
+    Inline { words: [u32; 32], len: usize },
+    Shared(Rc<[u32]>),
+}
+
+impl IrConstantWords {
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline { words, len } => &words[..*len],
+            Self::Shared(words) => words,
+        }
+    }
+}
+
+impl core::ops::Deref for IrConstantWords {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for IrConstantWords {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for IrConstantWords {}
+
+#[cfg(test)]
+impl From<Vec<u32>> for IrConstantWords {
+    fn from(values: Vec<u32>) -> Self {
+        if values.len() <= 32 {
+            let mut words = [0; 32];
+            words[..values.len()].copy_from_slice(&values);
+            Self::Inline {
+                words,
+                len: values.len(),
+            }
+        } else {
+            Self::Shared(values.into())
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct IrConstantBuffer {
     pub(crate) stage: crate::ir::ShaderStage,
     pub(crate) first_register: u32,
-    pub(crate) words: Vec<u32>,
+    pub(crate) words: IrConstantWords,
 }
 
 pub(crate) struct IrProgrammableDraw {
@@ -694,6 +744,7 @@ pub(crate) struct IrProgrammableDraw {
     pub(crate) textures: Rc<[IrTextureBinding]>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct IrTextureBinding {
     pub(crate) stage: crate::ir::ShaderStage,
     pub(crate) slot: u32,

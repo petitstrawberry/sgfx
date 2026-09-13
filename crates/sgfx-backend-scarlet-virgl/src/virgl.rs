@@ -27,9 +27,9 @@ use crate::completion::SubmitMode;
 use crate::dispatch::NativeScheduler;
 use crate::driver::{
     IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrBufferUpdate,
-    IrCompareFunction, IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram, IrFrontFace,
-    IrPipelineState, IrProgrammablePipeline, IrSamplerState, IrSubmission, IrTextureCopy,
-    IrTextureFormat, IrTextureSpec, IrTextureUpload, IrVertex, MAX_IR_VERTICES,
+    IrCompareFunction, IrConstantBuffer, IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram,
+    IrFrontFace, IrPipelineState, IrProgrammablePipeline, IrSamplerState, IrSubmission,
+    IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload, IrVertex, MAX_IR_VERTICES,
 };
 use crate::packets::UPLOAD_ARENA_COUNT;
 use crate::{
@@ -1894,6 +1894,8 @@ impl Queue {
         let mut bound_sampler_state = None;
         let mut bound_vertex_buffer = Some((resources.vertex_resource_id, 0));
         let mut bound_programmable = false;
+        let mut programmable_bindings = ProgrammableBindings::default();
+        let mut bound_viewport = None;
         let mut bound_scissor = Some((
             pass_scissor.x(),
             pass_scissor.y(),
@@ -1906,8 +1908,12 @@ impl Queue {
                 .get(draw.pipeline.slot)
                 .and_then(Option::as_ref)
                 .ok_or(HandleError::InvalidParameter)?;
-            if let Some(viewport) = draw.viewport {
+            if let Some(viewport) = draw
+                .viewport
+                .filter(|viewport| bound_viewport != Some(*viewport))
+            {
                 push_ir_viewport(&mut commands, viewport, target.orientation);
+                bound_viewport = Some(viewport);
             }
             if let Some(programmable) = &draw.programmable {
                 let native = resources
@@ -1915,7 +1921,14 @@ impl Queue {
                     .get(programmable.pipeline.slot)
                     .and_then(Option::as_ref)
                     .ok_or(HandleError::InvalidParameter)?;
-                push_programmable_draw(&mut commands, resources, native, pipeline, draw)?;
+                push_programmable_draw(
+                    &mut commands,
+                    resources,
+                    native,
+                    pipeline,
+                    draw,
+                    &mut programmable_bindings,
+                )?;
                 // The fixed path must restore all state after a programmable draw.
                 bound_programmable = true;
                 bound_blend = None;
@@ -1925,6 +1938,7 @@ impl Queue {
                 continue;
             }
             if bound_programmable {
+                programmable_bindings = ProgrammableBindings::default();
                 push_bind_shader(
                     &mut commands,
                     PIPE_SHADER_VERTEX,
@@ -3436,54 +3450,37 @@ fn push_programmable_vertex_elements(
     Ok(())
 }
 
-fn push_programmable_draw(
+/// Binding cache is local to one native packet and is discarded when the
+/// fixed pipeline takes over. Rasterizer and DSA state are still reasserted
+/// for every draw. Constant packing buffers retain their capacity.
+#[derive(Default)]
+struct ProgrammableBindings {
+    pipeline: Option<(u32, u32, u32, u32)>,
+    vertex_buffer: Option<(u32, u32, u32)>,
+    constants: Option<Rc<[IrConstantBuffer]>>,
+    vertex_constants: Vec<u32>,
+    fragment_constants: Vec<u32>,
+    textures: Vec<((u32, u32), (u32, u32))>,
+    scissor: Option<PixelRect>,
+    index_buffer: Option<(u32, u32, u32)>,
+}
+
+fn push_programmable_constants(
     commands: &mut Vec<u8>,
-    resources: &IrResources,
-    native: &IrNativeProgrammablePipeline,
-    state: &IrPipeline,
-    draw: &IrDraw,
+    constants: &Rc<[IrConstantBuffer]>,
+    bindings: &mut ProgrammableBindings,
 ) -> HandleResult<()> {
-    let programmable = draw
-        .programmable
-        .as_ref()
-        .ok_or(HandleError::InvalidParameter)?;
-    push_bind_shader(commands, PIPE_SHADER_VERTEX, native.vertex_shader_handle);
-    push_bind_shader(
-        commands,
-        PIPE_SHADER_FRAGMENT,
-        native.fragment_shader_handle,
-    );
-    push_bind_object(
-        commands,
-        VIRGL_OBJECT_VERTEX_ELEMENTS,
-        native.vertex_elements_handle,
-    );
-    push_bind_object(commands, VIRGL_OBJECT_BLEND, state.blend_handle);
-    push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
-    push_bind_object(commands, VIRGL_OBJECT_DSA, state.dsa_handle.unwrap_or(0));
-    if let (Some(layout), Some(binding)) =
-        (&programmable.pipeline.vertex_buffer, draw.vertex_buffer)
-    {
-        let buffer = uploaded_ir_buffer(resources, binding.buffer)?;
-        push_dword(
-            commands,
-            command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3),
-        );
-        push_dword(commands, layout.stride());
-        push_dword(commands, binding.offset);
-        push_dword(commands, buffer.resource_id);
-    } else {
-        push_dword(
-            commands,
-            command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 0),
-        );
+    if bindings.constants.as_ref().is_some_and(|previous| {
+        Rc::ptr_eq(previous, constants) || previous.as_ref() == constants.as_ref()
+    }) {
+        return Ok(());
     }
-    let mut vertex_constants = Vec::new();
-    let mut fragment_constants = Vec::new();
-    for constant in programmable.constants.iter() {
+    bindings.vertex_constants.clear();
+    bindings.fragment_constants.clear();
+    for constant in constants.iter() {
         let values = match constant.stage {
-            crate::ir::ShaderStage::Vertex => &mut vertex_constants,
-            crate::ir::ShaderStage::Fragment => &mut fragment_constants,
+            crate::ir::ShaderStage::Vertex => &mut bindings.vertex_constants,
+            crate::ir::ShaderStage::Fragment => &mut bindings.fragment_constants,
             _ => return Err(HandleError::InvalidParameter),
         };
         let start = usize::try_from(constant.first_register)
@@ -3495,18 +3492,120 @@ fn push_programmable_draw(
             .ok_or(HandleError::InvalidParameter)?;
         if values.len() < end {
             values
-                .try_reserve_exact(end - values.len())
+                .try_reserve(end - values.len())
                 .map_err(|_| HandleError::OutOfResources)?;
             values.resize(end, 0);
         }
         values[start..end].copy_from_slice(&constant.words);
     }
-    if !vertex_constants.is_empty() {
-        push_constant_words(commands, PIPE_SHADER_VERTEX, &vertex_constants)?;
+    if !bindings.vertex_constants.is_empty() {
+        push_constant_words(commands, PIPE_SHADER_VERTEX, &bindings.vertex_constants)?;
     }
-    if !fragment_constants.is_empty() {
-        push_constant_words(commands, PIPE_SHADER_FRAGMENT, &fragment_constants)?;
+    if !bindings.fragment_constants.is_empty() {
+        push_constant_words(commands, PIPE_SHADER_FRAGMENT, &bindings.fragment_constants)?;
     }
+    bindings.constants = Some(Rc::clone(constants));
+    Ok(())
+}
+
+fn push_programmable_texture_binding(
+    commands: &mut Vec<u8>,
+    bindings: &mut ProgrammableBindings,
+    stage: u32,
+    slot: u32,
+    view: u32,
+    sampler: u32,
+) -> HandleResult<()> {
+    let previous = bindings
+        .textures
+        .iter_mut()
+        .find(|entry| entry.0 == (stage, slot));
+    if previous.as_ref().is_none_or(|entry| entry.1.0 != view) {
+        push_dword(commands, command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3));
+        push_dword(commands, stage);
+        push_dword(commands, slot);
+        push_dword(commands, view);
+    }
+    if previous.as_ref().is_none_or(|entry| entry.1.1 != sampler) {
+        push_dword(
+            commands,
+            command_header(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3),
+        );
+        push_dword(commands, stage);
+        push_dword(commands, slot);
+        push_dword(commands, sampler);
+    }
+    if let Some(previous) = previous {
+        previous.1 = (view, sampler);
+    } else {
+        bindings
+            .textures
+            .try_reserve(1)
+            .map_err(|_| HandleError::OutOfResources)?;
+        bindings.textures.push(((stage, slot), (view, sampler)));
+    }
+    Ok(())
+}
+
+fn push_programmable_draw(
+    commands: &mut Vec<u8>,
+    resources: &IrResources,
+    native: &IrNativeProgrammablePipeline,
+    state: &IrPipeline,
+    draw: &IrDraw,
+    bindings: &mut ProgrammableBindings,
+) -> HandleResult<()> {
+    let programmable = draw
+        .programmable
+        .as_ref()
+        .ok_or(HandleError::InvalidParameter)?;
+    let pipeline_key = (
+        native.vertex_shader_handle,
+        native.fragment_shader_handle,
+        native.vertex_elements_handle,
+        state.blend_handle,
+    );
+    if bindings.pipeline != Some(pipeline_key) {
+        push_bind_shader(commands, PIPE_SHADER_VERTEX, native.vertex_shader_handle);
+        push_bind_shader(
+            commands,
+            PIPE_SHADER_FRAGMENT,
+            native.fragment_shader_handle,
+        );
+        push_bind_object(
+            commands,
+            VIRGL_OBJECT_VERTEX_ELEMENTS,
+            native.vertex_elements_handle,
+        );
+        push_bind_object(commands, VIRGL_OBJECT_BLEND, state.blend_handle);
+        bindings.pipeline = Some(pipeline_key);
+        bindings.constants = None;
+    }
+    push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
+    push_bind_object(commands, VIRGL_OBJECT_DSA, state.dsa_handle.unwrap_or(0));
+    if let (Some(layout), Some(binding)) =
+        (&programmable.pipeline.vertex_buffer, draw.vertex_buffer)
+    {
+        let buffer = uploaded_ir_buffer(resources, binding.buffer)?;
+        let key = (buffer.resource_id, layout.stride(), binding.offset);
+        if bindings.vertex_buffer != Some(key) {
+            push_dword(
+                commands,
+                command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3),
+            );
+            push_dword(commands, layout.stride());
+            push_dword(commands, binding.offset);
+            push_dword(commands, buffer.resource_id);
+            bindings.vertex_buffer = Some(key);
+        }
+    } else if bindings.vertex_buffer != Some((0, 0, 0)) {
+        push_dword(
+            commands,
+            command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 0),
+        );
+        bindings.vertex_buffer = Some((0, 0, 0));
+    }
+    push_programmable_constants(commands, &programmable.constants, bindings)?;
     for binding in programmable.textures.iter() {
         let stage = match binding.stage {
             crate::ir::ShaderStage::Vertex => PIPE_SHADER_VERTEX,
@@ -3526,27 +3625,31 @@ fn push_programmable_draw(
         if !ir_sampler_states_equal(sampler.state, binding.sampler) {
             return Err(HandleError::InvalidParameter);
         }
-        push_dword(commands, command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3));
-        push_dword(commands, stage);
-        push_dword(commands, binding.slot);
-        push_dword(commands, texture.sampler_view_handle());
-        push_dword(
+        push_programmable_texture_binding(
             commands,
-            command_header(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3),
-        );
-        push_dword(commands, stage);
-        push_dword(commands, binding.slot);
-        push_dword(commands, sampler.handle);
+            bindings,
+            stage,
+            binding.slot,
+            texture.sampler_view_handle(),
+            sampler.handle,
+        )?;
     }
-    push_ir_scissor(commands, ir_rect_to_pixel_rect(draw.scissor)?)?;
+    let scissor = ir_rect_to_pixel_rect(draw.scissor)?;
+    if bindings.scissor != Some(scissor) {
+        push_ir_scissor(commands, scissor)?;
+        bindings.scissor = Some(scissor);
+    }
     if let Some(binding) = programmable.index_buffer {
         let buffer = uploaded_ir_buffer(resources, binding.buffer)?;
-        push_index_buffer(
-            commands,
+        let key = (
             buffer.resource_id,
             binding.format.byte_size() as u32,
             binding.offset,
         );
+        if bindings.index_buffer != Some(key) {
+            push_index_buffer(commands, key.0, key.1, key.2);
+            bindings.index_buffer = Some(key);
+        }
         push_draw_topology_parameters(
             commands,
             draw.start_vertex,
@@ -4615,6 +4718,123 @@ mod tests {
         push_draw(&mut commands, 3, 6).unwrap();
         assert_eq!(dwords(&commands)[4], 0);
         assert_eq!(dwords(&commands)[6], 0);
+    }
+
+    #[test]
+    fn repeated_constant_banks_avoid_resending_and_reuse_packing_storage() {
+        let constants = |value| -> Rc<[IrConstantBuffer]> {
+            alloc::vec![IrConstantBuffer {
+                stage: crate::ir::ShaderStage::Vertex,
+                first_register: 1,
+                words: alloc::vec![value; 4].into(),
+            }]
+            .into()
+        };
+        let mut bindings = ProgrammableBindings::default();
+        let mut commands = Vec::new();
+        let first = constants(7);
+        push_programmable_constants(&mut commands, &first, &mut bindings).unwrap();
+        let encoded = commands.clone();
+        let storage = bindings.vertex_constants.as_ptr();
+        push_programmable_constants(&mut commands, &first, &mut bindings).unwrap();
+        let separate_owner = constants(7);
+        assert!(!Rc::ptr_eq(&first, &separate_owner));
+        push_programmable_constants(&mut commands, &separate_owner, &mut bindings).unwrap();
+        assert_eq!(commands, encoded);
+        commands.clear();
+        push_programmable_constants(&mut commands, &constants(9), &mut bindings).unwrap();
+        assert_eq!(bindings.vertex_constants.as_ptr(), storage);
+        assert_eq!(&bindings.vertex_constants, &[0, 0, 0, 0, 9, 9, 9, 9]);
+        assert_eq!(first[0].words.as_slice(), &[7; 4]);
+        let mut fresh_packet = ProgrammableBindings::default();
+        commands.clear();
+        push_programmable_constants(&mut commands, &first, &mut fresh_packet).unwrap();
+        assert_eq!(commands, encoded);
+    }
+
+    #[test]
+    fn texture_binding_cache_keeps_stage_and_slot_updates_independent() {
+        let mut bindings = ProgrammableBindings::default();
+        let mut commands = Vec::new();
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_FRAGMENT,
+            0,
+            17,
+            23,
+        )
+        .unwrap();
+        assert_eq!(dwords(&commands).len(), 8);
+        commands.clear();
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_FRAGMENT,
+            0,
+            17,
+            23,
+        )
+        .unwrap();
+        assert!(commands.is_empty());
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_FRAGMENT,
+            0,
+            19,
+            23,
+        )
+        .unwrap();
+        assert_eq!(
+            dwords(&commands),
+            alloc::vec![
+                command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3),
+                PIPE_SHADER_FRAGMENT,
+                0,
+                19
+            ]
+        );
+        commands.clear();
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_FRAGMENT,
+            0,
+            19,
+            29,
+        )
+        .unwrap();
+        assert_eq!(
+            dwords(&commands),
+            alloc::vec![
+                command_header(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3),
+                PIPE_SHADER_FRAGMENT,
+                0,
+                29
+            ]
+        );
+        commands.clear();
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_VERTEX,
+            0,
+            19,
+            29,
+        )
+        .unwrap();
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_FRAGMENT,
+            1,
+            19,
+            29,
+        )
+        .unwrap();
+        assert_eq!(dwords(&commands).len(), 16);
+        assert_eq!(bindings.textures.len(), 3);
     }
 
     #[test]
