@@ -196,9 +196,13 @@ game now presents its textured console background, the `demo1` 3D world,
 weapon and HUD on Scarlet AArch64 QEMU. Actual QEMU captures show continuing
 world frames and changed player views after input. A standard keyboard event
 also toggles the game console and pauses the world. These checks use the normal
-full-project release image. The Scarlet game's own screenshot command, combat,
-normal game shutdown and sustained performance have not been verified; the
-world/input evidence comes from the actual QEMU display. General game
+full-project release image. Subsequent release checks also execute the game's
+own `screenshot` command: `quake00.tga` is extracted from the stopped guest disk
+and decodes to the actual 1280x800 world, weapon and HUD. Both the original and
+batched programmable backend save a 4,096,018-byte TGA. The batched capture has
+12,898 distinct RGBA colors and opaque alpha throughout. The upstream `quit`
+command shuts down Vulkan, returns exit status 0, and removes the SGFX worker
+tasks. Combat and sustained FPS have not been verified. General game
 compatibility has not been established. The SWS input/window adapter resides in
 Scarlet's `user/lib/sws-client-c/examples/vkquake2`; upstream Vulkan renderer and
 shader sources remain separate. A618 arbitrary SPIR-V execution and Chromebook
@@ -209,3 +213,43 @@ adapter and shared SWS library source are
 `mremap` shrinking and remove quadratic private-page reclamation. Real guest
 checks preserve data across four 16 MiB shrinks and report 4 ms total for four
 8 MiB partial unmaps, compared with 509 ms before batch physical reclamation.
+
+## Native programmable submission cost
+
+SGFX `cd37a426e9625efcbfe4f22681a342a47a8784f6` batches consecutive native
+programmable draws using the same immutable pipeline. Previously every such
+draw became a separate pass and transport packet, repeatedly allocating command
+storage and re-emitting framebuffer/pass setup. Chunks now contain at most 64
+draws and fit a conservative 64 KiB command budget. The estimate includes
+zero-filled constant-register gaps, TGSI source, vertex elements and texture
+bindings. The encoder still checks the actual packet size before submission;
+the existing single-draw path remains available when a first-use estimate is
+too large. Draw order, each draw's constants, pipeline boundaries and first-pass
+clears are preserved. This changes only backend planning, with no public API or
+canonical IR revision change.
+
+All 48 native VirGL backend library tests pass in Linux release mode with
+`--features std,programmable`. Three new regressions cover ordered constant
+snapshots across chunks, fixed/programmable pipeline transitions with one clear,
+and the byte limit for sparse constant-register banks.
+
+A single release comparison on 2026-09-13 used AArch64 HVF, four guest CPUs,
+8 GiB RAM, 1280x800 display WSI, the same upstream game and the kernel/C SDK
+revisions above. Temporary clocks around `OwnedCommandBuffer::record`,
+`queue.submit` and buffer destruction ran in separate verification images.
+For loading-console submissions containing exactly 7,327 owned IR commands,
+there were 36 samples in each run:
+
+| Backend | Median `queue.submit` elapsed time |
+| --- | --- |
+| Original, SGFX `10eb666555e341032eae54cf01433b63ea88f00c` | 388 ms |
+| Batched, SGFX `cd37a426e9625efcbfe4f22681a342a47a8784f6` | 200.5 ms |
+
+This measures CPU submission through acceptance, not GPU completion or game
+FPS. World views differed between the two runs, so their timings are not a
+fixed-camera comparison. The batched run still spends hundreds of milliseconds
+submitting world work, and the SGFX device worker remains busy on one CPU.
+Buffer-shadow upload copying took only several milliseconds for the roughly
+3 MiB world payload. Worker command construction, allocation/reclamation and
+GPU/presentation waits still require separate measurements. The clean deployed
+release ICD is rebuilt from committed source without the temporary clocks.
