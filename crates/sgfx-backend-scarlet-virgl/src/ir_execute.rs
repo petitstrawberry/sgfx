@@ -339,7 +339,7 @@ impl IrResources {
         Ok(())
     }
 
-    fn mapped_image(&self, texture: TextureRef<'_>) -> Result<Rc<Image>, IrSubmitError> {
+    pub(super) fn mapped_image(&self, texture: TextureRef<'_>) -> Result<Rc<Image>, IrSubmitError> {
         if !texture.belongs_to(self.resources.as_ref()) {
             return Err(IrSubmitError::ResourceTableMismatch);
         }

@@ -1,6 +1,7 @@
 //! Validation and lowering for the native programmable graphics subset.
 
 use super::*;
+use crate::PixelRect;
 #[cfg(feature = "programmable")]
 use sgfx_codegen_virgl::programmable::{compile_shader, validate_shader_module};
 
@@ -348,9 +349,32 @@ impl Context {
             ));
         }
         let spec = texture_spec(reference, descriptor);
-        let mut bytes = self
-            .backend
-            .readback_ir_texture(&mut resources.backend, spec)?;
+        let mut bytes = match resources.mapped_image(reference) {
+            Ok(image) => {
+                let length = usize::try_from(descriptor.byte_size()?)
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+                let stride = spec.width.checked_mul(4).ok_or(ir::Error::OutOfBounds)?;
+                let mut pixels = Vec::new();
+                pixels
+                    .try_reserve_exact(length)
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+                pixels.resize(length, 0);
+                // A mapped render target is owned by the imported image, rather
+                // than the backend's internal texture allocation. This path
+                // waits for scheduled work before reading that same GPU image.
+                self.backend.readback_image_bgra(
+                    &image.as_ref().backend,
+                    &mut pixels,
+                    stride,
+                    PixelRect::new(0, 0, spec.width, spec.height),
+                )?;
+                pixels
+            }
+            Err(IrSubmitError::ImageNotMapped) => self
+                .backend
+                .readback_ir_texture(&mut resources.backend, spec)?,
+            Err(error) => return Err(error),
+        };
         if spec.format == IrTextureFormat::Rgba8 {
             for pixel in bytes.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
