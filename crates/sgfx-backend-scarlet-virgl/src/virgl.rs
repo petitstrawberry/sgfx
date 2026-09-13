@@ -26,10 +26,10 @@ use std::{
 use crate::completion::SubmitMode;
 use crate::dispatch::NativeScheduler;
 use crate::driver::{
-    IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrCompareFunction,
-    IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram, IrFrontFace, IrPipelineState,
-    IrProgrammablePipeline, IrSamplerState, IrSubmission, IrTextureCopy, IrTextureFormat,
-    IrTextureSpec, IrTextureUpload, IrVertex, MAX_IR_VERTICES,
+    IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrBufferUpdate,
+    IrCompareFunction, IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram, IrFrontFace,
+    IrPipelineState, IrProgrammablePipeline, IrSamplerState, IrSubmission, IrTextureCopy,
+    IrTextureFormat, IrTextureSpec, IrTextureUpload, IrVertex, MAX_IR_VERTICES,
 };
 use crate::packets::UPLOAD_ARENA_COUNT;
 use crate::{
@@ -1435,6 +1435,7 @@ impl Queue {
         resources: &mut IrResources,
         spec: IrBufferSpec,
         bytes: &[u8],
+        update: Option<&IrBufferUpdate>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
@@ -1454,6 +1455,7 @@ impl Queue {
         if uploaded_revision == Some(spec.revision) {
             return Ok(());
         }
+        let range = ir_buffer_upload_range(uploaded_revision, spec.revision, bytes.len(), update)?;
         self.prepare_ir_upload_arena(context, resources, mode)?;
 
         const INLINE_WRITE_FIXED_BYTES: usize = 12 * core::mem::size_of::<u32>();
@@ -1475,10 +1477,14 @@ impl Queue {
         commands
             .try_reserve_exact(self.max_command_size())
             .map_err(|_| HandleError::OutOfResources)?;
-        let mut offset = 0usize;
-        while offset < bytes.len() {
+        // A failed synchronous prefix may have changed physical bytes. Until
+        // every packet succeeds, a later submission must repair the full
+        // initialized shadow. Tracked rejection restores its cache snapshot.
+        ir_buffer(context, resources, spec)?.uploaded_revision = None;
+        let mut offset = range.start;
+        while offset < range.end {
             mode.prepare_packet(self.max_command_size())?;
-            let end = offset.saturating_add(max_payload).min(bytes.len());
+            let end = offset.saturating_add(max_payload).min(range.end);
             let chunk = bytes
                 .get(offset..end)
                 .ok_or(HandleError::InvalidParameter)?;
@@ -4064,6 +4070,34 @@ fn ir_address_mode(address: IrAddressMode) -> u32 {
     }
 }
 
+/// A partial upload is safe only on the exact physical predecessor revision.
+fn ir_buffer_upload_range(
+    uploaded_revision: Option<u64>,
+    revision: u64,
+    length: usize,
+    update: Option<&IrBufferUpdate>,
+) -> HandleResult<core::ops::Range<usize>> {
+    let Some(update) = update else {
+        return Ok(0..length);
+    };
+    if update.range.start >= update.range.end || update.range.end > length {
+        return Err(HandleError::InvalidParameter);
+    }
+    if uploaded_revision != Some(update.previous_revision)
+        || update.previous_revision.checked_add(1) != Some(revision)
+    {
+        return Ok(0..length);
+    }
+    let start = update.range.start & !3;
+    let end = update
+        .range
+        .end
+        .checked_add(3)
+        .ok_or(HandleError::InvalidParameter)?
+        & !3;
+    Ok(start..end.min(length))
+}
+
 fn ir_rasterizer_flags(cull_mode: IrCullMode, front_face: IrFrontFace) -> u32 {
     let cull_face = match cull_mode {
         IrCullMode::None => 0,
@@ -4351,6 +4385,32 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 mod tests {
     use super::*;
     use crate::driver::IrDepthState;
+
+    #[test]
+    fn buffer_delta_uploads_preserve_neighboring_words_and_repair_stale_storage() {
+        let update = IrBufferUpdate {
+            previous_revision: 8,
+            range: 5..11,
+        };
+        assert_eq!(
+            ir_buffer_upload_range(Some(8), 9, 4096, Some(&update)).unwrap(),
+            4..12
+        );
+        for uploaded in [None, Some(7), Some(10)] {
+            assert_eq!(
+                ir_buffer_upload_range(uploaded, 9, 4096, Some(&update)).unwrap(),
+                0..4096
+            );
+        }
+        assert_eq!(
+            ir_buffer_upload_range(Some(8), 10, 4096, Some(&update)).unwrap(),
+            0..4096
+        );
+        assert_eq!(
+            ir_buffer_upload_range(Some(8), 9, 4096, None).unwrap(),
+            0..4096
+        );
+    }
 
     fn dwords(bytes: &[u8]) -> Vec<u32> {
         bytes

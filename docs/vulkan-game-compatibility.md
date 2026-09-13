@@ -292,3 +292,23 @@ the `demo1` world, weapon and HUD. Its own 1280x800 TGA readback has 11,164
 distinct RGBA colors. The upstream quit command returns zero, verified by an
 `if`/`else` in the Linux shell, rather than interpolating `$?` in the native
 shell. Temporary timing sources and diagnostic binaries are not deployed.
+
+### Changed ranges in persistent native buffers
+
+The native backend bounds changed bytes in each ordered buffer update and
+merges subsequent writes to the same buffer. A partial GPU upload is used only
+when its physical storage has the exact predecessor revision. New, stale or
+partially failed storage is repaired from the complete initialized CPU shadow.
+Upload boundaries preserve neighboring bytes in the transport's 32-bit words;
+growth includes newly initialized zero-filled gaps. This does not change the
+canonical buffer-update command or the GPU/SWS SDK interfaces.
+
+All 57 Linux release backend tests pass, including changed-range merging,
+comparison chunk boundaries, first writes, growth and stale-revision repair.
+The release ICD renders the native game world, weapon and HUD; its 1280x800
+TGA readback has 8,223 distinct RGBA colors and the upstream quit returns zero.
+For the same 915 loading-console draws and 18 native pass chunks, 36 temporary
+clock samples give a backend median of 57 ms versus 60 ms before changed-range
+uploads. This is a modest CPU elapsed-time improvement and is not an FPS
+measurement. World buffer preparation costs also depend on the view and are
+not a controlled comparison. The deployed ICD contains no timing diagnostics.

@@ -394,11 +394,55 @@ struct BufferShadowUpdate {
     slot: usize,
     revision: u64,
     bytes: Vec<u8>,
+    upload: driver::IrBufferUpdate,
 }
 
 struct PendingBuffers {
     updates: Vec<BufferShadowUpdate>,
     canonical_validations: Vec<(usize, u64)>,
+}
+
+/// Bound changed bytes without walking large unchanged regions byte by byte.
+fn changed_buffer_bytes(
+    previous: Option<&[u8]>,
+    start: usize,
+    data: &[u8],
+) -> Result<core::ops::Range<usize>, IrSubmitError> {
+    let end = start
+        .checked_add(data.len())
+        .ok_or(IrSubmitError::InvalidVertexData)?;
+    let Some(previous) = previous else {
+        return Ok(0..end);
+    };
+    let old = previous.get(start..).unwrap_or(&[]);
+    let overlap = old.len().min(data.len());
+    let mut prefix = 0;
+    for (old, new) in old[..overlap].chunks(256).zip(data[..overlap].chunks(256)) {
+        if old != new {
+            prefix += old.iter().zip(new).take_while(|(a, b)| a == b).count();
+            break;
+        }
+        prefix += old.len();
+    }
+    let mut suffix = 0;
+    if data.len() <= old.len() {
+        for (old, new) in old[prefix..data.len()]
+            .rchunks(256)
+            .zip(data[prefix..].rchunks(256))
+        {
+            if old != new {
+                suffix += old
+                    .iter()
+                    .rev()
+                    .zip(new.iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                break;
+            }
+            suffix += old.len();
+        }
+    }
+    Ok((start + prefix).min(previous.len())..end - suffix)
 }
 
 enum BufferBytes<'pending, 'resource> {
@@ -474,32 +518,36 @@ impl PendingBuffers {
             // write retains its revision and needs no subsequent GPU upload.
             return Ok(());
         }
-        let bytes = if let Some(update) = self.updates.iter_mut().find(|update| update.slot == slot)
-        {
-            &mut update.bytes
-        } else {
-            let bytes = if let Some(previous) = previous {
-                Vec::from(previous)
+        let changed = changed_buffer_bytes(current, start, data)?;
+        let update =
+            if let Some(update) = self.updates.iter_mut().find(|update| update.slot == slot) {
+                update.upload.range.start = update.upload.range.start.min(changed.start);
+                update.upload.range.end = update.upload.range.end.max(changed.end);
+                update
             } else {
-                Vec::new()
+                let bytes = if let Some(previous) = previous {
+                    Vec::from(previous)
+                } else {
+                    Vec::new()
+                };
+                let revision = previous_revision
+                    .checked_add(1)
+                    .ok_or(IrSubmitError::OutOfMemory)?;
+                self.updates
+                    .try_reserve(1)
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+                self.updates.push(BufferShadowUpdate {
+                    slot,
+                    revision,
+                    bytes,
+                    upload: driver::IrBufferUpdate {
+                        previous_revision,
+                        range: changed,
+                    },
+                });
+                self.updates.last_mut().ok_or(IrSubmitError::OutOfMemory)?
             };
-            let revision = previous_revision
-                .checked_add(1)
-                .ok_or(IrSubmitError::OutOfMemory)?;
-            self.updates
-                .try_reserve(1)
-                .map_err(|_| IrSubmitError::OutOfMemory)?;
-            self.updates.push(BufferShadowUpdate {
-                slot,
-                revision,
-                bytes,
-            });
-            &mut self
-                .updates
-                .last_mut()
-                .ok_or(IrSubmitError::OutOfMemory)?
-                .bytes
-        };
+        let bytes = &mut update.bytes;
         if bytes.len() < write_end {
             bytes
                 .try_reserve_exact(write_end - bytes.len())
@@ -841,23 +889,22 @@ impl Queue {
                 continue;
             };
             for draw in &pass.submission.draws {
-                let mut bindings = Vec::new();
-                if let Some(binding) = draw.vertex_buffer {
-                    bindings.push(binding.buffer);
-                }
-                if let Some(programmable) = &draw.programmable
-                    && let Some(binding) = programmable.index_buffer
-                {
-                    bindings.push(binding.buffer);
-                }
-                for binding in bindings {
+                let bindings = [
+                    draw.vertex_buffer.map(|binding| binding.buffer),
+                    draw.programmable
+                        .as_ref()
+                        .and_then(|draw| draw.index_buffer)
+                        .map(|binding| binding.buffer),
+                ];
+                for binding in bindings.into_iter().flatten() {
                     if prepared_buffers.contains(&binding.slot) {
                         continue;
                     }
-                    let bytes = plan
+                    let update = plan
                         .buffer_updates
                         .iter()
-                        .find(|update| update.slot == binding.slot)
+                        .find(|update| update.slot == binding.slot);
+                    let bytes = update
                         .map(|update| update.bytes.as_slice())
                         .or_else(|| {
                             resources
@@ -871,6 +918,7 @@ impl Queue {
                         &mut resources.backend,
                         binding,
                         bytes,
+                        update.map(|update| &update.upload),
                         mode,
                     )?;
                     prepared_buffers
@@ -2731,6 +2779,60 @@ mod tests {
         IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrCullMode, IrFragmentProgram,
         IrFrontFace,
     };
+
+    #[test]
+    fn full_buffer_flush_tracks_only_changed_bytes_and_merges_later_writes() {
+        let previous = vec![3; 4096];
+        let mut flushed = previous.clone();
+        flushed[1025..1032].fill(9);
+        let mut pending = PendingBuffers::new();
+        pending
+            .write_bytes(1, 7, Some(&previous), 0, &flushed)
+            .unwrap();
+        assert_eq!(pending.updates[0].upload.range, 1025..1032);
+        pending
+            .write_bytes(1, 7, Some(&previous), 100, &[8, 3])
+            .unwrap();
+        let update = &pending.updates[0];
+        assert_eq!(update.upload.range, 100..1032);
+        assert_eq!(update.upload.previous_revision, 7);
+        assert_eq!(update.revision, 8);
+        assert_eq!(&update.bytes[101..1025], &previous[101..1025]);
+        assert_eq!(&update.bytes[1032..], &previous[1032..]);
+    }
+
+    #[test]
+    fn shadow_growth_uploads_the_zero_filled_gap() {
+        let mut pending = PendingBuffers::new();
+        pending
+            .write_bytes(1, 7, Some(&[1; 4]), 8, &[0; 4])
+            .unwrap();
+        assert_eq!(pending.updates[0].upload.range, 4..12);
+        assert_eq!(
+            pending.updates[0].bytes,
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let mut initial = PendingBuffers::new();
+        initial.write_bytes(1, 0, None, 8, &[0; 4]).unwrap();
+        assert_eq!(initial.updates[0].upload.range, 0..12);
+    }
+
+    #[test]
+    fn shadow_diff_finds_changes_across_comparison_chunk_boundaries() {
+        let previous = vec![0; 1032];
+        for position in [0, 255, 256, 257, 1023, 1031] {
+            let mut data = previous.clone();
+            data[position] = 1;
+            assert_eq!(
+                changed_buffer_bytes(Some(&previous), 0, &data).unwrap(),
+                position..position + 1
+            );
+        }
+        assert_eq!(
+            changed_buffer_bytes(Some(&previous), 4, &[0, 1, 0, 0]).unwrap(),
+            5..6
+        );
+    }
 
     #[test]
     fn identical_shadow_writes_keep_the_uploaded_revision() {

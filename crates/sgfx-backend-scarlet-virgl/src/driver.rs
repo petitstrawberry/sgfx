@@ -351,11 +351,12 @@ impl Queue {
         resources: &mut IrResources,
         buffer: IrBufferSpec,
         bytes: &[u8],
+        update: Option<&IrBufferUpdate>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
-                queue.prepare_ir_buffer(context, resources, buffer, bytes, mode)
+                queue.prepare_ir_buffer(context, resources, buffer, bytes, update, mode)
             }
         }
     }
@@ -483,6 +484,12 @@ pub(crate) struct IrBufferSpec {
     pub(crate) slot: usize,
     pub(crate) size: u64,
     pub(crate) revision: u64,
+}
+
+/// Byte changes relative to the last accepted CPU shadow revision.
+pub(crate) struct IrBufferUpdate {
+    pub(crate) previous_revision: u64,
+    pub(crate) range: core::ops::Range<usize>,
 }
 
 /// One draw's binding into a persistent canonical vertex buffer.
