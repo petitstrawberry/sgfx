@@ -312,3 +312,30 @@ clock samples give a backend median of 57 ms versus 60 ms before changed-range
 uploads. This is a modest CPU elapsed-time improvement and is not an FPS
 measurement. World buffer preparation costs also depend on the view and are
 not a controlled comparison. The deployed ICD contains no timing diagnostics.
+
+### Ordered Vulkan insertions and a bounded game FPS check
+
+Deferred descriptor bindings, barriers and image readbacks are appended in
+command order during Vulkan recording resolution. Execution now consumes each
+insertion once, preserving insertion order at the same command position and
+processing trailing readbacks. It no longer scans all insertions for each SGFX
+command. All 26 Linux release ICD library tests pass; a regression bounds the
+position checks for 10,000 commands and verifies repeated trailing insertions.
+
+Three ordinary upstream timedemo runs used 1280x800, four AArch64 HVF guest
+CPUs, 8 GiB RAM, VirGL 1.3.0, identical game settings and the same Cocoa GL
+display binary. The test demo contains the first 64 complete network messages
+from the bundled `q2demo1.dm2`, followed by its ordinary EOF marker. The game
+reports 57 timed frames in each run:
+
+| Release ICD | Engine elapsed time | Engine FPS |
+| --- | --- | --- |
+| Shared native bindings (`f7c45be`) | 19.0 s | 3.0 |
+| Changed native buffer ranges (`c57e68d`) | 17.1 s | 3.3 |
+| Changed ranges and ordered Vulkan insertions | 15.7 s | 3.6 |
+
+These are single, short demo runs without ICD profiling clocks. They show a
+modest improvement, not sustained or playable performance. The copied demo
+prefix is a private test asset and is not included in the repository or normal
+image. The ordinary full bundled demo can be timed with
+`+set timedemo 1 +demomap q2demo1.dm2`.

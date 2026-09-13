@@ -3122,6 +3122,22 @@ fn wait_submission(rt: &mut Runtime, submission: &sgfx::driver::Submission) -> V
     }
 }
 
+/// Resolution appends insertions at `ops.len()`, in nondecreasing order.
+/// Consume each insertion once instead of scanning the entire list per op.
+fn take_positioned<'a, T>(
+    remaining: &mut &'a [T],
+    position: usize,
+    key: impl Fn(&T) -> usize,
+) -> &'a [T] {
+    let count = remaining
+        .iter()
+        .take_while(|item| key(item) == position)
+        .count();
+    let (current, later) = remaining.split_at(count);
+    *remaining = later;
+    current
+}
+
 fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
     let mut used = rec.used_buffers.clone();
     for insertion in &rec.descriptors {
@@ -3167,8 +3183,11 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
             });
         }
     }
+    let mut descriptors = rec.descriptors.as_slice();
+    let mut barriers = rec.barriers.as_slice();
+    let mut copies = rec.copies.as_slice();
     for position in 0..=rec.ops.len() {
-        for d in rec.descriptors.iter().filter(|d| d.position == position) {
+        for d in take_positioned(&mut descriptors, position, |d| d.position) {
             let group = rt
                 .resources
                 .descriptor_group(&rt.table, d.set, &d.dynamic_offsets)?;
@@ -3177,7 +3196,7 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
                 bind_group: group,
             });
         }
-        for barrier in rec.barriers.iter().filter(|b| b.position == position) {
+        for barrier in take_positioned(&mut barriers, position, |b| b.position) {
             let mut ids = Vec::new();
             for set in &barrier.sets {
                 let set = rt
@@ -3211,7 +3230,7 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
                 ));
             }
         }
-        for copy in rec.copies.iter().filter(|c| c.position == position) {
+        for copy in take_positioned(&mut copies, position, |c| c.position) {
             if let Some(submission) = submit_owned(rt, std::mem::take(&mut ops))? {
                 wait_submission(rt, &submission)?;
             }
@@ -3460,6 +3479,28 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_insertions_preserve_order_with_linear_position_checks() {
+        const COMMANDS: usize = 10_000;
+        let mut entries: Vec<_> = (0..1000).map(|i| (i * 10, i)).collect();
+        entries.extend([(COMMANDS, 1000), (COMMANDS, 1001)]);
+        let mut remaining = entries.as_slice();
+        let checks = std::cell::Cell::new(0usize);
+        let mut observed = Vec::new();
+        for position in 0..=COMMANDS {
+            for entry in take_positioned(&mut remaining, position, |entry| {
+                checks.set(checks.get() + 1);
+                entry.0
+            }) {
+                observed.push(*entry);
+            }
+        }
+        assert_eq!(observed, entries);
+        assert!(remaining.is_empty());
+        assert!(checks.get() <= entries.len() + COMMANDS + 1);
+        assert!(take_positioned(&mut remaining, COMMANDS + 1, |entry| entry.0).is_empty());
+    }
 
     #[test]
     fn recording_accepts_application_programs_and_rejects_capacity_overflow() {
