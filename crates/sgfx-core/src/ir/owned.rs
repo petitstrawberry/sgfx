@@ -10,7 +10,7 @@ use super::{
     BindGroupId, BufferAccess, BufferId, CommandBuffer, CommandEncoder, ComputePipelineId,
     DepthLoadOp, DrawUniforms, Error, IndexFormat, LoadOp, PixelRect, ProgrammableRenderPipelineId,
     RenderPassDesc, RenderPipelineId, ResourceBarrier, ResourceTable, Result, SamplerId, StoreOp,
-    TextureAccess, TextureId, TextureWrite,
+    TextureAccess, TextureId, TextureWrite, Viewport,
 };
 
 /// An owned depth attachment, validated when its recording is replayed.
@@ -199,6 +199,8 @@ pub enum OwnedCommand {
     SetUniforms(DrawUniforms),
     /// Set or reset the render scissor.
     SetScissor(Option<PixelRect>),
+    /// Set the viewport for subsequent draws.
+    SetViewport(Viewport),
     /// Issue a non-indexed draw.
     Draw {
         /// Number of vertices.
@@ -369,6 +371,7 @@ impl OwnedCommandBuffer {
                             }
                             OwnedCommand::SetUniforms(uniforms) => pass.set_uniforms(*uniforms)?,
                             OwnedCommand::SetScissor(scissor) => pass.set_scissor(*scissor)?,
+                            OwnedCommand::SetViewport(viewport) => pass.set_viewport(*viewport)?,
                             OwnedCommand::Draw {
                                 vertex_count,
                                 first_vertex,

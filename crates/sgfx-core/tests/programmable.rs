@@ -80,7 +80,7 @@ fn descriptors_reject_duplicate_bindings_empty_visibility_and_invalid_storage_fo
     );
     assert_eq!(
         BindGroupLayoutDesc::new(vec![BindGroupLayoutEntry::new(
-            16,
+            MAX_BINDINGS_PER_GROUP as u32,
             ShaderStages::COMPUTE,
             BindingType::Sampler
         )]),
@@ -92,6 +92,58 @@ fn descriptors_reject_duplicate_bindings_empty_visibility_and_invalid_storage_fo
             Extent2D::new(1, 1).unwrap(),
             TextureUsage::STORAGE
         ),
+        Err(Error::InvalidDescriptor)
+    );
+}
+
+#[test]
+fn owned_viewports_validate_values_attachment_bounds_and_pass_scope() {
+    assert_eq!(
+        Viewport::new(0.0, 0.0, 0.0, 8.0, 0.0, 1.0),
+        Err(Error::InvalidValue)
+    );
+    assert_eq!(
+        Viewport::new(f32::NAN, 0.0, 8.0, 8.0, 0.0, 1.0),
+        Err(Error::InvalidValue)
+    );
+    let table = ResourceTable::new();
+    let target = table
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::Rgba8Unorm,
+                Extent2D::new(8, 8).unwrap(),
+                TextureUsage::RENDER_ATTACHMENT,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let valid = Viewport::new(2.0, 1.0, 6.0, 7.0, 0.2, 0.8).unwrap();
+    let begin = OwnedCommand::BeginRenderPass(OwnedRenderPassDesc {
+        target: target.id(),
+        area: PixelRect::new(0, 0, 8, 8).unwrap(),
+        load: LoadOp::DontCare,
+        store: StoreOp::Store,
+        depth: None,
+    });
+    let recording = OwnedCommandBuffer::new(vec![
+        begin.clone(),
+        OwnedCommand::SetViewport(valid),
+        OwnedCommand::EndRenderPass,
+    ]);
+    let commands = recording.record(&table).unwrap();
+    assert!(matches!(commands.commands()[1], Command::SetViewport(v) if v == valid));
+    let outside = Viewport::new(2.0, 0.0, 7.0, 8.0, 0.0, 1.0).unwrap();
+    assert_eq!(
+        OwnedCommandBuffer::new(vec![
+            begin,
+            OwnedCommand::SetViewport(outside),
+            OwnedCommand::EndRenderPass
+        ])
+        .validate(&table),
+        Err(Error::OutOfBounds)
+    );
+    assert_eq!(
+        OwnedCommandBuffer::new(vec![OwnedCommand::SetViewport(valid)]).validate(&table),
         Err(Error::InvalidDescriptor)
     );
 }

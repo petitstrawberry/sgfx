@@ -14,7 +14,7 @@ use programmable_commands::{AnnouncedAccess, PendingWrite};
 use super::{
     BufferRef, BufferUsage, Color, DrawUniforms, Error, FragmentProgram, IndexFormat, PixelRect,
     RenderPipelineRef, ResourceTable, Result, SamplerRef, TextureFormat, TextureRef, TextureUsage,
-    TextureWrite,
+    TextureWrite, Viewport,
 };
 
 /// Maximum commands retained by one logical command buffer.
@@ -318,6 +318,8 @@ pub enum Command<'r, 'data> {
     SetUniforms(DrawUniforms),
     /// Set or reset the scissor for subsequent draws.
     SetScissor(Option<PixelRect>),
+    /// Set the viewport for subsequent draws.
+    SetViewport(Viewport),
     /// Issue a non-indexed draw.
     Draw {
         /// Number of vertices to draw.
@@ -820,6 +822,16 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             return Err(Error::OutOfBounds);
         }
         self.encoder.push(Command::SetScissor(scissor))
+    }
+
+    /// Set a viewport wholly within the color attachment.
+    pub fn set_viewport(&mut self, viewport: Viewport) -> Result<()> {
+        let [x, y, width, height, _, _] = viewport.components();
+        let target = self.encoder.resources.texture(self.target)?.extent();
+        if x + width > target.width() as f32 || y + height > target.height() as f32 {
+            return Err(Error::OutOfBounds);
+        }
+        self.encoder.push(Command::SetViewport(viewport))
     }
 
     /// Record a non-indexed triangle-list draw.

@@ -26,7 +26,7 @@ pub use resource::{
     ResourceTable, SamplerDesc, SamplerId, SamplerRef, TextureDesc, TextureFormat, TextureId,
     TextureRef, TextureUsage, TextureWrite,
 };
-pub use types::{Color, Error, Extent2D, PixelRect, Result, Transform};
+pub use types::{Color, Error, Extent2D, PixelRect, Result, Transform, Viewport};
 
 mod programmable;
 mod shader;

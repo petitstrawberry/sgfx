@@ -6,7 +6,7 @@ use alloc::{string::String, vec::Vec};
 /// Maximum descriptor sets in a pipeline layout.
 pub const MAX_BIND_GROUPS: usize = 4;
 /// Maximum bindings in a descriptor set.
-pub const MAX_BINDINGS_PER_GROUP: usize = 16;
+pub const MAX_BINDINGS_PER_GROUP: usize = 32;
 
 /// A shader module and a stage-specific entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]
