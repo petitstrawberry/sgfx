@@ -938,6 +938,13 @@ impl ExecutionPlan {
                 || submission.vertices.len() > MAX_IR_VERTICES
                 || submission.draws.len() > MAX_IR_DRAWS_PER_SUBMISSION
                 || !chunk_fits_transport(submission.vertices.len(), submission.draws.len())
+                || submission.draws.len() > 1
+                    && submission
+                        .draws
+                        .first()
+                        .is_some_and(|draw| draw.programmable.is_some())
+                    && programmable_chunk_bytes(&submission.draws)
+                        .is_none_or(|bytes| bytes > IR_COMMAND_TRANSPORT_BYTES)
             {
                 return Err(IrSubmitError::InvalidVertexData);
             }
@@ -1769,6 +1776,52 @@ fn inline_vertex_capacity(vertex_count: usize, draw_count: usize) -> usize {
     transport_capacity.min(MAX_IR_VERTICES.saturating_sub(vertex_count))
 }
 
+fn programmable_draw_bytes(draw: &driver::IrProgrammableDraw) -> Option<usize> {
+    let mut constant_words = [0usize; 2];
+    for constant in &draw.constants {
+        let stage = match constant.stage {
+            ir::ShaderStage::Vertex => 0,
+            ir::ShaderStage::Fragment => 1,
+            _ => return None,
+        };
+        // The encoder fills register gaps before writing each stage's bank.
+        let end = usize::try_from(constant.first_register)
+            .ok()?
+            .checked_mul(4)?
+            .checked_add(constant.words.len())?;
+        constant_words[stage] = constant_words[stage].max(end);
+    }
+    constant_words[0]
+        .checked_add(constant_words[1])?
+        .checked_mul(core::mem::size_of::<u32>())?
+        .checked_add(IR_DRAW_COMMAND_BUDGET)?
+        // Includes first-use sampler/view creation and both stage bindings.
+        .checked_add(draw.textures.len().checked_mul(160)?)
+}
+
+fn programmable_chunk_bytes<'draw>(
+    draws: impl IntoIterator<Item = &'draw IrDraw>,
+) -> Option<usize> {
+    let mut draws = draws.into_iter();
+    let first = draws.next()?.programmable.as_ref()?;
+    // Reserve setup, surfaces, pipeline state and vertex elements once. Shader
+    // source is also sent at most once for this immutable pipeline in a chunk.
+    let mut bytes = 2 * IR_COMMAND_FIXED_BUDGET + 128;
+    #[cfg(feature = "programmable")]
+    for source in [&first.pipeline.vertex.tgsi, &first.pipeline.fragment.tgsi] {
+        bytes = bytes.checked_add(source.len().checked_add(4)? & !3)?;
+    }
+    bytes = bytes.checked_add(programmable_draw_bytes(first)?)?;
+    for draw in draws {
+        let programmable = draw.programmable.as_ref()?;
+        if !Rc::ptr_eq(&first.pipeline, &programmable.pipeline) {
+            return None;
+        }
+        bytes = bytes.checked_add(programmable_draw_bytes(programmable)?)?;
+    }
+    Some(bytes)
+}
+
 fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> {
     let IrSubmission {
         clear_color,
@@ -1785,26 +1838,15 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
     let mut first_chunk = true;
 
     for draw in draws {
-        if draw.programmable.is_some() {
-            if !chunk_draws.is_empty() {
-                push_pass_chunk(
-                    &mut chunks,
-                    &pass.target,
-                    clear_color,
-                    depth_attachment,
-                    clear_depth,
-                    render_area,
-                    core::mem::take(&mut chunk_vertices),
-                    core::mem::take(&mut chunk_draws),
-                    if first_chunk {
-                        texture_uploads.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    first_chunk,
-                )?;
-                first_chunk = false;
-            }
+        let flush = !chunk_draws.is_empty()
+            && if draw.programmable.is_some() {
+                chunk_draws.len() >= MAX_IR_DRAWS_PER_SUBMISSION
+                    || programmable_chunk_bytes(chunk_draws.iter().chain(core::iter::once(&draw)))
+                        .is_none_or(|bytes| bytes > IR_COMMAND_TRANSPORT_BYTES)
+            } else {
+                chunk_draws[0].programmable.is_some()
+            };
+        if flush {
             push_pass_chunk(
                 &mut chunks,
                 &pass.target,
@@ -1812,8 +1854,8 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                 depth_attachment,
                 clear_depth,
                 render_area,
-                Vec::new(),
-                alloc::vec![draw],
+                core::mem::take(&mut chunk_vertices),
+                core::mem::take(&mut chunk_draws),
                 if first_chunk {
                     texture_uploads.clone()
                 } else {
@@ -1822,6 +1864,15 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                 first_chunk,
             )?;
             first_chunk = false;
+        }
+        if draw.programmable.is_some() {
+            // A conservative first-use estimate may exceed the budget for an
+            // already materialized pipeline. Keep the original single-draw
+            // path; the packet encoder still checks its actual byte length.
+            chunk_draws
+                .try_reserve(1)
+                .map_err(|_| IrSubmitError::OutOfMemory)?;
+            chunk_draws.push(draw);
         } else if draw.vertex_buffer.is_none() {
             let end = draw
                 .start_vertex
@@ -2834,6 +2885,177 @@ mod tests {
                 .all(|chunk| chunk.submission.vertices.is_empty()
                     && chunk.submission.draws.len() <= MAX_IR_DRAWS_PER_SUBMISSION
                     && chunk_fits_transport(0, chunk.submission.draws.len()))
+        );
+    }
+
+    #[cfg(feature = "programmable")]
+    fn programmable_pipeline(slot: usize) -> Rc<driver::IrProgrammablePipeline> {
+        use sgfx_codegen_virgl::programmable::compile_shader;
+        let module = ir::ShaderModuleDesc::wgsl(
+            "@vertex fn vs(@location(0) position: vec4<f32>) -> @builtin(position) vec4<f32> { return position; }
+             @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"
+                .into(),
+        ).unwrap();
+        Rc::new(driver::IrProgrammablePipeline {
+            slot,
+            vertex: compile_shader(&module, ir::ShaderStage::Vertex, "vs").unwrap(),
+            fragment: compile_shader(&module, ir::ShaderStage::Fragment, "fs").unwrap(),
+            vertex_buffer: Some(
+                ir::VertexBufferLayout::new(
+                    16,
+                    vec![VertexAttribute::new(0, VertexFormat::Float32x4, 0)],
+                )
+                .unwrap(),
+            ),
+            topology: PrimitiveTopology::TriangleList,
+        })
+    }
+
+    #[cfg(feature = "programmable")]
+    fn programmable_draw(pipeline: &Rc<driver::IrProgrammablePipeline>, marker: usize) -> IrDraw {
+        let mut draw = draw(0, 3, marker);
+        draw.pipeline.slot = pipeline.slot + 256;
+        draw.vertex_buffer = Some(IrVertexBufferBinding {
+            buffer: IrBufferSpec {
+                slot: 1,
+                size: 48,
+                revision: 1,
+            },
+            offset: 0,
+        });
+        draw.programmable = Some(Rc::new(driver::IrProgrammableDraw {
+            pipeline: Rc::clone(pipeline),
+            index_buffer: None,
+            constants: vec![driver::IrConstantBuffer {
+                stage: ir::ShaderStage::Vertex,
+                first_register: 0,
+                words: vec![marker as u32, 0, 0, 0],
+            }],
+            textures: Vec::new(),
+        }));
+        draw
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn programmable_draws_share_bounded_chunks_and_keep_each_constant_snapshot() {
+        let pipeline = programmable_pipeline(0);
+        let draws = (0..130)
+            .map(|marker| programmable_draw(&pipeline, marker))
+            .collect();
+        let chunks = split_pass(execution_pass(Vec::new(), draws)).unwrap();
+        assert!(chunks.len() < 130 / 8);
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.submission.clear_color.is_some())
+                .count(),
+            1
+        );
+        let markers: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| {
+                assert!(chunk.submission.draws.len() <= MAX_IR_DRAWS_PER_SUBMISSION);
+                chunk
+                    .submission
+                    .draws
+                    .iter()
+                    .map(|draw| draw.programmable.as_ref().unwrap().constants[0].words[0])
+            })
+            .collect();
+        assert_eq!(markers, (0..130).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn fixed_and_different_programmable_pipelines_keep_draw_order_and_one_clear() {
+        let first = programmable_pipeline(0);
+        let second = programmable_pipeline(1);
+        let draws = vec![
+            draw(0, 3, 0),
+            draw(0, 3, 1),
+            programmable_draw(&first, 2),
+            programmable_draw(&first, 3),
+            programmable_draw(&second, 4),
+            programmable_draw(&second, 5),
+            draw(0, 3, 6),
+            programmable_draw(&first, 7),
+        ];
+        let vertex = IrVertex {
+            position: [0.0; 4],
+            secondary: [0.0; 4],
+            tertiary: [0.0; 2],
+        };
+        let chunks = split_pass(execution_pass(vec![vertex; 3], draws)).unwrap();
+        let markers: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .submission
+                    .draws
+                    .iter()
+                    .map(|draw| draw.uniforms.color[0] as usize)
+            })
+            .collect();
+        assert_eq!(markers, (0..8).collect::<Vec<_>>());
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.submission.clear_color.is_some())
+                .count(),
+            1
+        );
+        assert!(
+            chunks[0]
+                .submission
+                .draws
+                .iter()
+                .all(|draw| draw.programmable.is_none())
+        );
+        assert!(
+            chunks[1]
+                .submission
+                .draws
+                .iter()
+                .all(|draw| Rc::ptr_eq(&draw.programmable.as_ref().unwrap().pipeline, &first))
+        );
+        assert!(
+            chunks[2]
+                .submission
+                .draws
+                .iter()
+                .all(|draw| Rc::ptr_eq(&draw.programmable.as_ref().unwrap().pipeline, &second))
+        );
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn register_gaps_split_large_constant_banks_before_the_draw_count_limit() {
+        let pipeline = programmable_pipeline(0);
+        let draws = (0..20)
+            .map(|marker| {
+                let mut draw = programmable_draw(&pipeline, marker);
+                let programmable = Rc::get_mut(draw.programmable.as_mut().unwrap()).unwrap();
+                programmable.constants = [ir::ShaderStage::Vertex, ir::ShaderStage::Fragment]
+                    .into_iter()
+                    .map(|stage| driver::IrConstantBuffer {
+                        stage,
+                        first_register: 255,
+                        words: vec![marker as u32; 4],
+                    })
+                    .collect();
+                draw
+            })
+            .collect();
+        let chunks = split_pass(execution_pass(Vec::new(), draws)).unwrap();
+        assert!(chunks.len() > 3);
+        assert!(chunks.iter().all(|chunk| chunk.submission.draws.len() < 8));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.submission.draws.len())
+                .sum::<usize>(),
+            20
         );
     }
 }
