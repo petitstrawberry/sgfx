@@ -15,6 +15,14 @@ struct Output { @builtin(position) position: vec4<f32>, @location(0) color: vec3
 }
 @fragment fn fs_main(input: Output) -> @location(0) vec4<f32> { return vec4<f32>(input.color, 1.0); }
 "#;
+const TEXTURED: &str = r#"
+@group(1) @binding(4) var image: texture_2d<f32>;
+@group(2) @binding(7) var filtering: sampler;
+fn sample(uv: vec2<f32>) -> vec4<f32> { return textureSample(image, filtering, uv); }
+@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return sample(uv) * vec4<f32>(0.5, 1.0, 1.0, 1.0);
+}
+"#;
 fn wgsl(source: &str) -> ShaderModuleDesc {
     ShaderModuleDesc::wgsl(source.into()).unwrap()
 }
@@ -107,6 +115,52 @@ fn vulkan_normalized_cube_spirv_compiles() {
     let shader = vulkan_normalized_spirv(CUBE);
     compile_shader(&shader, ShaderStage::Vertex, "vs_main").unwrap();
     compile_shader(&shader, ShaderStage::Fragment, "fs_main").unwrap();
+}
+
+#[test]
+fn separate_texture_and_sampler_pairs_lower_for_wgsl_and_spirv() {
+    for module in [wgsl(TEXTURED), spirv(TEXTURED)] {
+        let shader = compile_shader(&module, ShaderStage::Fragment, "fs_main").unwrap();
+        assert_eq!(shader.textures.len(), 1);
+        let pair = &shader.textures[0];
+        assert_eq!(
+            (
+                pair.slot,
+                pair.image_group,
+                pair.image_binding,
+                pair.sampler_group,
+                pair.sampler_binding
+            ),
+            (0, 1, 4, 2, 7)
+        );
+        assert!(shader.tgsi.contains("DCL SAMP[0]"));
+        assert!(shader.tgsi.contains("DCL SVIEW[0], 2D, FLOAT"));
+        assert!(shader.tgsi.contains("TEX "));
+        assert!(shader.tgsi.contains("MUL"));
+    }
+}
+
+#[test]
+fn explicit_lod_sampling_and_multiple_pairs_have_distinct_slots() {
+    let source = r#"
+@group(0) @binding(0) var a: texture_2d<f32>;
+@group(0) @binding(1) var b: texture_2d<f32>;
+@group(0) @binding(2) var s: sampler;
+@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return textureSampleLevel(a, s, uv, 0.0) + textureSampleLevel(b, s, uv, 0.0);
+}"#;
+    for module in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+        assert_eq!(
+            shader
+                .textures
+                .iter()
+                .map(|b| (b.slot, b.image_binding, b.sampler_binding))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 2), (1, 1, 2)]
+        );
+        assert_eq!(shader.tgsi.matches("TXL ").count(), 2);
+    }
 }
 
 #[test]
@@ -207,6 +261,14 @@ fn export_tgsi_acceptance_fixtures() {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/virgl-compiler-shaders");
     std::fs::create_dir_all(&directory).unwrap();
+    for (format, source) in [("wgsl", wgsl(TEXTURED)), ("spirv", spirv(TEXTURED))] {
+        let shader = compile_shader(&source, ShaderStage::Fragment, "fs_main").unwrap();
+        std::fs::write(
+            directory.join(format!("textured-{format}.frag.tgsi")),
+            shader.tgsi,
+        )
+        .unwrap();
+    }
     for (format, source) in [("wgsl", wgsl(CUBE)), ("spirv", spirv(CUBE))] {
         for (stage, entry, suffix) in [
             (ShaderStage::Vertex, "vs_main", "vert"),

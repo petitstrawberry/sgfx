@@ -1,11 +1,8 @@
-//! Render a real indexed Vulkan cube to PNG or the Scarlet display, with a
-//! uniform perspective transform and a D32 depth attachment.
-//! Display output uses GPU readback and DisplaySurface, not Vulkan WSI.
-//! Use --linked for the statically linked SGFX ICD.
-//! A host loader can be selected with SGFX_VULKAN_LOADER and VK_DRIVER_FILES;
-//! otherwise SGFX_ICD_LIBRARY (or the adjacent built ICD) is used directly.
+//! Render an indexed Vulkan cube with D32 depth, optionally textured.
+//! Host builds use the installed Vulkan loader; driver selection is external.
+//! Scarlet currently packages Vulkan entry points statically.
 #[cfg(not(target_os = "scarlet"))]
-use ash::{Entry, vk};
+use ash::Entry;
 use std::{error::Error, fs::File, io::BufWriter, path::PathBuf};
 
 #[path = "../../examples/support/cube.rs"]
@@ -14,7 +11,6 @@ mod render;
 fn main() -> Result<(), Box<dyn Error>> {
     let mut output = None;
     let mut display_requested = false;
-    let mut linked = cfg!(target_os = "scarlet");
     let mut frames = 1usize;
     let mut verify = false;
     let mut options = render::Options::default();
@@ -25,7 +21,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 print_help();
                 return Ok(());
             }
-            "--linked" => linked = true,
+            "--linked" if cfg!(target_os = "scarlet") => {}
+            "--textured" => options.textured = true,
+            "--dynamic-viewport" => options.dynamic_viewport = true,
+            "--dynamic-uniform" => options.dynamic_uniform = true,
             "--verify" => verify = true,
             "--display" => display_requested = true,
             "--output" => {
@@ -72,42 +71,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-    // The optional dynamic library must outlive the entry and every Vulkan object.
+    #[cfg(target_os = "scarlet")]
+    let entry = vulkan_sgfx::linked_entry();
     #[cfg(not(target_os = "scarlet"))]
-    let library;
-    let entry = if linked {
-        println!("Vulkan entry: statically linked SGFX ICD");
-        vulkan_sgfx::linked_entry()
-    } else {
-        #[cfg(target_os = "scarlet")]
-        return Err("Scarlet requires the statically linked ICD".into());
-        #[cfg(not(target_os = "scarlet"))]
-        {
-            let loader = std::env::var_os("SGFX_VULKAN_LOADER");
-            let using_loader = loader.is_some();
-            let path = loader
-                .or_else(|| std::env::var_os("SGFX_ICD_LIBRARY"))
-                .map(PathBuf::from)
-                .map(Ok)
-                .unwrap_or_else(default_library)?;
-            library = unsafe { libloading::Library::new(&path)? };
-            let symbol: &[u8] = if using_loader {
-                b"vkGetInstanceProcAddr\0"
-            } else {
-                b"vk_icdGetInstanceProcAddr\0"
-            };
-            let get_instance_proc_addr =
-                unsafe { *library.get::<vk::PFN_vkGetInstanceProcAddr>(symbol)? };
-            println!("Vulkan entry: {}", path.display());
-            unsafe {
-                Entry::from_static_fn(ash::StaticFn {
-                    get_instance_proc_addr,
-                })
-            }
-        }
-    };
+    let entry = unsafe { Entry::load()? };
     if verify {
         render::verify(&entry)?;
+        if options.textured {
+            render::verify_textured(&entry)?;
+        }
     }
     for frame in 0..frames {
         let frame_options = render::Options {
@@ -163,12 +135,14 @@ fn print_help() {
          --frames COUNT    Render 1..3600 frames, rotating 0.045 radians per frame.\n\
                            PNG sequences use NAME-0000.png, NAME-0001.png, ...\n\
          --angle RADIANS   Set the initial rotation (default: 0.58).\n\
-         --linked          Use the linked SGFX ICD (automatic on Scarlet).\n\
+         --textured        Sample a staged checkerboard texture.\n\
+         --dynamic-viewport Use Vulkan dynamic viewport and scissor.\n\
+         --linked          Scarlet compatibility option (already automatic).\n\
          --verify          Check indexed rendering and depth before rendering.\n\
          --help, -h        Show this help.\n\
          \n\
          --display and --output can be combined. PNG-only output is 512x512.\n\
-         Host library selection: SGFX_VULKAN_LOADER or SGFX_ICD_LIBRARY."
+         Host driver selection: VK_DRIVER_FILES points to an ICD manifest."
     );
 }
 
@@ -252,24 +226,4 @@ impl CubeDisplay {
             .map_err(|error| format!("cannot present cube display frame: {error:?}"))?;
         Ok(())
     }
-}
-
-#[cfg(not(target_os = "scarlet"))]
-fn default_library() -> Result<PathBuf, Box<dyn Error>> {
-    let executable = std::env::current_exe()?;
-    let parent = executable
-        .parent()
-        .ok_or("cannot locate executable directory")?;
-    let profile = if parent.file_name().is_some_and(|name| name == "examples") {
-        parent
-            .parent()
-            .ok_or("cannot locate Cargo profile directory")?
-    } else {
-        parent
-    };
-    Ok(profile.join(format!(
-        "{}vulkan_sgfx{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )))
 }

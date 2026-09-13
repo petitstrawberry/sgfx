@@ -638,6 +638,7 @@ pub(crate) struct IrDraw {
     pub(crate) sampler: Option<IrSamplerState>,
     pub(crate) uniforms: IrUniforms,
     pub(crate) scissor: IrRect,
+    pub(crate) viewport: Option<[f32; 6]>,
 }
 
 /// Immutable compiled stages and vertex-fetch layout for one programmable pipeline.
@@ -668,6 +669,14 @@ pub(crate) struct IrProgrammableDraw {
     pub(crate) pipeline: Rc<IrProgrammablePipeline>,
     pub(crate) index_buffer: Option<IrIndexBufferBinding>,
     pub(crate) constants: Vec<IrConstantBuffer>,
+    pub(crate) textures: Vec<IrTextureBinding>,
+}
+
+pub(crate) struct IrTextureBinding {
+    pub(crate) stage: crate::ir::ShaderStage,
+    pub(crate) slot: u32,
+    pub(crate) texture: IrTextureSpec,
+    pub(crate) sampler: IrSamplerState,
 }
 
 /// Converted BGRA texture upload retained until all stream validation succeeds.

@@ -608,6 +608,7 @@ struct ActivePass<'r> {
     sampler: Option<SamplerRef<'r>>,
     uniforms: Option<DrawUniforms>,
     scissor: Option<ir::PixelRect>,
+    viewport: Option<ir::Viewport>,
 }
 
 #[derive(Clone, Copy)]
@@ -1118,6 +1119,7 @@ impl ExecutionPlan {
                         sampler: None,
                         uniforms: None,
                         scissor: None,
+                        viewport: None,
                     });
                     seen_pass = true;
                 }
@@ -1199,6 +1201,15 @@ impl ExecutionPlan {
                         return Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds));
                     }
                     pass.scissor = *value;
+                }
+                Command::SetViewport(value) => {
+                    let pass = active_pass_mut(&mut active)?;
+                    let extent = resources.resources.texture(pass.attachment)?.extent();
+                    let [x, y, width, height, _, _] = value.components();
+                    if x + width > extent.width() as f32 || y + height > extent.height() as f32 {
+                        return Err(ir::Error::OutOfBounds.into());
+                    }
+                    pass.viewport = Some(*value);
                 }
                 Command::Draw {
                     vertex_count,
@@ -1630,6 +1641,7 @@ fn append_draw(pass: &mut ActivePass<'_>, draw: DecodedDraw) -> Result<(), IrSub
         sampler: draw.sampler,
         uniforms: draw.uniforms,
         scissor: draw.scissor,
+        viewport: pass.viewport.map(ir::Viewport::components),
     });
     Ok(())
 }
@@ -2571,6 +2583,7 @@ mod tests {
                 width: 64,
                 height: 64,
             },
+            viewport: None,
         }
     }
 

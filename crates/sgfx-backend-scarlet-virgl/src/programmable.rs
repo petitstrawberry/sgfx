@@ -172,11 +172,14 @@ fn compile_pipeline(
         ));
     }
     for group in pipeline.layout().bind_groups() {
-        if group
-            .entries()
-            .iter()
-            .any(|binding| binding.ty() != ir::BindingType::UniformBuffer)
-        {
+        if group.entries().iter().any(|binding| {
+            !matches!(
+                binding.ty(),
+                ir::BindingType::UniformBuffer
+                    | ir::BindingType::SampledTexture
+                    | ir::BindingType::Sampler
+            )
+        }) {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::ResourceBindings,
             ));
@@ -269,6 +272,35 @@ fn compile_pipeline(
                     .is_none_or(|end| end > 1024)
             {
                 return Err(ir::Error::BindingLayoutMismatch.into());
+            }
+        }
+        for pair in &shader.textures {
+            for (group, binding, ty) in [
+                (
+                    pair.image_group,
+                    pair.image_binding,
+                    ir::BindingType::SampledTexture,
+                ),
+                (
+                    pair.sampler_group,
+                    pair.sampler_binding,
+                    ir::BindingType::Sampler,
+                ),
+            ] {
+                let entry = pipeline
+                    .layout()
+                    .bind_groups()
+                    .get(group as usize)
+                    .and_then(|group| {
+                        group
+                            .entries()
+                            .iter()
+                            .find(|entry| entry.binding() == binding)
+                    })
+                    .ok_or(ir::Error::BindingLayoutMismatch)?;
+                if entry.ty() != ty || !entry.visibility().contains(visibility) {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                }
             }
         }
     }
@@ -394,7 +426,53 @@ pub(super) fn decode_draw(
     }
     let compiled = resources.compiled_pipeline(reference.id())?;
     let mut constants = Vec::new();
+    let mut textures = Vec::new();
+    let resource = |group_index: u32, binding: u32| -> Result<ir::BindingResource, IrSubmitError> {
+        let group_ref = pass
+            .bind_groups
+            .get(group_index as usize)
+            .copied()
+            .flatten()
+            .ok_or(ir::Error::BindingLayoutMismatch)?;
+        let group = resources.resources.bind_group(group_ref)?;
+        if pipeline.layout().bind_groups().get(group_index as usize) != Some(group.layout()) {
+            return Err(ir::Error::BindingLayoutMismatch.into());
+        }
+        group
+            .entries()
+            .iter()
+            .find(|entry| entry.binding() == binding)
+            .map(|entry| entry.resource())
+            .ok_or_else(|| ir::Error::BindingLayoutMismatch.into())
+    };
     for shader in [&compiled.vertex, &compiled.fragment] {
+        for binding in &shader.textures {
+            let ir::BindingResource::Texture(texture) =
+                resource(binding.image_group, binding.image_binding)?
+            else {
+                return Err(ir::Error::BindingLayoutMismatch.into());
+            };
+            let ir::BindingResource::Sampler(sampler) =
+                resource(binding.sampler_group, binding.sampler_binding)?
+            else {
+                return Err(ir::Error::BindingLayoutMismatch.into());
+            };
+            let texture = resources.resources.texture_ref(texture)?;
+            let descriptor = resources.resources.texture(texture)?;
+            if !descriptor.usage().contains(TextureUsage::SAMPLED)
+                || texture == pass.attachment
+                || pass.depth_attachment == Some(texture)
+            {
+                return Err(ir::Error::InvalidUsage.into());
+            }
+            let sampler = resources.resources.sampler_ref(sampler)?;
+            textures.push(driver::IrTextureBinding {
+                stage: shader.stage,
+                slot: binding.slot,
+                texture: texture_spec(texture, descriptor),
+                sampler: sampler_state(resources.resources.sampler(sampler)?, sampler.slot()),
+            });
+        }
         for binding in &shader.uniform_buffers {
             let group_ref = pass
                 .bind_groups
@@ -527,6 +605,7 @@ pub(super) fn decode_draw(
             pipeline: compiled,
             index_buffer,
             constants,
+            textures,
         })),
         start_vertex: first as usize,
         vertex_count: count as usize,
@@ -565,6 +644,7 @@ pub(super) fn decode_draw(
             color: [0.0; 4],
         },
         scissor: pass_scissor(pass),
+        viewport: pass.viewport.map(ir::Viewport::components),
     })
 }
 

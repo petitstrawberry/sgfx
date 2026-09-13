@@ -1363,6 +1363,11 @@ impl Queue {
             if let Some(texture) = draw.texture {
                 ir_texture(context, resources, texture)?;
             }
+            if let Some(programmable) = &draw.programmable {
+                for binding in &programmable.textures {
+                    ir_texture(context, resources, binding.texture)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1736,6 +1741,26 @@ impl Queue {
                     push_programmable_pipeline(&mut commands, native)?;
                     initialized_programmable_pipelines.push(slot);
                 }
+                for binding in &programmable.textures {
+                    let texture = ir_texture(context, resources, binding.texture)?;
+                    if !texture.sampler_view_initialized()
+                        && !initialized_views.contains(&binding.texture.slot)
+                    {
+                        push_sampler_view(
+                            &mut commands,
+                            texture.sampler_view_handle(),
+                            texture.resource_id(),
+                        );
+                        initialized_views.push(binding.texture.slot);
+                    }
+                    let sampler = ir_sampler(context, resources, binding.sampler)?;
+                    if !sampler.initialized.get()
+                        && !initialized_samplers.contains(&sampler.state.slot)
+                    {
+                        push_ir_sampler(&mut commands, sampler);
+                        initialized_samplers.push(sampler.state.slot);
+                    }
+                }
             }
             if let (Some(texture_spec), Some(sampler)) = (draw.texture, draw.sampler) {
                 let texture = ir_texture(context, resources, texture_spec)?;
@@ -1835,6 +1860,9 @@ impl Queue {
                 .get(draw.pipeline.slot)
                 .and_then(Option::as_ref)
                 .ok_or(HandleError::InvalidParameter)?;
+            if let Some(viewport) = draw.viewport {
+                push_ir_viewport(&mut commands, viewport, target.orientation);
+            }
             if let Some(programmable) = &draw.programmable {
                 let native = resources
                     .programmable_pipelines
@@ -2514,6 +2542,25 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
             return Err(HandleError::InvalidParameter);
         }
     }
+    for binding in &programmable.textures {
+        if !matches!(
+            binding.stage,
+            crate::ir::ShaderStage::Vertex | crate::ir::ShaderStage::Fragment
+        ) || binding.slot >= 16
+            || !binding.texture.sampled
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+        if resources
+            .texture_specs
+            .get(binding.texture.slot)
+            .copied()
+            .flatten()
+            != Some(binding.texture)
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+    }
     Ok(())
 }
 
@@ -2607,6 +2654,14 @@ fn validate_ir_draw(
     draw: &IrDraw,
     vertices_len: usize,
 ) -> HandleResult<()> {
+    if let Some([x, y, width, height, min_depth, max_depth]) = draw.viewport {
+        if crate::ir::Viewport::new(x, y, width, height, min_depth, max_depth).is_err()
+            || x + width > target_width as f32
+            || y + height > target_height as f32
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+    }
     if draw.programmable.is_some() {
         if draw.vertex_count == 0
             || !draw.vertex_count.is_multiple_of(3)
@@ -3359,6 +3414,37 @@ fn push_programmable_draw(
     if !fragment_constants.is_empty() {
         push_constant_words(commands, PIPE_SHADER_FRAGMENT, &fragment_constants)?;
     }
+    for binding in &programmable.textures {
+        let stage = match binding.stage {
+            crate::ir::ShaderStage::Vertex => PIPE_SHADER_VERTEX,
+            crate::ir::ShaderStage::Fragment => PIPE_SHADER_FRAGMENT,
+            _ => return Err(HandleError::InvalidParameter),
+        };
+        let texture = resources
+            .textures
+            .get(binding.texture.slot)
+            .and_then(Option::as_ref)
+            .ok_or(HandleError::InvalidParameter)?;
+        let sampler = resources
+            .samplers
+            .get(binding.sampler.slot)
+            .and_then(Option::as_ref)
+            .ok_or(HandleError::InvalidParameter)?;
+        if !ir_sampler_states_equal(sampler.state, binding.sampler) {
+            return Err(HandleError::InvalidParameter);
+        }
+        push_dword(commands, command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3));
+        push_dword(commands, stage);
+        push_dword(commands, binding.slot);
+        push_dword(commands, texture.sampler_view_handle());
+        push_dword(
+            commands,
+            command_header(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3),
+        );
+        push_dword(commands, stage);
+        push_dword(commands, binding.slot);
+        push_dword(commands, sampler.handle);
+    }
     push_ir_scissor(commands, ir_rect_to_pixel_rect(draw.scissor)?)?;
     if let Some(binding) = programmable.index_buffer {
         let buffer = uploaded_ir_buffer(resources, binding.buffer)?;
@@ -4080,6 +4166,33 @@ fn push_viewport(commands: &mut Vec<u8>, viewport: Viewport, orientation: Frameb
     push_float(commands, viewport.width() as f32 / 2.0);
     push_float(commands, viewport.height() as f32 / 2.0);
     push_float(commands, 0.5);
+}
+
+fn push_ir_viewport(
+    commands: &mut Vec<u8>,
+    viewport: [f32; 6],
+    orientation: FramebufferOrientation,
+) {
+    let [x, y, width, height, min_depth, max_depth] = viewport;
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7),
+    );
+    push_dword(commands, 0);
+    for component in [
+        width / 2.0,
+        if orientation.origin_upper_left {
+            -height / 2.0
+        } else {
+            height / 2.0
+        },
+        (max_depth - min_depth) / 2.0,
+        x + width / 2.0,
+        y + height / 2.0,
+        (min_depth + max_depth) / 2.0,
+    ] {
+        push_float(commands, component);
+    }
 }
 
 fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count: usize) {

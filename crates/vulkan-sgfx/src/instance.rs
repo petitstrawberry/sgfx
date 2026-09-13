@@ -231,6 +231,11 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             )
         }
         #[cfg(target_os = "macos")]
+        b"vkCreateMacOSSurfaceMVK" => procedure!(
+            crate::wsi::create_macos_surface,
+            vk::PFN_vkCreateMacOSSurfaceMVK
+        ),
+        #[cfg(target_os = "macos")]
         b"vkDestroySurfaceKHR" => {
             procedure!(crate::wsi::destroy_surface, vk::PFN_vkDestroySurfaceKHR)
         }
@@ -390,6 +395,10 @@ fn instance_extensions() -> &'static [(&'static CStr, u32)] {
     {
         &[
             (vk::KHR_SURFACE_NAME, vk::KHR_SURFACE_SPEC_VERSION),
+            (
+                vk::MVK_MACOS_SURFACE_NAME,
+                vk::MVK_MACOS_SURFACE_SPEC_VERSION,
+            ),
             (
                 vk::EXT_METAL_SURFACE_NAME,
                 vk::EXT_METAL_SURFACE_SPEC_VERSION,
@@ -597,6 +606,10 @@ unsafe extern "system" fn get_physical_device_properties(
             max_memory_allocation_count: 1024,
             buffer_image_granularity: 256,
             max_bound_descriptor_sets: limits.max_bound_descriptor_sets,
+            max_per_stage_descriptor_samplers: if graphics { 16 } else { 0 },
+            max_per_stage_descriptor_sampled_images: if graphics { 16 } else { 0 },
+            max_descriptor_set_samplers: if graphics { 16 } else { 0 },
+            max_descriptor_set_sampled_images: if graphics { 16 } else { 0 },
             max_per_stage_descriptor_uniform_buffers: limits.max_uniform_buffers_per_stage,
             max_per_stage_descriptor_storage_buffers: if storage_buffers {
                 limits.max_storage_buffers_per_stage
@@ -607,6 +620,12 @@ unsafe extern "system" fn get_physical_device_properties(
                 .max_uniform_buffers_per_stage
                 .saturating_add(limits.max_storage_buffers_per_stage)
                 .saturating_add(limits.max_color_attachments),
+            max_descriptor_set_uniform_buffers_dynamic: limits.max_uniform_buffers_per_stage,
+            max_descriptor_set_storage_buffers_dynamic: if storage_buffers {
+                limits.max_storage_buffers_per_stage
+            } else {
+                0
+            },
             max_descriptor_set_uniform_buffers: limits.max_uniform_buffers_per_stage,
             max_descriptor_set_storage_buffers: if storage_buffers {
                 limits.max_storage_buffers_per_stage
@@ -774,7 +793,9 @@ unsafe extern "system" fn get_physical_device_format_properties(
     {
         // In Vulkan 1.0, transfer support follows image-format support; the
         // TRANSFER_SRC/DST format-feature bits belong to maintenance1 / 1.1.
-        properties.optimal_tiling_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT;
+        properties.optimal_tiling_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
     }
     if capabilities.supports_depth32_attachment() && format == vk::Format::D32_SFLOAT {
         properties.optimal_tiling_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT;
@@ -1032,7 +1053,7 @@ mod tests {
                     vk::Format::R8G8B8A8_UNORM,
                     vk::ImageType::TYPE_2D,
                     vk::ImageTiling::OPTIMAL,
-                    vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageUsageFlags::STORAGE,
                     vk::ImageCreateFlags::empty(),
                     &mut image
                 ),

@@ -39,6 +39,21 @@ pub struct UniformBufferBinding {
     pub size: u32,
 }
 
+/// A shader sampling operation's separate SGFX texture and sampler bindings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextureSamplerBinding {
+    /// TGSI sampler/view slot within this stage.
+    pub slot: u32,
+    /// Texture group.
+    pub image_group: u32,
+    /// Texture binding.
+    pub image_binding: u32,
+    /// Sampler group.
+    pub sampler_group: u32,
+    /// Sampler binding.
+    pub sampler_binding: u32,
+}
+
 /// Numeric type of a stage interface location.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoScalar {
@@ -64,6 +79,8 @@ pub struct CompiledShader {
     pub tgsi: String,
     /// Used uniform buffers, flattened into an inline constant bank per stage.
     pub uniform_buffers: Vec<UniformBufferBinding>,
+    /// Sampling pairs bound independently for each shader stage.
+    pub textures: Vec<TextureSamplerBinding>,
     /// Input locations consumed by the shader, for pipeline validation.
     pub input_locations: Vec<u32>,
     /// Output locations produced by the shader, for pipeline validation.
@@ -83,7 +100,7 @@ pub struct CompiledShader {
 /// zero-to-one clip range to Gallium's negative-one-to-one range at the output.
 /// Uniform buffers keep their declared byte layout and are flattened into each
 /// stage's bounded inline constant bank.
-/// Compute, textures, storage buffers, loops, dynamic indexing and early returns
+/// Compute, storage buffers, loops, dynamic indexing and early returns
 /// are currently rejected. See the tests for executable examples of the subset.
 pub fn compile_shader(
     desc: &ShaderModuleDesc,
@@ -161,6 +178,8 @@ enum Shape {
     Vector(K, usize),
     Matrix(usize, usize),
     Aggregate(Vec<Shape>),
+    Image(u32, u32),
+    Sampler(u32, u32),
 }
 impl Shape {
     fn len(&self) -> usize {
@@ -169,6 +188,7 @@ impl Shape {
             Self::Vector(_, n) => *n,
             Self::Matrix(c, r) => c * r,
             Self::Aggregate(items) => items.iter().map(Self::len).sum(),
+            Self::Image(..) | Self::Sampler(..) => 0,
         }
     }
     fn kind(&self) -> Result<K> {
@@ -224,6 +244,7 @@ struct Compiler<'a> {
     temp_lanes: usize,
     globals: Vec<Option<Value>>,
     uniforms: Vec<UniformBufferBinding>,
+    textures: Vec<TextureSamplerBinding>,
     input_locations: Vec<u32>,
     output_locations: Vec<u32>,
     call_depth: usize,
@@ -247,6 +268,7 @@ impl<'a> Compiler<'a> {
             temp_lanes: 0,
             globals: vec![None; module.global_variables.len()],
             uniforms: Vec::new(),
+            textures: Vec::new(),
             input_locations: Vec::new(),
             output_locations: Vec::new(),
             call_depth: 0,
@@ -597,6 +619,36 @@ impl<'a> Compiler<'a> {
                 continue;
             }
             match global.space {
+                AddressSpace::Handle => {
+                    let binding = global
+                        .binding
+                        .as_ref()
+                        .ok_or_else(|| unsupported("unbound texture/sampler"))?;
+                    let shape = match self.module.types[global.ty].inner {
+                        T::Image {
+                            dim: naga::ImageDimension::D2,
+                            arrayed: false,
+                            class:
+                                naga::ImageClass::Sampled {
+                                    kind: K::Float,
+                                    multi: false,
+                                },
+                        } => Shape::Image(binding.group, binding.binding),
+                        T::Sampler { comparison: false } => {
+                            Shape::Sampler(binding.group, binding.binding)
+                        }
+                        _ => {
+                            return Err(unsupported(
+                                "only non-comparison samplers and float 2D textures are supported",
+                            ));
+                        }
+                    };
+                    self.globals[handle.index()] = Some(Value {
+                        shape,
+                        lanes: Vec::new(),
+                        writable: false,
+                    });
+                }
                 AddressSpace::Uniform => {
                     let binding = global
                         .binding
@@ -718,6 +770,7 @@ impl<'a> Compiler<'a> {
             stage: self.stage,
             tgsi,
             uniform_buffers: self.uniforms,
+            textures: self.textures,
             input_locations: self.input_locations,
             output_locations: self.output_locations,
             vertex_inputs: self.vertex_inputs,
@@ -863,6 +916,25 @@ impl<'a> Compiler<'a> {
         if let Some(v) = &frame.expressions[handle.index()] {
             return Ok(v.clone());
         }
+        // Opaque image/sampler values keep the binding carried by their source.
+        // Their Naga type alone cannot identify an SGFX descriptor binding.
+        let direct = match frame.function.expressions[handle].clone() {
+            E::GlobalVariable(h) => Some(
+                self.globals[h.index()]
+                    .clone()
+                    .ok_or_else(|| unsupported("unused/unsupported global"))?,
+            ),
+            E::FunctionArgument(i) => Some(frame.arguments[i as usize].clone()),
+            E::Load { pointer } => {
+                let value = self.expression(frame, pointer)?;
+                Some(self.snapshot(&value)?)
+            }
+            _ => None,
+        };
+        if let Some(value) = direct {
+            frame.expressions[handle.index()] = Some(value.clone());
+            return Ok(value);
+        }
         let shape = self.shape(frame.info[handle].ty.inner_with(&self.module.types))?;
         let value = match frame.function.expressions[handle].clone() {
             E::Literal(v) => self.immediate(v)?,
@@ -994,6 +1066,85 @@ impl<'a> Compiler<'a> {
                         &[&c.lanes[i % c.lanes.len()], &a.lanes[i], &b.lanes[i]],
                     )?;
                 }
+                result
+            }
+            E::ImageSample {
+                image,
+                sampler,
+                gather: None,
+                coordinate,
+                array_index: None,
+                offset: None,
+                level,
+                depth_ref: None,
+            } => {
+                let image = self.expression(frame, image)?;
+                let sampler = self.expression(frame, sampler)?;
+                let (
+                    Shape::Image(image_group, image_binding),
+                    Shape::Sampler(sampler_group, sampler_binding),
+                ) = (&image.shape, &sampler.shape)
+                else {
+                    return Err(unsupported("sampling handles"));
+                };
+                let mut pair = TextureSamplerBinding {
+                    slot: 0,
+                    image_group: *image_group,
+                    image_binding: *image_binding,
+                    sampler_group: *sampler_group,
+                    sampler_binding: *sampler_binding,
+                };
+                let slot = if let Some(pair) = self.textures.iter().find(|p| {
+                    p.image_group == pair.image_group
+                        && p.image_binding == pair.image_binding
+                        && p.sampler_group == pair.sampler_group
+                        && p.sampler_binding == pair.sampler_binding
+                }) {
+                    pair.slot
+                } else {
+                    if self.textures.len() >= 16 {
+                        return Err(unsupported("more than 16 sampling pairs"));
+                    }
+                    pair.slot = self.textures.len() as u32;
+                    let slot = pair.slot;
+                    self.textures.push(pair);
+                    self.declarations.push(format!("DCL SAMP[{slot}]"));
+                    self.declarations
+                        .push(format!("DCL SVIEW[{slot}], 2D, FLOAT"));
+                    slot
+                };
+                let coordinate = self.expression(frame, coordinate)?;
+                if !matches!(coordinate.shape, Shape::Vector(K::Float, 2)) {
+                    return Err(unsupported("2D sampling coordinates"));
+                }
+                self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
+                let coords = self.allocate(Shape::Vector(K::Float, 4), false)?;
+                let zero = self.immediate(Literal::F32(0.0))?;
+                for component in 0..4 {
+                    let source = coordinate.lanes.get(component).unwrap_or(&zero.lanes[0]);
+                    self.instruction("MOV", &coords.lanes[component], &[source])?;
+                }
+                let opcode = match level {
+                    naga::SampleLevel::Auto if self.stage == ShaderStage::Fragment => "TEX",
+                    naga::SampleLevel::Zero => "TXL",
+                    naga::SampleLevel::Exact(lod) => {
+                        let lod = self.expression(frame, lod)?;
+                        self.instruction("MOV", &coords.lanes[3], &[&lod.lanes[0]])?;
+                        "TXL"
+                    }
+                    naga::SampleLevel::Bias(bias) if self.stage == ShaderStage::Fragment => {
+                        let bias = self.expression(frame, bias)?;
+                        self.instruction("MOV", &coords.lanes[3], &[&bias.lanes[0]])?;
+                        "TXB"
+                    }
+                    _ => return Err(unsupported("sampling level/gradients")),
+                };
+                self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
+                let result = self.allocate(Shape::Vector(K::Float, 4), false)?;
+                self.instructions.push(format!(
+                    "{opcode} {}, {}, SAMP[{slot}], 2D",
+                    result.lanes[0].register, coords.lanes[0].register
+                ));
                 result
             }
             E::Math {

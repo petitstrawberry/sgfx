@@ -10,7 +10,7 @@ name = "vulkan_sgfx"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-cube-demo = ["dep:png", "dep:libloading", "dep:framebuffer", "naga/wgsl-in"]
+cube-demo = ["dep:png", "dep:framebuffer", "naga/wgsl-in"]
 
 [[bin]]
 name = "vulkan-cube"
@@ -23,7 +23,7 @@ ash = { version = "0.38", default-features = false, features = ["debug", "std"] 
 png = { version = "0.18", optional = true }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
-libloading = { version = "0.8", optional = true }
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
 sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-wgpu"] }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]

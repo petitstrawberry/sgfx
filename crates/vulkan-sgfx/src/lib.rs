@@ -12,6 +12,8 @@ mod resources;
 mod runtime;
 #[cfg(target_os = "scarlet")]
 pub mod scarlet_image;
+mod spirv;
+mod transfer;
 #[cfg(target_os = "macos")]
 mod wsi;
 

@@ -24,22 +24,25 @@ remain incomplete.
 - SPIR-V shader modules, compute pipelines, and vertex/fragment pipelines.
   Naga validates and normalizes Vulkan coordinate conventions before SGFX
   shader definition; backend shader/pipeline validation occurs at creation.
-- Descriptor sets for uniform and storage buffers; up to four sets with 16
-  bindings each, one descriptor per binding, no dynamic offsets or arrays.
+- Descriptor sets for uniform/storage buffers (including dynamic offsets),
+  separate images/samplers and combined image samplers; four sets with 16
+  logical bindings each, one descriptor per binding. Arrays are unsupported.
 - Host-visible coherent memory with stable, aligned mappings; buffer memory
   binding, host upload/readback, and nonoverlapping allocations. Buffers have
   four-byte sizes; binding offsets use the reported alignment. Uniform ranges
   are limited to 16 KiB and storage ranges to 128 MiB.
 - Primary command buffers and pools, pipeline/set binding, compute dispatch,
   single-color render passes, non-indexed and indexed drawing, vertex buffers,
-  buffer copies, whole-image RGBA8 readback, supported whole-resource barriers,
+  buffer copies, checked buffer-to-image uploads, whole-image RGBA8/BGRA8
+  readback, supported whole-resource barriers, dynamic viewport/scissor,
   D32 depth testing, front-face/back-face culling, fences, and binary semaphores.
 - Offscreen graphics: RGBA8_UNORM or BGRA8_UNORM color, optional D32_SFLOAT
   depth, optimal 2D images, one mip/layer/sample, at most 2048×2048, one color
   attachment, triangle lists, one vertex binding, four vertex formats, and one
-  instance per draw. Blending, stencil, multisampling, indirect drawing,
-  sampled images, and general dynamic state are absent.
-- macOS WSI exposes `VK_KHR_surface`, `VK_EXT_metal_surface`,
+  instance per draw. Common alpha/additive blending and sampled 2D textures
+  work. Stencil, multisampling, mipmaps, image blits, indirect drawing,
+  and other dynamic state are absent.
+- macOS WSI exposes `VK_KHR_surface`, `VK_EXT_metal_surface`, `VK_MVK_macos_surface`,
   `VK_KHR_portability_enumeration`, and `VK_KHR_swapchain`. It implements Metal
   surface creation, surface capability/format/mode queries, FIFO swapchains,
   acquire, and queue present. Swapchain images are SGFX `PRESENT` textures on
@@ -212,7 +215,7 @@ unsupported application feature chains.
 `SGFX_VULKAN_LOADER` belongs only to these repository diagnostics: it tells a
 test harness which loader dynamic library to open with `libloading`. It is not
 read by the ICD, is not required by Vulkan applications, and is not used by
-`render_demo` or `windowed`. Those applications use `ash::Entry::load()` and the
+`render_demo`, `windowed`, or the host `vulkan-cube` executable. Those applications use `ash::Entry::load()` and the
 operating system's normal Vulkan loader; ICD selection is external through the
 standard manifest mechanism.
 
@@ -236,14 +239,14 @@ and verify the chosen Mesa driver. The Linux check also used
 
 ## Limits and remaining work
 
-- **Not Vulkan conformant.** The ICD exposes 96 procedure names on macOS,
-  including 12 `vkCmd*` operations, but this is only a bounded executable
+- **Not Vulkan conformant.** The ICD exposes 102 procedure names on macOS,
+  including 15 `vkCmd*` operations, but this is only a bounded executable
   subset. WSI currently covers macOS Metal, FIFO mode, opaque composition, and
   fixed-size swapchains. Other platform surfaces, window-resize handling in the
   example, timeline semaphores, secondary command buffers, descriptor indexing,
   push constants, pipeline
   caches, queries, events, sparse resources, external memory, multisampling,
-  complex render passes, indirect operations, sampled images, or arbitrary
+  multiple subpasses, indirect operations, mipmaps, image blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent
   append-only IDs. When no live Vulkan objects retain an epoch's IDs, the ICD

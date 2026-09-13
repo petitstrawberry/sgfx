@@ -54,6 +54,9 @@ pub struct Options {
     pub depth_test: bool,
     pub cull_back: bool,
     pub front_clockwise: bool,
+    pub textured: bool,
+    pub dynamic_viewport: bool,
+    pub dynamic_uniform: bool,
 }
 
 impl Default for Options {
@@ -66,6 +69,9 @@ impl Default for Options {
             depth_test: true,
             cull_back: false,
             front_clockwise: false,
+            textured: false,
+            dynamic_viewport: false,
+            dynamic_uniform: false,
         }
     }
 }
@@ -145,6 +151,35 @@ pub(crate) fn cube_indices(options: Options) -> Vec<u8> {
     bytes
 }
 
+pub(crate) fn textured_vertices() -> Vec<u8> {
+    cube_vertices()
+        .chunks_exact(24)
+        .enumerate()
+        .flat_map(|(index, vertex)| {
+            let uv = [[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]][index % 4];
+            vertex
+                .iter()
+                .copied()
+                .chain(uv.into_iter().flat_map(f32::to_le_bytes))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+pub(crate) fn checkerboard() -> Vec<u8> {
+    (0..32)
+        .flat_map(|y| {
+            (0..32).flat_map(move |x| {
+                if (x / 4 + y / 4) % 2 == 0 {
+                    [240, 240, 240, 255]
+                } else {
+                    [24, (32 + y * 3) as u8, (64 + x * 3) as u8, 255]
+                }
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn transform(options: Options) -> Vec<u8> {
     let (sy, cy) = options.angle.sin_cos();
     let (sx, cx) = (-0.42f32).sin_cos();
@@ -185,6 +220,7 @@ struct SceneResources {
     images: Vec<vk::Image>,
     views: Vec<vk::ImageView>,
     shaders: Vec<vk::ShaderModule>,
+    samplers: Vec<vk::Sampler>,
     descriptor_layouts: Vec<vk::DescriptorSetLayout>,
     descriptor_pools: Vec<vk::DescriptorPool>,
     pipeline_layouts: Vec<vk::PipelineLayout>,
@@ -205,6 +241,7 @@ impl SceneResources {
             images: vec![],
             views: vec![],
             shaders: vec![],
+            samplers: vec![],
             descriptor_layouts: vec![],
             descriptor_pools: vec![],
             pipeline_layouts: vec![],
@@ -249,6 +286,9 @@ impl Drop for SceneResources {
                 }
                 for &h in &self.shaders {
                     device.destroy_shader_module(h, None);
+                }
+                for &h in &self.samplers {
+                    device.destroy_sampler(h, None);
                 }
                 for &h in &self.views {
                     device.destroy_image_view(h, None);
@@ -307,19 +347,155 @@ unsafe fn upload_buffer(
     }
 }
 
+unsafe fn create_texture(
+    device: &ash::Device,
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    resources: &mut SceneResources,
+) -> Result<(vk::Image, vk::ImageView, vk::Sampler, vk::Buffer), Box<dyn Error>> {
+    unsafe {
+        let image = device.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: 32,
+                    height: 32,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )?;
+        resources.images.push(image);
+        let requirements = device.get_image_memory_requirements(image);
+        let memory = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type(
+                    properties,
+                    requirements,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )?),
+            None,
+        )?;
+        resources.memories.push(memory);
+        device.bind_image_memory(image, memory, 0)?;
+        let view = device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                ),
+            None,
+        )?;
+        resources.views.push(view);
+        let sampler = device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .min_filter(vk::Filter::NEAREST)
+                .mag_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                .address_mode_w(vk::SamplerAddressMode::REPEAT)
+                .min_lod(0.0)
+                .max_lod(0.0),
+            None,
+        )?;
+        resources.samplers.push(sampler);
+        let staging = upload_buffer(
+            device,
+            properties,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            &checkerboard(),
+            resources,
+        )?;
+        Ok((image, view, sampler, staging))
+    }
+}
+
+unsafe fn upload_texture(
+    device: &ash::Device,
+    command: vk::CommandBuffer,
+    image: vk::Image,
+    staging: vk::Buffer,
+) {
+    unsafe {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        device.cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .image(image)
+                .subresource_range(range)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)],
+        );
+        device.cmd_copy_buffer_to_image(
+            command,
+            staging,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: 32,
+                    height: 32,
+                    depth: 1,
+                })],
+        );
+        device.cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .image(image)
+                .subresource_range(range)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)],
+        );
+    }
+}
+
 // Handles are used only with their creating device. Readback follows the
 // transfer-to-host barrier and fence wait, and preserves exact RGBA bytes.
 pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>> {
-    let vertex_words = shader_words(
-        include_str!("../assets/cube.wgsl"),
-        naga::ShaderStage::Vertex,
-        "vs_main",
-    )?;
-    let fragment_words = shader_words(
-        include_str!("../assets/cube.wgsl"),
-        naga::ShaderStage::Fragment,
-        "fs_main",
-    )?;
+    let source = if options.textured {
+        include_str!("../assets/textured_cube.wgsl")
+    } else {
+        include_str!("../assets/cube.wgsl")
+    };
+    let vertex_words = shader_words(source, naga::ShaderStage::Vertex, "vs_main")?;
+    let fragment_words = shader_words(source, naga::ShaderStage::Fragment, "fs_main")?;
     let [width, height] = options.size;
     if !options.angle.is_finite() {
         return Err("cube angle must be finite".into());
@@ -474,7 +650,11 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             &device,
             &memory_properties,
             vk::BufferUsageFlags::VERTEX_BUFFER,
-            &cube_vertices(),
+            &if options.textured {
+                textured_vertices()
+            } else {
+                cube_vertices()
+            },
             &mut resources,
         )?;
         let index_buffer = upload_buffer(
@@ -484,11 +664,21 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             &cube_indices(options),
             &mut resources,
         )?;
+        let uniform_bytes = if options.dynamic_uniform {
+            [vec![0; 256], transform(options)].concat()
+        } else {
+            transform(options)
+        };
+        let uniform_type = if options.dynamic_uniform {
+            vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+        } else {
+            vk::DescriptorType::UNIFORM_BUFFER
+        };
         let uniform_buffer = upload_buffer(
             &device,
             &memory_properties,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
-            &transform(options),
+            &uniform_bytes,
             &mut resources,
         )?;
 
@@ -590,11 +780,34 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             None,
         )?;
         resources.shaders.push(fragment_shader);
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+        let texture = if options.textured {
+            Some(create_texture(&device, &memory_properties, &mut resources)?)
+        } else {
+            None
+        };
+        let mut bindings = vec![
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(uniform_type)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX),
+        ];
+        if texture.is_some() {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            );
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(2)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            );
+        }
         let descriptor_layout = device.create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
             None,
@@ -606,9 +819,23 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             None,
         )?;
         resources.pipeline_layouts.push(pipeline_layout);
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)];
+        let mut pool_sizes = vec![
+            vk::DescriptorPoolSize::default()
+                .ty(uniform_type)
+                .descriptor_count(1),
+        ];
+        if texture.is_some() {
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(1),
+            );
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(1),
+            );
+        }
         let descriptor_pool = device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
@@ -629,10 +856,31 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             &[vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_type(uniform_type)
                 .buffer_info(&uniform_info)],
             &[],
         );
+        if let Some((_, view, sampler, _)) = texture {
+            let info = [vk::DescriptorImageInfo::default()
+                .image_view(view)
+                .sampler(sampler)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&info),
+                ],
+                &[],
+            );
+        }
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -645,9 +893,9 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
         ];
         let vertex_bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
-            .stride(24)
+            .stride(if options.textured { 32 } else { 24 })
             .input_rate(vk::VertexInputRate::VERTEX)];
-        let vertex_attributes = [
+        let mut vertex_attributes = vec![
             vk::VertexInputAttributeDescription::default()
                 .location(0)
                 .binding(0)
@@ -659,6 +907,15 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(12),
         ];
+        if options.textured {
+            vertex_attributes.push(
+                vk::VertexInputAttributeDescription::default()
+                    .location(2)
+                    .binding(0)
+                    .format(vk::Format::R32G32_SFLOAT)
+                    .offset(24),
+            );
+        }
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
             .vertex_attribute_descriptions(&vertex_attributes);
@@ -704,7 +961,16 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             .depth_test_enable(options.depth_test)
             .depth_write_enable(options.depth_test)
             .depth_compare_op(vk::CompareOp::LESS);
+        let dynamics = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(
+            if options.dynamic_viewport {
+                &dynamics
+            } else {
+                &[]
+            },
+        );
         let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+            .dynamic_state(&dynamic)
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -737,6 +1003,9 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
+        if let Some((image, _, _, staging)) = texture {
+            upload_texture(&device, command_buffer, image, staging);
+        }
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue { float32: CLEAR },
@@ -756,7 +1025,7 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             pipeline_layout,
             0,
             &[descriptor_set],
-            &[],
+            if options.dynamic_uniform { &[256] } else { &[] },
         );
         device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex_buffer], &[0]);
         device.cmd_bind_index_buffer(
@@ -778,6 +1047,10 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
                 .clear_values(&clear_values),
             vk::SubpassContents::INLINE,
         );
+        if options.dynamic_viewport {
+            device.cmd_set_viewport(command_buffer, 0, &viewports);
+            device.cmd_set_scissor(command_buffer, 0, &scissors);
+        }
         device.cmd_draw_indexed(command_buffer, 36, 1, 0, 0, 0);
         device.cmd_end_render_pass(command_buffer);
 
@@ -883,6 +1156,56 @@ pub fn validate_image(pixels: &[u8], size: [u32; 2]) -> Result<(), Box<dyn Error
     if is_clear(&pixels[center..center + 4]) {
         return Err("cube center is empty".into());
     }
+    Ok(())
+}
+
+pub fn verify_textured(entry: &Entry) -> Result<(), Box<dyn Error>> {
+    let options = Options {
+        size: [256, 256],
+        textured: true,
+        ..Options::default()
+    };
+    let static_pixels = render(entry, options)?;
+    let dynamic_pixels = render(
+        entry,
+        Options {
+            dynamic_viewport: true,
+            ..options
+        },
+    )?;
+    let offset_pixels = render(
+        entry,
+        Options {
+            dynamic_viewport: true,
+            dynamic_uniform: true,
+            ..options
+        },
+    )?;
+    let color_pixels = render(
+        entry,
+        Options {
+            textured: false,
+            ..options
+        },
+    )?;
+    validate_image(&static_pixels, options.size)?;
+    if static_pixels != dynamic_pixels {
+        return Err("static and dynamic viewport/scissor renderings differ".into());
+    }
+    if static_pixels != offset_pixels {
+        return Err("dynamic uniform offset selected incorrect matrix bytes".into());
+    }
+    let changed = static_pixels
+        .chunks_exact(4)
+        .zip(color_pixels.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    if changed < 4_000 {
+        return Err(format!("texture sampling changed only {changed} pixels").into());
+    }
+    println!(
+        "PASS: staged texture sampling changed {changed} pixels; static/dynamic viewport, scissor and uniform-offset readbacks identical"
+    );
     Ok(())
 }
 

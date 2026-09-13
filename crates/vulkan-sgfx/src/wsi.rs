@@ -14,6 +14,43 @@ const INVALID: vk::Result = vk::Result::ERROR_INITIALIZATION_FAILED;
 const UNSUPPORTED: vk::Result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
 const MAX_SWAPCHAIN_IMAGES: u32 = 8;
 
+#[link(name = "objc")]
+unsafe extern "C" {
+    fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+    fn objc_msgSend(receiver: *mut c_void, selector: *mut c_void) -> *mut c_void;
+}
+
+pub(crate) unsafe extern "system" fn create_macos_surface(
+    instance: vk::Instance,
+    info: *const vk::MacOSSurfaceCreateInfoMVK<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    output: *mut vk::SurfaceKHR,
+) -> vk::Result {
+    if output.is_null() {
+        return INVALID;
+    }
+    *output = vk::SurfaceKHR::null();
+    let Some(info) = info.as_ref() else {
+        return INVALID;
+    };
+    if info.s_type != vk::StructureType::MACOS_SURFACE_CREATE_INFO_MVK
+        || !info.p_next.is_null()
+        || !info.flags.is_empty()
+        || info.p_view.is_null()
+        || !allocator.is_null()
+        || !crate::instance::instance_valid(instance)
+    {
+        return UNSUPPORTED;
+    }
+    // VK_MVK_macos_surface supplies an NSView backed by a CAMetalLayer.
+    let layer = objc_msgSend(info.p_view.cast_mut(), sel_registerName(c"layer".as_ptr()));
+    if layer.is_null() {
+        return INVALID;
+    }
+    let metal = vk::MetalSurfaceCreateInfoEXT::default().layer(layer.cast());
+    create_metal_surface(instance, &metal, allocator, output)
+}
+
 #[derive(Clone, Copy)]
 struct Surface {
     instance: usize,
@@ -370,6 +407,8 @@ pub(crate) unsafe extern "system" fn create_swapchain(
                         height: extent.height,
                         depth: 1,
                     },
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
                     bound: None,
                     swapchain: Some(swapchain),
                 },
