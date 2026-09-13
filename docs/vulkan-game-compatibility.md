@@ -192,9 +192,20 @@ strip draw ranges and push-constant lowering. Initial vkQuake2 textures and
 Vulkan resources now initialize on the guest, and its game module and `demo1`
 server load through Scarlet's existing Linux ABI. Bounded dynamic indexing
 allows the original world-warp fullscreen shader to create its pipeline; the
-game now presents its textured console background and font across continuing
-acquire/submit/present iterations. Map/weapon rendering, playable input and
-sustained performance have not yet been established. The SWS input/window adapter resides in
+game now presents its textured console background, the `demo1` 3D world,
+weapon and HUD on Scarlet AArch64 QEMU. Actual QEMU captures show continuing
+world frames and changed player views after input. A standard keyboard event
+also toggles the game console and pauses the world. These checks use the normal
+full-project release image. The Scarlet game's own screenshot command, combat,
+normal game shutdown and sustained performance have not been verified; the
+world/input evidence comes from the actual QEMU display. General game
+compatibility has not been established. The SWS input/window adapter resides in
 Scarlet's `user/lib/sws-client-c/examples/vkquake2`; upstream Vulkan renderer and
 shader sources remain separate. A618 arbitrary SPIR-V execution and Chromebook
-hardware testing remain incomplete.
+hardware testing remain incomplete. The tested release kernel and Linux ABI
+module are Scarlet `7297aac3e91c09daecd4c09c4c9cb7d57d2e6af3`; the C window/input
+adapter and shared SWS library source are
+`838333bc392f5e345136aa84132c178de2b64c11`. These kernel changes add in-place
+`mremap` shrinking and remove quadratic private-page reclamation. Real guest
+checks preserve data across four 16 MiB shrinks and report 4 ms total for four
+8 MiB partial unmaps, compared with 509 ms before batch physical reclamation.
