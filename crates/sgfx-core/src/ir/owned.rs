@@ -8,9 +8,9 @@ use alloc::vec::Vec;
 
 use super::{
     BindGroupId, BufferAccess, BufferId, CommandBuffer, CommandEncoder, ComputePipelineId,
-    DepthLoadOp, DrawUniforms, Error, IndexFormat, LoadOp, PixelRect, ProgrammableRenderPipelineId,
-    RenderPassDesc, RenderPipelineId, ResourceBarrier, ResourceTable, Result, SamplerId,
-    ShaderStages, StoreOp, TextureAccess, TextureId, TextureWrite, Viewport,
+    DepthLoadOp, DrawUniforms, Error, FilterMode, IndexFormat, LoadOp, PixelRect,
+    ProgrammableRenderPipelineId, RenderPassDesc, RenderPipelineId, ResourceBarrier, ResourceTable,
+    Result, SamplerId, ShaderStages, StoreOp, TextureAccess, TextureId, TextureWrite, Viewport,
 };
 
 /// An owned depth attachment, validated when its recording is replayed.
@@ -63,6 +63,17 @@ impl OwnedRenderPassDesc {
 /// An owned resource transition, validated when its recording is replayed.
 #[derive(Debug, Clone, Copy)]
 pub enum OwnedResourceBarrier {
+    /// Change the declared access for one mip level.
+    TextureMip {
+        /// Texture identity.
+        texture: TextureId,
+        /// Mip level.
+        mip_level: u32,
+        /// Access preceding the transition.
+        before: TextureAccess,
+        /// Access following the transition.
+        after: TextureAccess,
+    },
     /// Change the declared access for a buffer.
     Buffer {
         /// Buffer identity in the replay resource table.
@@ -86,6 +97,17 @@ pub enum OwnedResourceBarrier {
 impl OwnedResourceBarrier {
     fn resolve(self, resources: &ResourceTable) -> Result<ResourceBarrier<'_>> {
         Ok(match self {
+            Self::TextureMip {
+                texture,
+                mip_level,
+                before,
+                after,
+            } => ResourceBarrier::TextureMip {
+                texture: resources.texture_ref(texture)?,
+                mip_level,
+                before,
+                after,
+            },
             Self::Buffer {
                 buffer,
                 before,
@@ -114,6 +136,32 @@ impl OwnedResourceBarrier {
 /// retained in the recording, so replayed commands borrow their data safely.
 #[derive(Debug, Clone)]
 pub enum OwnedCommand {
+    /// Upload owned pixels to an explicitly selected mip level.
+    WriteTextureMip {
+        /// Destination texture.
+        texture: TextureId,
+        /// Destination mip level.
+        mip_level: u32,
+        /// Destination rectangle.
+        destination: PixelRect,
+        /// Source row stride.
+        bytes_per_row: u32,
+        /// Owned pixels.
+        data: Vec<u8>,
+    },
+    /// Scale a complete source mip into a complete destination mip on the GPU.
+    BlitTexture {
+        /// Source texture.
+        source: TextureId,
+        /// Source mip level.
+        source_mip: u32,
+        /// Destination texture.
+        destination: TextureId,
+        /// Destination mip level.
+        destination_mip: u32,
+        /// Texel filter.
+        filter: FilterMode,
+    },
     /// Upload owned bytes into a logical buffer.
     WriteBuffer {
         /// Destination buffer.
@@ -296,6 +344,30 @@ impl OwnedCommandBuffer {
         let mut commands = self.commands.iter();
         while let Some(command) = commands.next() {
             match command {
+                OwnedCommand::WriteTextureMip {
+                    texture,
+                    mip_level,
+                    destination,
+                    bytes_per_row,
+                    data,
+                } => encoder.write_texture(
+                    resources.texture_ref(*texture)?,
+                    TextureWrite::new(*destination, *bytes_per_row, data)?
+                        .with_mip_level(*mip_level),
+                )?,
+                OwnedCommand::BlitTexture {
+                    source,
+                    source_mip,
+                    destination,
+                    destination_mip,
+                    filter,
+                } => encoder.blit_texture(
+                    resources.texture_ref(*source)?,
+                    *source_mip,
+                    resources.texture_ref(*destination)?,
+                    *destination_mip,
+                    *filter,
+                )?,
                 OwnedCommand::WriteBuffer {
                     buffer,
                     offset,
@@ -449,10 +521,10 @@ mod tests {
 
     use super::*;
     use crate::ir::{
-        BindGroupDesc, BindGroupEntry, BindGroupLayoutDesc, BindGroupLayoutEntry, BindingResource,
-        BindingType, BufferDesc, BufferUsage, Command, ComputePipelineDesc, Extent2D, MAX_COMMANDS,
-        PipelineLayoutDesc, ShaderEntryPoint, ShaderModuleDesc, ShaderStage, ShaderStages,
-        TextureDesc, TextureFormat, TextureUsage,
+        AddressMode, BindGroupDesc, BindGroupEntry, BindGroupLayoutDesc, BindGroupLayoutEntry,
+        BindingResource, BindingType, BufferDesc, BufferUsage, Command, ComputePipelineDesc,
+        Extent2D, MAX_COMMANDS, PipelineLayoutDesc, SamplerDesc, ShaderEntryPoint,
+        ShaderModuleDesc, ShaderStage, ShaderStages, TextureDesc, TextureFormat, TextureUsage,
     };
 
     fn render_desc(resources: &ResourceTable) -> OwnedRenderPassDesc {
@@ -713,6 +785,155 @@ mod tests {
                 Err(Error::InvalidDescriptor)
             );
         }
+    }
+
+    #[test]
+    fn mip_dimensions_uploads_and_dependencies_are_checked_per_level() {
+        let resources = ResourceTable::new();
+        let desc = TextureDesc::new(
+            TextureFormat::Rgba8Unorm,
+            Extent2D::new(7, 3).unwrap(),
+            TextureUsage::COPY_SRC | TextureUsage::COPY_DST | TextureUsage::SAMPLED,
+        )
+        .unwrap();
+        assert!(desc.with_mip_level_count(0).is_err());
+        assert!(desc.with_mip_level_count(4).is_err());
+        let desc = desc.with_mip_level_count(3).unwrap();
+        assert_eq!(desc.mip_extent(1).unwrap(), Extent2D::new(3, 1).unwrap());
+        assert_eq!(desc.mip_extent(2).unwrap(), Extent2D::new(1, 1).unwrap());
+        assert_eq!(desc.mip_extent(3), Err(Error::OutOfBounds));
+        assert_eq!(desc.byte_size(), Ok(100));
+        let texture = resources.define_texture(desc).unwrap().id();
+        let data = vec![7; 12];
+        let recording = OwnedCommandBuffer::new(vec![
+            OwnedCommand::WriteTextureMip {
+                texture,
+                mip_level: 1,
+                destination: PixelRect::new(0, 0, 3, 1).unwrap(),
+                bytes_per_row: 12,
+                data: data.clone(),
+            },
+            OwnedCommand::ResourceBarrier(OwnedResourceBarrier::TextureMip {
+                texture,
+                mip_level: 1,
+                before: TextureAccess::CopyDestination,
+                after: TextureAccess::CopySource,
+            }),
+            OwnedCommand::BlitTexture {
+                source: texture,
+                source_mip: 1,
+                destination: texture,
+                destination_mip: 2,
+                filter: FilterMode::Linear,
+            },
+            OwnedCommand::ResourceBarrier(OwnedResourceBarrier::TextureMip {
+                texture,
+                mip_level: 2,
+                before: TextureAccess::CopyDestination,
+                after: TextureAccess::Sampled,
+            }),
+        ]);
+        assert_eq!(recording.record(&resources).unwrap().command_count(), 4);
+        let mut wrong = recording.commands().to_vec();
+        wrong.push(OwnedCommand::ResourceBarrier(
+            OwnedResourceBarrier::TextureMip {
+                texture,
+                mip_level: 1,
+                before: TextureAccess::CopyDestination,
+                after: TextureAccess::Sampled,
+            },
+        ));
+        assert_eq!(
+            OwnedCommandBuffer::new(wrong).validate(&resources),
+            Err(Error::InvalidResourceAccess)
+        );
+        for command in [
+            OwnedCommand::WriteTextureMip {
+                texture,
+                mip_level: 2,
+                destination: PixelRect::new(0, 0, 3, 1).unwrap(),
+                bytes_per_row: 12,
+                data,
+            },
+            OwnedCommand::BlitTexture {
+                source: texture,
+                source_mip: 3,
+                destination: texture,
+                destination_mip: 2,
+                filter: FilterMode::Nearest,
+            },
+        ] {
+            assert_eq!(
+                OwnedCommandBuffer::new(vec![command]).validate(&resources),
+                Err(Error::OutOfBounds)
+            );
+        }
+        assert_eq!(
+            OwnedCommandBuffer::new(vec![OwnedCommand::BlitTexture {
+                source: texture,
+                source_mip: 1,
+                destination: texture,
+                destination_mip: 1,
+                filter: FilterMode::Nearest
+            }])
+            .validate(&resources),
+            Err(Error::ResourceAccessConflict)
+        );
+    }
+
+    #[test]
+    fn mip_descriptors_reject_overflow_and_nonportable_storage_or_lod_values() {
+        let extent = Extent2D::new(8, 8).unwrap();
+        for (format, usage) in [
+            (TextureFormat::Depth32Float, TextureUsage::RENDER_ATTACHMENT),
+            (TextureFormat::Rgba8Unorm, TextureUsage::STORAGE),
+            (TextureFormat::Bgra8Unorm, TextureUsage::PRESENT),
+        ] {
+            assert!(
+                TextureDesc::new(format, extent, usage)
+                    .unwrap()
+                    .with_mip_level_count(2)
+                    .is_err()
+            );
+        }
+        let huge = TextureDesc::new(
+            TextureFormat::Rgba8Unorm,
+            Extent2D::new(u32::MAX, u32::MAX).unwrap(),
+            TextureUsage::COPY_SRC,
+        )
+        .unwrap();
+        assert_eq!(huge.byte_size(), Err(Error::Overflow));
+        let sampler = SamplerDesc::new(
+            FilterMode::Linear,
+            FilterMode::Nearest,
+            AddressMode::Repeat,
+            AddressMode::ClampToEdge,
+        );
+        for (min, max) in [
+            (-1.0, 1.0),
+            (2.0, 1.0),
+            (f32::NAN, 1.0),
+            (0.0, f32::INFINITY),
+        ] {
+            assert!(
+                sampler
+                    .with_mip_filter(FilterMode::Linear, min, max)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            sampler
+                .with_mip_filter(FilterMode::Nearest, -0.0, 0.0)
+                .unwrap(),
+            sampler
+        );
+        let sampler = sampler
+            .with_mip_filter(FilterMode::Linear, 1.25, 9.5)
+            .unwrap();
+        assert_eq!(
+            (sampler.min_lod(), sampler.max_lod(), sampler.mip_filter()),
+            (1.25, 9.5, FilterMode::Linear)
+        );
     }
 
     #[test]

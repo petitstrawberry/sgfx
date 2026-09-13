@@ -276,7 +276,7 @@ pub enum BindingResource {
         /// Non-zero byte length.
         size: u64,
     },
-    /// A whole single-mip 2D texture.
+    /// A whole 2D sampled mip chain, or level zero for a storage binding.
     Texture(TextureId),
     /// A sampler.
     Sampler(SamplerId),
@@ -597,6 +597,17 @@ pub enum ResourceBarrier<'r> {
     Texture {
         /// Resource.
         texture: TextureRef<'r>,
+        /// Previous access.
+        before: TextureAccess,
+        /// Subsequent access.
+        after: TextureAccess,
+    },
+    /// Synchronize one mip level independently of the other levels.
+    TextureMip {
+        /// Resource.
+        texture: TextureRef<'r>,
+        /// Checked mip level.
+        mip_level: u32,
         /// Previous access.
         before: TextureAccess,
         /// Subsequent access.

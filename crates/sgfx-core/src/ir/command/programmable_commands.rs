@@ -13,13 +13,13 @@ pub(super) enum PendingWrite {
 #[derive(Clone, Copy)]
 pub(super) enum AnnouncedAccess {
     Buffer(BufferId, BufferAccess),
-    Texture(TextureId, TextureAccess),
+    Texture(TextureId, u32, TextureAccess),
 }
 impl AnnouncedAccess {
     fn resource(self) -> PendingWrite {
         match self {
             Self::Buffer(id, _) => PendingWrite::Buffer(id),
-            Self::Texture(id, _) => PendingWrite::Texture(id),
+            Self::Texture(id, _, _) => PendingWrite::Texture(id),
         }
     }
 }
@@ -72,7 +72,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
     /// implement the dependency; WGPU's ordered passes implement it implicitly.
     pub fn resource_barrier(&mut self, barrier: ResourceBarrier<'r>) -> Result<()> {
         self.ensure_outside_pass()?;
-        let announced = match barrier {
+        let mut announced = Vec::new();
+        match barrier {
             ResourceBarrier::Buffer {
                 buffer,
                 before,
@@ -85,33 +86,85 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                 if self.pending_writes.contains(&key) && before != BufferAccess::StorageReadWrite {
                     return Err(Error::InvalidResourceAccess);
                 }
-                if self.announced_accesses.iter().any(|entry| matches!(entry, AnnouncedAccess::Buffer(id, access) if *id == buffer.id() && *access != before)) { return Err(Error::InvalidResourceAccess); }
-                AnnouncedAccess::Buffer(buffer.id(), after)
+                if self.announced_accesses.iter().any(|entry| matches!(entry, AnnouncedAccess::Buffer(id, access) if *id == buffer.id() && *access != before)) {
+                    return Err(Error::InvalidResourceAccess);
+                }
+                announced.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                announced.push(AnnouncedAccess::Buffer(buffer.id(), after));
             }
             ResourceBarrier::Texture {
                 texture,
                 before,
                 after,
             } => {
-                let desc = self.resources.texture(texture)?;
-                Self::require_texture_usage(desc.usage(), before.usage())?;
-                Self::require_texture_usage(desc.usage(), after.usage())?;
-                let key = PendingWrite::Texture(texture.id());
-                if self.pending_writes.contains(&key) && before != TextureAccess::StorageWrite {
-                    return Err(Error::InvalidResourceAccess);
+                let count = self.resources.texture(texture)?.mip_level_count();
+                announced
+                    .try_reserve(count as usize)
+                    .map_err(|_| Error::OutOfMemory)?;
+                for mip in 0..count {
+                    self.validate_texture_transition(texture, mip, before, after)?;
+                    announced.push(AnnouncedAccess::Texture(texture.id(), mip, after));
                 }
-                if self.announced_accesses.iter().any(|entry| matches!(entry, AnnouncedAccess::Texture(id, access) if *id == texture.id() && *access != before)) { return Err(Error::InvalidResourceAccess); }
-                AnnouncedAccess::Texture(texture.id(), after)
             }
-        };
+            ResourceBarrier::TextureMip {
+                texture,
+                mip_level,
+                before,
+                after,
+            } => {
+                self.validate_texture_transition(texture, mip_level, before, after)?;
+                announced.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                announced.push(AnnouncedAccess::Texture(texture.id(), mip_level, after));
+            }
+        }
         self.announced_accesses
-            .try_reserve(1)
+            .try_reserve(announced.len())
             .map_err(|_| Error::OutOfMemory)?;
         self.push(Command::ResourceBarrier(barrier))?;
-        let key = announced.resource();
-        self.pending_writes.retain(|pending| *pending != key);
-        self.consume_access(key);
-        self.announced_accesses.push(announced);
+        for access in announced {
+            match access {
+                AnnouncedAccess::Buffer(id, _) => {
+                    let key = PendingWrite::Buffer(id);
+                    self.pending_writes.retain(|pending| *pending != key);
+                    self.consume_access(key);
+                }
+                AnnouncedAccess::Texture(id, mip, _) => {
+                    // Storage textures have only level zero in this subset.
+                    if mip == 0 {
+                        self.pending_writes
+                            .retain(|pending| *pending != PendingWrite::Texture(id));
+                    }
+                    self.announced_accesses.retain(|entry| !matches!(entry,
+                        AnnouncedAccess::Texture(other, other_mip, _) if *other == id && *other_mip == mip));
+                }
+            }
+            self.announced_accesses.push(access);
+        }
+        Ok(())
+    }
+    fn validate_texture_transition(
+        &self,
+        texture: TextureRef<'_>,
+        mip: u32,
+        before: TextureAccess,
+        after: TextureAccess,
+    ) -> Result<()> {
+        let desc = self.resources.texture(texture)?;
+        desc.mip_extent(mip)?;
+        Self::require_texture_usage(desc.usage(), before.usage())?;
+        Self::require_texture_usage(desc.usage(), after.usage())?;
+        if mip == 0
+            && self
+                .pending_writes
+                .contains(&PendingWrite::Texture(texture.id()))
+            && before != TextureAccess::StorageWrite
+        {
+            return Err(Error::InvalidResourceAccess);
+        }
+        if self.announced_accesses.iter().any(|entry| matches!(entry,
+            AnnouncedAccess::Texture(id, level, access) if *id == texture.id() && *level == mip && *access != before)) {
+            return Err(Error::InvalidResourceAccess);
+        }
         Ok(())
     }
     /// Begin a compute pass. A dropped pass remains open and prevents finish.
@@ -147,13 +200,29 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         texture: TextureRef<'_>,
         access: TextureAccess,
     ) -> Result<()> {
-        if self
-            .pending_writes
-            .contains(&PendingWrite::Texture(texture.id()))
+        for mip in 0..self.resources.texture(texture)?.mip_level_count() {
+            self.check_texture_mip_access(texture, mip, access)?;
+        }
+        Ok(())
+    }
+    pub(super) fn check_texture_mip_access(
+        &self,
+        texture: TextureRef<'_>,
+        mip: u32,
+        access: TextureAccess,
+    ) -> Result<()> {
+        self.resources.texture(texture)?.mip_extent(mip)?;
+        if mip == 0
+            && self
+                .pending_writes
+                .contains(&PendingWrite::Texture(texture.id()))
         {
             return Err(Error::MissingBarrier);
         }
-        if self.announced_accesses.iter().any(|entry| matches!(entry, AnnouncedAccess::Texture(id, expected) if *id == texture.id() && *expected != access)) { return Err(Error::InvalidResourceAccess); }
+        if self.announced_accesses.iter().any(|entry| matches!(entry,
+            AnnouncedAccess::Texture(id, level, expected) if *id == texture.id() && *level == mip && *expected != access)) {
+            return Err(Error::InvalidResourceAccess);
+        }
         Ok(())
     }
     pub(super) fn consume_access(&mut self, resource: PendingWrite) {

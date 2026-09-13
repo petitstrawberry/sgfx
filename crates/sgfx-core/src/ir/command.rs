@@ -12,9 +12,9 @@ pub use programmable_commands::ComputePassEncoder;
 use programmable_commands::{AnnouncedAccess, PendingWrite};
 
 use super::{
-    BufferRef, BufferUsage, Color, DrawUniforms, Error, FragmentProgram, IndexFormat, PixelRect,
-    RenderPipelineRef, ResourceTable, Result, SamplerRef, TextureFormat, TextureRef, TextureUsage,
-    TextureWrite, Viewport,
+    BufferRef, BufferUsage, Color, DrawUniforms, Error, FilterMode, FragmentProgram, IndexFormat,
+    PixelRect, RenderPipelineRef, ResourceTable, Result, SamplerRef, TextureFormat, TextureRef,
+    TextureUsage, TextureWrite, Viewport,
 };
 
 /// Maximum commands retained by one logical command buffer.
@@ -222,6 +222,20 @@ impl<'r> RenderPassDesc<'r> {
 /// Commands are exposed only through [`CommandBuffer::commands`]. Resource
 /// references remain lifetime-branded and cannot be constructed from raw IDs.
 pub enum Command<'r, 'data> {
+    /// Scale a complete color mip level into a complete destination mip level.
+    /// The operation is a GPU transfer; filtering uses texel-center coordinates.
+    BlitTexture {
+        /// Source texture with COPY_SRC usage.
+        source: TextureRef<'r>,
+        /// Source mip level.
+        source_mip: u32,
+        /// Destination texture with COPY_DST usage.
+        destination: TextureRef<'r>,
+        /// Destination mip level.
+        destination_mip: u32,
+        /// Nearest or linear sampling.
+        filter: FilterMode,
+    },
     /// Copy non-overlapping byte ranges between logical buffers.
     CopyBufferToBuffer {
         /// Source buffer.
@@ -427,7 +441,10 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         self.ensure_outside_pass()?;
         let desc = self.resources.texture(texture)?;
         Self::require_texture_usage(desc.usage(), TextureUsage::COPY_DST)?;
-        if !write.destination().is_within(desc.extent()) {
+        if !write
+            .destination()
+            .is_within(desc.mip_extent(write.mip_level())?)
+        {
             return Err(Error::OutOfBounds);
         }
         let tight = write
@@ -446,8 +463,51 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         if u64::try_from(write.data().len()).map_err(|_| Error::Overflow)? < required {
             return Err(Error::OutOfBounds);
         }
-        self.check_texture_access(texture, TextureAccess::CopyDestination)?;
+        self.check_texture_mip_access(texture, write.mip_level(), TextureAccess::CopyDestination)?;
         self.push(Command::WriteTexture { texture, write })
+    }
+
+    /// Record a GPU blit between complete color mip levels. Different levels
+    /// of one texture are allowed; the same texture/level pair is rejected.
+    pub fn blit_texture(
+        &mut self,
+        source: TextureRef<'r>,
+        source_mip: u32,
+        destination: TextureRef<'r>,
+        destination_mip: u32,
+        filter: FilterMode,
+    ) -> Result<()> {
+        self.ensure_outside_pass()?;
+        let src = self.resources.texture(source)?;
+        let dst = self.resources.texture(destination)?;
+        Self::require_texture_usage(src.usage(), TextureUsage::COPY_SRC)?;
+        Self::require_texture_usage(dst.usage(), TextureUsage::COPY_DST)?;
+        src.mip_extent(source_mip)?;
+        dst.mip_extent(destination_mip)?;
+        if src.format() != dst.format()
+            || !matches!(
+                src.format(),
+                TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
+            )
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        if self.resources.same_texture(source, destination)? && source_mip == destination_mip {
+            return Err(Error::ResourceAccessConflict);
+        }
+        self.check_texture_mip_access(source, source_mip, TextureAccess::CopySource)?;
+        self.check_texture_mip_access(
+            destination,
+            destination_mip,
+            TextureAccess::CopyDestination,
+        )?;
+        self.push(Command::BlitTexture {
+            source,
+            source_mip,
+            destination,
+            destination_mip,
+            filter,
+        })
     }
 
     /// Record a format-preserving texture-to-texture copy outside a render pass.
@@ -488,8 +548,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         {
             return Err(Error::InvalidValue);
         }
-        self.check_texture_access(source, TextureAccess::CopySource)?;
-        self.check_texture_access(destination, TextureAccess::CopyDestination)?;
+        self.check_texture_mip_access(source, 0, TextureAccess::CopySource)?;
+        self.check_texture_mip_access(destination, 0, TextureAccess::CopyDestination)?;
         self.push(Command::CopyTextureToTexture {
             source,
             source_rect,
@@ -524,9 +584,9 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                     .map(|desc| desc.format())
             })
             .transpose()?;
-        self.check_texture_access(desc.target, TextureAccess::RenderAttachment)?;
+        self.check_texture_mip_access(desc.target, 0, TextureAccess::RenderAttachment)?;
         if let Some(depth) = desc.depth_attachment() {
-            self.check_texture_access(depth.target(), TextureAccess::RenderAttachment)?;
+            self.check_texture_mip_access(depth.target(), 0, TextureAccess::RenderAttachment)?;
         }
         self.reserve_pass_begin()?;
         self.push(Command::BeginRenderPass(desc))?;

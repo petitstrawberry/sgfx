@@ -122,6 +122,7 @@ pub struct TextureDesc {
     format: TextureFormat,
     extent: Extent2D,
     usage: TextureUsage,
+    mip_level_count: u32,
 }
 
 impl TextureDesc {
@@ -150,6 +151,7 @@ impl TextureDesc {
                 format,
                 extent,
                 usage,
+                mip_level_count: 1,
             })
         }
     }
@@ -174,6 +176,56 @@ impl TextureDesc {
     /// The texture usage flags.
     pub const fn usage(self) -> TextureUsage {
         self.usage
+    }
+
+    /// Declare a complete or partial 2D mip chain. Render attachments and
+    /// storage bindings continue to use level zero; sampled bindings use the
+    /// complete declared chain. Depth, storage and presentation images retain
+    /// one level in this portable subset.
+    pub fn with_mip_level_count(mut self, count: u32) -> Result<Self> {
+        let maximum = self.extent.width().max(self.extent.height()).ilog2() + 1;
+        if count == 0
+            || count > maximum
+            || (count > 1
+                && (self.format == TextureFormat::Depth32Float
+                    || self.usage.contains(TextureUsage::STORAGE)
+                    || self.usage.contains(TextureUsage::PRESENT)))
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.mip_level_count = count;
+        Ok(self)
+    }
+
+    /// Return the number of declared mip levels.
+    pub const fn mip_level_count(self) -> u32 {
+        self.mip_level_count
+    }
+
+    /// Return the checked dimensions of a mip level, including odd-sized
+    /// chains and dimensions clamped to one texel.
+    pub fn mip_extent(self, level: u32) -> Result<Extent2D> {
+        if level >= self.mip_level_count {
+            return Err(Error::OutOfBounds);
+        }
+        Extent2D::new(
+            (self.extent.width() >> level).max(1),
+            (self.extent.height() >> level).max(1),
+        )
+    }
+
+    /// Return the tightly packed byte size of every declared mip level.
+    pub fn byte_size(self) -> Result<u64> {
+        let mut size = 0u64;
+        for level in 0..self.mip_level_count {
+            let extent = self.mip_extent(level)?;
+            let bytes = u64::from(extent.width())
+                .checked_mul(u64::from(extent.height()))
+                .and_then(|v| v.checked_mul(u64::from(self.format.bytes_per_pixel())))
+                .ok_or(Error::Overflow)?;
+            size = size.checked_add(bytes).ok_or(Error::Overflow)?;
+        }
+        Ok(size)
     }
 }
 
@@ -304,6 +356,9 @@ pub struct SamplerDesc {
     mag_filter: FilterMode,
     address_u: AddressMode,
     address_v: AddressMode,
+    mip_filter: FilterMode,
+    min_lod_bits: u32,
+    max_lod_bits: u32,
 }
 
 impl SamplerDesc {
@@ -329,6 +384,9 @@ impl SamplerDesc {
             mag_filter,
             address_u,
             address_v,
+            mip_filter: FilterMode::Nearest,
+            min_lod_bits: 0,
+            max_lod_bits: 0,
         }
     }
     /// Return the minification filter.
@@ -359,6 +417,35 @@ impl SamplerDesc {
     pub const fn address_v(self) -> AddressMode {
         self.address_v
     }
+
+    /// Set mip filtering and a finite, nonnegative LOD interval. Keeping
+    /// floating values as validated bits preserves descriptor equality.
+    pub fn with_mip_filter(
+        mut self,
+        filter: FilterMode,
+        min_lod: f32,
+        max_lod: f32,
+    ) -> Result<Self> {
+        if !min_lod.is_finite() || !max_lod.is_finite() || min_lod < 0.0 || max_lod < min_lod {
+            return Err(Error::InvalidValue);
+        }
+        self.mip_filter = filter;
+        self.min_lod_bits = if min_lod == 0.0 { 0 } else { min_lod.to_bits() };
+        self.max_lod_bits = if max_lod == 0.0 { 0 } else { max_lod.to_bits() };
+        Ok(self)
+    }
+    /// Return mip-level filtering.
+    pub const fn mip_filter(self) -> FilterMode {
+        self.mip_filter
+    }
+    /// Return the minimum LOD.
+    pub const fn min_lod(self) -> f32 {
+        f32::from_bits(self.min_lod_bits)
+    }
+    /// Return the maximum LOD.
+    pub const fn max_lod(self) -> f32 {
+        f32::from_bits(self.max_lod_bits)
+    }
 }
 
 /// Borrowed pixel data and layout for one texture upload.
@@ -367,6 +454,7 @@ pub struct TextureWrite<'data> {
     destination: PixelRect,
     bytes_per_row: u32,
     data: &'data [u8],
+    mip_level: u32,
 }
 
 impl<'data> TextureWrite<'data> {
@@ -392,6 +480,7 @@ impl<'data> TextureWrite<'data> {
                 destination,
                 bytes_per_row,
                 data,
+                mip_level: 0,
             })
         }
     }
@@ -415,6 +504,15 @@ impl<'data> TextureWrite<'data> {
     /// The source byte slice.
     pub const fn data(self) -> &'data [u8] {
         self.data
+    }
+    /// Select a destination mip level; recording validates it against the texture.
+    pub const fn with_mip_level(mut self, level: u32) -> Self {
+        self.mip_level = level;
+        self
+    }
+    /// Return the destination mip level.
+    pub const fn mip_level(self) -> u32 {
+        self.mip_level
     }
 }
 
