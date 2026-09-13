@@ -442,21 +442,48 @@ impl PendingBuffers {
             return Err(IrSubmitError::InvalidVertexData);
         }
         let start = usize::try_from(offset).map_err(|_| IrSubmitError::InvalidVertexData)?;
+        let slot = buffer.slot();
+        self.write_bytes(
+            slot,
+            resources.buffer_revision(slot)?,
+            resources.shadow(buffer)?,
+            start,
+            data,
+        )
+    }
+
+    fn write_bytes(
+        &mut self,
+        slot: usize,
+        previous_revision: u64,
+        previous: Option<&[u8]>,
+        start: usize,
+        data: &[u8],
+    ) -> Result<(), IrSubmitError> {
         let write_end = start
             .checked_add(data.len())
             .ok_or(IrSubmitError::InvalidVertexData)?;
-        let slot = buffer.slot();
+        let current = self
+            .updates
+            .iter()
+            .find(|update| update.slot == slot)
+            .map(|update| update.bytes.as_slice())
+            .or(previous);
+        if current.and_then(|bytes| bytes.get(start..write_end)) == Some(data) {
+            // Buffer shadows are authoritative for this backend. An identical
+            // write retains its revision and needs no subsequent GPU upload.
+            return Ok(());
+        }
         let bytes = if let Some(update) = self.updates.iter_mut().find(|update| update.slot == slot)
         {
             &mut update.bytes
         } else {
-            let bytes = if let Some(previous) = resources.shadow(buffer)? {
+            let bytes = if let Some(previous) = previous {
                 Vec::from(previous)
             } else {
                 Vec::new()
             };
-            let revision = resources
-                .buffer_revision(slot)?
+            let revision = previous_revision
                 .checked_add(1)
                 .ok_or(IrSubmitError::OutOfMemory)?;
             self.updates
@@ -605,6 +632,7 @@ struct ActivePass<'r> {
     submission: IrSubmission,
     pipeline: Option<RenderPipelineRef<'r>>,
     programmable: Option<ir::ProgrammableRenderPipelineRef<'r>>,
+    programmable_cache: Option<ProgrammableDrawCache<'r>>,
     bind_groups: [Option<ir::BindGroupRef<'r>>; ir::MAX_BIND_GROUPS],
     vertex_buffer: Option<(BufferRef<'r>, u64)>,
     index_buffer: Option<(BufferRef<'r>, u64, IndexFormat)>,
@@ -614,6 +642,24 @@ struct ActivePass<'r> {
     scissor: Option<ir::PixelRect>,
     viewport: Option<ir::Viewport>,
     push_constants: [[u8; 128]; 2],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProgrammableDrawKey<'r> {
+    pipeline: ir::ProgrammableRenderPipelineRef<'r>,
+    bind_groups: [Option<ir::BindGroupRef<'r>>; ir::MAX_BIND_GROUPS],
+    push_constants: [[u8; 128]; 2],
+}
+
+struct ProgrammableDrawCache<'r> {
+    key: ProgrammableDrawKey<'r>,
+    draw: Rc<driver::IrProgrammableDraw>,
+}
+
+impl ProgrammableDrawCache<'_> {
+    fn get(&self, key: &ProgrammableDrawKey<'_>) -> Option<Rc<driver::IrProgrammableDraw>> {
+        (self.key == *key).then(|| Rc::clone(&self.draw))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1175,6 +1221,7 @@ impl ExecutionPlan {
                         },
                         pipeline: None,
                         programmable: None,
+                        programmable_cache: None,
                         push_constants: [[0; 128]; 2],
                         bind_groups: [None; ir::MAX_BIND_GROUPS],
                         vertex_buffer: None,
@@ -1778,7 +1825,7 @@ fn inline_vertex_capacity(vertex_count: usize, draw_count: usize) -> usize {
 
 fn programmable_draw_bytes(draw: &driver::IrProgrammableDraw) -> Option<usize> {
     let mut constant_words = [0usize; 2];
-    for constant in &draw.constants {
+    for constant in draw.constants.iter() {
         let stage = match constant.stage {
             ir::ShaderStage::Vertex => 0,
             ir::ShaderStage::Fragment => 1,
@@ -2685,6 +2732,51 @@ mod tests {
         IrFrontFace,
     };
 
+    #[test]
+    fn identical_shadow_writes_keep_the_uploaded_revision() {
+        let mut pending = PendingBuffers::new();
+        let previous = [1, 2, 3, 4];
+        pending
+            .write_bytes(3, 9, Some(&previous), 1, &[2, 3])
+            .unwrap();
+        pending
+            .write_bytes(3, 9, Some(&previous), 0, &previous)
+            .unwrap();
+        assert!(pending.updates.is_empty());
+    }
+
+    #[test]
+    fn ordered_shadow_writes_compare_against_the_pending_contents() {
+        let mut pending = PendingBuffers::new();
+        let previous = [1, 2, 3, 4];
+        pending
+            .write_bytes(3, 9, Some(&previous), 1, &[8, 9])
+            .unwrap();
+        let allocation = pending.updates[0].bytes.as_ptr();
+        pending
+            .write_bytes(3, 9, Some(&previous), 1, &[8, 9])
+            .unwrap();
+        assert_eq!(pending.updates[0].bytes.as_ptr(), allocation);
+        assert_eq!(pending.updates[0].bytes, [1, 8, 9, 4]);
+        pending
+            .write_bytes(3, 9, Some(&previous), 2, &[3, 7])
+            .unwrap();
+        assert_eq!(pending.updates.len(), 1);
+        assert_eq!(pending.updates[0].revision, 10);
+        assert_eq!(pending.updates[0].bytes, [1, 8, 3, 7]);
+        assert_eq!(previous, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_zero_write_without_a_shadow_still_materializes_buffer_storage() {
+        let mut pending = PendingBuffers::new();
+        pending.write_bytes(2, 0, None, 4, &[0; 4]).unwrap();
+        assert_eq!(pending.updates[0].revision, 1);
+        assert_eq!(pending.updates[0].bytes, [0; 8]);
+        pending.write_bytes(2, 0, None, 0, &[0; 8]).unwrap();
+        assert_eq!(pending.updates.len(), 1);
+    }
+
     fn target() -> driver::IrTextureSpec {
         driver::IrTextureSpec {
             slot: 0,
@@ -2930,8 +3022,9 @@ mod tests {
                 stage: ir::ShaderStage::Vertex,
                 first_register: 0,
                 words: vec![marker as u32, 0, 0, 0],
-            }],
-            textures: Vec::new(),
+            }]
+            .into(),
+            textures: Vec::new().into(),
         }));
         draw
     }
@@ -2964,6 +3057,41 @@ mod tests {
             })
             .collect();
         assert_eq!(markers, (0..130).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn shared_constant_snapshots_survive_chunk_splitting_and_state_changes() {
+        let pipeline = programmable_pipeline(0);
+        let first = programmable_draw(&pipeline, 7);
+        let second = programmable_draw(&pipeline, 9);
+        let draws = (0..130)
+            .map(|index| {
+                if index < 65 {
+                    first.clone()
+                } else {
+                    second.clone()
+                }
+            })
+            .collect();
+        let chunks = split_pass(execution_pass(Vec::new(), draws)).unwrap();
+        assert!(chunks.len() > 1);
+        for (index, draw) in chunks
+            .iter()
+            .flat_map(|chunk| &chunk.submission.draws)
+            .enumerate()
+        {
+            let expected = if index < 65 { &first } else { &second };
+            let snapshot = draw.programmable.as_ref().unwrap();
+            assert!(Rc::ptr_eq(
+                snapshot,
+                expected.programmable.as_ref().unwrap()
+            ));
+            assert_eq!(
+                snapshot.constants[0].words[0],
+                if index < 65 { 7 } else { 9 }
+            );
+        }
     }
 
     #[cfg(feature = "programmable")]
@@ -3043,7 +3171,8 @@ mod tests {
                         first_register: 255,
                         words: vec![marker as u32; 4],
                     })
-                    .collect();
+                    .collect::<Vec<_>>()
+                    .into();
                 draw
             })
             .collect();

@@ -1377,7 +1377,7 @@ impl Queue {
                 ir_texture(context, resources, texture)?;
             }
             if let Some(programmable) = &draw.programmable {
-                for binding in &programmable.textures {
+                for binding in programmable.textures.iter() {
                     ir_texture(context, resources, binding.texture)?;
                 }
             }
@@ -1471,6 +1471,10 @@ impl Queue {
             .map(|bytes| bytes & !(core::mem::size_of::<u32>() - 1))
             .filter(|bytes| *bytes > 0)
             .ok_or(HandleError::InvalidParameter)?;
+        let mut commands = Vec::new();
+        commands
+            .try_reserve_exact(self.max_command_size())
+            .map_err(|_| HandleError::OutOfResources)?;
         let mut offset = 0usize;
         while offset < bytes.len() {
             mode.prepare_packet(self.max_command_size())?;
@@ -1478,10 +1482,7 @@ impl Queue {
             let chunk = bytes
                 .get(offset..end)
                 .ok_or(HandleError::InvalidParameter)?;
-            let mut commands = Vec::new();
-            commands
-                .try_reserve_exact(INLINE_WRITE_FIXED_BYTES.saturating_add(chunk.len()))
-                .map_err(|_| HandleError::OutOfResources)?;
+            commands.clear();
             push_ir_buffer_upload(
                 &mut commands,
                 resource_id,
@@ -1778,7 +1779,7 @@ impl Queue {
                     push_programmable_pipeline(&mut commands, native)?;
                     initialized_programmable_pipelines.push(slot);
                 }
-                for binding in &programmable.textures {
+                for binding in programmable.textures.iter() {
                     let texture = ir_texture(context, resources, binding.texture)?;
                     if !texture.sampler_view_initialized()
                         && !initialized_views.contains(&binding.texture.slot)
@@ -2570,7 +2571,7 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
             return Err(HandleError::InvalidParameter);
         }
     }
-    for constant in &programmable.constants {
+    for constant in programmable.constants.iter() {
         if !matches!(
             constant.stage,
             crate::ir::ShaderStage::Vertex | crate::ir::ShaderStage::Fragment
@@ -2585,7 +2586,7 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
             return Err(HandleError::InvalidParameter);
         }
     }
-    for binding in &programmable.textures {
+    for binding in programmable.textures.iter() {
         if !matches!(
             binding.stage,
             crate::ir::ShaderStage::Vertex | crate::ir::ShaderStage::Fragment
@@ -3473,7 +3474,7 @@ fn push_programmable_draw(
     }
     let mut vertex_constants = Vec::new();
     let mut fragment_constants = Vec::new();
-    for constant in &programmable.constants {
+    for constant in programmable.constants.iter() {
         let values = match constant.stage {
             crate::ir::ShaderStage::Vertex => &mut vertex_constants,
             crate::ir::ShaderStage::Fragment => &mut fragment_constants,
@@ -3500,7 +3501,7 @@ fn push_programmable_draw(
     if !fragment_constants.is_empty() {
         push_constant_words(commands, PIPE_SHADER_FRAGMENT, &fragment_constants)?;
     }
-    for binding in &programmable.textures {
+    for binding in programmable.textures.iter() {
         let stage = match binding.stage {
             crate::ir::ShaderStage::Vertex => PIPE_SHADER_VERTEX,
             crate::ir::ShaderStage::Fragment => PIPE_SHADER_FRAGMENT,

@@ -451,7 +451,7 @@ fn buffer_spec(
 pub(super) fn decode_draw(
     resources: &IrResources,
     pending: &PendingBuffers,
-    pass: &ActivePass<'_>,
+    pass: &mut ActivePass<'_>,
     first: u32,
     count: u32,
     base_vertex: Option<i32>,
@@ -474,127 +474,145 @@ pub(super) fn decode_draw(
         return Err(ir::Error::InvalidDescriptor.into());
     }
     let compiled = resources.compiled_pipeline(reference.id())?;
+    let key = ProgrammableDrawKey {
+        pipeline: reference,
+        bind_groups: pass.bind_groups,
+        push_constants: pass.push_constants,
+    };
+    let cached = pass
+        .programmable_cache
+        .as_ref()
+        .and_then(|cache| cache.get(&key));
     let mut constants = Vec::new();
     let mut textures = Vec::new();
-    let resource = |group_index: u32, binding: u32| -> Result<ir::BindingResource, IrSubmitError> {
-        let group_ref = pass
-            .bind_groups
-            .get(group_index as usize)
-            .copied()
-            .flatten()
-            .ok_or(ir::Error::BindingLayoutMismatch)?;
-        let group = resources.resources.bind_group(group_ref)?;
-        if pipeline.layout().bind_groups().get(group_index as usize) != Some(group.layout()) {
-            return Err(ir::Error::BindingLayoutMismatch.into());
-        }
-        group
-            .entries()
-            .iter()
-            .find(|entry| entry.binding() == binding)
-            .map(|entry| entry.resource())
-            .ok_or_else(|| ir::Error::BindingLayoutMismatch.into())
-    };
-    for shader in [&compiled.vertex, &compiled.fragment] {
-        for binding in &shader.textures {
-            let ir::BindingResource::Texture(texture) =
-                resource(binding.image_group, binding.image_binding)?
-            else {
-                return Err(ir::Error::BindingLayoutMismatch.into());
-            };
-            let ir::BindingResource::Sampler(sampler) =
-                resource(binding.sampler_group, binding.sampler_binding)?
-            else {
-                return Err(ir::Error::BindingLayoutMismatch.into());
-            };
-            let texture = resources.resources.texture_ref(texture)?;
-            let descriptor = resources.resources.texture(texture)?;
-            if !descriptor.usage().contains(TextureUsage::SAMPLED)
-                || texture == pass.attachment
-                || pass.depth_attachment == Some(texture)
-            {
-                return Err(ir::Error::InvalidUsage.into());
-            }
-            let sampler = resources.resources.sampler_ref(sampler)?;
-            textures.push(driver::IrTextureBinding {
-                stage: shader.stage,
-                slot: binding.slot,
-                texture: texture_spec(texture, descriptor),
-                sampler: sampler_state(resources.resources.sampler(sampler)?, sampler.slot()),
-            });
-        }
-        if let Some(push) = &shader.push_constants {
-            let stage = if shader.stage == ir::ShaderStage::Vertex {
-                0
-            } else {
-                1
-            };
-            let mut words: Vec<u32> = pass.push_constants[stage][..push.size as usize]
-                .chunks_exact(4)
-                .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
-                .collect();
-            words.resize(push.size.div_ceil(16) as usize * 4, 0);
-            constants.push(driver::IrConstantBuffer {
-                stage: shader.stage,
-                first_register: push.first_register,
-                words,
-            });
-        }
-        for binding in &shader.uniform_buffers {
+    if cached.is_none() {
+        let resource = |group_index: u32,
+                        binding: u32|
+         -> Result<ir::BindingResource, IrSubmitError> {
             let group_ref = pass
                 .bind_groups
-                .get(binding.group as usize)
+                .get(group_index as usize)
                 .copied()
                 .flatten()
                 .ok_or(ir::Error::BindingLayoutMismatch)?;
             let group = resources.resources.bind_group(group_ref)?;
-            if pipeline.layout().bind_groups().get(binding.group as usize) != Some(group.layout()) {
+            if pipeline.layout().bind_groups().get(group_index as usize) != Some(group.layout()) {
                 return Err(ir::Error::BindingLayoutMismatch.into());
             }
-            let entry = group
+            group
                 .entries()
                 .iter()
-                .find(|entry| entry.binding() == binding.binding)
-                .ok_or(ir::Error::BindingLayoutMismatch)?;
-            let ir::BindingResource::Buffer {
-                buffer,
-                offset,
-                size,
-            } = entry.resource()
-            else {
-                return Err(ir::Error::BindingLayoutMismatch.into());
-            };
-            let constant_size = binding.size.next_multiple_of(16);
-            if size < u64::from(binding.size) || size > 16 * 1024 || offset > u64::from(u32::MAX) {
-                return Err(ir::Error::OutOfBounds.into());
+                .find(|entry| entry.binding() == binding)
+                .map(|entry| entry.resource())
+                .ok_or_else(|| ir::Error::BindingLayoutMismatch.into())
+        };
+        for shader in [&compiled.vertex, &compiled.fragment] {
+            for binding in &shader.textures {
+                let ir::BindingResource::Texture(texture) =
+                    resource(binding.image_group, binding.image_binding)?
+                else {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                };
+                let ir::BindingResource::Sampler(sampler) =
+                    resource(binding.sampler_group, binding.sampler_binding)?
+                else {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                };
+                let texture = resources.resources.texture_ref(texture)?;
+                let descriptor = resources.resources.texture(texture)?;
+                if !descriptor.usage().contains(TextureUsage::SAMPLED)
+                    || texture == pass.attachment
+                    || pass.depth_attachment == Some(texture)
+                {
+                    return Err(ir::Error::InvalidUsage.into());
+                }
+                let sampler = resources.resources.sampler_ref(sampler)?;
+                textures.push(driver::IrTextureBinding {
+                    stage: shader.stage,
+                    slot: binding.slot,
+                    texture: texture_spec(texture, descriptor),
+                    sampler: sampler_state(resources.resources.sampler(sampler)?, sampler.slot()),
+                });
             }
-            let buffer = resources.resources.buffer_ref(buffer)?;
-            let bytes = pending.bytes(resources, buffer)?;
-            let end = offset
-                .checked_add(u64::from(binding.size))
-                .ok_or(ir::Error::Overflow)?;
-            if end > bytes.as_slice().len() as u64 {
-                return Err(ir::Error::OutOfBounds.into());
-            }
-            let start = usize::try_from(offset).map_err(|_| ir::Error::Overflow)?;
-            let end = usize::try_from(end).map_err(|_| ir::Error::Overflow)?;
-            let mut words = Vec::new();
-            words
-                .try_reserve_exact(constant_size as usize / 4)
-                .map_err(|_| IrSubmitError::OutOfMemory)?;
-            words.extend(
-                bytes.as_slice()[start..end]
+            if let Some(push) = &shader.push_constants {
+                let stage = if shader.stage == ir::ShaderStage::Vertex {
+                    0
+                } else {
+                    1
+                };
+                let mut words: Vec<u32> = pass.push_constants[stage][..push.size as usize]
                     .chunks_exact(4)
-                    .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]])),
-            );
-            words.resize(constant_size as usize / 4, 0);
-            constants
-                .try_reserve(1)
-                .map_err(|_| IrSubmitError::OutOfMemory)?;
-            constants.push(driver::IrConstantBuffer {
-                stage: shader.stage,
-                first_register: binding.first_register,
-                words,
-            });
+                    .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+                    .collect();
+                words.resize(push.size.div_ceil(16) as usize * 4, 0);
+                constants.push(driver::IrConstantBuffer {
+                    stage: shader.stage,
+                    first_register: push.first_register,
+                    words,
+                });
+            }
+            for binding in &shader.uniform_buffers {
+                let group_ref = pass
+                    .bind_groups
+                    .get(binding.group as usize)
+                    .copied()
+                    .flatten()
+                    .ok_or(ir::Error::BindingLayoutMismatch)?;
+                let group = resources.resources.bind_group(group_ref)?;
+                if pipeline.layout().bind_groups().get(binding.group as usize)
+                    != Some(group.layout())
+                {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                }
+                let entry = group
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.binding() == binding.binding)
+                    .ok_or(ir::Error::BindingLayoutMismatch)?;
+                let ir::BindingResource::Buffer {
+                    buffer,
+                    offset,
+                    size,
+                } = entry.resource()
+                else {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                };
+                let constant_size = binding.size.next_multiple_of(16);
+                if size < u64::from(binding.size)
+                    || size > 16 * 1024
+                    || offset > u64::from(u32::MAX)
+                {
+                    return Err(ir::Error::OutOfBounds.into());
+                }
+                let buffer = resources.resources.buffer_ref(buffer)?;
+                let bytes = pending.bytes(resources, buffer)?;
+                let end = offset
+                    .checked_add(u64::from(binding.size))
+                    .ok_or(ir::Error::Overflow)?;
+                if end > bytes.as_slice().len() as u64 {
+                    return Err(ir::Error::OutOfBounds.into());
+                }
+                let start = usize::try_from(offset).map_err(|_| ir::Error::Overflow)?;
+                let end = usize::try_from(end).map_err(|_| ir::Error::Overflow)?;
+                let mut words = Vec::new();
+                words
+                    .try_reserve_exact(constant_size as usize / 4)
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+                words.extend(
+                    bytes.as_slice()[start..end]
+                        .chunks_exact(4)
+                        .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]])),
+                );
+                words.resize(constant_size as usize / 4, 0);
+                constants
+                    .try_reserve(1)
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+                constants.push(driver::IrConstantBuffer {
+                    stage: shader.stage,
+                    first_register: binding.first_register,
+                    words,
+                });
+            }
         }
     }
     let mut maximum_vertex = first
@@ -663,13 +681,24 @@ pub(super) fn decode_draw(
         None
     };
     let raster = pipeline.raster();
-    Ok(IrDraw {
-        programmable: Some(Rc::new(driver::IrProgrammableDraw {
+    // Writes are forbidden inside a render pass, so unchanged binding state
+    // refers to the same owned constants. Bounds are still checked per draw.
+    let programmable = if let Some(cached) = cached {
+        draw_with_index(cached, index_buffer)
+    } else {
+        Rc::new(driver::IrProgrammableDraw {
             pipeline: compiled,
             index_buffer,
-            constants,
-            textures,
-        })),
+            constants: constants.into(),
+            textures: textures.into(),
+        })
+    };
+    pass.programmable_cache = Some(ProgrammableDrawCache {
+        key,
+        draw: Rc::clone(&programmable),
+    });
+    Ok(IrDraw {
+        programmable: Some(programmable),
         start_vertex: first as usize,
         vertex_count: count as usize,
         vertex_buffer,
@@ -711,11 +740,27 @@ pub(super) fn decode_draw(
     })
 }
 
+#[cfg(feature = "programmable")]
+fn draw_with_index(
+    state: Rc<driver::IrProgrammableDraw>,
+    index_buffer: Option<driver::IrIndexBufferBinding>,
+) -> Rc<driver::IrProgrammableDraw> {
+    if state.index_buffer == index_buffer {
+        return state;
+    }
+    Rc::new(driver::IrProgrammableDraw {
+        pipeline: Rc::clone(&state.pipeline),
+        index_buffer,
+        constants: Rc::clone(&state.constants),
+        textures: Rc::clone(&state.textures),
+    })
+}
+
 #[cfg(not(feature = "programmable"))]
 pub(super) fn decode_draw(
     _resources: &IrResources,
     _pending: &PendingBuffers,
-    _pass: &ActivePass<'_>,
+    _pass: &mut ActivePass<'_>,
     _first: u32,
     _count: u32,
     _base_vertex: Option<i32>,
@@ -802,6 +847,106 @@ mod tests {
         assert_eq!(compiled.vertex.vertex_inputs.len(), 2);
         assert!(compiled.vertex.tgsi.contains("CONST[1]"));
         assert!(compiled.fragment.tgsi.contains("GENERIC[0]"));
+    }
+
+    #[test]
+    fn shared_draw_state_detects_binding_changes_and_retains_older_snapshots() {
+        let table = ResourceTable::new();
+        let id = pipeline(
+            &table,
+            VertexFormat::Float32x3,
+            ir::BindingType::UniformBuffer,
+        );
+        let other_id = pipeline(
+            &table,
+            VertexFormat::Float32x3,
+            ir::BindingType::UniformBuffer,
+        );
+        let buffer = table
+            .define_buffer(
+                ir::BufferDesc::new(64, BufferUsage::UNIFORM | BufferUsage::INDEX).unwrap(),
+            )
+            .unwrap();
+        let pipeline_ref = table.programmable_render_pipeline_ref(id).unwrap();
+        let layout = table
+            .programmable_render_pipeline(pipeline_ref)
+            .unwrap()
+            .layout()
+            .bind_groups()[0]
+            .clone();
+        let make_group = || {
+            table
+                .define_bind_group(
+                    ir::BindGroupDesc::new(
+                        &table,
+                        layout.clone(),
+                        vec![ir::BindGroupEntry::new(
+                            0,
+                            ir::BindingResource::Buffer {
+                                buffer: buffer.id(),
+                                offset: 0,
+                                size: 64,
+                            },
+                        )],
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let group = make_group();
+        let other_group = make_group();
+        let mut key = ProgrammableDrawKey {
+            pipeline: pipeline_ref,
+            bind_groups: [None; ir::MAX_BIND_GROUPS],
+            push_constants: [[0; 128]; 2],
+        };
+        key.bind_groups[0] = Some(group);
+        let snapshot = Rc::new(driver::IrProgrammableDraw {
+            pipeline: compile_pipeline(&table, id).unwrap(),
+            index_buffer: None,
+            constants: vec![driver::IrConstantBuffer {
+                stage: ir::ShaderStage::Vertex,
+                first_register: 0,
+                words: vec![42; 16],
+            }]
+            .into(),
+            textures: Vec::new().into(),
+        });
+        let cache = ProgrammableDrawCache {
+            key,
+            draw: Rc::clone(&snapshot),
+        };
+        let older = cache.get(&key).unwrap();
+        assert!(Rc::ptr_eq(&older, &snapshot));
+        let mut changes = [key; 4];
+        changes[0].pipeline = table.programmable_render_pipeline_ref(other_id).unwrap();
+        changes[1].bind_groups[0] = Some(other_group);
+        changes[2].push_constants[0][0] = 1;
+        changes[3].push_constants[1][0] = 1;
+        for changed in changes {
+            assert!(cache.get(&changed).is_none());
+        }
+        drop(cache);
+        drop(snapshot);
+        assert_eq!(older.constants[0].words, [42; 16]);
+        let index = driver::IrIndexBufferBinding {
+            buffer: IrBufferSpec {
+                slot: buffer.slot(),
+                size: 64,
+                revision: 1,
+            },
+            offset: 2,
+            format: IndexFormat::Uint16,
+            base_vertex: 7,
+        };
+        let indexed = draw_with_index(Rc::clone(&older), Some(index));
+        assert!(!Rc::ptr_eq(&indexed, &older));
+        assert!(Rc::ptr_eq(&indexed.constants, &older.constants));
+        assert!(Rc::ptr_eq(&indexed.textures, &older.textures));
+        assert!(older.index_buffer.is_none());
+        assert_eq!(indexed.index_buffer.unwrap().base_vertex, 7);
+        let same_index = draw_with_index(Rc::clone(&indexed), Some(index));
+        assert!(Rc::ptr_eq(&same_index, &indexed));
     }
 
     #[test]

@@ -251,5 +251,44 @@ fixed-camera comparison. The batched run still spends hundreds of milliseconds
 submitting world work, and the SGFX device worker remains busy on one CPU.
 Buffer-shadow upload copying took only several milliseconds for the roughly
 3 MiB world payload. Worker command construction, allocation/reclamation and
-GPU/presentation waits still require separate measurements. The clean deployed
-release ICD is rebuilt from committed source without the temporary clocks.
+GPU/presentation waits were measured separately in the follow-up below. The
+clean deployed release ICD is rebuilt from committed source without the clocks.
+
+### Shared draw bindings and reusable buffer upload storage
+
+A follow-up native backend change shares immutable constant/texture snapshots
+while pipeline, bind groups and stage push constants remain unchanged inside a
+render pass. Indexed draw offsets and signed base vertices keep their own draw
+state and do not force another copy of the same bindings. Index/vertex bounds
+are still validated for every draw. Buffer writes compare against the latest
+ordered CPU shadow; identical data keeps its revision, while first writes and
+changed/overlapping ranges still materialize their correct contents. Native
+buffer uploads reuse one bounded command vector across all transport packets.
+These are private backend changes; canonical IR and the native GPU/SWS SDK
+revisions remain unchanged.
+
+The 53 Linux release backend tests pass. Added regressions cover persistent
+and pending shadow contents, initial zero writes, binding changes, independent
+index state, and shared snapshot ownership across transport chunks.
+
+Additional temporary worker/backend/WSI clocks used the same release kernel,
+C SDK and upstream game as above. For exactly 915 loading-console draws in 18
+native pass chunks (7,327 owned IR commands), 36 samples in each run give:
+
+| Measured phase | Batched backend before sharing | Shared bindings/upload storage |
+| --- | --- | --- |
+| Backend plan through submission and cleanup | 201.5 ms | 60 ms |
+| Destruction of the lowered drawing events | 139.5 ms | 16 ms |
+| `queue.submit` through acceptance | 204 ms | 65 ms |
+| Whole Vulkan queue worker job | 274.5 ms | 143.5 ms |
+
+These are medians of CPU elapsed times, not FPS. World views and draw counts
+differed between runs and are not a fixed-camera performance comparison.
+During the measured world work, producer completion and SWS presentation
+usually took 0-2 ms, while command recording/lowering and cleanup continued to
+take tens or hundreds of milliseconds. The worker remains CPU-bound; this does
+not establish playable performance. The changed release backend again renders
+the `demo1` world, weapon and HUD. Its own 1280x800 TGA readback has 11,164
+distinct RGBA colors. The upstream quit command returns zero, verified by an
+`if`/`else` in the Linux shell, rather than interpolating `$?` in the native
+shell. Temporary timing sources and diagnostic binaries are not deployed.

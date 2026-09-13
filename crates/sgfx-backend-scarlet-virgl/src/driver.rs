@@ -666,7 +666,7 @@ pub(crate) struct IrProgrammablePipeline {
     pub(crate) topology: crate::ir::PrimitiveTopology,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IrIndexBufferBinding {
     pub(crate) buffer: IrBufferSpec,
     pub(crate) offset: u32,
@@ -683,8 +683,8 @@ pub(crate) struct IrConstantBuffer {
 pub(crate) struct IrProgrammableDraw {
     pub(crate) pipeline: Rc<IrProgrammablePipeline>,
     pub(crate) index_buffer: Option<IrIndexBufferBinding>,
-    pub(crate) constants: Vec<IrConstantBuffer>,
-    pub(crate) textures: Vec<IrTextureBinding>,
+    pub(crate) constants: Rc<[IrConstantBuffer]>,
+    pub(crate) textures: Rc<[IrTextureBinding]>,
 }
 
 pub(crate) struct IrTextureBinding {
