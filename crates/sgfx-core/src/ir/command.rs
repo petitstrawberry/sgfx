@@ -903,11 +903,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         self.encoder.push(Command::SetViewport(viewport))
     }
 
-    /// Record a non-indexed triangle-list draw.
+    /// Record a non-indexed draw using the selected pipeline's topology.
     ///
     /// # Arguments
     ///
-    /// * `vertex_count` - Positive multiple of three vertices.
+    /// * `vertex_count` - Positive multiple of three for lists, at least three for strips.
     /// * `first_vertex` - First vertex relative to the bound vertex buffer.
     ///
     /// # Returns
@@ -956,11 +956,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         Ok(())
     }
 
-    /// Record an indexed triangle-list draw.
+    /// Record an indexed draw using the selected pipeline's topology.
     ///
     /// # Arguments
     ///
-    /// * `index_count` - Positive multiple of three indices.
+    /// * `index_count` - Positive multiple of three for lists, at least three for strips.
     /// * `first_index` - First index relative to the bound index buffer.
     /// * `base_vertex` - Signed base vertex added by a future backend.
     ///
@@ -1048,10 +1048,16 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     }
 
     fn validate_draw(&self, count: u32) -> Result<()> {
-        if count == 0 || !count.is_multiple_of(3) {
+        let pipeline = self.pipeline.ok_or(Error::PipelineNotSet)?;
+        let valid_count = self
+            .encoder
+            .resources
+            .with_pipeline(pipeline, |descriptor| {
+                descriptor.topology().accepts_count(count)
+            })?;
+        if !valid_count {
             return Err(Error::InvalidValue);
         }
-        let pipeline = self.pipeline.ok_or(Error::PipelineNotSet)?;
         let fragment = self
             .encoder
             .resources

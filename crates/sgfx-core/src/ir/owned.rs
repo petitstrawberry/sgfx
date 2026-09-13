@@ -937,6 +937,64 @@ mod tests {
     }
 
     #[test]
+    fn owned_draw_counts_follow_the_programmable_pipeline_topology() {
+        use crate::ir::{
+            BlendState, PrimitiveTopology, ProgrammableRenderPipelineDesc, RasterState,
+        };
+        let table = ResourceTable::new();
+        let shader = table
+            .define_shader_module(
+                ShaderModuleDesc::wgsl(
+                    "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }
+             @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"
+                        .into(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let pass = render_desc(&table);
+        for (topology, accepted) in [
+            (PrimitiveTopology::TriangleList, false),
+            (PrimitiveTopology::TriangleStrip, true),
+        ] {
+            let pipeline = table
+                .define_programmable_render_pipeline(
+                    ProgrammableRenderPipelineDesc::new(
+                        ShaderEntryPoint::new(shader, ShaderStage::Vertex, "vs".into()).unwrap(),
+                        ShaderEntryPoint::new(shader, ShaderStage::Fragment, "fs".into()).unwrap(),
+                        PipelineLayoutDesc::new(vec![]).unwrap(),
+                        TextureFormat::Rgba8Unorm,
+                        None,
+                        topology,
+                        BlendState::REPLACE,
+                        RasterState::new(
+                            crate::ir::CullMode::None,
+                            crate::ir::FrontFace::CounterClockwise,
+                        ),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id();
+            let recording = |count| {
+                OwnedCommandBuffer::new(vec![
+                    OwnedCommand::BeginRenderPass(pass),
+                    OwnedCommand::SetProgrammablePipeline(pipeline),
+                    OwnedCommand::Draw {
+                        vertex_count: count,
+                        first_vertex: 0,
+                    },
+                    OwnedCommand::EndRenderPass,
+                ])
+            };
+            assert_eq!(recording(4).validate(&table).is_ok(), accepted);
+            assert_eq!(recording(2).validate(&table), Err(Error::InvalidValue));
+            assert_eq!(recording(0).validate(&table), Err(Error::InvalidValue));
+            assert_eq!(recording(3).validate(&table), Ok(()));
+        }
+    }
+
+    #[test]
     fn bind_group_capacity_rejects_growth_without_invalidating_existing_ids() {
         let table = ResourceTable::new();
         let desc = super::super::BindGroupDesc::new(

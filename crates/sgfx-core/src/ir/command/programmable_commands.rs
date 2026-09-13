@@ -503,12 +503,13 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         Ok(())
     }
     fn validate_programmable_count(&self, count: u32) -> Result<ProgrammableRenderPipelineDesc> {
-        if count == 0 || !count.is_multiple_of(3) {
+        let desc = self.encoder.resources.programmable_render_pipeline(
+            self.programmable_pipeline.ok_or(Error::PipelineNotSet)?,
+        )?;
+        if !desc.topology().accepts_count(count) {
             return Err(Error::InvalidValue);
         }
-        self.encoder
-            .resources
-            .programmable_render_pipeline(self.programmable_pipeline.ok_or(Error::PipelineNotSet)?)
+        Ok(desc)
     }
     pub(super) fn draw_programmable(&mut self, count: u32, first: u32) -> Result<()> {
         let desc = self.validate_programmable_count(count)?;
