@@ -21,10 +21,10 @@ pub use pipeline::{
     VertexBufferLayout, VertexFormat,
 };
 pub use resource::{
-    AddressMode, BufferDesc, BufferId, BufferRef, BufferUsage, FilterMode, MAX_BUFFERS,
-    MAX_RENDER_PIPELINES, MAX_SAMPLERS, MAX_TEXTURES, RenderPipelineId, RenderPipelineRef,
-    ResourceTable, SamplerDesc, SamplerId, SamplerRef, TextureDesc, TextureFormat, TextureId,
-    TextureRef, TextureUsage, TextureWrite,
+    AddressMode, BufferDesc, BufferId, BufferRef, BufferUsage, FilterMode,
+    MAX_BIND_GROUP_DEFINITIONS, MAX_BUFFERS, MAX_RENDER_PIPELINES, MAX_SAMPLERS, MAX_TEXTURES,
+    RenderPipelineId, RenderPipelineRef, ResourceTable, SamplerDesc, SamplerId, SamplerRef,
+    TextureDesc, TextureFormat, TextureId, TextureRef, TextureUsage, TextureWrite,
 };
 pub use types::{Color, Error, Extent2D, PixelRect, Result, Transform, Viewport};
 

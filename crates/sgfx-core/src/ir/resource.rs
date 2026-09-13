@@ -20,6 +20,8 @@ pub const MAX_BUFFERS: usize = 1_024;
 pub const MAX_SAMPLERS: usize = 256;
 /// Maximum render pipelines held by one [`ResourceTable`].
 pub const MAX_RENDER_PIPELINES: usize = 256;
+/// Maximum immutable bind-group definitions held by one resource table.
+pub const MAX_BIND_GROUP_DEFINITIONS: usize = 4_096;
 
 static NEXT_RESOURCE_TABLE_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -699,7 +701,7 @@ impl ResourceTable {
     /// Define an immutable bind group and return its branded reference.
     pub fn define_bind_group(&self, desc: BindGroupDesc) -> Result<BindGroupRef<'_>> {
         desc.validate(self)?;
-        let index = Self::push(&self.bind_groups, desc, 256)?;
+        let index = Self::push(&self.bind_groups, desc, MAX_BIND_GROUP_DEFINITIONS)?;
         Ok(BindGroupRef { owner: self, index })
     }
     /// Resolve a persistent bind group identity in its owning table.

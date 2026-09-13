@@ -556,7 +556,7 @@ impl BufferAccess {
         }
     }
 }
-/// Whole-texture access scope; images currently have exactly one mip and layer.
+/// Texture access scope; sampled images may contain multiple mip levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureAccess {
     /// Copy/upload writes.

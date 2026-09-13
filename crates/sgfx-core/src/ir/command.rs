@@ -18,7 +18,7 @@ use super::{
 };
 
 /// Maximum commands retained by one logical command buffer.
-pub const MAX_COMMANDS: usize = 4_096;
+pub const MAX_COMMANDS: usize = 65_536;
 
 /// Color attachment initialization operation for a render pass.
 #[derive(Debug, Clone, Copy, PartialEq)]

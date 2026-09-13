@@ -937,6 +937,26 @@ mod tests {
     }
 
     #[test]
+    fn bind_group_capacity_rejects_growth_without_invalidating_existing_ids() {
+        let table = ResourceTable::new();
+        let desc = super::super::BindGroupDesc::new(
+            &table,
+            super::super::BindGroupLayoutDesc::new(vec![]).unwrap(),
+            vec![],
+        )
+        .unwrap();
+        let first = table.define_bind_group(desc.clone()).unwrap().id();
+        for _ in 1..super::super::MAX_BIND_GROUP_DEFINITIONS {
+            table.define_bind_group(desc.clone()).unwrap();
+        }
+        assert!(matches!(
+            table.define_bind_group(desc),
+            Err(Error::ResourceLimitExceeded)
+        ));
+        assert!(table.bind_group_ref(first).is_ok());
+    }
+
+    #[test]
     fn replay_enforces_canonical_command_capacity() {
         let resources = ResourceTable::new();
         let buffer = resources
