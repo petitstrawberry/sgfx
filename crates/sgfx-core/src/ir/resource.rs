@@ -1,6 +1,6 @@
 //! Logical resource descriptors, validated resource tables, and branded references.
 
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
 use core::cell::RefCell;
 use core::fmt;
 use core::ops::{BitOr, BitOrAssign};
@@ -526,9 +526,9 @@ pub struct ResourceTable {
     samplers: RefCell<Vec<SamplerDesc>>,
     pipelines: RefCell<Vec<RenderPipelineDesc>>,
     shader_modules: RefCell<Vec<ShaderModuleDesc>>,
-    bind_groups: RefCell<Vec<BindGroupDesc>>,
+    bind_groups: RefCell<Vec<Rc<BindGroupDesc>>>,
     compute_pipelines: RefCell<Vec<ComputePipelineDesc>>,
-    programmable_pipelines: RefCell<Vec<ProgrammableRenderPipelineDesc>>,
+    programmable_pipelines: RefCell<Vec<Rc<ProgrammableRenderPipelineDesc>>>,
 }
 
 impl ResourceTable {
@@ -701,7 +701,7 @@ impl ResourceTable {
     /// Define an immutable bind group and return its branded reference.
     pub fn define_bind_group(&self, desc: BindGroupDesc) -> Result<BindGroupRef<'_>> {
         desc.validate(self)?;
-        let index = Self::push(&self.bind_groups, desc, MAX_BIND_GROUP_DEFINITIONS)?;
+        let index = Self::push(&self.bind_groups, Rc::new(desc), MAX_BIND_GROUP_DEFINITIONS)?;
         Ok(BindGroupRef { owner: self, index })
     }
     /// Resolve a persistent bind group identity in its owning table.
@@ -714,6 +714,13 @@ impl ResourceTable {
     }
     /// Return an owned copy of a validated bind group descriptor.
     pub fn bind_group(&self, reference: BindGroupRef<'_>) -> Result<BindGroupDesc> {
+        self.bind_group_shared(reference)
+            .map(|desc| (*desc).clone())
+    }
+    /// Return shared immutable binding metadata without copying its entries.
+    /// The table qualification is checked on every call. The returned value
+    /// remains valid while further definitions grow the table.
+    pub fn bind_group_shared(&self, reference: BindGroupRef<'_>) -> Result<Rc<BindGroupDesc>> {
         if !core::ptr::eq(reference.owner, self) {
             return Err(Error::ResourceTableMismatch);
         }
@@ -761,7 +768,7 @@ impl ResourceTable {
     ) -> Result<ProgrammableRenderPipelineRef<'_>> {
         self.shader_module_ref(desc.vertex().module())?;
         self.shader_module_ref(desc.fragment().module())?;
-        let index = Self::push(&self.programmable_pipelines, desc, 256)?;
+        let index = Self::push(&self.programmable_pipelines, Rc::new(desc), 256)?;
         Ok(ProgrammableRenderPipelineRef { owner: self, index })
     }
     /// Resolve a persistent programmable render pipeline identity in its owning table.
@@ -780,6 +787,16 @@ impl ResourceTable {
         &self,
         reference: ProgrammableRenderPipelineRef<'_>,
     ) -> Result<ProgrammableRenderPipelineDesc> {
+        self.programmable_render_pipeline_shared(reference)
+            .map(|desc| (*desc).clone())
+    }
+    /// Return shared immutable pipeline metadata without copying its layout
+    /// or vertex attributes. Ownership validation is identical to the copying
+    /// getter and no table borrow is retained while the descriptor is used.
+    pub fn programmable_render_pipeline_shared(
+        &self,
+        reference: ProgrammableRenderPipelineRef<'_>,
+    ) -> Result<Rc<ProgrammableRenderPipelineDesc>> {
         if !core::ptr::eq(reference.owner, self) {
             return Err(Error::ResourceTableMismatch);
         }
@@ -1205,3 +1222,125 @@ impl ProgrammableRenderPipelineRef<'_> {
     }
 }
 impl_resource_ref_traits!(ProgrammableRenderPipelineRef);
+
+#[cfg(test)]
+mod shared_metadata_tests {
+    use super::*;
+    use crate::ir::*;
+    use alloc::vec;
+
+    #[test]
+    fn shared_bindings_retain_identity_across_table_growth_and_validate_owners() {
+        let table = ResourceTable::new();
+        let foreign = ResourceTable::new();
+        let buffer = table
+            .define_buffer(BufferDesc::new(16, BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = BindGroupLayoutDesc::new(vec![BindGroupLayoutEntry::new(
+            0,
+            ShaderStages::VERTEX,
+            BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let desc = BindGroupDesc::new(
+            &table,
+            layout,
+            vec![BindGroupEntry::new(
+                0,
+                BindingResource::Buffer {
+                    buffer,
+                    offset: 0,
+                    size: 16,
+                },
+            )],
+        )
+        .unwrap();
+        let reference = table.define_bind_group(desc.clone()).unwrap();
+        let shared = table.bind_group_shared(reference).unwrap();
+        for _ in 0..32 {
+            table.define_bind_group(desc.clone()).unwrap();
+            assert!(Rc::ptr_eq(
+                &shared,
+                &table.bind_group_shared(reference).unwrap()
+            ));
+        }
+        let copied = table.bind_group(reference).unwrap();
+        assert_eq!(*shared, copied);
+        assert_ne!(shared.entries().as_ptr(), copied.entries().as_ptr());
+        assert_eq!(
+            foreign.bind_group_shared(reference).unwrap_err(),
+            Error::ResourceTableMismatch
+        );
+        assert_eq!(
+            foreign.bind_group(reference).unwrap_err(),
+            Error::ResourceTableMismatch
+        );
+    }
+
+    #[test]
+    fn shared_pipelines_preserve_copying_getter_and_survive_new_definitions() {
+        let table = ResourceTable::new();
+        let foreign = ResourceTable::new();
+        let shader = table
+            .define_shader_module(
+                ShaderModuleDesc::wgsl(
+                    "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }
+                     @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"
+                        .into(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let desc = ProgrammableRenderPipelineDesc::new(
+            ShaderEntryPoint::new(shader, ShaderStage::Vertex, "vs".into()).unwrap(),
+            ShaderEntryPoint::new(shader, ShaderStage::Fragment, "fs".into()).unwrap(),
+            PipelineLayoutDesc::new(vec![]).unwrap(),
+            TextureFormat::Rgba8Unorm,
+            Some(
+                VertexBufferLayout::new(
+                    8,
+                    vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+                )
+                .unwrap(),
+            ),
+            PrimitiveTopology::TriangleList,
+            BlendState::REPLACE,
+            RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        )
+        .unwrap();
+        let reference = table
+            .define_programmable_render_pipeline(desc.clone())
+            .unwrap();
+        let shared = table
+            .programmable_render_pipeline_shared(reference)
+            .unwrap();
+        for _ in 0..32 {
+            table
+                .define_programmable_render_pipeline(desc.clone())
+                .unwrap();
+            assert!(Rc::ptr_eq(
+                &shared,
+                &table
+                    .programmable_render_pipeline_shared(reference)
+                    .unwrap()
+            ));
+        }
+        let copied = table.programmable_render_pipeline(reference).unwrap();
+        assert_eq!(*shared, copied);
+        assert_ne!(
+            shared.vertex_buffer().unwrap().attributes().as_ptr(),
+            copied.vertex_buffer().unwrap().attributes().as_ptr()
+        );
+        assert_eq!(
+            foreign
+                .programmable_render_pipeline_shared(reference)
+                .unwrap_err(),
+            Error::ResourceTableMismatch
+        );
+        assert_eq!(
+            foreign.programmable_render_pipeline(reference).unwrap_err(),
+            Error::ResourceTableMismatch
+        );
+    }
+}

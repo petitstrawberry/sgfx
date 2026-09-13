@@ -4,6 +4,7 @@ use crate::ir::{
     programmable::{binding_writes, resource_alias},
     *,
 };
+use alloc::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PendingWrite {
@@ -244,7 +245,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             }
             let group = self
                 .resources
-                .bind_group(groups[slot].ok_or(Error::BindGroupNotSet)?)?;
+                .bind_group_shared(groups[slot].ok_or(Error::BindGroupNotSet)?)?;
             if group.layout() != expected {
                 return Err(Error::BindingLayoutMismatch);
             }
@@ -376,7 +377,7 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
         if index as usize >= MAX_BIND_GROUPS {
             return Err(Error::OutOfBounds);
         }
-        self.encoder.resources.bind_group(bind_group)?;
+        self.encoder.resources.bind_group_shared(bind_group)?;
         self.encoder
             .push(Command::SetBindGroup { index, bind_group })?;
         self.bind_groups[index as usize] = Some(bind_group);
@@ -419,7 +420,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         offset: u32,
         data: &'data [u8],
     ) -> Result<()> {
-        let pipeline = self.encoder.resources.programmable_render_pipeline(
+        let pipeline = self.encoder.resources.programmable_render_pipeline_shared(
             self.programmable_pipeline.ok_or(Error::PipelineNotSet)?,
         )?;
         pipeline
@@ -439,7 +440,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         let desc = self
             .encoder
             .resources
-            .programmable_render_pipeline(pipeline)?;
+            .programmable_render_pipeline_shared(pipeline)?;
         if desc.target_format() != self.target_format
             || desc
                 .depth_state()
@@ -458,7 +459,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         if index as usize >= MAX_BIND_GROUPS {
             return Err(Error::OutOfBounds);
         }
-        self.encoder.resources.bind_group(bind_group)?;
+        self.encoder.resources.bind_group_shared(bind_group)?;
         self.encoder
             .push(Command::SetBindGroup { index, bind_group })?;
         self.bind_groups[index as usize] = Some(bind_group);
@@ -502,8 +503,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .map_err(|_| Error::OutOfMemory)?;
         Ok(())
     }
-    fn validate_programmable_count(&self, count: u32) -> Result<ProgrammableRenderPipelineDesc> {
-        let desc = self.encoder.resources.programmable_render_pipeline(
+    fn validate_programmable_count(
+        &self,
+        count: u32,
+    ) -> Result<Rc<ProgrammableRenderPipelineDesc>> {
+        let desc = self.encoder.resources.programmable_render_pipeline_shared(
             self.programmable_pipeline.ok_or(Error::PipelineNotSet)?,
         )?;
         if !desc.topology().accepts_count(count) {
