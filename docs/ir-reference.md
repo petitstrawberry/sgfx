@@ -460,8 +460,8 @@ always require an index buffer; a backend validates indirect vertex addresses
 against opaque index data, including signed base vertices. Triangle-list counts
 are positive multiples of three; triangle strips require at least three vertices
 or indices. Backend support is narrower: WGPU executes nonindexed programmable
-strips and rejects indexed strips before acceptance; native VirGL currently
-accepts triangle lists only. Primitive restart has no IR representation.
+strips and rejects indexed strips before acceptance; native VirGL accepts both
+indexed and nonindexed programmable strips. Primitive restart has no IR representation.
 Copies require distinct buffers, copy usage, nonzero sizes, and four-byte-aligned
 offsets/sizes. All new passes retain the bounded command encoder's reserved end
 slot and explicit `end()` requirement.

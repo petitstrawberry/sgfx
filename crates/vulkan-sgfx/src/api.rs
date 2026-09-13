@@ -173,7 +173,7 @@ pub(crate) fn with_device<T: Send + 'static>(
     call(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
 pub(crate) fn with_queue<T: Send + 'static>(
     queue: vk::Queue,
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
@@ -220,11 +220,14 @@ unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
     names.iter().all(|&name| {
         !name.is_null() && {
             let name = unsafe { CStr::from_ptr(name) };
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
             {
                 name == vk::KHR_SWAPCHAIN_NAME
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(
+                target_os = "macos",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            )))]
             {
                 #[cfg(target_os = "scarlet")]
                 {
@@ -450,7 +453,7 @@ unsafe extern "system" fn device_wait_idle(device: vk::Device) -> vk::Result {
     };
     status(wait_idle(&driver))
 }
-unsafe extern "system" fn queue_wait_idle(queue: vk::Queue) -> vk::Result {
+pub(crate) unsafe extern "system" fn queue_wait_idle(queue: vk::Queue) -> vk::Result {
     let driver = match driver(queue.as_raw(), Kind::Queue) {
         Ok(driver) => driver,
         Err(error) => return error,
@@ -2701,7 +2704,11 @@ fn wait_and_consume_semaphores(d: &Driver, semaphores: &[Arc<AtomicU8>]) -> VkRe
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "scarlet-wsi"),
+    test
+))]
 pub(crate) fn signal_acquire_sync(
     device: vk::Device,
     semaphore: vk::Semaphore,
@@ -2739,7 +2746,11 @@ pub(crate) fn signal_acquire_sync(
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "scarlet-wsi"),
+    test
+))]
 pub(crate) fn wait_queue_semaphores(queue: vk::Queue, handles: &[vk::Semaphore]) -> VkResult<()> {
     let d = driver(queue.as_raw(), Kind::Queue)?;
     let semaphores = semaphore_refs(&d, handles)?;
@@ -3331,15 +3342,15 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkWaitForFences" => entry!(wait_for_fences),
         b"vkCreateSemaphore" => entry!(create_semaphore),
         b"vkDestroySemaphore" => entry!(destroy_semaphore),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkCreateSwapchainKHR" => entry!(crate::wsi::create_swapchain),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkDestroySwapchainKHR" => entry!(crate::wsi::destroy_swapchain),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkGetSwapchainImagesKHR" => entry!(crate::wsi::get_swapchain_images),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkAcquireNextImageKHR" => entry!(crate::wsi::acquire_next_image),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkQueuePresentKHR" => entry!(crate::wsi::queue_present),
         #[cfg(target_os = "scarlet")]
         b"vkGetImageScarletHandleSGFX" => {

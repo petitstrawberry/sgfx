@@ -30,7 +30,7 @@ fn spirv(source: &str) -> ShaderModuleDesc {
     let module = naga::front::wgsl::parse_str(source).unwrap();
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
+        naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(&module)
     .unwrap();
@@ -186,6 +186,53 @@ struct U { a: f32, b: vec3<f32>, c: mat4x4<f32> };
 }
 
 #[test]
+fn push_constants_follow_uniforms_and_preserve_each_stage_byte_layout() {
+    let source = r#"
+struct Uniforms { matrix: mat4x4<f32> };
+struct Push { bias: vec3<f32>, gain: f32 };
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+var<push_constant> push: Push;
+@vertex fn vertex(@location(0) p: vec4<f32>) -> @builtin(position) vec4<f32> {
+    return uniforms.matrix * p + vec4<f32>(push.bias, push.gain);
+}
+@fragment fn fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(push.bias * push.gain, 1.0);
+}"#;
+    for module in [wgsl(source), spirv(source)] {
+        validate_shader_module(&module).unwrap();
+        let vertex = compile_shader(&module, ShaderStage::Vertex, "vertex").unwrap();
+        let fragment = compile_shader(&module, ShaderStage::Fragment, "fragment").unwrap();
+        assert_eq!(vertex.uniform_buffers[0].first_register, 0);
+        assert_eq!(vertex.uniform_buffers[0].size, 64);
+        let push = vertex.push_constants.unwrap();
+        assert_eq!((push.first_register, push.size), (4, 16));
+        assert!(vertex.tgsi.contains("DCL CONST[0..4]"));
+        assert!(vertex.tgsi.contains("CONST[4].wwww"));
+        let push = fragment.push_constants.unwrap();
+        assert_eq!((push.first_register, push.size), (0, 16));
+        assert!(fragment.uniform_buffers.is_empty());
+        assert!(fragment.tgsi.contains("CONST[0].wwww"));
+    }
+}
+
+#[test]
+fn push_constant_limits_are_checked_before_emitting_a_shader() {
+    let source = r#"
+struct Push { a: mat4x4<f32>, b: mat4x4<f32>, c: vec4<f32> };
+var<push_constant> push: Push;
+@vertex fn main(@location(0) p: vec4<f32>) -> @builtin(position) vec4<f32> {
+    return push.a * p + push.b * p + push.c;
+}"#;
+    for module in [wgsl(source), spirv(source)] {
+        let error = compile_shader(&module, ShaderStage::Vertex, "main").unwrap_err();
+        assert!(
+            error.0.contains("push-constant block exceeds 128 bytes"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn actual_shader_operations_and_constants_change_the_program() {
     let source = r#"@fragment fn fragment(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
       let adjusted = color.bgr * 0.25 + vec3<f32>(0.125);
@@ -223,6 +270,29 @@ fn adjust(v: vec4<f32>) -> vec4<f32> { return v * vec4<f32>(0.5, 1.0, 1.0, 1.0);
 }
 
 #[test]
+fn bounded_dynamic_reads_compile_for_fullscreen_vertex_arrays_and_components() {
+    let source = r#"
+@vertex fn main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    var positions = array<vec4<f32>, 3>(
+        vec4<f32>(-1.0, -1.0, 0.0, 1.0),
+        vec4<f32>(3.0, -1.0, 0.0, 1.0),
+        vec4<f32>(-1.0, 3.0, 0.0, 1.0));
+    let selected = &positions[index % 3u];
+    positions[0].z = 0.5;
+    let current = *selected;
+    let component = current[index % 2u];
+    return vec4<f32>(current.xy, component * 0.0 + current.z, current.w);
+}"#;
+    for module in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&module, ShaderStage::Vertex, "main").unwrap();
+        assert!(shader.input_locations.is_empty());
+        assert!(shader.tgsi.contains("VERTEXID"));
+        assert!(shader.tgsi.contains("USEQ"));
+        assert!(shader.tgsi.contains("UCMP"));
+    }
+}
+
+#[test]
 fn unsupported_shaders_fail_instead_of_emitting_a_compatibility_shader() {
     let cases = [
         (
@@ -236,9 +306,9 @@ fn unsupported_shaders_fail_instead_of_emitting_a_compatibility_shader() {
             "resource address space",
         ),
         (
-            "@vertex fn main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{let a=array<vec4<f32>,2>(vec4<f32>(0.0),vec4<f32>(1.0));return a[i];}",
+            "@vertex fn main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{var a=array<vec4<f32>,2>(vec4<f32>(0.0),vec4<f32>(1.0));a[i]=vec4<f32>(2.0);return a[0];}",
             ShaderStage::Vertex,
-            "dynamic indexing",
+            "store target",
         ),
         (
             "@vertex fn main(@location(0) p:vec4<f32>)->@builtin(position) vec4<f32>{var v=p; for(var i=0;i<3;i++){v.x+=1.0;}return v;}",

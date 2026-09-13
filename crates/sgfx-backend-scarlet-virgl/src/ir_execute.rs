@@ -613,6 +613,7 @@ struct ActivePass<'r> {
     uniforms: Option<DrawUniforms>,
     scissor: Option<ir::PixelRect>,
     viewport: Option<ir::Viewport>,
+    push_constants: [[u8; 128]; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -941,7 +942,7 @@ impl ExecutionPlan {
                 return Err(IrSubmitError::InvalidVertexData);
             }
             for draw in &submission.draws {
-                if draw.vertex_count == 0 || !draw.vertex_count.is_multiple_of(3) {
+                if !driver::draw_count_valid(draw) {
                     return Err(IrSubmitError::InvalidVertexData);
                 }
                 if draw.programmable.is_none()
@@ -966,61 +967,14 @@ impl ExecutionPlan {
         // building buffer shadows, materializing resources, or submitting work.
         // A valid programmable stream is not malformed fixed-function IR.
         for command in commands.commands() {
-            let textures = match command {
-                Command::WriteTexture { texture, .. } | Command::SetTexture(texture) => {
-                    [Some(*texture), None]
-                }
-                Command::CopyTextureToTexture {
-                    source,
-                    destination,
-                    ..
-                } => [Some(*source), Some(*destination)],
-                Command::BeginRenderPass(desc) => [
-                    Some(desc.target()),
-                    desc.depth_attachment().map(|depth| depth.target()),
-                ],
-                Command::ResourceBarrier(
-                    ir::ResourceBarrier::Texture { texture, .. }
-                    | ir::ResourceBarrier::TextureMip { texture, .. },
-                ) => [Some(*texture), None],
-                _ => [None, None],
-            };
-            for texture in textures.into_iter().flatten() {
-                if resources.resources().texture(texture)?.mip_level_count() != 1 {
-                    return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
-                }
-            }
-            if let Command::SetBindGroup { bind_group, .. } = command {
-                let table = resources.resources();
-                for entry in table.bind_group(*bind_group)?.entries() {
-                    if let ir::BindingResource::Texture(texture) = entry.resource() {
-                        if table
-                            .texture(table.texture_ref(texture)?)?
-                            .mip_level_count()
-                            != 1
-                        {
-                            return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
-                        }
-                    }
-                }
-            }
-            let unsupported =
-                match command {
-                    Command::BlitTexture { .. } => UnsupportedIrFeature::Mipmaps,
-                    Command::WriteTexture { write, .. } if write.mip_level() != 0 => {
-                        UnsupportedIrFeature::Mipmaps
-                    }
-                    Command::ResourceBarrier(ir::ResourceBarrier::TextureMip {
-                        mip_level, ..
-                    }) if *mip_level != 0 => UnsupportedIrFeature::Mipmaps,
-                    Command::BeginComputePass
-                    | Command::EndComputePass
-                    | Command::SetComputePipeline(_)
-                    | Command::Dispatch { .. } => UnsupportedIrFeature::ProgrammableExecution,
-                    Command::SetPushConstants { .. } => UnsupportedIrFeature::PushConstants,
+            let unsupported = match command {
+                Command::BeginComputePass
+                | Command::EndComputePass
+                | Command::SetComputePipeline(_)
+                | Command::Dispatch { .. } => UnsupportedIrFeature::ProgrammableExecution,
 
-                    _ => continue,
-                };
+                _ => continue,
+            };
             return Err(IrSubmitError::Unsupported(unsupported));
         }
         let mut pending_buffers = PendingBuffers::new();
@@ -1030,6 +984,54 @@ impl ExecutionPlan {
 
         for command in commands.commands() {
             match command {
+                Command::BlitTexture {
+                    source,
+                    source_mip,
+                    destination,
+                    destination_mip,
+                    filter,
+                } if active.is_none() => {
+                    let source_desc = resources.resources().texture(*source)?;
+                    let destination_desc = resources.resources().texture(*destination)?;
+                    let source_extent = source_desc.mip_extent(*source_mip)?;
+                    let destination_extent = destination_desc.mip_extent(*destination_mip)?;
+                    if !source_desc.usage().contains(TextureUsage::COPY_SRC)
+                        || !destination_desc.usage().contains(TextureUsage::COPY_DST)
+                        || source_desc.format() != destination_desc.format()
+                        || !matches!(
+                            source_desc.format(),
+                            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+                        )
+                        || source.id() == destination.id() && source_mip == destination_mip
+                    {
+                        return Err(ir::Error::InvalidUsage.into());
+                    }
+                    events
+                        .try_reserve(1)
+                        .map_err(|_| IrSubmitError::OutOfMemory)?;
+                    events.push(ExecutionEvent::Copy(driver::IrTextureCopy {
+                        source: texture_spec(*source, source_desc),
+                        source_rect: IrRect {
+                            x: 0,
+                            y: 0,
+                            width: source_extent.width(),
+                            height: source_extent.height(),
+                        },
+                        destination: texture_spec(*destination, destination_desc),
+                        destination_rect: IrRect {
+                            x: 0,
+                            y: 0,
+                            width: destination_extent.width(),
+                            height: destination_extent.height(),
+                        },
+                        source_mip: *source_mip,
+                        destination_mip: *destination_mip,
+                        filter: Some(match filter {
+                            FilterMode::Nearest => IrFilterMode::Nearest,
+                            FilterMode::Linear => IrFilterMode::Linear,
+                        }),
+                    }));
+                }
                 Command::CopyTextureToTexture {
                     source,
                     source_rect,
@@ -1060,6 +1062,9 @@ impl ExecutionPlan {
                         .try_reserve(1)
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
                     events.push(ExecutionEvent::Copy(driver::IrTextureCopy {
+                        source_mip: 0,
+                        destination_mip: 0,
+                        filter: None,
                         source: source_spec,
                         source_rect: ir_rect(*source_rect),
                         destination: destination_spec,
@@ -1163,6 +1168,7 @@ impl ExecutionPlan {
                         },
                         pipeline: None,
                         programmable: None,
+                        push_constants: [[0; 128]; 2],
                         bind_groups: [None; ir::MAX_BIND_GROUPS],
                         vertex_buffer: None,
                         index_buffer: None,
@@ -1191,6 +1197,31 @@ impl ExecutionPlan {
                         .try_reserve(chunks.len())
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
                     events.extend(chunks.into_iter().map(ExecutionEvent::Pass));
+                }
+                Command::SetPushConstants {
+                    stages,
+                    offset,
+                    data,
+                } => {
+                    let pass = active.as_mut().ok_or(ir::Error::RenderPassNotActive)?;
+                    if stages.contains(ir::ShaderStages::COMPUTE) {
+                        return Err(IrSubmitError::Unsupported(
+                            UnsupportedIrFeature::ProgrammableExecution,
+                        ));
+                    }
+                    let start = *offset as usize;
+                    let end = start
+                        .checked_add(data.len())
+                        .filter(|&end| end <= 128)
+                        .ok_or(ir::Error::OutOfBounds)?;
+                    for (stage, flag) in [ir::ShaderStages::VERTEX, ir::ShaderStages::FRAGMENT]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if stages.contains(flag) {
+                            pass.push_constants[stage][start..end].copy_from_slice(data);
+                        }
+                    }
                 }
                 Command::SetPipeline(reference) => {
                     let pass = active_pass_mut(&mut active)?;
@@ -2099,6 +2130,12 @@ fn texture_binding(
 fn sampler_state(descriptor: SamplerDesc, slot: usize) -> IrSamplerState {
     IrSamplerState {
         slot,
+        mip_filter: match descriptor.mip_filter() {
+            FilterMode::Nearest => IrFilterMode::Nearest,
+            FilterMode::Linear => IrFilterMode::Linear,
+        },
+        min_lod: descriptor.min_lod(),
+        max_lod: descriptor.max_lod(),
         min_filter: match descriptor.min_filter() {
             FilterMode::Nearest => IrFilterMode::Nearest,
             FilterMode::Linear => IrFilterMode::Linear,
@@ -2401,6 +2438,14 @@ fn convert_texture_upload(
         ));
     }
     let destination = write.destination();
+    if write.mip_level() >= texture.mip_levels
+        || !destination.is_within(ir::Extent2D::new(
+            (texture.width >> write.mip_level()).max(1),
+            (texture.height >> write.mip_level()).max(1),
+        )?)
+    {
+        return Err(ir::Error::OutOfBounds.into());
+    }
     let tight = usize::try_from(destination.width())
         .ok()
         .and_then(|width| {
@@ -2459,6 +2504,7 @@ fn convert_texture_upload(
         }
     }
     Ok(IrTextureUpload {
+        mip_level: write.mip_level(),
         texture,
         destination: IrRect {
             x: destination.x(),
@@ -2562,6 +2608,7 @@ fn texture_spec(texture: TextureRef<'_>, descriptor: TextureDesc) -> driver::IrT
         slot: texture.slot(),
         width: extent.width(),
         height: extent.height(),
+        mip_levels: descriptor.mip_level_count(),
         sampled: usage.contains(TextureUsage::SAMPLED),
         render_attachment: usage.contains(TextureUsage::RENDER_ATTACHMENT),
         copy_destination: usage.contains(TextureUsage::COPY_DST),
@@ -2592,6 +2639,7 @@ mod tests {
             slot: 0,
             width: 64,
             height: 64,
+            mip_levels: 1,
             sampled: false,
             render_attachment: true,
             copy_destination: false,
@@ -2663,6 +2711,7 @@ mod tests {
             slot: 1,
             width: 64,
             height: 64,
+            mip_levels: 1,
             sampled: false,
             render_attachment: true,
             copy_destination: false,

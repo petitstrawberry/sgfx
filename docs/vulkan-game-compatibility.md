@@ -27,12 +27,20 @@ command procedures. This remains a bounded, non-conformant Vulkan 1.0 path.
   layer. Partial/flipped blits and format conversion are rejected.
 - Nearest/linear mip filters and nonzero sampler LOD clamps. Sampled views
   cover the declared chain; render/depth/storage/present attachments retain
-  one mip. Native VirGL and A618 explicitly reject multi-mip storage and blits.
+  one mip. Native VirGL supports color mip storage and full-mip blits when the
+  kernel advertises `GPU_EXECUTION_SUPPORT_IMAGE_MIPS`; older kernels and A618
+  continue to reject them.
 - Native VirGL shader sampling: Naga image/sampler pairs reflect SGFX bindings
   into per-stage TGSI slots, with actual `TEX`, `TXL`, and `TXB` instructions.
+- Native VirGL bounded dynamic reads of arrays, vectors and matrix columns.
+  Pointer reads take their value at the load, preserving preceding stores;
+  dynamic stores, runtime-sized arrays and storage-buffer indexing remain
+  unsupported. This covers ordinary vertex-indexed fullscreen triangles.
 - Nonindexed triangle strips on Metal, plus signed base vertices for indexed
-  triangle lists. Indexed strips are rejected before GPU acceptance because
-  WGPU's implicit primitive restart would change ordinary Vulkan indices.
+  triangle lists. Native VirGL also executes indexed and nonindexed strips,
+  including seven-index strips and signed base vertices. WGPU rejects indexed
+  strips before acceptance because its implicit primitive restart would change
+  ordinary Vulkan indices.
 - Swapchain transitions from `PRESENT_SRC_KHR` to transfer source and full-mip
   image readback with either implicit or explicitly tightly packed row sizes.
   Swapchain metadata retains the application's declared image usage.
@@ -47,8 +55,10 @@ carry mip filtering/LOD clamps, and `TextureMip` barriers synchronize selected
 levels independently. Pipeline layouts declare validated, stage-specific
 push-constant ranges, bounded to 128 bytes. Incremental updates retain owned
 bytes and compatible-layout information at every draw and dispatch. Metal
-executes push constants; native VirGL currently reports a zero-byte limit and
-rejects nonempty push-constant layouts.
+executes push constants. Native VirGL flattens each stage's push-constant block
+after its UBO constants, with an owned snapshot per draw and a 128-byte limit.
+Its mip, sampler and strip changes extend the backend's internal command data;
+they reuse the already canonical IR commands and require no new public IR fork.
 The maximum IR bind-group entries increase from 16 to 32 to accommodate the
 frontend's descriptor expansion. Sampling and upload already had canonical
 IR resource/command types; the Vulkan lowering and VirGL programmable path now
@@ -155,7 +165,36 @@ transforms. The PointSize vertex module triggers a Naga 24 writer/parser
 interface-structure layout regression. A post-normalization validation rejects
 it before WGPU, preserving device usability for subsequent modules. An authored
 minimal SPIR-V interface fixture covers this regression. Point/line rendering,
-indexed strips, general resource reclamation and wider Vulkan coverage remain
-incomplete. Native VirGL still lacks the mip/blit and push-constant capabilities
-used by this game, and this macOS result does not establish Scarlet game
-compatibility.
+indexed strips on WGPU, general resource reclamation and wider Vulkan coverage
+remain incomplete. This macOS result does not establish Scarlet game compatibility.
+
+## Scarlet Linux ABI and ordinary-loader WSI
+
+Build `vulkan-sgfx` on Linux/musl with
+`--release --no-default-features --features scarlet-wsi`, linking the ordinary
+Linux `libsws_client_c.so`. This enables the native Scarlet GPU namespace and
+seven standard `VK_KHR_display` procedures alongside common surface/swapchain
+queries. An unmodified Khronos loader reads the standard ICD JSON manifest.
+The primary SWS output supplies a fullscreen display plane; three registered
+SGFX GPU images rotate only after the compositor returns the exact buffer
+identity and commit serial. Producer GPU completion precedes presentation.
+Closing the window retires its retained image without waiting forever for the
+last displayed buffer.
+
+An ordinary C Vulkan application, `crates/vulkan-sgfx/examples/display.c`, links
+only `libvulkan`. On Scarlet AArch64 QEMU it discovers
+`SGFX Vulkan (Scarlet VirGL GPU 0)`, completes 60 acquire/submit/present iterations,
+and shuts down cleanly. No preload library, private loader, or SGFX API is used
+by this application.
+
+Native VirGL backend release tests cover mip storage/uploads/blit packets,
+strip draw ranges and push-constant lowering. Initial vkQuake2 textures and
+Vulkan resources now initialize on the guest, and its game module and `demo1`
+server load through Scarlet's existing Linux ABI. Bounded dynamic indexing
+allows the original world-warp fullscreen shader to create its pipeline; the
+game now presents its textured console background and font across continuing
+acquire/submit/present iterations. Map/weapon rendering, playable input and
+sustained performance have not yet been established. The SWS input/window adapter resides in
+Scarlet's `user/lib/sws-client-c/examples/vkquake2`; upstream Vulkan renderer and
+shader sources remain separate. A618 arbitrary SPIR-V execution and Chromebook
+hardware testing remain incomplete.

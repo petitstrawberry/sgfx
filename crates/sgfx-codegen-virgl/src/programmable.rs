@@ -4,7 +4,7 @@
 //! shader-name matching or fixed-shader substitution. The optional feature uses
 //! Naga's standard-library frontends; the compatibility encoder remains no_std.
 
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::fmt::{self, Write};
 use naga::{
     AddressSpace, BinaryOperator as B, Binding, BuiltIn, Expression as E, Handle, Literal,
@@ -36,6 +36,13 @@ pub struct UniformBufferBinding {
     /// First vec4 register in the stage's flattened inline constant bank.
     pub first_register: u32,
     /// Required byte span, including the source language's padding.
+    pub size: u32,
+}
+
+/// Push-constant byte layout and its separate inline constant-register span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushConstantBinding {
+    pub first_register: u32,
     pub size: u32,
 }
 
@@ -79,6 +86,8 @@ pub struct CompiledShader {
     pub tgsi: String,
     /// Used uniform buffers, flattened into an inline constant bank per stage.
     pub uniform_buffers: Vec<UniformBufferBinding>,
+    /// Push constants occupy a distinct span after every uniform buffer.
+    pub push_constants: Option<PushConstantBinding>,
     /// Sampling pairs bound independently for each shader stage.
     pub textures: Vec<TextureSamplerBinding>,
     /// Input locations consumed by the shader, for pipeline validation.
@@ -100,7 +109,7 @@ pub struct CompiledShader {
 /// zero-to-one clip range to Gallium's negative-one-to-one range at the output.
 /// Uniform buffers keep their declared byte layout and are flattened into each
 /// stage's bounded inline constant bank.
-/// Compute, storage buffers, loops, dynamic indexing and early returns
+/// Compute, storage buffers, loops, dynamic indexing stores and early returns
 /// are currently rejected. See the tests for executable examples of the subset.
 pub fn compile_shader(
     desc: &ShaderModuleDesc,
@@ -149,7 +158,7 @@ fn parse_shader_module(desc: &ShaderModuleDesc) -> Result<naga::Module> {
 fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo> {
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
+        naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(module)
     .map_err(|error| ShaderCompileError(format!("shader validation: {error}")))
@@ -215,14 +224,39 @@ struct Value {
     shape: Shape,
     lanes: Vec<Lane>,
     writable: bool,
+    indirect: Option<Box<IndirectRead>>,
+}
+#[derive(Clone, Debug)]
+struct IndirectRead {
+    elements: Vec<Value>,
+    index: Lane,
 }
 impl Value {
     fn element(&self, index: usize) -> Result<Self> {
         let (offset, shape) = self.shape.element(index)?;
+        let indirect = self
+            .indirect
+            .as_ref()
+            .map(|read| {
+                Ok::<_, ShaderCompileError>(Box::new(IndirectRead {
+                    elements: read
+                        .elements
+                        .iter()
+                        .map(|value| value.element(index))
+                        .collect::<Result<_>>()?,
+                    index: read.index.clone(),
+                }))
+            })
+            .transpose()?;
         Ok(Self {
-            lanes: self.lanes[offset..offset + shape.len()].to_vec(),
+            lanes: if indirect.is_none() {
+                self.lanes[offset..offset + shape.len()].to_vec()
+            } else {
+                Vec::new()
+            },
             shape,
             writable: self.writable,
+            indirect,
         })
     }
 }
@@ -244,6 +278,7 @@ struct Compiler<'a> {
     temp_lanes: usize,
     globals: Vec<Option<Value>>,
     uniforms: Vec<UniformBufferBinding>,
+    push_constants: Option<PushConstantBinding>,
     textures: Vec<TextureSamplerBinding>,
     input_locations: Vec<u32>,
     output_locations: Vec<u32>,
@@ -268,6 +303,7 @@ impl<'a> Compiler<'a> {
             temp_lanes: 0,
             globals: vec![None; module.global_variables.len()],
             uniforms: Vec::new(),
+            push_constants: None,
             textures: Vec::new(),
             input_locations: Vec::new(),
             output_locations: Vec::new(),
@@ -341,6 +377,7 @@ impl<'a> Compiler<'a> {
             shape,
             lanes,
             writable,
+            indirect: None,
         })
     }
     fn instruction(&mut self, opcode: &str, destination: &Lane, sources: &[&Lane]) -> Result<()> {
@@ -382,9 +419,31 @@ impl<'a> Compiler<'a> {
                 component: 0,
             }],
             writable: false,
+            indirect: None,
         })
     }
     fn snapshot(&mut self, value: &Value) -> Result<Value> {
+        if let Some(read) = &value.indirect {
+            let result = self.allocate(value.shape.clone(), false)?;
+            let zero = self.immediate(Literal::U32(0))?;
+            for dst in &result.lanes {
+                self.instruction("MOV", dst, &[&zero.lanes[0]])?;
+            }
+            let matches = self.allocate(Shape::Scalar(K::Bool), false)?;
+            for (index, element) in read.elements.iter().enumerate() {
+                let element = self.snapshot(element)?;
+                let expected = self.immediate(Literal::U32(index as u32))?;
+                self.instruction(
+                    "USEQ",
+                    &matches.lanes[0],
+                    &[&read.index, &expected.lanes[0]],
+                )?;
+                for (dst, src) in result.lanes.iter().zip(&element.lanes) {
+                    self.instruction("UCMP", dst, &[&matches.lanes[0], src, dst])?;
+                }
+            }
+            return Ok(result);
+        }
         let result = self.allocate(value.shape.clone(), false)?;
         for (dst, src) in result.lanes.iter().zip(&value.lanes) {
             self.instruction("MOV", dst, &[src])?;
@@ -406,6 +465,7 @@ impl<'a> Compiler<'a> {
             lanes: vec![zero.lanes[0].clone(); shape.len()],
             shape,
             writable: false,
+            indirect: None,
         })
     }
     fn global_expression(&mut self, handle: Handle<E>) -> Result<Value> {
@@ -422,6 +482,7 @@ impl<'a> Compiler<'a> {
                     shape: self.shape(&self.module.types[ty].inner)?,
                     lanes,
                     writable: false,
+                    indirect: None,
                 })
             }
             E::Splat { size, value } => {
@@ -430,6 +491,7 @@ impl<'a> Compiler<'a> {
                     shape: Shape::Vector(v.shape.kind()?, size as usize),
                     lanes: vec![v.lanes[0].clone(); size as usize],
                     writable: false,
+                    indirect: None,
                 })
             }
             _ => Err(unsupported("constant expression")),
@@ -481,6 +543,7 @@ impl<'a> Compiler<'a> {
             shape,
             lanes,
             writable: false,
+            indirect: None,
         })
     }
     fn io(
@@ -499,6 +562,7 @@ impl<'a> Compiler<'a> {
                 shape,
                 lanes,
                 writable: !input,
+                indirect: None,
             });
         }
         if !matches!(shape, Shape::Scalar(_) | Shape::Vector(..)) {
@@ -608,12 +672,14 @@ impl<'a> Compiler<'a> {
                 .collect(),
             shape,
             writable: !input,
+            indirect: None,
         })
     }
     fn compile(mut self, index: usize) -> Result<CompiledShader> {
         let entry = &self.module.entry_points[index];
         let entry_info = self.info.get_entry_point(index);
         let mut uniform_handles = Vec::new();
+        let mut push_constant_handle = None;
         for (handle, global) in self.module.global_variables.iter() {
             if entry_info[handle].is_empty() {
                 continue;
@@ -647,6 +713,7 @@ impl<'a> Compiler<'a> {
                         shape,
                         lanes: Vec::new(),
                         writable: false,
+                        indirect: None,
                     });
                 }
                 AddressSpace::Uniform => {
@@ -655,6 +722,11 @@ impl<'a> Compiler<'a> {
                         .as_ref()
                         .ok_or_else(|| unsupported("uniform without resource binding"))?;
                     uniform_handles.push((binding.group, binding.binding, handle));
+                }
+                AddressSpace::PushConstant => {
+                    if push_constant_handle.replace(handle).is_some() {
+                        return Err(unsupported("multiple push-constant blocks"));
+                    }
                 }
                 AddressSpace::Private => {}
                 _ => {
@@ -688,6 +760,23 @@ impl<'a> Compiler<'a> {
             self.uniforms.push(UniformBufferBinding {
                 group,
                 binding,
+                first_register,
+                size,
+            });
+            self.globals[handle.index()] = Some(self.uniform_value(ty, first_register * 16)?);
+        }
+        if let Some(handle) = push_constant_handle {
+            let ty = self.module.global_variables[handle].ty;
+            let size = layouter[ty].size;
+            if size == 0 || size > 128 {
+                return Err(unsupported("push-constant block exceeds 128 bytes"));
+            }
+            let first_register = next_constant_register;
+            next_constant_register = next_constant_register
+                .checked_add(size.div_ceil(16))
+                .filter(|&register| register <= 1024)
+                .ok_or_else(|| unsupported("more than 1024 inline constant registers"))?;
+            self.push_constants = Some(PushConstantBinding {
                 first_register,
                 size,
             });
@@ -770,6 +859,7 @@ impl<'a> Compiler<'a> {
             stage: self.stage,
             tgsi,
             uniform_buffers: self.uniforms,
+            push_constants: self.push_constants,
             textures: self.textures,
             input_locations: self.input_locations,
             output_locations: self.output_locations,
@@ -953,10 +1043,46 @@ impl<'a> Compiler<'a> {
                 self.expression(frame, base)?.element(index as usize)?
             }
             E::Access { base, index } => {
-                let index = self
-                    .constant_index(frame, index)
-                    .ok_or_else(|| unsupported("dynamic indexing"))?;
-                self.expression(frame, base)?.element(index as usize)?
+                let base = self.expression(frame, base)?;
+                if let Some(index) = self.constant_index(frame, index) {
+                    base.element(index as usize)?
+                } else {
+                    let index = self.expression(frame, index)?;
+                    if !matches!(index.shape, Shape::Scalar(K::Sint | K::Uint)) {
+                        return Err(unsupported("non-integer composite index"));
+                    }
+                    let count = match &base.shape {
+                        Shape::Vector(_, count) | Shape::Matrix(count, _) => *count,
+                        Shape::Aggregate(elements) => elements.len(),
+                        _ => return Err(unsupported("dynamic indexing of non-composite")),
+                    };
+                    let elements = (0..count)
+                        .map(|i| base.element(i))
+                        .collect::<Result<Vec<_>>>()?;
+                    let value = Value {
+                        shape: elements
+                            .first()
+                            .ok_or_else(|| unsupported("empty composite"))?
+                            .shape
+                            .clone(),
+                        lanes: Vec::new(),
+                        writable: false,
+                        indirect: Some(Box::new(IndirectRead {
+                            elements,
+                            index: index.lanes[0].clone(),
+                        })),
+                    };
+                    // Pointer indexing must read the registers at Load, after
+                    // preceding stores. A value index is evaluated immediately.
+                    if matches!(
+                        frame.info[handle].ty.inner_with(&self.module.types),
+                        T::Pointer { .. } | T::ValuePointer { .. }
+                    ) {
+                        value
+                    } else {
+                        self.snapshot(&value)?
+                    }
+                }
             }
             E::Compose { components, .. } => {
                 let mut lanes = Vec::new();
@@ -970,6 +1096,7 @@ impl<'a> Compiler<'a> {
                     shape,
                     lanes,
                     writable: false,
+                    indirect: None,
                 }
             }
             E::Splat { size, value } => {
@@ -978,6 +1105,7 @@ impl<'a> Compiler<'a> {
                     shape,
                     lanes: vec![v.lanes[0].clone(); size as usize],
                     writable: false,
+                    indirect: None,
                 }
             }
             E::Swizzle {
@@ -993,6 +1121,7 @@ impl<'a> Compiler<'a> {
                         .map(|p| v.lanes[*p as usize].clone())
                         .collect(),
                     writable: false,
+                    indirect: None,
                 }
             }
             E::Binary { op, left, right } => {
@@ -1034,6 +1163,7 @@ impl<'a> Compiler<'a> {
                         shape,
                         lanes: v.lanes,
                         writable: false,
+                        indirect: None,
                     }
                 } else {
                     if convert != Some(4) {

@@ -617,6 +617,9 @@ pub(crate) struct IrSamplerState {
     pub(crate) mag_filter: IrFilterMode,
     pub(crate) address_u: IrAddressMode,
     pub(crate) address_v: IrAddressMode,
+    pub(crate) mip_filter: IrFilterMode,
+    pub(crate) min_lod: f32,
+    pub(crate) max_lod: f32,
 }
 
 /// Draw-uniform constants sent to the GPU without CPU vertex transformation.
@@ -641,6 +644,17 @@ pub(crate) struct IrDraw {
     pub(crate) viewport: Option<[f32; 6]>,
 }
 
+pub(crate) fn draw_count_valid(draw: &IrDraw) -> bool {
+    match draw
+        .programmable
+        .as_ref()
+        .map(|draw| draw.pipeline.topology)
+    {
+        Some(crate::ir::PrimitiveTopology::TriangleStrip) => draw.vertex_count >= 3,
+        _ => draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(3),
+    }
+}
+
 /// Immutable compiled stages and vertex-fetch layout for one programmable pipeline.
 pub(crate) struct IrProgrammablePipeline {
     pub(crate) slot: usize,
@@ -649,6 +663,7 @@ pub(crate) struct IrProgrammablePipeline {
     #[cfg(feature = "programmable")]
     pub(crate) fragment: sgfx_codegen_virgl::programmable::CompiledShader,
     pub(crate) vertex_buffer: Option<crate::ir::VertexBufferLayout>,
+    pub(crate) topology: crate::ir::PrimitiveTopology,
 }
 
 #[derive(Clone, Copy)]
@@ -685,6 +700,7 @@ pub(crate) struct IrTextureUpload {
     pub(crate) texture: IrTextureSpec,
     pub(crate) destination: IrRect,
     pub(crate) pixels: Vec<u8>,
+    pub(crate) mip_level: u32,
 }
 
 /// Logical texture materialization requirements without backend identifiers.
@@ -693,6 +709,7 @@ pub(crate) struct IrTextureSpec {
     pub(crate) slot: usize,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) mip_levels: u32,
     pub(crate) sampled: bool,
     pub(crate) render_attachment: bool,
     pub(crate) copy_destination: bool,
@@ -715,6 +732,10 @@ pub(crate) struct IrTextureCopy {
     pub(crate) source_rect: IrRect,
     pub(crate) destination: IrTextureSpec,
     pub(crate) destination_rect: IrRect,
+    pub(crate) source_mip: u32,
+    pub(crate) destination_mip: u32,
+    /// None requests an exact copy; Some requests a filtered GPU blit.
+    pub(crate) filter: Option<IrFilterMode>,
 }
 
 /// Complete backend-neutral render submission for one mapped presentation target.

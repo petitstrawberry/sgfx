@@ -48,6 +48,7 @@ const VIRGL_CCMD_RESOURCE_INLINE_WRITE: u32 = 9;
 const VIRGL_CCMD_SET_SAMPLER_VIEWS: u32 = 10;
 const VIRGL_CCMD_SET_INDEX_BUFFER: u32 = 11;
 const VIRGL_CCMD_RESOURCE_COPY_REGION: u32 = 17;
+const VIRGL_CCMD_BLIT: u32 = 16;
 const VIRGL_CCMD_SET_CONSTANT_BUFFER: u32 = 12;
 const VIRGL_CCMD_SET_SCISSOR_STATE: u32 = 15;
 const VIRGL_CCMD_BIND_SAMPLER_STATES: u32 = 18;
@@ -75,6 +76,7 @@ const PIPE_SHADER_VERTEX: u32 = 0;
 const PIPE_SHADER_FRAGMENT: u32 = 1;
 const VIRGL_SHADER_TOKEN_COUNT_HINT: u32 = 300;
 const PIPE_PRIM_TRIANGLES: u32 = 4;
+const PIPE_PRIM_TRIANGLE_STRIP: u32 = 5;
 const PIPE_CLEAR_COLOR0: u32 = 1 << 2;
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
 
@@ -465,6 +467,7 @@ impl Context {
             resource_id,
             width,
             height,
+            mip_levels: 1,
             context_handle: self.handle_id(),
             sampler_view_handle: self.allocate_object_handle()?,
             sampler_view_initialized: Cell::new(false),
@@ -498,6 +501,7 @@ impl Context {
             resource_id,
             width,
             height,
+            mip_levels: 1,
             context_handle: self.handle_id(),
             sampler_view_handle: self.allocate_object_handle()?,
             sampler_view_initialized: Cell::new(false),
@@ -525,6 +529,7 @@ impl Context {
             resource_id,
             width: info.width,
             height: info.height,
+            mip_levels: 1,
             context_handle: self.handle_id(),
             sampler_view_handle: self.allocate_object_handle()?,
             sampler_view_initialized: Cell::new(false),
@@ -582,11 +587,12 @@ impl Context {
         } else {
             GPU_IMAGE_FORMAT_BGRA8_UNORM
         };
-        let raw = self.device.raw.create_image_with_format_and_usage(
+        let raw = self.device.raw.create_mip_image_with_format_and_usage(
             format,
             spec.width,
             spec.height,
             usage,
+            spec.mip_levels,
         )?;
         let resource_id = resource_id_from_token(self.raw.attach_image(&raw)?)?;
         Ok(Texture {
@@ -594,6 +600,7 @@ impl Context {
             resource_id,
             width: spec.width,
             height: spec.height,
+            mip_levels: spec.mip_levels,
             context_handle: self.handle_id(),
             sampler_view_handle: self.allocate_object_handle()?,
             sampler_view_initialized: Cell::new(false),
@@ -1201,6 +1208,12 @@ struct IrPassDepthTarget {
 }
 
 impl IrTexture {
+    fn mip_levels(&self) -> u32 {
+        match self {
+            Self::Internal(texture) => texture.mip_levels,
+            Self::Mapped(_) => 1,
+        }
+    }
     fn resource_id(&self) -> u32 {
         match self {
             Self::Internal(texture) => texture.resource_id,
@@ -1504,7 +1517,7 @@ impl Queue {
         let IrTexture::Internal(texture) = texture else {
             return Err(HandleError::InvalidParameter);
         };
-        if !mode.is_tracked() {
+        if !mode.is_tracked() && upload.mip_level == 0 {
             return context.upload_texture_bgra(
                 texture,
                 &upload.pixels,
@@ -1533,14 +1546,24 @@ impl Queue {
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
             || resources.context_handle != context.handle_id()
-            || !ir_rect_is_within(copy.source_rect, copy.source.width, copy.source.height)
+            || copy.source_mip >= copy.source.mip_levels
+            || copy.destination_mip >= copy.destination.mip_levels
+            || copy.source_mip >= 32
+            || copy.destination_mip >= 32
+            || copy.filter.is_none() && (copy.source_mip != 0 || copy.destination_mip != 0)
+            || !ir_rect_is_within(
+                copy.source_rect,
+                (copy.source.width >> copy.source_mip).max(1),
+                (copy.source.height >> copy.source_mip).max(1),
+            )
             || !ir_rect_is_within(
                 copy.destination_rect,
-                copy.destination.width,
-                copy.destination.height,
+                (copy.destination.width >> copy.destination_mip).max(1),
+                (copy.destination.height >> copy.destination_mip).max(1),
             )
-            || copy.source_rect.width != copy.destination_rect.width
-            || copy.source_rect.height != copy.destination_rect.height
+            || copy.filter.is_none()
+                && (copy.source_rect.width != copy.destination_rect.width
+                    || copy.source_rect.height != copy.destination_rect.height)
         {
             return Err(HandleError::InvalidParameter);
         }
@@ -1550,15 +1573,28 @@ impl Queue {
         let destination_id = destination.resource_id();
         let mut commands = Vec::new();
         commands
-            .try_reserve_exact(56)
+            .try_reserve_exact(88)
             .map_err(|_| HandleError::OutOfResources)?;
-        push_resource_copy(
-            &mut commands,
-            destination_id,
-            copy.destination_rect,
-            source_id,
-            copy.source_rect,
-        );
+        if let Some(filter) = copy.filter {
+            push_mip_blit(
+                &mut commands,
+                destination_id,
+                copy.destination_mip,
+                copy.destination_rect,
+                source_id,
+                copy.source_mip,
+                copy.source_rect,
+                filter,
+            );
+        } else {
+            push_resource_copy(
+                &mut commands,
+                destination_id,
+                copy.destination_rect,
+                source_id,
+                copy.source_rect,
+            );
+        }
         mode.submit(&self.raw, &commands)
     }
 
@@ -1711,10 +1747,11 @@ impl Queue {
             let texture = ir_texture(context, resources, IrTextureSpec { ..upload.texture })?;
             let view_is_pending = initialized_views.contains(&upload.texture.slot);
             if !texture.sampler_view_initialized() && !view_is_pending {
-                push_sampler_view(
+                push_sampler_mip_view(
                     &mut commands,
                     texture.sampler_view_handle(),
                     texture.resource_id(),
+                    texture.mip_levels(),
                 );
                 initialized_views.push(upload.texture.slot);
             }
@@ -1746,10 +1783,11 @@ impl Queue {
                     if !texture.sampler_view_initialized()
                         && !initialized_views.contains(&binding.texture.slot)
                     {
-                        push_sampler_view(
+                        push_sampler_mip_view(
                             &mut commands,
                             texture.sampler_view_handle(),
                             texture.resource_id(),
+                            texture.mip_levels(),
                         );
                         initialized_views.push(binding.texture.slot);
                     }
@@ -1766,10 +1804,11 @@ impl Queue {
                 let texture = ir_texture(context, resources, texture_spec)?;
                 let view_is_pending = initialized_views.contains(&texture_spec.slot);
                 if !texture.sampler_view_initialized() && !view_is_pending {
-                    push_sampler_view(
+                    push_sampler_mip_view(
                         &mut commands,
                         texture.sampler_view_handle(),
                         texture.resource_id(),
+                        texture.mip_levels(),
                     );
                     initialized_views.push(texture_spec.slot);
                 }
@@ -2273,6 +2312,7 @@ pub(crate) struct Texture {
     resource_id: u32,
     width: u32,
     height: u32,
+    mip_levels: u32,
     context_handle: i32,
     sampler_view_handle: u32,
     sampler_view_initialized: Cell<bool>,
@@ -2442,6 +2482,9 @@ fn ir_sampler_states_equal(left: IrSamplerState, right: IrSamplerState) -> bool 
     left.slot == right.slot
         && ir_filter_modes_equal(left.min_filter, right.min_filter)
         && ir_filter_modes_equal(left.mag_filter, right.mag_filter)
+        && ir_filter_modes_equal(left.mip_filter, right.mip_filter)
+        && left.min_lod.to_bits() == right.min_lod.to_bits()
+        && left.max_lod.to_bits() == right.max_lod.to_bits()
         && ir_address_modes_equal(left.address_u, right.address_u)
         && ir_address_modes_equal(left.address_v, right.address_v)
 }
@@ -2663,8 +2706,7 @@ fn validate_ir_draw(
         }
     }
     if draw.programmable.is_some() {
-        if draw.vertex_count == 0
-            || !draw.vertex_count.is_multiple_of(3)
+        if !super::driver::draw_count_valid(draw)
             || draw.pipeline.slot >= resources.pipelines.len()
             || !ir_rect_is_within(draw.scissor, target_width, target_height)
         {
@@ -3072,6 +3114,10 @@ fn push_legacy_bind_state(commands: &mut Vec<u8>, vertex_resource_id: u32) {
 }
 
 fn push_sampler_view(commands: &mut Vec<u8>, handle: u32, resource_id: u32) {
+    push_sampler_mip_view(commands, handle, resource_id, 1);
+}
+
+fn push_sampler_mip_view(commands: &mut Vec<u8>, handle: u32, resource_id: u32, mip_levels: u32) {
     push_dword(
         commands,
         command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6),
@@ -3080,7 +3126,7 @@ fn push_sampler_view(commands: &mut Vec<u8>, handle: u32, resource_id: u32) {
     push_dword(commands, resource_id);
     push_dword(commands, VIRGL_FORMAT_B8G8R8A8_UNORM);
     push_dword(commands, 0);
-    push_dword(commands, 0);
+    push_dword(commands, (mip_levels - 1) << 8); // first level 0, last level in bits 8..15
     push_dword(
         commands,
         PIPE_SWIZZLE_X | (PIPE_SWIZZLE_Y << 3) | (PIPE_SWIZZLE_Z << 6) | (PIPE_SWIZZLE_W << 9),
@@ -3118,6 +3164,46 @@ fn push_resource_copy(
     push_dword(commands, source.width);
     push_dword(commands, source.height);
     push_dword(commands, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_mip_blit(
+    commands: &mut Vec<u8>,
+    destination_resource: u32,
+    destination_level: u32,
+    destination: crate::driver::IrRect,
+    source_resource: u32,
+    source_level: u32,
+    source: crate::driver::IrRect,
+    filter: IrFilterMode,
+) {
+    push_dword(commands, command_header(VIRGL_CCMD_BLIT, 0, 21));
+    // PIPE_MASK_RGBA (not PIPE_CLEAR_COLOR0), image filter, no scissor.
+    push_dword(commands, 0xf | (ir_filter_mode(filter) << 8));
+    push_dword(commands, 0);
+    push_dword(commands, 0);
+    for word in [
+        destination_resource,
+        destination_level,
+        VIRGL_FORMAT_B8G8R8A8_UNORM,
+        destination.x,
+        destination.y,
+        0,
+        destination.width,
+        destination.height,
+        1,
+        source_resource,
+        source_level,
+        VIRGL_FORMAT_B8G8R8A8_UNORM,
+        source.x,
+        source.y,
+        0,
+        source.width,
+        source.height,
+        1,
+    ] {
+        push_dword(commands, word);
+    }
 }
 
 fn push_sampler_state_binding(commands: &mut Vec<u8>, handle: u32) {
@@ -3454,15 +3540,23 @@ fn push_programmable_draw(
             binding.format.byte_size() as u32,
             binding.offset,
         );
-        push_draw_parameters(
+        push_draw_topology_parameters(
             commands,
             draw.start_vertex,
             draw.vertex_count,
             true,
             binding.base_vertex,
+            programmable.pipeline.topology,
         )
     } else {
-        push_draw(commands, draw.start_vertex, draw.vertex_count)
+        push_draw_topology_parameters(
+            commands,
+            draw.start_vertex,
+            draw.vertex_count,
+            false,
+            0,
+            programmable.pipeline.topology,
+        )
     }
 }
 
@@ -3545,12 +3639,12 @@ fn push_ir_sampler(commands: &mut Vec<u8>, sampler: &IrSampler) {
             | (ir_address_mode(state.address_v) << 3)
             | (PIPE_TEX_WRAP_CLAMP_TO_EDGE << 6)
             | (ir_filter_mode(state.min_filter) << 9)
-            | (PIPE_TEX_MIPFILTER_NONE << 11)
+            | (ir_filter_mode(state.mip_filter) << 11)
             | (ir_filter_mode(state.mag_filter) << 13),
     );
     push_float(commands, 0.0);
-    push_float(commands, 0.0);
-    push_float(commands, 0.0);
+    push_float(commands, state.min_lod);
+    push_float(commands, state.max_lod);
     for _ in 0..4 {
         push_dword(commands, 0);
     }
@@ -3836,7 +3930,13 @@ fn submit_ir_texture_inline_write(
         .checked_mul(rect.height as usize)
         .ok_or(HandleError::InvalidParameter)?;
     if resource_id == 0
-        || !ir_rect_is_within(rect, upload.texture.width, upload.texture.height)
+        || upload.mip_level >= upload.texture.mip_levels
+        || upload.mip_level >= 32
+        || !ir_rect_is_within(
+            rect,
+            (upload.texture.width >> upload.mip_level).max(1),
+            (upload.texture.height >> upload.mip_level).max(1),
+        )
         || upload.texture.format == IrTextureFormat::Depth32Float
         || upload.pixels.len() != byte_len
     {
@@ -3876,7 +3976,7 @@ fn submit_ir_texture_inline_write(
                 ),
             );
             push_dword(&mut commands, resource_id);
-            push_dword(&mut commands, 0); // mip level
+            push_dword(&mut commands, upload.mip_level);
             push_dword(&mut commands, 0); // unused transfer usage; not a synchronization flag
             push_dword(&mut commands, stride);
             push_dword(&mut commands, length as u32); // layer stride
@@ -4070,15 +4170,39 @@ fn push_draw_parameters(
     indexed: bool,
     base_vertex: i32,
 ) -> HandleResult<()> {
+    push_draw_topology_parameters(
+        commands,
+        start_vertex,
+        vertex_count,
+        indexed,
+        base_vertex,
+        crate::ir::PrimitiveTopology::TriangleList,
+    )
+}
+
+fn push_draw_topology_parameters(
+    commands: &mut Vec<u8>,
+    start_vertex: usize,
+    vertex_count: usize,
+    indexed: bool,
+    base_vertex: i32,
+    topology: crate::ir::PrimitiveTopology,
+) -> HandleResult<()> {
     let start_vertex = u32::try_from(start_vertex).map_err(|_| HandleError::InvalidParameter)?;
     let vertex_count = u32::try_from(vertex_count).map_err(|_| HandleError::InvalidParameter)?;
-    if vertex_count == 0 || vertex_count % 3 != 0 {
-        return Err(HandleError::InvalidParameter);
-    }
+    let primitive = match topology {
+        crate::ir::PrimitiveTopology::TriangleList if vertex_count > 0 && vertex_count % 3 == 0 => {
+            PIPE_PRIM_TRIANGLES
+        }
+        crate::ir::PrimitiveTopology::TriangleStrip if vertex_count >= 3 => {
+            PIPE_PRIM_TRIANGLE_STRIP
+        }
+        _ => return Err(HandleError::InvalidParameter),
+    };
     push_dword(commands, command_header(VIRGL_CCMD_DRAW_VBO, 0, 12));
     push_dword(commands, start_vertex);
     push_dword(commands, vertex_count);
-    push_dword(commands, PIPE_PRIM_TRIANGLES);
+    push_dword(commands, primitive);
     push_dword(commands, u32::from(indexed));
     push_dword(commands, 1);
     push_dword(commands, base_vertex as u32);
@@ -4232,6 +4356,130 @@ mod tests {
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte command word")))
             .collect()
+    }
+
+    #[test]
+    fn mip_blit_preserves_levels_extents_and_color_mask() {
+        let mut commands = Vec::new();
+        let rect = |width, height| crate::driver::IrRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        push_mip_blit(
+            &mut commands,
+            7,
+            2,
+            rect(3, 1),
+            7,
+            1,
+            rect(7, 3),
+            IrFilterMode::Linear,
+        );
+        let words = dwords(&commands);
+        assert_eq!(
+            words,
+            [
+                command_header(VIRGL_CCMD_BLIT, 0, 21),
+                0x10f,
+                0,
+                0,
+                7,
+                2,
+                VIRGL_FORMAT_B8G8R8A8_UNORM,
+                0,
+                0,
+                0,
+                3,
+                1,
+                1,
+                7,
+                1,
+                VIRGL_FORMAT_B8G8R8A8_UNORM,
+                0,
+                0,
+                0,
+                7,
+                3,
+                1
+            ]
+        );
+        commands.clear();
+        push_sampler_mip_view(&mut commands, 9, 7, 4);
+        assert_eq!(dwords(&commands)[5], 3 << 8);
+    }
+
+    #[test]
+    fn triangle_strip_draw_preserves_index_range_and_base_vertex() {
+        let mut commands = Vec::new();
+        push_draw_topology_parameters(
+            &mut commands,
+            2,
+            7,
+            true,
+            -3,
+            crate::ir::PrimitiveTopology::TriangleStrip,
+        )
+        .unwrap();
+        let words = dwords(&commands);
+        assert_eq!(
+            &words[1..7],
+            &[2, 7, PIPE_PRIM_TRIANGLE_STRIP, 1, 1, (-3i32) as u32]
+        );
+        commands.clear();
+        assert_eq!(
+            push_draw_topology_parameters(
+                &mut commands,
+                0,
+                2,
+                false,
+                0,
+                crate::ir::PrimitiveTopology::TriangleStrip
+            ),
+            Err(HandleError::InvalidParameter)
+        );
+        assert!(commands.is_empty());
+        assert_eq!(
+            push_draw(&mut commands, 0, 7),
+            Err(HandleError::InvalidParameter)
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn mip_upload_uses_real_subresource_and_rejects_base_extent() {
+        let mut upload = texture_upload(1, 1);
+        upload.texture.width = 7;
+        upload.texture.height = 3;
+        upload.texture.mip_levels = 3;
+        upload.mip_level = 1;
+        upload.destination = crate::driver::IrRect {
+            x: 2,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let mut submitted = 0;
+        submit_ir_texture_inline_write(7, &upload, 64, |packet| {
+            let words = dwords(packet);
+            assert_eq!(words[2], 1);
+            assert_eq!(&words[6..11], &[2, 0, 0, 1, 1]);
+            submitted += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(submitted, 1);
+        upload.destination.x = 3; // Inside level zero, outside the 3x1 mip.
+        assert_eq!(
+            submit_ir_texture_inline_write(7, &upload, 64, |_| panic!("invalid upload submitted")),
+            Err(HandleError::InvalidParameter)
+        );
+        upload.mip_level = 3;
+        assert_eq!(
+            submit_ir_texture_inline_write(7, &upload, 64, |_| panic!("unallocated mip submitted")),
+            Err(HandleError::InvalidParameter)
+        );
     }
 
     #[test]
@@ -4541,12 +4789,14 @@ mod tests {
                 slot: 0,
                 width: width + 3,
                 height: height + 5,
+                mip_levels: 1,
                 sampled: true,
                 render_attachment: false,
                 copy_destination: true,
                 present: false,
                 format: IrTextureFormat::Bgra8,
             },
+            mip_level: 0,
             destination: crate::driver::IrRect {
                 x: 3,
                 y: 5,

@@ -99,6 +99,8 @@ impl fmt::Display for Error {
 /// Logical SGFX features that are not yet represented by this backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedFeature {
+    /// Shareable presentation images are unavailable on this WGPU platform.
+    PresentationPlatform,
     /// Reserved for compatibility; ordered uploads are now supported.
     LateUpload,
     /// A buffer upload offset or byte length is not a multiple of WGPU's

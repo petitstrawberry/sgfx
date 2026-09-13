@@ -10,6 +10,9 @@ name = "vulkan_sgfx"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = ["backend-wgpu"]
+backend-wgpu = ["sgfx/backend-wgpu"]
+scarlet-wsi = ["sgfx/scarlet-native-api"]
 cube-demo = ["dep:png", "dep:framebuffer", "naga/wgsl-in"]
 
 [[bin]]
@@ -20,14 +23,14 @@ required-features = ["cube-demo"]
 [dependencies]
 naga = { version = "24", features = ["spv-in", "spv-out"] }
 ash = { version = "0.38", default-features = false, features = ["debug", "std"] }
+sgfx = { path = "../sgfx", default-features = false, features = ["std"] }
 png = { version = "0.18", optional = true }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
-sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-wgpu"] }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "85f0cead4cb4c9add021360f1b469f08bf0d23a9", default-features = false, features = ["std"], optional = true }
+framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4b5257897e341a0d0d3136b37d47b0157b9985cd", default-features = false, features = ["std"], optional = true }
 sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-scarlet-virgl"] }
 
 [dev-dependencies]

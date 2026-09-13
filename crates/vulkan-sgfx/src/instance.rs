@@ -77,7 +77,7 @@ pub(crate) fn instance_valid(instance: vk::Instance) -> bool {
         .contains_key(&(instance.as_raw() as usize))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
 pub(crate) fn physical_instance(physical: vk::PhysicalDevice) -> Option<usize> {
     instances()
         .physical_owners
@@ -129,11 +129,15 @@ pub unsafe extern "system" fn vk_icdGetPhysicalDeviceProcAddr(
     if name.is_null() || !instance_valid(instance) {
         return None;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
     {
-        crate::wsi::lookup_physical(unsafe { CStr::from_ptr(name) })
+        let name = unsafe { CStr::from_ptr(name) };
+        let function = crate::wsi::lookup_physical(name);
+        #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+        let function = function.or_else(|| crate::display::lookup(name));
+        function
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi"))))]
     None
 }
 
@@ -235,31 +239,37 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             crate::wsi::create_macos_surface,
             vk::PFN_vkCreateMacOSSurfaceMVK
         ),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkDestroySurfaceKHR" => {
             procedure!(crate::wsi::destroy_surface, vk::PFN_vkDestroySurfaceKHR)
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkGetPhysicalDeviceSurfaceSupportKHR" => procedure!(
             crate::wsi::get_physical_device_surface_support,
             vk::PFN_vkGetPhysicalDeviceSurfaceSupportKHR
         ),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" => procedure!(
             crate::wsi::get_physical_device_surface_capabilities,
             vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR
         ),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkGetPhysicalDeviceSurfaceFormatsKHR" => procedure!(
             crate::wsi::get_physical_device_surface_formats,
             vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR
         ),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
         b"vkGetPhysicalDeviceSurfacePresentModesKHR" => procedure!(
             crate::wsi::get_physical_device_surface_present_modes,
             vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
         ),
-        _ => crate::api::lookup_device(name),
+        _ => {
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            if let Some(function) = crate::display::lookup(name) {
+                return Some(function);
+            }
+            crate::api::lookup_device(name)
+        }
     }
 }
 
@@ -353,7 +363,7 @@ pub(crate) unsafe extern "system" fn destroy_instance(
             registry.physical_owners.remove(&physical.id());
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
     crate::wsi::destroy_instance_surfaces(instance);
 }
 
@@ -409,12 +419,19 @@ fn instance_extensions() -> &'static [(&'static CStr, u32)] {
             ),
         ]
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    {
+        &[
+            (vk::KHR_SURFACE_NAME, vk::KHR_SURFACE_SPEC_VERSION),
+            (vk::KHR_DISPLAY_NAME, vk::KHR_DISPLAY_SPEC_VERSION),
+        ]
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi"))))]
     &[]
 }
 
 fn device_extensions() -> &'static [(&'static CStr, u32)] {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
     {
         &[(vk::KHR_SWAPCHAIN_NAME, vk::KHR_SWAPCHAIN_SPEC_VERSION)]
     }
@@ -422,7 +439,11 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
     {
         &[(crate::scarlet_image::DEVICE_EXTENSION_NAME, 1)]
     }
-    #[cfg(not(any(target_os = "macos", target_os = "scarlet")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    )))]
     &[]
 }
 
@@ -959,10 +980,29 @@ mod tests {
                     "{name:?}"
                 );
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
             assert!(get_instance_proc_addr(instance, c"vkCreateSwapchainKHR".as_ptr()).is_some());
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(
+                target_os = "macos",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            )))]
             assert!(get_instance_proc_addr(instance, c"vkCreateSwapchainKHR".as_ptr()).is_none());
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            for name in [
+                c"vkGetPhysicalDeviceDisplayPropertiesKHR",
+                c"vkGetPhysicalDeviceDisplayPlanePropertiesKHR",
+                c"vkGetDisplayPlaneSupportedDisplaysKHR",
+                c"vkGetDisplayModePropertiesKHR",
+                c"vkCreateDisplayModeKHR",
+                c"vkGetDisplayPlaneCapabilitiesKHR",
+                c"vkCreateDisplayPlaneSurfaceKHR",
+            ] {
+                assert!(get_instance_proc_addr(vk::Instance::null(), name.as_ptr()).is_none());
+                assert!(
+                    get_instance_proc_addr(instance, name.as_ptr()).is_some(),
+                    "{name:?}"
+                );
+            }
             assert!(
                 get_instance_proc_addr(instance, c"vkGetPhysicalDeviceFeatures2".as_ptr())
                     .is_none()

@@ -6,6 +6,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod api;
+#[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+mod display;
 mod images;
 mod instance;
 mod push_constants;
@@ -15,7 +17,7 @@ mod runtime;
 pub mod scarlet_image;
 mod spirv;
 mod transfer;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
 mod wsi;
 
 /// Construct a Vulkan entry table for the ICD linked into this executable.

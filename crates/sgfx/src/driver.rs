@@ -211,7 +211,13 @@ impl Adapter {
         match &self.backend {
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
             AdapterBackend::Wgpu(adapter) => create_wgpu_device(adapter),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             AdapterBackend::ScarletVirgl(adapter) => create_virgl_device(adapter),
         }
     }
@@ -221,7 +227,13 @@ impl Adapter {
 enum AdapterBackend {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     Wgpu(WgpuAdapter),
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     ScarletVirgl(ScarletAdapter),
 }
 
@@ -253,7 +265,13 @@ impl Instance {
         ) {
             adapters.extend(discover_wgpu_adapters());
         }
-        #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+        #[cfg(all(
+            any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-native-api")
+            ),
+            feature = "backend-scarlet-virgl"
+        ))]
         if matches!(
             preference,
             BackendPreference::Auto | BackendPreference::ScarletVirgl
@@ -291,7 +309,13 @@ pub struct Device {
 enum DeviceBackend {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     Wgpu(WgpuDevice),
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     ScarletVirgl(Rc<sgfx_backend_scarlet_virgl::Context>),
 }
 
@@ -311,7 +335,13 @@ impl Device {
                 device_id: self.id,
                 backend: ResourcesBackend::Wgpu(device.context.create_resources(table)),
             }),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             DeviceBackend::ScarletVirgl(context) => context
                 .create_ir_resources(table)
                 .map(|resources| Resources {
@@ -330,7 +360,13 @@ impl Device {
                 device_id: self.id,
                 backend: QueueBackend::Wgpu(device.context.create_queue()),
             }),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             DeviceBackend::ScarletVirgl(context) => context
                 .create_queue()
                 .map(|queue| Queue {
@@ -347,7 +383,13 @@ impl Device {
     /// Create a presentable image on this device.
     #[cfg(any(
         all(target_os = "macos", feature = "backend-wgpu"),
-        all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+        all(
+            any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-native-api")
+            ),
+            feature = "backend-scarlet-virgl"
+        )
     ))]
     pub fn create_presentation_image(
         &self,
@@ -356,6 +398,13 @@ impl Device {
         format: ir::TextureFormat,
     ) -> Result<PresentationImage> {
         match &self.backend {
+            #[cfg(all(
+                not(any(target_os = "macos", target_os = "scarlet")),
+                feature = "backend-wgpu"
+            ))]
+            DeviceBackend::Wgpu(_) => Err(Error::Wgpu(sgfx_backend_wgpu::Error::Unsupported(
+                sgfx_backend_wgpu::UnsupportedFeature::PresentationPlatform,
+            ))),
             #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
             DeviceBackend::Wgpu(device) => device
                 .context
@@ -365,7 +414,13 @@ impl Device {
                     backend: PresentationImageBackend::Wgpu(image),
                 })
                 .map_err(Error::Wgpu),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             DeviceBackend::ScarletVirgl(context) => {
                 if format != ir::TextureFormat::Bgra8Unorm {
                     return Err(Error::ScarletBackendUnsupported);
@@ -418,7 +473,13 @@ impl Device {
 /// Device-local image used by a platform presentation context.
 #[cfg(any(
     all(target_os = "macos", feature = "backend-wgpu"),
-    all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+    all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    )
 ))]
 pub struct PresentationImage {
     device_id: usize,
@@ -427,25 +488,49 @@ pub struct PresentationImage {
 
 #[cfg(any(
     all(target_os = "macos", feature = "backend-wgpu"),
-    all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+    all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    )
 ))]
 enum PresentationImageBackend {
     #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
     Wgpu(alloc::sync::Arc<sgfx_backend_wgpu::Image>),
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     ScarletVirgl(Rc<sgfx_backend_scarlet_virgl::Image>),
 }
 
 #[cfg(any(
     all(target_os = "macos", feature = "backend-wgpu"),
-    all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+    all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    )
 ))]
 impl PresentationImage {
     pub fn width(&self) -> u32 {
         match &self.backend {
             #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
             PresentationImageBackend::Wgpu(image) => image.width(),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             PresentationImageBackend::ScarletVirgl(image) => image.width(),
         }
     }
@@ -454,7 +539,13 @@ impl PresentationImage {
         match &self.backend {
             #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
             PresentationImageBackend::Wgpu(image) => image.height(),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             PresentationImageBackend::ScarletVirgl(image) => image.height(),
         }
     }
@@ -463,13 +554,25 @@ impl PresentationImage {
         match &self.backend {
             #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
             PresentationImageBackend::Wgpu(image) => image.format(),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             PresentationImageBackend::ScarletVirgl(_) => ir::TextureFormat::Bgra8Unorm,
         }
     }
 
     /// Duplicate the Scarlet GPU image capability for another context or process.
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     pub fn duplicate_shared_handle(&self) -> Result<crate::Handle> {
         let PresentationImageBackend::ScarletVirgl(image) = &self.backend;
         image
@@ -514,7 +617,13 @@ pub struct Resources {
 enum ResourcesBackend {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     Wgpu(sgfx_backend_wgpu::Resources),
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     ScarletVirgl(sgfx_backend_scarlet_virgl::IrResources),
 }
 
@@ -522,7 +631,13 @@ impl Resources {
     /// Map a logical render target to a device-local shareable image.
     #[cfg(any(
         all(target_os = "macos", feature = "backend-wgpu"),
-        all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+        all(
+            any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-native-api")
+            ),
+            feature = "backend-scarlet-virgl"
+        )
     ))]
     pub fn map_presentation_image(
         &mut self,
@@ -533,11 +648,22 @@ impl Resources {
             return Err(Error::ResourceDeviceMismatch);
         }
         match (&mut self.backend, &image.backend) {
+            #[cfg(all(
+                not(any(target_os = "macos", target_os = "scarlet")),
+                feature = "backend-wgpu"
+            ))]
+            (ResourcesBackend::Wgpu(_), _) => Err(Error::ResourceDeviceMismatch),
             #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
             (ResourcesBackend::Wgpu(resources), PresentationImageBackend::Wgpu(image)) => resources
                 .map_image(texture, alloc::sync::Arc::clone(image))
                 .map_err(Error::Wgpu),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             (
                 ResourcesBackend::ScarletVirgl(resources),
                 PresentationImageBackend::ScarletVirgl(image),
@@ -550,13 +676,30 @@ impl Resources {
     /// Remove a logical PRESENT texture mapping.
     #[cfg(any(
         all(target_os = "macos", feature = "backend-wgpu"),
-        all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+        all(
+            any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-native-api")
+            ),
+            feature = "backend-scarlet-virgl"
+        )
     ))]
     pub fn unmap_presentation_image(&mut self, texture: ir::TextureId) {
         match &mut self.backend {
+            #[cfg(all(
+                not(any(target_os = "macos", target_os = "scarlet")),
+                feature = "backend-wgpu"
+            ))]
+            ResourcesBackend::Wgpu(_) => {}
             #[cfg(all(target_os = "macos", feature = "backend-wgpu"))]
             ResourcesBackend::Wgpu(resources) => resources.unmap_image(texture),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 let _ = resources.unmap_image(texture);
             }
@@ -569,7 +712,13 @@ impl Resources {
             ResourcesBackend::Wgpu(resources) => {
                 resources.validate_shader_module(id).map_err(Error::Wgpu)
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             ResourcesBackend::ScarletVirgl(resources) => resources
                 .validate_shader_module(id)
                 .map_err(Error::ScarletVirglIr),
@@ -585,7 +734,13 @@ impl Resources {
             ResourcesBackend::Wgpu(resources) => resources
                 .validate_programmable_render_pipeline(id)
                 .map_err(Error::Wgpu),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             ResourcesBackend::ScarletVirgl(resources) => resources
                 .validate_programmable_render_pipeline(id)
                 .map_err(Error::ScarletVirglIr),
@@ -598,7 +753,13 @@ impl Resources {
             ResourcesBackend::Wgpu(resources) => {
                 resources.validate_compute_pipeline(id).map_err(Error::Wgpu)
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             ResourcesBackend::ScarletVirgl(resources) => resources
                 .validate_compute_pipeline(id)
                 .map_err(Error::ScarletVirglIr),
@@ -612,7 +773,13 @@ impl Resources {
             ResourcesBackend::Wgpu(resources) => {
                 resources.read_buffer(id, offset, size).map_err(Error::Wgpu)
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             ResourcesBackend::ScarletVirgl(resources) => resources
                 .read_buffer(id, offset, size)
                 .map_err(Error::ScarletVirglIr),
@@ -629,7 +796,13 @@ pub struct Queue {
 enum QueueBackend {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     Wgpu(sgfx_backend_wgpu::Queue),
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     ScarletVirgl {
         queue: sgfx_backend_scarlet_virgl::Queue,
         context: Rc<sgfx_backend_scarlet_virgl::Context>,
@@ -659,7 +832,13 @@ impl Queue {
                         backend: SubmissionBackend::Wgpu(receipt),
                     })
                 }),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             (
                 QueueBackend::ScarletVirgl { queue, context },
                 ResourcesBackend::ScarletVirgl(resources),
@@ -698,7 +877,13 @@ impl Queue {
             (QueueBackend::Wgpu(_), ResourcesBackend::Wgpu(resources)) => resources
                 .read_texture_mip(id, mip_level)
                 .map_err(Error::Wgpu),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             (
                 QueueBackend::ScarletVirgl { context, .. },
                 ResourcesBackend::ScarletVirgl(resources),
@@ -729,7 +914,13 @@ pub struct Submission {
 enum SubmissionBackend {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     Wgpu(sgfx_backend_wgpu::Submission),
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     ScarletVirgl(sgfx_backend_scarlet_virgl::Submission),
 }
 
@@ -738,7 +929,13 @@ impl fmt::Debug for Submission {
         match &self.backend {
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
             SubmissionBackend::Wgpu(receipt) => receipt.fmt(formatter),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             SubmissionBackend::ScarletVirgl(receipt) => receipt.fmt(formatter),
         }
     }
@@ -751,7 +948,13 @@ impl Completion for Submission {
         match &self.backend {
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
             SubmissionBackend::Wgpu(receipt) => receipt.poll().map_err(Error::Wgpu),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             SubmissionBackend::ScarletVirgl(receipt) => {
                 receipt.poll().map_err(Error::ScarletVirglIr)
             }
@@ -762,7 +965,13 @@ impl Completion for Submission {
         match &self.backend {
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
             SubmissionBackend::Wgpu(receipt) => receipt.wait(timeout).map_err(Error::Wgpu),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             SubmissionBackend::ScarletVirgl(receipt) => {
                 receipt.wait(timeout).map_err(Error::ScarletVirglIr)
             }
@@ -925,14 +1134,26 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
     })
 }
 
-#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+#[cfg(all(
+    any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-native-api")
+    ),
+    feature = "backend-scarlet-virgl"
+))]
 #[derive(Clone)]
 struct ScarletAdapter {
     path: String,
     backend_id: Vec<u8>,
 }
 
-#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+#[cfg(all(
+    any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-native-api")
+    ),
+    feature = "backend-scarlet-virgl"
+))]
 fn discover_virgl_adapters() -> Vec<Adapter> {
     use alloc::format;
     use gpu_raw::Gpu;
@@ -972,11 +1193,19 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                 bgra8_color_attachment: true,
                 depth32_attachment: capabilities.supports_depth(),
                 image_readback: capabilities.supports_image_readback(),
-                image_blits: false,
+                image_blits: capabilities.supports_image_mips(),
                 limits: Limits {
-                    max_push_constants_size: 0,
+                    max_push_constants_size: if capabilities.supports_programmable_graphics() {
+                        128
+                    } else {
+                        0
+                    },
                     max_image_dimension_2d: 2048,
-                    max_image_mip_levels: 1,
+                    max_image_mip_levels: if capabilities.supports_image_mips() {
+                        12
+                    } else {
+                        1
+                    },
                     max_uniform_buffer_range: 16 * 1024,
                     max_storage_buffer_range: 0,
                     max_bound_descriptor_sets: 4,
@@ -1005,7 +1234,13 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
     adapters
 }
 
-#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+#[cfg(all(
+    any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-native-api")
+    ),
+    feature = "backend-scarlet-virgl"
+))]
 fn create_virgl_device(adapter: &ScarletAdapter) -> Result<Device> {
     use gpu_raw::Gpu;
 

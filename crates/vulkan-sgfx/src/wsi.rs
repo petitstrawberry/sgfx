@@ -1,12 +1,15 @@
-//! macOS Vulkan WSI backed by the selected SGFX WGPU device.
+//! Vulkan WSI backed by the selected SGFX presentation device.
 
 use ash::vk::{self, Handle};
 use sgfx::ir;
 use std::{
     collections::HashMap,
-    ffi::{CStr, c_void},
+    ffi::CStr,
     sync::{Mutex, MutexGuard, OnceLock},
 };
+
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 
 use crate::api::{next_id, signal_acquire_sync, wait_queue_semaphores, with_device, with_queue};
 
@@ -14,12 +17,14 @@ const INVALID: vk::Result = vk::Result::ERROR_INITIALIZATION_FAILED;
 const UNSUPPORTED: vk::Result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
 const MAX_SWAPCHAIN_IMAGES: u32 = 8;
 
+#[cfg(target_os = "macos")]
 #[link(name = "objc")]
 unsafe extern "C" {
     fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
     fn objc_msgSend(receiver: *mut c_void, selector: *mut c_void) -> *mut c_void;
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) unsafe extern "system" fn create_macos_surface(
     instance: vk::Instance,
     info: *const vk::MacOSSurfaceCreateInfoMVK<'_>,
@@ -54,7 +59,10 @@ pub(crate) unsafe extern "system" fn create_macos_surface(
 #[derive(Clone, Copy)]
 struct Surface {
     instance: usize,
+    #[cfg(target_os = "macos")]
     layer: usize,
+    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    extent: vk::Extent2D,
 }
 
 fn surfaces() -> MutexGuard<'static, HashMap<vk::SurfaceKHR, Surface>> {
@@ -81,6 +89,7 @@ pub(crate) fn destroy_instance_surfaces(instance: vk::Instance) {
     surfaces().retain(|_, surface| surface.instance != instance);
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) unsafe extern "system" fn create_metal_surface(
     instance: vk::Instance,
     info: *const vk::MetalSurfaceCreateInfoEXT<'_>,
@@ -161,10 +170,11 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_capabilities(
     if surface_for_physical(physical, surface).is_err() {
         return INVALID;
     }
-    let Some(adapter) = crate::instance::physical_adapter(physical) else {
+    let Some(_adapter) = crate::instance::physical_adapter(physical) else {
         return INVALID;
     };
-    let maximum = adapter
+    #[cfg(target_os = "macos")]
+    let maximum = _adapter
         .capabilities()
         .limits()
         .max_image_dimension_2d
@@ -173,14 +183,23 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_capabilities(
         *output = vk::SurfaceCapabilitiesKHR {
             min_image_count: 2,
             max_image_count: MAX_SWAPCHAIN_IMAGES,
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            current_extent: surface_for_physical(physical, surface).unwrap().extent,
+            #[cfg(target_os = "macos")]
             current_extent: vk::Extent2D {
                 width: u32::MAX,
                 height: u32::MAX,
             },
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            min_image_extent: surface_for_physical(physical, surface).unwrap().extent,
+            #[cfg(target_os = "macos")]
             min_image_extent: vk::Extent2D {
                 width: 1,
                 height: 1,
             },
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            max_image_extent: surface_for_physical(physical, surface).unwrap().extent,
+            #[cfg(target_os = "macos")]
             max_image_extent: vk::Extent2D {
                 width: maximum,
                 height: maximum,
@@ -197,7 +216,11 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_capabilities(
     vk::Result::SUCCESS
 }
 
-unsafe fn enumerate<T: Copy>(values: &[T], count: *mut u32, output: *mut T) -> vk::Result {
+pub(crate) unsafe fn enumerate<T: Copy>(
+    values: &[T],
+    count: *mut u32,
+    output: *mut T,
+) -> vk::Result {
     if count.is_null() {
         return INVALID;
     }
@@ -241,6 +264,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_formats(
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         });
     }
+    #[cfg(target_os = "macos")]
     if capabilities.supports_rgba8_color_attachment() {
         formats.push(vk::SurfaceFormatKHR {
             format: vk::Format::R8G8B8A8_UNORM,
@@ -273,7 +297,10 @@ pub(crate) struct Swapchain {
     physical_images: Vec<sgfx::driver::PresentationImage>,
     acquired: Vec<bool>,
     next_image: usize,
+    #[cfg(target_os = "macos")]
     window: sgfx::driver::WindowContext,
+    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    window: crate::display::Window,
 }
 
 fn swapchain_usage(usage: vk::ImageUsageFlags) -> ir::TextureUsage {
@@ -338,6 +365,10 @@ pub(crate) unsafe extern "system" fn create_swapchain(
     {
         return UNSUPPORTED;
     }
+    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    if info.image_extent != surface.extent || info.image_format != vk::Format::B8G8R8A8_UNORM {
+        return vk::Result::ERROR_OUT_OF_DATE_KHR;
+    }
     let image_count = info.min_image_count;
     let format = info.image_format;
     let extent = info.image_extent;
@@ -357,6 +388,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
         }
         let ir_format = crate::images::texture_format(format).ok_or(UNSUPPORTED)?;
+        #[cfg(target_os = "macos")]
         // SAFETY: the Vulkan surface contract keeps the CAMetalLayer alive.
         let window = unsafe {
             runtime.device.create_metal_window_context(
@@ -367,6 +399,8 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             )
         }
         .map_err(crate::runtime::backend_failure)?;
+        #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+        let mut window = crate::display::Window::new(extent)?;
         let size = ir::Extent2D::new(extent.width, extent.height).map_err(|_| INVALID)?;
         let mut images = Vec::with_capacity(image_count as usize);
         let mut physical_images = Vec::with_capacity(image_count as usize);
@@ -412,9 +446,13 @@ pub(crate) unsafe extern "system" fn create_swapchain(
                     usage: image_usage,
                     bound: None,
                     swapchain: Some(swapchain),
+                    #[cfg(target_os = "scarlet")]
+                    shared: None,
                 },
             );
             images.push(image);
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            window.register(&physical)?;
             physical_images.push(physical);
         }
         runtime.resources.swapchains.insert(
@@ -494,28 +532,58 @@ pub(crate) unsafe extern "system" fn acquire_next_image(
         return INVALID;
     }
     unsafe { *output = u32::MAX };
-    let index = match with_device(device, move |runtime| {
-        let swapchain = runtime
-            .resources
-            .swapchains
-            .get_mut(&swapchain)
-            .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
-        for offset in 0..swapchain.images.len() {
-            let index = (swapchain.next_image + offset) % swapchain.images.len();
-            if !swapchain.acquired[index] {
-                swapchain.acquired[index] = true;
-                swapchain.next_image = (index + 1) % swapchain.images.len();
-                return Ok(index as u32);
+    let started = std::time::Instant::now();
+    let index = loop {
+        let result = with_device(device, move |runtime| {
+            let swapchain = runtime
+                .resources
+                .swapchains
+                .get_mut(&swapchain)
+                .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            swapchain.window.dispatch()?;
+            for offset in 0..swapchain.images.len() {
+                let index = (swapchain.next_image + offset) % swapchain.images.len();
+                if !swapchain.acquired[index] && {
+                    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+                    {
+                        swapchain.window.available(index)
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        true
+                    }
+                } {
+                    swapchain.acquired[index] = true;
+                    swapchain.next_image = (index + 1) % swapchain.images.len();
+                    return Ok(index as u32);
+                }
             }
+            Err(vk::Result::NOT_READY)
+        });
+        match result {
+            Ok(index) => break index,
+            Err(vk::Result::NOT_READY) => {
+                if timeout == 0 {
+                    return vk::Result::NOT_READY;
+                }
+                let delay = if timeout == u64::MAX {
+                    std::time::Duration::from_millis(1)
+                } else {
+                    let elapsed = started.elapsed().as_nanos();
+                    if elapsed >= u128::from(timeout) {
+                        return vk::Result::TIMEOUT;
+                    }
+                    std::time::Duration::from_nanos(
+                        (u128::from(timeout) - elapsed).min(1_000_000) as u64
+                    )
+                };
+                // Keep the driver worker available to present and complete
+                // submissions while waiting for a compositor release.
+                std::thread::sleep(delay);
+            }
+            Err(error) => return error,
         }
-        Err(if timeout == 0 {
-            vk::Result::NOT_READY
-        } else {
-            vk::Result::TIMEOUT
-        })
-    }) {
-        Ok(index) => index,
-        Err(error) => return error,
     };
     if let Err(error) = signal_acquire_sync(device, semaphore, fence) {
         let _ = with_device(device, move |runtime| {
@@ -562,6 +630,13 @@ pub(crate) unsafe extern "system" fn queue_present(
     if let Err(error) = wait_queue_semaphores(queue, &waits) {
         return error;
     }
+    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    {
+        let result = unsafe { crate::api::queue_wait_idle(queue) };
+        if result != vk::Result::SUCCESS {
+            return result;
+        }
+    }
     let presented = with_queue(queue, move |runtime| {
         let mut results = Vec::with_capacity(swapchains.len());
         for (&handle, &index) in swapchains.iter().zip(&indices) {
@@ -586,10 +661,13 @@ pub(crate) unsafe extern "system" fn queue_present(
                         height: swapchain.physical_images[index].height(),
                     }
                 );
+                #[cfg(target_os = "macos")]
                 let result = swapchain
                     .window
                     .present(&swapchain.physical_images[index])
                     .map_err(present_error);
+                #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+                let result = swapchain.window.present(index);
                 if result.is_ok() {
                     swapchain.acquired[index] = false;
                 }
@@ -614,6 +692,7 @@ pub(crate) unsafe extern "system" fn queue_present(
         .unwrap_or(vk::Result::SUCCESS)
 }
 
+#[cfg(target_os = "macos")]
 fn present_error(error: sgfx::Error) -> vk::Result {
     match crate::runtime::backend_failure(error) {
         vk::Result::ERROR_OUT_OF_HOST_MEMORY => vk::Result::ERROR_OUT_OF_HOST_MEMORY,
@@ -653,7 +732,7 @@ pub(crate) fn lookup_physical(name: &CStr) -> vk::PFN_vkVoidFunction {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
@@ -741,4 +820,20 @@ mod tests {
             crate::instance::destroy_instance(instance, std::ptr::null());
         }
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+pub(crate) fn insert_display_surface(
+    instance: vk::Instance,
+    extent: vk::Extent2D,
+) -> vk::SurfaceKHR {
+    let handle = vk::SurfaceKHR::from_raw(next_id());
+    surfaces().insert(
+        handle,
+        Surface {
+            instance: instance.as_raw() as usize,
+            extent,
+        },
+    );
+    handle
 }

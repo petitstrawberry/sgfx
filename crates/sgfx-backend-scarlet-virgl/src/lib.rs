@@ -68,6 +68,7 @@ pub struct Capabilities {
     image_upload: bool,
     image_readback: bool,
     depth: bool,
+    image_mips: bool,
 }
 
 impl Capabilities {
@@ -90,6 +91,8 @@ impl Capabilities {
             image_readback: rendering
                 && info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_READBACK != 0,
             depth: rendering && info.execution_support & GPU_EXECUTION_SUPPORT_DEPTH != 0,
+            image_mips: rendering
+                && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_IMAGE_MIPS != 0,
         }
     }
 
@@ -142,6 +145,12 @@ impl Capabilities {
     /// `true` when `Depth32Float` render attachments can be used.
     pub const fn supports_depth(&self) -> bool {
         self.depth
+    }
+
+    /// Return whether the kernel allocates real image mip storage for VirGL
+    /// uploads, sampling and color blits.
+    pub const fn supports_image_mips(&self) -> bool {
+        self.image_mips
     }
 }
 

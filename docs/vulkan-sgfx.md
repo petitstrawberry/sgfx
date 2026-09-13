@@ -2,7 +2,8 @@
 
 `vulkan-sgfx` is a loader-discoverable, **non-conformant development ICD**. It
 implements a bounded executable subset to exercise Vulkan → SGFX portable IR →
-backend execution and, on macOS, presentation through Metal. Its manifest and
+backend execution, macOS presentation through Metal, and Linux ABI presentation
+through Scarlet SWS with `VK_KHR_display`. Its manifest and
 physical device use the Vulkan 1.0 ABI version. This is not a claim of Vulkan
 1.0 conformance: substantial mandatory core functionality is absent. Do not
 select it as a general application driver. Cross-platform WSI, resource
@@ -24,13 +25,15 @@ remain incomplete.
 - SPIR-V shader modules, compute pipelines, and vertex/fragment pipelines.
   Naga validates and normalizes Vulkan coordinate conventions before SGFX
   shader definition; backend shader/pipeline validation occurs at creation.
-- Stage-specific push constants up to 128 bytes on capable Metal adapters,
-  with incremental updates and a value snapshot per draw/dispatch. Native
-  VirGL reports no push-constant support and rejects nonempty ranges.
+- Stage-specific push constants up to 128 bytes on capable Metal and native
+  programmable VirGL adapters, with incremental updates and a value snapshot
+  per draw/dispatch. VirGL stores its stage snapshot after UBO constants.
 - Sampled RGBA8/BGRA8 mip chains on capable Metal adapters, checked per-mip
   uploads/barriers/readback, complete matching-format GPU mip blits with
   nearest/linear filtering, and sampler mip filtering/LOD clamps. Native VirGL
-  and A618 explicitly reject unsupported mip storage and blits.
+  uploads/samples color mip chains and emits full-mip color blits when the kernel
+  reports real mip storage. Multi-mip readback remains unsupported there. Older
+  kernels and A618 reject unsupported mip storage and blits.
 - Descriptor sets for uniform/storage buffers (including dynamic offsets),
   separate images/samplers and combined image samplers; four sets with 16
   logical bindings each, one descriptor per binding. Arrays are unsupported.
@@ -49,7 +52,8 @@ remain incomplete.
   base vertices for indexed lists, one vertex binding, four vertex formats, and one
   instance per draw. Common alpha/additive blending and sampled 2D textures
   work. Attachments retain one mip; sampled images can contain a checked chain.
-  Indexed strips and primitive restart, stencil, multisampling,
+  Native VirGL also supports indexed strips without primitive restart. Indexed
+  strips on WGPU, primitive restart, stencil, multisampling,
   partial/flipped/format-converting blits, indirect drawing,
   and other dynamic state are absent.
 - macOS WSI exposes `VK_KHR_surface`, `VK_EXT_metal_surface`, `VK_MVK_macos_surface`,
@@ -57,6 +61,12 @@ remain incomplete.
   surface creation, surface capability/format/mode queries, FIFO swapchains,
   acquire, and queue present. Swapchain images are SGFX `PRESENT` textures on
   the exact WGPU/Metal device selected by `vkCreateDevice`.
+- Linux/musl builds with `scarlet-wsi` expose `VK_KHR_surface`, `VK_KHR_display`,
+  and `VK_KHR_swapchain` through the unmodified Khronos loader. Standard display
+  discovery/mode/plane procedures create a fullscreen SWS window, and registered
+  GPU swapchain images are returned only on actual compositor release. The
+  ordinary C `examples/display.c` checks 60 presentations and clean shutdown
+  on Scarlet AArch64 QEMU. This does not yet establish vkQuake2 game rendering.
 
 Each `vkCmd*` records into command-buffer-local owned storage on the calling
 thread. Submit resolves the Vulkan handles and descriptor state into
@@ -261,7 +271,10 @@ and verify the chosen Mesa driver. The Linux check also used
   `aarch64-unknown-scarlet` cube uses the same Vulkan frontend, SGFX facade,
   SPIR-V-to-TGSI lowering, `/dev/gpu0`, VirGL submit/completion, GPU readback,
   and `DisplaySurface`. The Scarlet toolchain currently drops the requested
-  `cdylib`, so this result is not native `.so` loader integration. A618 still
+  `cdylib`, so this cube result uses a linked frontend. The separate Linux/musl
+  `scarlet-wsi` build is an actual `.so` ICD loaded by the ordinary Khronos
+  loader on Scarlet's Linux ABI, with 60 KHR_display presentations verified.
+  A618 still
   rejects programmable execution and is not advertised as a Vulkan adapter.
 - **Conservative memory and transfer costs.** Referenced host-visible buffers
   are uploaded from CPU shadow storage. GPU-written mapped buffers and

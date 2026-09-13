@@ -22,10 +22,19 @@ use core::fmt;
 
 pub use sgfx_core::{backend, ir};
 
+#[cfg(all(target_os = "linux", feature = "scarlet-native-api"))]
+pub use sgfx_backend_scarlet_virgl::Handle;
+
 /// Backend-neutral adapter, device, resource, queue, and completion facade.
 #[cfg(any(
     all(not(target_os = "scarlet"), feature = "backend-wgpu"),
-    all(target_os = "scarlet", feature = "backend-scarlet-virgl")
+    all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    )
 ))]
 pub mod driver;
 
@@ -153,26 +162,47 @@ pub enum Error {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     Wgpu(sgfx_backend_wgpu::Error),
     /// A Scarlet/VirGL device or context operation failed.
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     ScarletVirglHandle(sgfx_backend_scarlet_virgl::HandleError),
     /// A Scarlet/VirGL IR materialization or execution operation failed.
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     ScarletVirglIr(sgfx_backend_scarlet_virgl::IrSubmitError),
     /// A Scarlet GPU control connection could not be opened or queried.
     #[cfg(all(
-        target_os = "scarlet",
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
         any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
     ))]
     ScarletGpu,
     /// The opened Scarlet GPU does not match an explicitly requested backend.
     #[cfg(all(
-        target_os = "scarlet",
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
         any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
     ))]
     BackendDeviceMismatch(BackendKind),
     /// No compiled Scarlet backend supports the opened GPU.
     #[cfg(all(
-        target_os = "scarlet",
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
         any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
     ))]
     ScarletBackendUnsupported,
@@ -227,9 +257,21 @@ impl Error {
                     | E::CompletionObservation => ErrorKind::DeviceLost,
                 }
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             Self::ScarletVirglHandle(error) => virgl_handle_error_kind(*error),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             Self::ScarletVirglIr(error) => {
                 use sgfx_backend_scarlet_virgl::IrSubmitError as E;
                 match error {
@@ -251,12 +293,18 @@ impl Error {
                 }
             }
             #[cfg(all(
-                target_os = "scarlet",
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
                 any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::ScarletGpu | Self::BackendDeviceMismatch(_) => ErrorKind::InitializationFailed,
             #[cfg(all(
-                target_os = "scarlet",
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
                 any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::ScarletBackendUnsupported => ErrorKind::Unsupported,
@@ -309,7 +357,13 @@ impl Error {
                         | E::Unsupported(_)
                 )
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             Self::ScarletVirglIr(error) => {
                 use sgfx_backend_scarlet_virgl::{HandleError, IrSubmitError as E};
                 matches!(
@@ -370,7 +424,13 @@ fn ir_error_kind(error: ir::Error) -> ErrorKind {
     }
 }
 
-#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+#[cfg(all(
+    any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-native-api")
+    ),
+    feature = "backend-scarlet-virgl"
+))]
 fn virgl_handle_error_kind(error: sgfx_backend_scarlet_virgl::HandleError) -> ErrorKind {
     use sgfx_backend_scarlet_virgl::HandleError as E;
     match error {
@@ -408,21 +468,39 @@ impl fmt::Display for Error {
             }
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
             Self::Wgpu(error) => write!(formatter, "SGFX WGPU backend failed: {error}"),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             Self::ScarletVirglHandle(error) => {
                 write!(formatter, "SGFX Scarlet/VirGL device failed: {error:?}")
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
             Self::ScarletVirglIr(error) => {
                 write!(formatter, "SGFX Scarlet/VirGL execution failed: {error:?}")
             }
             #[cfg(all(
-                target_os = "scarlet",
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
                 any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::ScarletGpu => formatter.write_str("SGFX Scarlet GPU control operation failed"),
             #[cfg(all(
-                target_os = "scarlet",
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
                 any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::BackendDeviceMismatch(backend) => {
@@ -432,7 +510,10 @@ impl fmt::Display for Error {
                 )
             }
             #[cfg(all(
-                target_os = "scarlet",
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
                 any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::ScarletBackendUnsupported => {
@@ -519,7 +600,13 @@ fn resolve_backend(preference: BackendPreference) -> Result<BackendKind> {
 }
 
 fn default_backend() -> Result<BackendKind> {
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     {
         return Ok(BackendKind::ScarletVirgl);
     }
@@ -546,7 +633,10 @@ const fn default_backend_kind() -> BackendKind {
         feature = "backend-scarlet-adreno"
     )) {
         BackendKind::ScarletAdreno
-    } else if cfg!(target_os = "scarlet") {
+    } else if cfg!(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-native-api")
+    )) {
         BackendKind::ScarletVirgl
     } else {
         BackendKind::Wgpu
@@ -558,7 +648,10 @@ fn require_backend(backend: BackendKind) -> Result<BackendKind> {
         BackendKind::Wgpu => cfg!(all(not(target_os = "scarlet"), feature = "backend-wgpu")),
         BackendKind::Metal => false,
         BackendKind::ScarletVirgl => cfg!(all(
-            target_os = "scarlet",
+            any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-native-api")
+            ),
             feature = "backend-scarlet-virgl"
         )),
         BackendKind::ScarletAdreno => cfg!(all(
@@ -618,7 +711,13 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
+    #[cfg(all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ))]
     #[test]
     fn rejection_classification_separates_native_limits_from_device_failure() {
         use sgfx_backend_scarlet_virgl::{HandleError, IrSubmitError as E};

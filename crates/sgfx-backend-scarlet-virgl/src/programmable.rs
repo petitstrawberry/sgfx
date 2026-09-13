@@ -139,11 +139,6 @@ fn compile_pipeline(
 ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
     let reference = resources.programmable_render_pipeline_ref(id)?;
     let pipeline = resources.programmable_render_pipeline(reference)?;
-    if !pipeline.layout().push_constant_ranges().is_empty() {
-        return Err(IrSubmitError::Unsupported(
-            UnsupportedIrFeature::PushConstants,
-        ));
-    }
     if !matches!(
         pipeline.target_format(),
         TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
@@ -152,7 +147,10 @@ fn compile_pipeline(
             UnsupportedIrFeature::PipelineTargetFormat,
         ));
     }
-    if pipeline.topology() != PrimitiveTopology::TriangleList {
+    if !matches!(
+        pipeline.topology(),
+        PrimitiveTopology::TriangleList | PrimitiveTopology::TriangleStrip
+    ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PrimitiveTopology,
         ));
@@ -257,6 +255,19 @@ fn compile_pipeline(
                 ));
             }
         };
+        if let Some(push) = &shader.push_constants {
+            let ranges = pipeline.layout().push_constant_ranges();
+            // Require the declared source block within the bounded stage layout.
+            for byte in 0..push.size {
+                if !ranges.iter().any(|range| {
+                    range.stages().contains(visibility)
+                        && byte >= range.offset()
+                        && byte < range.offset() + range.size()
+                }) {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                }
+            }
+        }
         for binding in &shader.uniform_buffers {
             let layout = pipeline
                 .layout()
@@ -311,6 +322,7 @@ fn compile_pipeline(
         }
     }
     let compiled = Rc::new(driver::IrProgrammablePipeline {
+        topology: pipeline.topology(),
         slot: reference.slot(),
         vertex,
         fragment,
@@ -408,9 +420,6 @@ pub(super) fn validate_barrier(barrier: ir::ResourceBarrier<'_>) -> Result<(), I
                 UnsupportedIrFeature::ExplicitBarrier,
             ))
         }
-        ir::ResourceBarrier::TextureMip { mip_level, .. } if mip_level != 0 => {
-            Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps))
-        }
         _ => Ok(()),
     }
 }
@@ -447,13 +456,17 @@ pub(super) fn decode_draw(
     count: u32,
     base_vertex: Option<i32>,
 ) -> Result<IrDraw, IrSubmitError> {
-    if count == 0 || !count.is_multiple_of(3) {
-        return Err(ir::Error::InvalidValue.into());
-    }
     let reference = pass.programmable.ok_or(ir::Error::PipelineNotSet)?;
     let pipeline = resources
         .resources
         .programmable_render_pipeline(reference)?;
+    let valid_count = match pipeline.topology() {
+        PrimitiveTopology::TriangleList => count > 0 && count.is_multiple_of(3),
+        PrimitiveTopology::TriangleStrip => count >= 3,
+    };
+    if !valid_count {
+        return Err(ir::Error::InvalidValue.into());
+    }
     let target = resources.resources.texture(pass.attachment)?;
     if target.format() != pipeline.target_format()
         || pipeline.depth_state().is_some() && pass.depth_attachment.is_none()
@@ -509,6 +522,23 @@ pub(super) fn decode_draw(
                 sampler: sampler_state(resources.resources.sampler(sampler)?, sampler.slot()),
             });
         }
+        if let Some(push) = &shader.push_constants {
+            let stage = if shader.stage == ir::ShaderStage::Vertex {
+                0
+            } else {
+                1
+            };
+            let mut words: Vec<u32> = pass.push_constants[stage][..push.size as usize]
+                .chunks_exact(4)
+                .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+                .collect();
+            words.resize(push.size.div_ceil(16) as usize * 4, 0);
+            constants.push(driver::IrConstantBuffer {
+                stage: shader.stage,
+                first_register: push.first_register,
+                words,
+            });
+        }
         for binding in &shader.uniform_buffers {
             let group_ref = pass
                 .bind_groups
@@ -534,17 +564,13 @@ pub(super) fn decode_draw(
                 return Err(ir::Error::BindingLayoutMismatch.into());
             };
             let constant_size = binding.size.next_multiple_of(16);
-            if size < u64::from(constant_size)
-                || !size.is_multiple_of(16)
-                || size > 16 * 1024
-                || offset > u64::from(u32::MAX)
-            {
+            if size < u64::from(binding.size) || size > 16 * 1024 || offset > u64::from(u32::MAX) {
                 return Err(ir::Error::OutOfBounds.into());
             }
             let buffer = resources.resources.buffer_ref(buffer)?;
             let bytes = pending.bytes(resources, buffer)?;
             let end = offset
-                .checked_add(u64::from(constant_size))
+                .checked_add(u64::from(binding.size))
                 .ok_or(ir::Error::Overflow)?;
             if end > bytes.as_slice().len() as u64 {
                 return Err(ir::Error::OutOfBounds.into());
@@ -560,6 +586,7 @@ pub(super) fn decode_draw(
                     .chunks_exact(4)
                     .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]])),
             );
+            words.resize(constant_size as usize / 4, 0);
             constants
                 .try_reserve(1)
                 .map_err(|_| IrSubmitError::OutOfMemory)?;
