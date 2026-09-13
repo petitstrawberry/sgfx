@@ -27,6 +27,10 @@ remain incomplete.
 - Stage-specific push constants up to 128 bytes on capable Metal adapters,
   with incremental updates and a value snapshot per draw/dispatch. Native
   VirGL reports no push-constant support and rejects nonempty ranges.
+- Sampled RGBA8/BGRA8 mip chains on capable Metal adapters, checked per-mip
+  uploads/barriers/readback, complete matching-format GPU mip blits with
+  nearest/linear filtering, and sampler mip filtering/LOD clamps. Native VirGL
+  and A618 explicitly reject unsupported mip storage and blits.
 - Descriptor sets for uniform/storage buffers (including dynamic offsets),
   separate images/samplers and combined image samplers; four sets with 16
   logical bindings each, one descriptor per binding. Arrays are unsupported.
@@ -37,13 +41,14 @@ remain incomplete.
 - Primary command buffers and pools, pipeline/set binding, compute dispatch,
   single-color render passes, non-indexed and indexed drawing, vertex buffers,
   buffer copies, checked buffer-to-image uploads, whole-image RGBA8/BGRA8
-  readback, supported whole-resource barriers, dynamic viewport/scissor,
+  mip readback, whole-resource/per-mip barriers, dynamic viewport/scissor,
   D32 depth testing, front-face/back-face culling, fences, and binary semaphores.
 - Offscreen graphics: RGBA8_UNORM or BGRA8_UNORM color, optional D32_SFLOAT
-  depth, optimal 2D images, one mip/layer/sample, at most 2048×2048, one color
+  depth, optimal 2D images, one layer/sample, at most 2048×2048, one color
   attachment, triangle lists, one vertex binding, four vertex formats, and one
   instance per draw. Common alpha/additive blending and sampled 2D textures
-  work. Stencil, multisampling, mipmaps, image blits, indirect drawing,
+  work. Attachments retain one mip; sampled images can contain a checked chain.
+  Stencil, multisampling, partial/flipped/format-converting blits, indirect drawing,
   and other dynamic state are absent.
 - macOS WSI exposes `VK_KHR_surface`, `VK_EXT_metal_surface`, `VK_MVK_macos_surface`,
   `VK_KHR_portability_enumeration`, and `VK_KHR_swapchain`. It implements Metal
@@ -228,13 +233,13 @@ and verify the chosen Mesa driver. The Linux check also used
 
 ## Limits and remaining work
 
-- **Not Vulkan conformant.** The ICD exposes 103 procedure names on macOS,
-  including 16 `vkCmd*` operations, but this is only a bounded executable
+- **Not Vulkan conformant.** The ICD exposes 104 procedure names on macOS,
+  including 17 `vkCmd*` operations, but this is only a bounded executable
   subset. WSI currently covers macOS Metal, FIFO mode, opaque composition, and
   fixed-size swapchains. Other platform surfaces, window-resize handling in the
   example, timeline semaphores, secondary command buffers, descriptor indexing,
   pipeline caches, queries, events, sparse resources, external memory, multisampling,
-  multiple subpasses, indirect operations, mipmaps, image blits, or arbitrary
+  multiple subpasses, indirect operations, partial/flipped/converting blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent
   append-only IDs. When no live Vulkan objects retain an epoch's IDs, the ICD

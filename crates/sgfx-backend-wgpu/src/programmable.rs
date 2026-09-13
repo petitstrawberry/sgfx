@@ -489,7 +489,9 @@ impl Resources {
                             size: core::num::NonZeroU64::new(*size),
                         })
                     }
-                    Resource::Texture(texture) => raw::BindingResource::TextureView(&texture.view),
+                    Resource::Texture(texture) => {
+                        raw::BindingResource::TextureView(&texture.sampled_view)
+                    }
                     Resource::Sampler(sampler) => raw::BindingResource::Sampler(sampler),
                 },
             })

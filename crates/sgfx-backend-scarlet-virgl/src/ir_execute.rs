@@ -28,6 +28,8 @@ use crate::{Context, HandleError, Image, Queue, Submission, Texture};
 /// An IR feature that the active backend facade cannot lower faithfully yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedIrFeature {
+    /// Mip storage, uploads and GPU blits are not implemented by native VirGL yet.
+    Mipmaps,
     /// Shader push-constant blocks have not been lowered by this native backend.
     PushConstants,
     /// The command sequence is outside the one-upload-phase, one-pass subset.
@@ -964,15 +966,61 @@ impl ExecutionPlan {
         // building buffer shadows, materializing resources, or submitting work.
         // A valid programmable stream is not malformed fixed-function IR.
         for command in commands.commands() {
-            let unsupported = match command {
-                Command::BeginComputePass
-                | Command::EndComputePass
-                | Command::SetComputePipeline(_)
-                | Command::Dispatch { .. } => UnsupportedIrFeature::ProgrammableExecution,
-                Command::SetPushConstants { .. } => UnsupportedIrFeature::PushConstants,
-
-                _ => continue,
+            let textures = match command {
+                Command::WriteTexture { texture, .. } | Command::SetTexture(texture) => {
+                    [Some(*texture), None]
+                }
+                Command::CopyTextureToTexture {
+                    source,
+                    destination,
+                    ..
+                } => [Some(*source), Some(*destination)],
+                Command::BeginRenderPass(desc) => [
+                    Some(desc.target()),
+                    desc.depth_attachment().map(|depth| depth.target()),
+                ],
+                Command::ResourceBarrier(
+                    ir::ResourceBarrier::Texture { texture, .. }
+                    | ir::ResourceBarrier::TextureMip { texture, .. },
+                ) => [Some(*texture), None],
+                _ => [None, None],
             };
+            for texture in textures.into_iter().flatten() {
+                if resources.resources().texture(texture)?.mip_level_count() != 1 {
+                    return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
+                }
+            }
+            if let Command::SetBindGroup { bind_group, .. } = command {
+                let table = resources.resources();
+                for entry in table.bind_group(*bind_group)?.entries() {
+                    if let ir::BindingResource::Texture(texture) = entry.resource() {
+                        if table
+                            .texture(table.texture_ref(texture)?)?
+                            .mip_level_count()
+                            != 1
+                        {
+                            return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
+                        }
+                    }
+                }
+            }
+            let unsupported =
+                match command {
+                    Command::BlitTexture { .. } => UnsupportedIrFeature::Mipmaps,
+                    Command::WriteTexture { write, .. } if write.mip_level() != 0 => {
+                        UnsupportedIrFeature::Mipmaps
+                    }
+                    Command::ResourceBarrier(ir::ResourceBarrier::TextureMip {
+                        mip_level, ..
+                    }) if *mip_level != 0 => UnsupportedIrFeature::Mipmaps,
+                    Command::BeginComputePass
+                    | Command::EndComputePass
+                    | Command::SetComputePipeline(_)
+                    | Command::Dispatch { .. } => UnsupportedIrFeature::ProgrammableExecution,
+                    Command::SetPushConstants { .. } => UnsupportedIrFeature::PushConstants,
+
+                    _ => continue,
+                };
             return Err(IrSubmitError::Unsupported(unsupported));
         }
         let mut pending_buffers = PendingBuffers::new();

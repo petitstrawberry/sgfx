@@ -72,6 +72,7 @@ impl AdapterInfo {
 pub struct Limits {
     pub max_push_constants_size: u32,
     pub max_image_dimension_2d: u32,
+    pub max_image_mip_levels: u32,
     pub max_uniform_buffer_range: u32,
     pub max_storage_buffer_range: u32,
     pub max_bound_descriptor_sets: u32,
@@ -107,6 +108,7 @@ pub struct Capabilities {
     bgra8_color_attachment: bool,
     depth32_attachment: bool,
     image_readback: bool,
+    image_blits: bool,
     limits: Limits,
 }
 
@@ -157,6 +159,10 @@ impl Capabilities {
 
     pub const fn supports_image_readback(&self) -> bool {
         self.image_readback
+    }
+    /// Whether color mip blits execute on this backend.
+    pub const fn supports_image_blits(&self) -> bool {
+        self.image_blits
     }
 
     pub const fn limits(&self) -> Limits {
@@ -673,22 +679,41 @@ impl Queue {
 
     /// Read a color texture after the caller has established completion.
     pub fn read_texture(&self, resources: &mut Resources, id: ir::TextureId) -> Result<Vec<u8>> {
+        self.read_texture_mip(resources, id, 0)
+    }
+
+    /// Read one color mip after establishing completion, through the selected backend.
+    pub fn read_texture_mip(
+        &self,
+        resources: &mut Resources,
+        id: ir::TextureId,
+        mip_level: u32,
+    ) -> Result<Vec<u8>> {
         if self.device_id != resources.device_id {
             return Err(Error::ResourceDeviceMismatch);
         }
         #[allow(unreachable_patterns)]
         match (&self.backend, &mut resources.backend) {
             #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
-            (QueueBackend::Wgpu(_), ResourcesBackend::Wgpu(resources)) => {
-                resources.read_texture(id).map_err(Error::Wgpu)
-            }
+            (QueueBackend::Wgpu(_), ResourcesBackend::Wgpu(resources)) => resources
+                .read_texture_mip(id, mip_level)
+                .map_err(Error::Wgpu),
             #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-virgl"))]
             (
                 QueueBackend::ScarletVirgl { context, .. },
                 ResourcesBackend::ScarletVirgl(resources),
-            ) => context
-                .read_texture(resources, id)
-                .map_err(Error::ScarletVirglIr),
+            ) => {
+                if mip_level != 0 {
+                    return Err(Error::ScarletVirglIr(
+                        sgfx_backend_scarlet_virgl::IrSubmitError::Unsupported(
+                            sgfx_backend_scarlet_virgl::UnsupportedIrFeature::Mipmaps,
+                        ),
+                    ));
+                }
+                context
+                    .read_texture(resources, id)
+                    .map_err(Error::ScarletVirglIr)
+            }
             _ => Err(Error::ResourceDeviceMismatch),
         }
     }
@@ -818,6 +843,7 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                         .allowed_usages
                         .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
                     image_readback: true,
+                    image_blits: true,
                     limits: runtime,
                 },
                 backend: AdapterBackend::Wgpu(WgpuAdapter {
@@ -835,6 +861,7 @@ fn wgpu_runtime_limits(adapter: wgpu::Limits) -> Limits {
     Limits {
         max_push_constants_size: 0,
         max_image_dimension_2d: requested.max_texture_dimension_2d,
+        max_image_mip_levels: requested.max_texture_dimension_2d.ilog2() + 1,
         max_uniform_buffer_range: requested.max_uniform_buffer_binding_size,
         max_storage_buffer_range: requested.max_storage_buffer_binding_size,
         max_bound_descriptor_sets: requested.max_bind_groups,
@@ -945,9 +972,11 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                 bgra8_color_attachment: true,
                 depth32_attachment: capabilities.supports_depth(),
                 image_readback: capabilities.supports_image_readback(),
+                image_blits: false,
                 limits: Limits {
                     max_push_constants_size: 0,
                     max_image_dimension_2d: 2048,
+                    max_image_mip_levels: 1,
                     max_uniform_buffer_range: 16 * 1024,
                     max_storage_buffer_range: 0,
                     max_bound_descriptor_sets: 4,

@@ -333,6 +333,9 @@ impl Context {
         }
         let reference = resources.resources.texture_ref(id)?;
         let descriptor = resources.resources.texture(reference)?;
+        if descriptor.mip_level_count() != 1 {
+            return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
+        }
         if !descriptor.usage().contains(TextureUsage::COPY_SRC) {
             return Err(ir::Error::InvalidUsage.into());
         }
@@ -374,11 +377,15 @@ pub(super) fn validate_barrier(barrier: ir::ResourceBarrier<'_>) -> Result<(), I
             ))
         }
         ir::ResourceBarrier::Texture { before, after, .. }
+        | ir::ResourceBarrier::TextureMip { before, after, .. }
             if [before, after].contains(&ir::TextureAccess::StorageWrite) =>
         {
             Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::ExplicitBarrier,
             ))
+        }
+        ir::ResourceBarrier::TextureMip { mip_level, .. } if mip_level != 0 => {
+            Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps))
         }
         _ => Ok(()),
     }

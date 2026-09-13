@@ -65,9 +65,14 @@ impl Resources {
     /// This explicitly waits on native targets. Depth textures are unsupported;
     /// browsers return [`UnsupportedFeature::BlockingWait`].
     pub fn read_texture(&mut self, id: TextureId) -> Result<Vec<u8>> {
+        self.read_texture_mip(id, 0)
+    }
+
+    /// Read the tightly packed pixels of one checked color mip level.
+    pub fn read_texture_mip(&mut self, id: TextureId, mip_level: u32) -> Result<Vec<u8>> {
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = id;
+            let _ = (id, mip_level);
             Err(Error::Unsupported(UnsupportedFeature::BlockingWait))
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -85,8 +90,9 @@ impl Resources {
             if !descriptor.usage().contains(TextureUsage::COPY_SRC) {
                 return Err(Error::InvalidState);
             }
-            let width = descriptor.extent().width();
-            let height = descriptor.extent().height();
+            let extent = descriptor.mip_extent(mip_level)?;
+            let width = extent.width();
+            let height = extent.height();
             let row_size = width
                 .checked_mul(descriptor.format().bytes_per_pixel())
                 .ok_or(Error::Unsupported(UnsupportedFeature::ResourceSize))?;
@@ -110,7 +116,7 @@ impl Resources {
                 encoder.copy_texture_to_buffer(
                     raw::TexelCopyTextureInfo {
                         texture: &source.texture,
-                        mip_level: 0,
+                        mip_level,
                         origin: raw::Origin3d::ZERO,
                         aspect: raw::TextureAspect::All,
                     },

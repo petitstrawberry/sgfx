@@ -10,6 +10,7 @@ pub(crate) struct Image {
     pub id: ir::TextureId,
     pub format: vk::Format,
     pub extent: vk::Extent3D,
+    pub mip_levels: u32,
     pub usage: vk::ImageUsageFlags,
     pub bound: Option<(vk::DeviceMemory, u64)>,
     pub swapchain: Option<vk::SwapchainKHR>,
@@ -18,6 +19,24 @@ pub(crate) struct Image {
 }
 
 impl Image {
+    pub(crate) fn mip_extent(&self, mip: u32) -> Result<vk::Extent3D, vk::Result> {
+        if mip >= self.mip_levels {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        Ok(vk::Extent3D {
+            width: (self.extent.width >> mip).max(1),
+            height: (self.extent.height >> mip).max(1),
+            depth: 1,
+        })
+    }
+    pub(crate) fn byte_size(&self) -> u64 {
+        (0..self.mip_levels)
+            .map(|mip| {
+                let size = self.mip_extent(mip).expect("validated image mip count");
+                u64::from(size.width) * u64::from(size.height) * 4
+            })
+            .sum()
+    }
     pub(crate) fn usable(&self) -> bool {
         self.bound.is_some() || self.swapchain.is_some()
     }
@@ -80,10 +99,6 @@ fn status(result: Result<(), vk::Result>) -> vk::Result {
     result.err().unwrap_or(vk::Result::SUCCESS)
 }
 
-fn image_size(extent: vk::Extent3D) -> u64 {
-    u64::from(extent.width) * u64::from(extent.height) * 4
-}
-
 unsafe extern "system" fn create_image(
     device: vk::Device,
     info: *const vk::ImageCreateInfo<'_>,
@@ -104,7 +119,12 @@ unsafe extern "system" fn create_image(
         || supported.is_empty()
         || info.tiling != vk::ImageTiling::OPTIMAL
         || info.samples != vk::SampleCountFlags::TYPE_1
-        || info.mip_levels != 1
+        || info.mip_levels == 0
+        || (info.mip_levels > 1
+            && info.usage.intersects(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            ))
         || info.array_layers != 1
         || info.extent.depth != 1
         || info.extent.width == 0
@@ -119,6 +139,7 @@ unsafe extern "system" fn create_image(
         return UNSUPPORTED;
     }
     let extent = info.extent;
+    let mip_levels = info.mip_levels;
     let format = info.format;
     let image_usage = info.usage;
     let mut usage = ir::TextureUsage::empty();
@@ -139,7 +160,13 @@ unsafe extern "system" fn create_image(
     match with_device(device, move |runtime| {
         let size = ir::Extent2D::new(extent.width, extent.height).map_err(|_| INVALID)?;
         let ir_format = texture_format(format).ok_or(UNSUPPORTED)?;
-        let desc = ir::TextureDesc::new(ir_format, size, usage).map_err(|_| INVALID)?;
+        if mip_levels > runtime.capabilities.limits().max_image_mip_levels {
+            return Err(UNSUPPORTED);
+        }
+        let desc = ir::TextureDesc::new(ir_format, size, usage)
+            .map_err(|_| INVALID)?
+            .with_mip_level_count(mip_levels)
+            .map_err(|_| UNSUPPORTED)?;
         let id = runtime
             .table
             .define_texture(desc)
@@ -152,6 +179,7 @@ unsafe extern "system" fn create_image(
                 id,
                 format,
                 extent,
+                mip_levels,
                 usage: image_usage,
                 bound: None,
                 swapchain: None,
@@ -204,7 +232,7 @@ unsafe extern "system" fn get_image_memory_requirements(
     if let Ok(requirements) = with_device(device, move |runtime| {
         let image = runtime.resources.images.get(&image).ok_or(INVALID)?;
         Ok(vk::MemoryRequirements {
-            size: image_size(image.extent),
+            size: image.byte_size(),
             alignment: 4,
             memory_type_bits: 1,
         })
@@ -220,7 +248,12 @@ unsafe extern "system" fn bind_image_memory(
     offset: vk::DeviceSize,
 ) -> vk::Result {
     status(with_device(device, move |runtime| {
-        let size = image_size(runtime.resources.images.get(&image).ok_or(INVALID)?.extent);
+        let size = runtime
+            .resources
+            .images
+            .get(&image)
+            .ok_or(INVALID)?
+            .byte_size();
         if !offset.is_multiple_of(4)
             || !crate::resources::memory_available(&runtime.resources, memory, offset, size)
         {
@@ -255,7 +288,7 @@ unsafe extern "system" fn create_image_view(
         || image_usage(info.format).is_empty()
         || range.aspect_mask != image_aspect(info.format)
         || range.base_mip_level != 0
-        || !matches!(range.level_count, 1 | vk::REMAINING_MIP_LEVELS)
+        || range.level_count == 0
         || range.base_array_layer != 0
         || !matches!(range.layer_count, 1 | vk::REMAINING_ARRAY_LAYERS)
         || [
@@ -275,6 +308,11 @@ unsafe extern "system" fn create_image_view(
         let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
         if !data.usable() || data.format != format {
             return Err(INVALID);
+        }
+        // Sampled views currently cover the complete chain. Attachment images
+        // have one level, so no partial view is silently expanded.
+        if range.level_count != data.mip_levels && range.level_count != vk::REMAINING_MIP_LEVELS {
+            return Err(UNSUPPORTED);
         }
         let handle = vk::ImageView::from_raw(next_id());
         runtime.resources.views.insert(handle, image);

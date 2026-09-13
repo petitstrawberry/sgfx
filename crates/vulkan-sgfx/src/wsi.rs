@@ -400,6 +400,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             runtime.resources.images.insert(
                 image,
                 crate::images::Image {
+                    mip_levels: 1,
                     id,
                     format,
                     extent: vk::Extent3D {

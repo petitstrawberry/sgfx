@@ -302,7 +302,7 @@ not silently change command meanings.
 
 Shader modules, compute dispatch and explicit same-queue resource dependencies
 are part of the [programmable extension](#programmable-graphics-and-compute).
-Instancing, multiple color attachments, mip/array/3D textures and cross-queue
+Instancing, multiple color attachments, array/3D textures and cross-queue
 semaphore commands remain outside the implemented subset. Presentation and
 completion observation are outside the command enum.
 
@@ -515,9 +515,18 @@ depth-attachment, and barrier forms replace references with their persistent IDs
 This extension serves offscreen vertex/fragment rendering, descriptor-backed
 uniforms and storage, compute-buffer workloads, RGBA8 storage images, and compute
 to copy/draw dependencies. It retains one color attachment, optional depth, one
-interleaved vertex buffer, single-sample 2D textures with exactly one mip and one
-layer, direct draws/dispatches, and one queue. MRT, mip chains, texture arrays/3D
-images, multisampling, descriptor arrays/indexing, dynamic descriptor offsets,
-push constants, indirect commands, tessellation/geometry stages, presentation,
+interleaved vertex buffer, single-sample 2D textures with one layer, direct
+draws/dispatches, and one queue. Sampled color textures can declare checked mip
+chains with `TextureDesc::with_mip_level_count`; attachment, depth, storage and
+present textures retain one mip. `TextureWrite::with_mip_level` selects an
+upload level, `blit_texture` scales complete matching-format color levels, and
+`ResourceBarrier::TextureMip` checks independent level dependencies. Sampler
+mip filtering and finite nonnegative LOD clamps are explicit descriptor state.
+`OwnedCommand` has 26 variants, including owned mip uploads and blits. Pipeline
+layouts and `SetPushConstants` carry up to 128 checked, stage-specific bytes.
+Actual backend support remains capability-dependent.
+
+MRT, texture arrays/3D images, multisampling, descriptor arrays/indexing, dynamic
+descriptor offsets, indirect commands, tessellation/geometry stages, presentation,
 and queue-family ownership transfer are deferred. No descriptor encodes those
 features, so they cannot be silently flattened into the supported subset.

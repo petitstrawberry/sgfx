@@ -312,12 +312,10 @@ pub(crate) fn memory_available(
         .buffers
         .values()
         .any(|b| overlaps(b.bound, b.size))
-        && !resources.images.values().any(|i| {
-            overlaps(
-                i.bound,
-                u64::from(i.extent.width) * u64::from(i.extent.height) * 4,
-            )
-        })
+        && !resources
+            .images
+            .values()
+            .any(|i| overlaps(i.bound, i.byte_size()))
 }
 pub(crate) fn backend_failure(error: crate::runtime::BackendError) -> vk::Result {
     crate::runtime::backend_failure(error)
@@ -1014,7 +1012,10 @@ unsafe extern "system" fn create_descriptor_pool(
         if !i.p_next.is_null()
             || !vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET.contains(i.flags)
             || i.max_sets == 0
-            || i.max_sets as usize > LIMIT
+            // Declared pool capacity does not materialize any SGFX bind groups.
+            // The separate live-object and canonical-table budgets apply when
+            // sets are allocated and descriptor configurations are submitted.
+            || i.max_sets > 16384
         {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
@@ -1547,7 +1548,6 @@ unsafe extern "system" fn create_sampler(
             || i.compare_enable != vk::FALSE
             || i.unnormalized_coordinates != vk::FALSE
             || i.mip_lod_bias != 0.0
-            || i.min_lod != 0.0
             || !i.max_lod.is_finite()
             || i.max_lod < 0.0
             || !matches!(
@@ -1572,7 +1572,16 @@ unsafe extern "system" fn create_sampler(
             filter(i.mag_filter)?,
             address(i.address_mode_u)?,
             address(i.address_mode_v)?,
-        );
+        )
+        .with_mip_filter(
+            match i.mipmap_mode {
+                vk::SamplerMipmapMode::LINEAR => ir::FilterMode::Linear,
+                _ => ir::FilterMode::Nearest,
+            },
+            i.min_lod,
+            i.max_lod,
+        )
+        .map_err(failure)?;
         let handle = crate::api::with_device(device, move |r| {
             let id = r.table.define_sampler(desc).map_err(failure)?.id();
             let handle = vk::Sampler::from_raw(crate::api::next_id());
@@ -1782,6 +1791,7 @@ mod tests {
         resources.images.insert(
             image,
             crate::images::Image {
+                mip_levels: 1,
                 id: texture,
                 format: vk::Format::R8G8B8A8_UNORM,
                 extent: vk::Extent3D {
@@ -1819,7 +1829,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(&ops[0], ir::OwnedCommand::WriteTexture { bytes_per_row: 12, data, .. } if data == &(12u8..32).collect::<Vec<_>>())
+            matches!(&ops[0], ir::OwnedCommand::WriteTextureMip { mip_level: 0, bytes_per_row: 12, data, .. } if data == &(12u8..32).collect::<Vec<_>>())
         );
         let mut short = region;
         short.buffer_row_length = 1;
@@ -2022,6 +2032,127 @@ mod tests {
         assert_eq!(
             normalize_spirv(words),
             Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+        );
+    }
+
+    #[test]
+    fn mip_blits_validate_subresources_and_memory_binding_covers_the_chain() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let memory = vk::DeviceMemory::from_raw(1);
+        resources.memories.insert(
+            memory,
+            Memory {
+                bytes: AlignedBytes::zeroed(128).unwrap(),
+                mapped: false,
+            },
+        );
+        let texture = table
+            .define_texture(
+                ir::TextureDesc::new(
+                    ir::TextureFormat::Rgba8Unorm,
+                    ir::Extent2D::new(4, 4).unwrap(),
+                    ir::TextureUsage::COPY_SRC | ir::TextureUsage::COPY_DST,
+                )
+                .unwrap()
+                .with_mip_level_count(3)
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let image = vk::Image::from_raw(2);
+        resources.images.insert(
+            image,
+            crate::images::Image {
+                id: texture,
+                format: vk::Format::R8G8B8A8_UNORM,
+                extent: vk::Extent3D {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                },
+                mip_levels: 3,
+                usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+                bound: Some((memory, 0)),
+                swapchain: None,
+                #[cfg(target_os = "scarlet")]
+                shared: None,
+            },
+        );
+        assert_eq!(resources.images[&image].byte_size(), 84);
+        assert!(!memory_available(&resources, memory, 64, 4));
+        assert!(!memory_available(&resources, memory, 80, 4));
+        assert!(memory_available(&resources, memory, 84, 4));
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        let region = vk::ImageBlit::default()
+            .src_subresource(layers)
+            .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: 4, y: 4, z: 1 }])
+            .dst_subresource(layers.mip_level(1))
+            .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: 2, y: 2, z: 1 }]);
+        let lower = |region, source_layout, filter| {
+            crate::transfer::blit(
+                &resources,
+                image,
+                source_layout,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+                filter,
+            )
+        };
+        let commands = lower(
+            region,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::Filter::LINEAR,
+        )
+        .unwrap();
+        assert!(matches!(
+            commands[0],
+            ir::OwnedCommand::BlitTexture {
+                source_mip: 0,
+                destination_mip: 1,
+                filter: ir::FilterMode::Linear,
+                ..
+            }
+        ));
+        let mut partial = region;
+        partial.dst_offsets[1].x = 1;
+        let mut flip = region;
+        flip.src_offsets.swap(0, 1);
+        let mut layer = region;
+        layer.src_subresource.layer_count = 2;
+        let mut nonexistent = region;
+        nonexistent.dst_subresource.mip_level = 3;
+        let mut same_level = region;
+        same_level.dst_subresource = region.src_subresource;
+        same_level.dst_offsets = region.src_offsets;
+        for invalid in [partial, flip, layer, nonexistent, same_level] {
+            assert!(
+                lower(
+                    invalid,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::Filter::LINEAR
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            lower(
+                region,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::Filter::LINEAR
+            )
+            .is_err()
+        );
+        assert!(
+            lower(
+                region,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::Filter::CUBIC_EXT
+            )
+            .is_err()
         );
     }
 

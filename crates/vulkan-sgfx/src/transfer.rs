@@ -3,6 +3,90 @@ use crate::resources::Resources;
 use ash::vk;
 use sgfx::ir;
 
+/// Lower complete, positive-direction color mip blits into executable IR.
+/// Partial source/destination rectangles, flips, format conversion and layers
+/// remain outside this subset and are rejected before backend execution.
+pub(crate) fn blit(
+    resources: &Resources,
+    source: vk::Image,
+    source_layout: vk::ImageLayout,
+    destination: vk::Image,
+    destination_layout: vk::ImageLayout,
+    regions: &[vk::ImageBlit],
+    filter: vk::Filter,
+) -> Result<Vec<ir::OwnedCommand>, vk::Result> {
+    let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
+    let unsupported = vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    if !matches!(
+        source_layout,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL | vk::ImageLayout::GENERAL
+    ) || !matches!(
+        destination_layout,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL | vk::ImageLayout::GENERAL
+    ) {
+        return Err(unsupported);
+    }
+    let filter = match filter {
+        vk::Filter::NEAREST => ir::FilterMode::Nearest,
+        vk::Filter::LINEAR => ir::FilterMode::Linear,
+        _ => return Err(unsupported),
+    };
+    let src = resources.images.get(&source).ok_or(invalid)?;
+    let dst = resources.images.get(&destination).ok_or(invalid)?;
+    if !src.usable()
+        || !dst.usable()
+        || !src.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+        || !dst.usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
+    {
+        return Err(invalid);
+    }
+    if src.format != dst.format
+        || !matches!(
+            src.format,
+            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+        )
+    {
+        return Err(unsupported);
+    }
+    let mut commands = Vec::with_capacity(regions.len());
+    for region in regions {
+        for (image, subresource, offsets) in [
+            (src, region.src_subresource, region.src_offsets),
+            (dst, region.dst_subresource, region.dst_offsets),
+        ] {
+            let extent = image.mip_extent(subresource.mip_level)?;
+            if subresource.aspect_mask != vk::ImageAspectFlags::COLOR
+                || subresource.base_array_layer != 0
+                || subresource.layer_count != 1
+                || offsets
+                    != [
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: extent.width as i32,
+                            y: extent.height as i32,
+                            z: 1,
+                        },
+                    ]
+            {
+                return Err(unsupported);
+            }
+        }
+        if source == destination
+            && region.src_subresource.mip_level == region.dst_subresource.mip_level
+        {
+            return Err(invalid);
+        }
+        commands.push(ir::OwnedCommand::BlitTexture {
+            source: src.id,
+            source_mip: region.src_subresource.mip_level,
+            destination: dst.id,
+            destination_mip: region.dst_subresource.mip_level,
+            filter,
+        });
+    }
+    Ok(commands)
+}
+
 pub(crate) fn upload(
     resources: &Resources,
     source: vk::Buffer,
@@ -35,7 +119,6 @@ pub(crate) fn upload(
     let mut ops = Vec::with_capacity(regions.len());
     for region in regions {
         if region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
-            || region.image_subresource.mip_level != 0
             || region.image_subresource.base_array_layer != 0
             || region.image_subresource.layer_count != 1
             || region.image_extent.depth != 1
@@ -46,6 +129,8 @@ pub(crate) fn upload(
         {
             return Err(unsupported);
         }
+        let mip_level = region.image_subresource.mip_level;
+        let extent = target.mip_extent(mip_level)?;
         let destination = ir::PixelRect::new(
             region.image_offset.x as u32,
             region.image_offset.y as u32,
@@ -53,8 +138,8 @@ pub(crate) fn upload(
             region.image_extent.height,
         )
         .map_err(|_| invalid)?;
-        if destination.x() + destination.width() > target.extent.width
-            || destination.y() + destination.height() > target.extent.height
+        if destination.x() + destination.width() > extent.width
+            || destination.y() + destination.height() > extent.height
         {
             return Err(invalid);
         }
@@ -83,7 +168,8 @@ pub(crate) fn upload(
             .map_err(|_| invalid)?;
         let end = usize::try_from(binding.checked_add(end).ok_or(invalid)?).map_err(|_| invalid)?;
         let data = memory.bytes.get(start..end).ok_or(invalid)?.to_vec();
-        ops.push(ir::OwnedCommand::WriteTexture {
+        ops.push(ir::OwnedCommand::WriteTextureMip {
+            mip_level,
             texture: target.id,
             destination,
             bytes_per_row: stride,

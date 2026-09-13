@@ -18,6 +18,7 @@ use wgpu as raw;
 
 use sgfx_core::backend::{CommandSubmitter, SubmitError};
 
+mod blit;
 mod completion;
 mod programmable;
 mod readback;
@@ -259,6 +260,7 @@ impl Context {
             width,
             height,
             format,
+            1,
             raw::TextureUsages::TEXTURE_BINDING
                 | raw::TextureUsages::RENDER_ATTACHMENT
                 | raw::TextureUsages::COPY_SRC
@@ -290,6 +292,7 @@ impl Context {
             clear_pipelines: Vec::new(),
             mapped_images: Vec::new(),
             programmable: programmable::Cache::default(),
+            blit: blit::Cache::default(),
         }
     }
 
@@ -779,6 +782,7 @@ pub struct Resources {
     clear_pipelines: Vec<(raw::TextureFormat, bool, Arc<GpuClearPipeline>)>,
     mapped_images: Vec<(TextureId, Arc<GpuTexture>)>,
     programmable: programmable::Cache,
+    blit: blit::Cache,
 }
 
 impl Resources {
@@ -864,6 +868,7 @@ impl Resources {
             descriptor.extent().width(),
             descriptor.extent().height(),
             descriptor.format(),
+            descriptor.mip_level_count(),
             usage,
         )?;
         self.textures.push((id, Arc::clone(&texture)));
@@ -928,7 +933,11 @@ impl Resources {
                 address_mode_w: raw::AddressMode::ClampToEdge,
                 mag_filter: filter_mode(descriptor.mag_filter()),
                 min_filter: filter_mode(descriptor.min_filter()),
-                mipmap_filter: raw::FilterMode::Nearest,
+                mipmap_filter: filter_mode(descriptor.mip_filter()),
+                // Logical textures have at most 32 levels. Larger Vulkan LOD
+                // maxima are equivalent to this physical clamp.
+                lod_min_clamp: descriptor.min_lod().min(32.0),
+                lod_max_clamp: descriptor.max_lod().min(32.0),
                 ..raw::SamplerDescriptor::default()
             },
         ));
@@ -1197,6 +1206,24 @@ impl Queue {
                             data.len() as u64,
                         );
                     }
+                }
+                Command::BlitTexture {
+                    source,
+                    source_mip,
+                    destination,
+                    destination_mip,
+                    filter,
+                } => {
+                    let source = resources.texture(*source)?;
+                    let destination = resources.texture(*destination)?;
+                    resources.encode_mip_blit(
+                        &mut encoder,
+                        &source,
+                        *source_mip,
+                        &destination,
+                        *destination_mip,
+                        *filter,
+                    )?;
                 }
                 Command::WriteTexture { texture, write } => {
                     let texture_resource = resources.texture(*texture)?;
@@ -1694,7 +1721,7 @@ impl Queue {
         if let Some((texture, sampler)) = sampled {
             entries.push(raw::BindGroupEntry {
                 binding: 1,
-                resource: raw::BindingResource::TextureView(&texture.view),
+                resource: raw::BindingResource::TextureView(&texture.sampled_view),
             });
             entries.push(raw::BindGroupEntry {
                 binding: 2,
@@ -1782,6 +1809,7 @@ impl From<DrawUniforms> for Uniforms {
 struct GpuTexture {
     texture: raw::Texture,
     view: raw::TextureView,
+    sampled_view: raw::TextureView,
     format: raw::TextureFormat,
     logical_format: TextureFormat,
     width: u32,
@@ -1868,7 +1896,7 @@ fn encode_texture_upload(
         },
         raw::TexelCopyTextureInfo {
             texture: &texture.texture,
-            mip_level: 0,
+            mip_level: write.mip_level(),
             origin: raw::Origin3d {
                 x: area.x(),
                 y: area.y(),
@@ -1890,6 +1918,7 @@ fn create_gpu_texture(
     width: u32,
     height: u32,
     format: TextureFormat,
+    mip_level_count: u32,
     usage: raw::TextureUsages,
 ) -> Result<Arc<GpuTexture>> {
     let max_dimension = device.limits().max_texture_dimension_2d;
@@ -1905,17 +1934,22 @@ fn create_gpu_texture(
             height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count,
         sample_count: 1,
         dimension: raw::TextureDimension::D2,
         format: raw_format,
         usage,
         view_formats: &[],
     });
-    let view = texture.create_view(&raw::TextureViewDescriptor::default());
+    let view = texture.create_view(&raw::TextureViewDescriptor {
+        mip_level_count: Some(1),
+        ..Default::default()
+    });
+    let sampled_view = texture.create_view(&raw::TextureViewDescriptor::default());
     Ok(Arc::new(GpuTexture {
         texture,
         view,
+        sampled_view,
         format: raw_format,
         logical_format: format,
         width,
@@ -1936,9 +1970,21 @@ fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
     }
     if descriptor.usage().contains(TextureUsage::COPY_SRC) {
         usage |= raw::TextureUsages::COPY_SRC;
+        if matches!(
+            descriptor.format(),
+            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
+        ) {
+            usage |= raw::TextureUsages::TEXTURE_BINDING;
+        }
     }
     if descriptor.usage().contains(TextureUsage::COPY_DST) {
         usage |= raw::TextureUsages::COPY_DST;
+        if matches!(
+            descriptor.format(),
+            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
+        ) {
+            usage |= raw::TextureUsages::RENDER_ATTACHMENT;
+        }
     }
     if usage.is_empty() {
         Err(Error::InvalidState)

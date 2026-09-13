@@ -496,6 +496,7 @@ struct DeferredBarrier {
 }
 #[derive(Clone)]
 struct ReadImage {
+    mip_level: u32,
     position: usize,
     image: vk::Image,
     buffer: vk::Buffer,
@@ -568,6 +569,14 @@ pub(crate) fn set_pipeline_layout_metadata(
 
 #[derive(Clone)]
 enum RecordedCommand {
+    BlitImage {
+        source: vk::Image,
+        source_layout: vk::ImageLayout,
+        destination: vk::Image,
+        destination_layout: vk::ImageLayout,
+        regions: Vec<vk::ImageBlit>,
+        filter: vk::Filter,
+    },
     PushConstants {
         layout: ir::PipelineLayoutDesc,
         stages: ir::ShaderStages,
@@ -724,6 +733,7 @@ impl Recording {
                 return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
             }
             RecordedCommand::CopyImageToBuffer { .. }
+            | RecordedCommand::BlitImage { .. }
             | RecordedCommand::CopyBuffer { .. }
             | RecordedCommand::CopyBufferToImage { .. }
                 if self.render_active =>
@@ -772,6 +782,28 @@ impl ResolvedRecording {
 impl RecordedCommand {
     fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
         match self {
+            Self::BlitImage {
+                source,
+                source_layout,
+                destination,
+                destination_layout,
+                regions,
+                filter,
+            } => {
+                if rec.render.is_some() || !rt.capabilities.supports_image_blits() {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                rec.ops.extend(crate::transfer::blit(
+                    &rt.resources,
+                    *source,
+                    *source_layout,
+                    *destination,
+                    *destination_layout,
+                    regions,
+                    *filter,
+                )?);
+                rec.used_images.extend([*source, *destination]);
+            }
             Self::PushConstants {
                 layout,
                 stages,
@@ -1160,20 +1192,18 @@ impl RecordedCommand {
                     return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                 }
                 for region in regions {
+                    let extent = image_data.mip_extent(region.image_subresource.mip_level)?;
                     if region.buffer_row_length != 0
                         || region.buffer_image_height != 0
                         || region.image_offset != vk::Offset3D::default()
-                        || region.image_extent != image_data.extent
+                        || region.image_extent != extent
                         || region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
-                        || region.image_subresource.mip_level != 0
                         || region.image_subresource.base_array_layer != 0
                         || region.image_subresource.layer_count != 1
                     {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
-                    let size = u64::from(image_data.extent.width)
-                        * u64::from(image_data.extent.height)
-                        * 4;
+                    let size = u64::from(extent.width) * u64::from(extent.height) * 4;
                     if region.buffer_offset % 4 != 0
                         || region
                             .buffer_offset
@@ -1183,12 +1213,13 @@ impl RecordedCommand {
                         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                     }
                     rec.copies.push(ReadImage {
+                        mip_level: region.image_subresource.mip_level,
                         position: rec.ops.len(),
                         image: *image,
                         buffer: *buffer,
                         offset: region.buffer_offset,
-                        width: image_data.extent.width,
-                        height: image_data.extent.height,
+                        width: extent.width,
+                        height: extent.height,
                     });
                 }
                 rec.used_buffers.push(*buffer);
@@ -1340,8 +1371,6 @@ impl RecordedCommand {
                     if *extended
                         || !(*source_queue == vk::QUEUE_FAMILY_IGNORED
                             && *destination_queue == vk::QUEUE_FAMILY_IGNORED)
-                        || range.base_mip_level != 0
-                        || range.level_count != 1
                         || range.base_array_layer != 0
                         || range.layer_count != 1
                     {
@@ -1355,15 +1384,30 @@ impl RecordedCommand {
                     if range.aspect_mask != crate::images::image_aspect(image_data.format) {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
+                    let level_count = if range.level_count == vk::REMAINING_MIP_LEVELS {
+                        image_data.mip_levels.checked_sub(range.base_mip_level)
+                    } else {
+                        Some(range.level_count)
+                    }
+                    .filter(|count| *count > 0)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    let end = range
+                        .base_mip_level
+                        .checked_add(level_count)
+                        .filter(|end| *end <= image_data.mip_levels)
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
                     let after = texture_access(*new_layout)?;
                     if *old_layout != vk::ImageLayout::UNDEFINED {
-                        rec.ops.push(ir::OwnedCommand::ResourceBarrier(
-                            ir::OwnedResourceBarrier::Texture {
-                                texture: image_data.id,
-                                before: texture_access(*old_layout)?,
-                                after,
-                            },
-                        ));
+                        for mip_level in range.base_mip_level..end {
+                            rec.ops.push(ir::OwnedCommand::ResourceBarrier(
+                                ir::OwnedResourceBarrier::TextureMip {
+                                    mip_level,
+                                    texture: image_data.id,
+                                    before: texture_access(*old_layout)?,
+                                    after,
+                                },
+                            ));
+                        }
                     }
                     rec.used_images.push(*image);
                 }
@@ -2232,6 +2276,40 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
             image,
             layout,
             regions,
+        },
+    );
+}
+
+unsafe extern "system" fn cmd_blit_image(
+    command: vk::CommandBuffer,
+    source: vk::Image,
+    source_layout: vk::ImageLayout,
+    destination: vk::Image,
+    destination_layout: vk::ImageLayout,
+    count: u32,
+    regions: *const vk::ImageBlit,
+    filter: vk::Filter,
+) {
+    if count == 0 || count > 4000 {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
+    let regions = match slice(regions, count) {
+        Ok(regions) => regions.to_vec(),
+        Err(error) => {
+            record_error(command, error);
+            return;
+        }
+    };
+    record(
+        command,
+        RecordedCommand::BlitImage {
+            source,
+            source_layout,
+            destination,
+            destination_layout,
+            regions,
+            filter,
         },
     );
 }
@@ -3121,7 +3199,7 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
                 .id;
             let bytes = rt
                 .queue
-                .read_texture(&mut rt.cache, image_id)
+                .read_texture_mip(&mut rt.cache, image_id, copy.mip_level)
                 .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
             if bytes.len() != (copy.width as usize) * (copy.height as usize) * 4 {
                 return Err(vk::Result::ERROR_DEVICE_LOST);
@@ -3219,6 +3297,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdBindPipeline" => entry!(cmd_bind_pipeline),
         b"vkCmdBindDescriptorSets" => entry!(cmd_bind_descriptor_sets),
         b"vkCmdPushConstants" => entry!(cmd_push_constants),
+        b"vkCmdBlitImage" => entry!(cmd_blit_image),
         b"vkCmdDispatch" => entry!(cmd_dispatch),
         b"vkCmdDraw" => entry!(cmd_draw),
         b"vkCmdDrawIndexed" => entry!(cmd_draw_indexed),

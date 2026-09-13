@@ -798,6 +798,10 @@ unsafe extern "system" fn get_physical_device_format_properties(
             | vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
     }
+    if capabilities.supports_image_blits() && !properties.optimal_tiling_features.is_empty() {
+        properties.optimal_tiling_features |=
+            vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
+    }
     if capabilities.supports_depth32_attachment() && format == vk::Format::D32_SFLOAT {
         properties.optimal_tiling_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT;
     }
@@ -865,17 +869,27 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
     }
     unsafe {
-        let max_dimension = capabilities.limits().max_image_dimension_2d;
+        let max_dimension = capabilities.limits().max_image_dimension_2d.min(2048);
         *output = vk::ImageFormatProperties {
             max_extent: vk::Extent3D {
                 width: max_dimension,
                 height: max_dimension,
                 depth: 1,
             },
-            max_mip_levels: 1,
+            max_mip_levels: if usage.intersects(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            ) {
+                1
+            } else {
+                capabilities
+                    .limits()
+                    .max_image_mip_levels
+                    .min(max_dimension.ilog2() + 1)
+            },
             max_array_layers: 1,
             sample_counts: vk::SampleCountFlags::TYPE_1,
-            max_resource_size: u64::from(max_dimension).pow(2) * 4,
+            max_resource_size: u64::from(max_dimension).pow(2) * 4 * 2,
         }
     };
     vk::Result::SUCCESS
