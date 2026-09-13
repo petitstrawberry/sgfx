@@ -38,6 +38,10 @@ impl ShaderStages {
     pub const fn empty() -> Self {
         Self(0)
     }
+    /// Return the portable vertex/fragment/compute bit mask.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
 
     /// Return whether this set contains no stages.
     pub const fn is_empty(self) -> bool {

@@ -64,6 +64,117 @@ fn dispatch<'r>(
 }
 
 #[test]
+fn push_constant_ranges_validate_alignment_limits_and_stage_overlap() {
+    for (stages, offset, size, expected) in [
+        (ShaderStages::empty(), 0, 4, Error::InvalidDescriptor),
+        (ShaderStages::VERTEX, 2, 4, Error::InvalidDescriptor),
+        (ShaderStages::VERTEX, 0, 6, Error::InvalidDescriptor),
+        (ShaderStages::VERTEX, 0, 0, Error::InvalidDescriptor),
+        (ShaderStages::VERTEX, 128, 4, Error::OutOfBounds),
+        (ShaderStages::VERTEX, u32::MAX - 3, 4, Error::Overflow),
+    ] {
+        assert_eq!(PushConstantRange::new(stages, offset, size), Err(expected));
+    }
+    let vertex = PushConstantRange::new(ShaderStages::VERTEX, 0, 64).unwrap();
+    let fragment = PushConstantRange::new(ShaderStages::FRAGMENT, 0, 16).unwrap();
+    let layout = PipelineLayoutDesc::new(vec![])
+        .unwrap()
+        .with_push_constant_ranges(vec![vertex, fragment])
+        .unwrap();
+    assert!(
+        layout
+            .validate_push_constants(ShaderStages::VERTEX | ShaderStages::FRAGMENT, 4, &[1; 12])
+            .is_ok()
+    );
+    assert_eq!(
+        layout.validate_push_constants(ShaderStages::FRAGMENT, 16, &[1; 4]),
+        Err(Error::BindingLayoutMismatch)
+    );
+    assert_eq!(
+        layout.validate_push_constants(ShaderStages::COMPUTE, 0, &[1; 4]),
+        Err(Error::BindingLayoutMismatch)
+    );
+    assert_eq!(
+        layout.validate_push_constants(ShaderStages::VERTEX, 2, &[1; 4]),
+        Err(Error::InvalidValue)
+    );
+    assert_eq!(
+        layout.validate_push_constants(ShaderStages::VERTEX, 0, &[1; 4]),
+        Err(Error::BindingLayoutMismatch)
+    );
+    assert!(
+        layout
+            .validate_push_constants(ShaderStages::VERTEX, 20, &[1; 4])
+            .is_ok()
+    );
+    assert_eq!(
+        layout.validate_push_constants(ShaderStages::VERTEX, 0, &[]),
+        Err(Error::InvalidValue)
+    );
+    assert_eq!(
+        PipelineLayoutDesc::new(vec![])
+            .unwrap()
+            .with_push_constant_ranges(vec![vertex, vertex]),
+        Err(Error::InvalidDescriptor)
+    );
+}
+
+#[test]
+fn owned_push_constants_replay_without_copying_and_require_pipeline_and_scope() {
+    let table = ResourceTable::new();
+    let layout = PipelineLayoutDesc::new(vec![])
+        .unwrap()
+        .with_push_constant_ranges(vec![
+            PushConstantRange::new(ShaderStages::COMPUTE, 16, 16).unwrap(),
+        ])
+        .unwrap();
+    let pipeline = table
+        .define_compute_pipeline(
+            ComputePipelineDesc::new(shader(&table, ShaderStage::Compute), layout).unwrap(),
+        )
+        .unwrap()
+        .id();
+    let data = vec![7; 8];
+    let address = data.as_ptr();
+    let update = OwnedCommand::SetPushConstants {
+        stages: ShaderStages::COMPUTE,
+        offset: 20,
+        data,
+    };
+    let recording = OwnedCommandBuffer::new(vec![
+        OwnedCommand::BeginComputePass,
+        OwnedCommand::SetComputePipeline(pipeline),
+        update.clone(),
+        OwnedCommand::EndComputePass,
+    ]);
+    // The cloned recording owns its own bytes, and replay borrows those exact bytes.
+    let OwnedCommand::SetPushConstants { data, .. } = &recording.commands()[2] else {
+        panic!()
+    };
+    let retained = data.as_ptr();
+    assert_ne!(retained, address);
+    for _ in 0..2 {
+        let borrowed = recording.record(&table).unwrap();
+        assert!(
+            matches!(&borrowed.commands()[2], Command::SetPushConstants { offset: 20, data, .. } if data.as_ptr() == retained && *data == [7; 8])
+        );
+    }
+    assert_eq!(
+        OwnedCommandBuffer::new(vec![
+            OwnedCommand::BeginComputePass,
+            update.clone(),
+            OwnedCommand::EndComputePass,
+        ])
+        .validate(&table),
+        Err(Error::PipelineNotSet)
+    );
+    assert_eq!(
+        OwnedCommandBuffer::new(vec![update]).validate(&table),
+        Err(Error::InvalidDescriptor)
+    );
+}
+
+#[test]
 fn descriptors_reject_duplicate_bindings_empty_visibility_and_invalid_storage_formats() {
     let entry = BindGroupLayoutEntry::new(0, ShaderStages::COMPUTE, BindingType::UniformBuffer);
     assert_eq!(

@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 use super::{
     BindGroupId, BufferAccess, BufferId, CommandBuffer, CommandEncoder, ComputePipelineId,
     DepthLoadOp, DrawUniforms, Error, IndexFormat, LoadOp, PixelRect, ProgrammableRenderPipelineId,
-    RenderPassDesc, RenderPipelineId, ResourceBarrier, ResourceTable, Result, SamplerId, StoreOp,
-    TextureAccess, TextureId, TextureWrite, Viewport,
+    RenderPassDesc, RenderPipelineId, ResourceBarrier, ResourceTable, Result, SamplerId,
+    ShaderStages, StoreOp, TextureAccess, TextureId, TextureWrite, Viewport,
 };
 
 /// An owned depth attachment, validated when its recording is replayed.
@@ -201,6 +201,15 @@ pub enum OwnedCommand {
     SetScissor(Option<PixelRect>),
     /// Set the viewport for subsequent draws.
     SetViewport(Viewport),
+    /// Update owned push-constant bytes for the selected programmable pipeline.
+    SetPushConstants {
+        /// Updated shader stages.
+        stages: ShaderStages,
+        /// First byte in the stage's push-constant block.
+        offset: u32,
+        /// Owned bytes.
+        data: Vec<u8>,
+    },
     /// Issue a non-indexed draw.
     Draw {
         /// Number of vertices.
@@ -372,6 +381,11 @@ impl OwnedCommandBuffer {
                             OwnedCommand::SetUniforms(uniforms) => pass.set_uniforms(*uniforms)?,
                             OwnedCommand::SetScissor(scissor) => pass.set_scissor(*scissor)?,
                             OwnedCommand::SetViewport(viewport) => pass.set_viewport(*viewport)?,
+                            OwnedCommand::SetPushConstants {
+                                stages,
+                                offset,
+                                data,
+                            } => pass.set_push_constants(*stages, *offset, data)?,
                             OwnedCommand::Draw {
                                 vertex_count,
                                 first_vertex,
@@ -408,6 +422,11 @@ impl OwnedCommandBuffer {
                                 )?;
                             }
                             OwnedCommand::Dispatch { x, y, z } => pass.dispatch(*x, *y, *z)?,
+                            OwnedCommand::SetPushConstants {
+                                stages,
+                                offset,
+                                data,
+                            } => pass.set_push_constants(*stages, *offset, data)?,
                             _ => return Err(Error::InvalidDescriptor),
                         }
                     }

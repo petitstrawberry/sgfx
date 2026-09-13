@@ -275,6 +275,26 @@ pub struct ComputePassEncoder<'encoder, 'r, 'data> {
     bind_groups: [Option<BindGroupRef<'r>>; MAX_BIND_GROUPS],
 }
 impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
+    /// Update push constants declared by the selected compute pipeline.
+    pub fn set_push_constants(
+        &mut self,
+        stages: ShaderStages,
+        offset: u32,
+        data: &'data [u8],
+    ) -> Result<()> {
+        let pipeline = self
+            .encoder
+            .resources
+            .compute_pipeline(self.pipeline.ok_or(Error::PipelineNotSet)?)?;
+        pipeline
+            .layout()
+            .validate_push_constants(stages, offset, data)?;
+        self.encoder.push(Command::SetPushConstants {
+            stages,
+            offset,
+            data,
+        })
+    }
     /// Select a compute pipeline from this command buffer's resource table.
     pub fn set_pipeline(&mut self, pipeline: ComputePipelineRef<'r>) -> Result<()> {
         self.encoder.resources.compute_pipeline(pipeline)?;
@@ -323,6 +343,25 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
     }
 }
 impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
+    /// Update push constants declared by the selected programmable graphics pipeline.
+    pub fn set_push_constants(
+        &mut self,
+        stages: ShaderStages,
+        offset: u32,
+        data: &'data [u8],
+    ) -> Result<()> {
+        let pipeline = self.encoder.resources.programmable_render_pipeline(
+            self.programmable_pipeline.ok_or(Error::PipelineNotSet)?,
+        )?;
+        pipeline
+            .layout()
+            .validate_push_constants(stages, offset, data)?;
+        self.encoder.push(Command::SetPushConstants {
+            stages,
+            offset,
+            data,
+        })
+    }
     /// Select programmable graphics with compatible color and optional depth formats.
     pub fn set_programmable_pipeline(
         &mut self,

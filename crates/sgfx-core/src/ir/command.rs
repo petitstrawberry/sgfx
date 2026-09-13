@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 mod programmable_commands;
 use super::{
     BindGroupRef, ComputePipelineRef, MAX_BIND_GROUPS, ProgrammableRenderPipelineRef,
-    ResourceBarrier,
+    ResourceBarrier, ShaderStages,
 };
 use super::{BufferAccess, TextureAccess};
 pub use programmable_commands::ComputePassEncoder;
@@ -320,6 +320,15 @@ pub enum Command<'r, 'data> {
     SetScissor(Option<PixelRect>),
     /// Set the viewport for subsequent draws.
     SetViewport(Viewport),
+    /// Update aligned bytes for declared programmable shader stages.
+    SetPushConstants {
+        /// Updated shader stages.
+        stages: ShaderStages,
+        /// First byte in the stage's push-constant block.
+        offset: u32,
+        /// Bytes retained by this command recording.
+        data: &'data [u8],
+    },
     /// Issue a non-indexed draw.
     Draw {
         /// Number of vertices to draw.

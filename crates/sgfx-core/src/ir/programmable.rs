@@ -7,6 +7,44 @@ use alloc::{string::String, vec::Vec};
 pub const MAX_BIND_GROUPS: usize = 4;
 /// Maximum bindings in a descriptor set.
 pub const MAX_BINDINGS_PER_GROUP: usize = 32;
+/// Maximum portable push-constant byte range. Backends may expose a lower limit.
+pub const MAX_PUSH_CONSTANT_BYTES: u32 = 128;
+
+/// A byte range visible to one or more shader stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushConstantRange {
+    stages: ShaderStages,
+    offset: u32,
+    size: u32,
+}
+impl PushConstantRange {
+    /// Construct a non-empty, four-byte-aligned range within the portable limit.
+    pub fn new(stages: ShaderStages, offset: u32, size: u32) -> Result<Self> {
+        if stages.is_empty() || size == 0 || !offset.is_multiple_of(4) || !size.is_multiple_of(4) {
+            return Err(Error::InvalidDescriptor);
+        }
+        if offset.checked_add(size).ok_or(Error::Overflow)? > MAX_PUSH_CONSTANT_BYTES {
+            return Err(Error::OutOfBounds);
+        }
+        Ok(Self {
+            stages,
+            offset,
+            size,
+        })
+    }
+    /// Shader stages consuming the range.
+    pub const fn stages(self) -> ShaderStages {
+        self.stages
+    }
+    /// First byte in the stage's push-constant block.
+    pub const fn offset(self) -> u32 {
+        self.offset
+    }
+    /// Non-zero number of bytes.
+    pub const fn size(self) -> u32 {
+        self.size
+    }
+}
 
 /// A shader module and a stage-specific entry point.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +176,7 @@ impl BindGroupLayoutDesc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineLayoutDesc {
     bind_groups: Vec<BindGroupLayoutDesc>,
+    push_constant_ranges: Vec<PushConstantRange>,
 }
 impl PipelineLayoutDesc {
     /// Construct a layout containing up to four descriptor sets.
@@ -145,11 +184,84 @@ impl PipelineLayoutDesc {
         if bind_groups.len() > MAX_BIND_GROUPS {
             return Err(Error::InvalidDescriptor);
         }
-        Ok(Self { bind_groups })
+        Ok(Self {
+            bind_groups,
+            push_constant_ranges: Vec::new(),
+        })
     }
     /// Return descriptor sets in shader set-number order.
     pub fn bind_groups(&self) -> &[BindGroupLayoutDesc] {
         &self.bind_groups
+    }
+    /// Add ranges with each shader stage appearing in at most one range.
+    /// Ranges for different stages may overlap in bytes.
+    pub fn with_push_constant_ranges(mut self, mut ranges: Vec<PushConstantRange>) -> Result<Self> {
+        if ranges.len() > 3 {
+            return Err(Error::InvalidDescriptor);
+        }
+        let mut used = ShaderStages::empty();
+        for range in &ranges {
+            for stage in [
+                ShaderStages::VERTEX,
+                ShaderStages::FRAGMENT,
+                ShaderStages::COMPUTE,
+            ] {
+                if range.stages.contains(stage) && used.contains(stage) {
+                    return Err(Error::InvalidDescriptor);
+                }
+            }
+            used |= range.stages;
+        }
+        ranges.sort_unstable_by_key(|range| (range.offset, range.size, range.stages.bits()));
+        self.push_constant_ranges = ranges;
+        Ok(self)
+    }
+    /// Declared push-constant ranges.
+    pub fn push_constant_ranges(&self) -> &[PushConstantRange] {
+        &self.push_constant_ranges
+    }
+    /// Check that every updated stage declares the complete aligned byte range.
+    pub fn validate_push_constants(
+        &self,
+        stages: ShaderStages,
+        offset: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        if stages.is_empty()
+            || data.is_empty()
+            || !offset.is_multiple_of(4)
+            || !data.len().is_multiple_of(4)
+        {
+            return Err(Error::InvalidValue);
+        }
+        let size = u32::try_from(data.len()).map_err(|_| Error::Overflow)?;
+        let end = offset.checked_add(size).ok_or(Error::Overflow)?;
+        if end > MAX_PUSH_CONSTANT_BYTES {
+            return Err(Error::OutOfBounds);
+        }
+        for stage in [
+            ShaderStages::VERTEX,
+            ShaderStages::FRAGMENT,
+            ShaderStages::COMPUTE,
+        ] {
+            if stages.contains(stage)
+                && !self.push_constant_ranges.iter().any(|range| {
+                    range.stages.contains(stage)
+                        && offset >= range.offset
+                        && end <= range.offset + range.size
+                })
+            {
+                return Err(Error::BindingLayoutMismatch);
+            }
+        }
+        if self.push_constant_ranges.iter().any(|range| {
+            offset < range.offset + range.size
+                && range.offset < end
+                && !stages.contains(range.stages)
+        }) {
+            return Err(Error::BindingLayoutMismatch);
+        }
+        Ok(())
     }
 }
 /// An owned resource identity and optional byte range used by one binding.
