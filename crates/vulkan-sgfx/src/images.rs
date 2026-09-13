@@ -710,6 +710,7 @@ struct GraphicsState {
     vertex: Option<ir::VertexBufferLayout>,
     depth: Option<ir::DepthState>,
     raster: ir::RasterState,
+    topology: ir::PrimitiveTopology,
 }
 
 fn compare(op: vk::CompareOp) -> Result<ir::CompareFunction, vk::Result> {
@@ -830,7 +831,10 @@ unsafe fn graphics_state(
         || !vertex.flags.is_empty()
         || !assembly.p_next.is_null()
         || !assembly.flags.is_empty()
-        || assembly.topology != vk::PrimitiveTopology::TRIANGLE_LIST
+        || !matches!(
+            assembly.topology,
+            vk::PrimitiveTopology::TRIANGLE_LIST | vk::PrimitiveTopology::TRIANGLE_STRIP
+        )
         || assembly.primitive_restart_enable != vk::FALSE
         || !viewport.p_next.is_null()
         || !viewport.flags.is_empty()
@@ -987,6 +991,11 @@ unsafe fn graphics_state(
         vertex: vertex_layout(vertex)?,
         depth,
         raster: ir::RasterState::new(cull, front),
+        topology: if assembly.topology == vk::PrimitiveTopology::TRIANGLE_STRIP {
+            ir::PrimitiveTopology::TriangleStrip
+        } else {
+            ir::PrimitiveTopology::TriangleList
+        },
     })
 }
 
@@ -1078,7 +1087,7 @@ unsafe extern "system" fn create_graphics_pipelines(
                 layout,
                 target_format,
                 state.vertex,
-                ir::PrimitiveTopology::TriangleList,
+                state.topology,
                 state.blend,
                 state.raster,
             )

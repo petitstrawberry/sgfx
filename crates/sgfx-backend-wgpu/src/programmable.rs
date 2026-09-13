@@ -16,6 +16,7 @@ pub(super) struct Cache {
         Arc<RenderPipeline>,
     )>,
     compute: Vec<(ir::ComputePipelineId, Arc<ComputePipeline>)>,
+    pub(super) groups: Vec<(ir::BindGroupId, Arc<raw::BindGroup>)>,
 }
 
 pub(super) struct RenderPipeline {
@@ -23,6 +24,7 @@ pub(super) struct RenderPipeline {
     pub has_vertex_buffer: bool,
     pub has_depth: bool,
     pub empty_groups: Vec<Option<Arc<raw::BindGroup>>>,
+    pub topology: ir::PrimitiveTopology,
 }
 
 pub(super) struct ComputePipeline {
@@ -339,6 +341,9 @@ impl Resources {
                             ir::PrimitiveTopology::TriangleList => {
                                 raw::PrimitiveTopology::TriangleList
                             }
+                            ir::PrimitiveTopology::TriangleStrip => {
+                                raw::PrimitiveTopology::TriangleStrip
+                            }
                         },
                         front_face: match desc.raster().front_face() {
                             ir::FrontFace::Clockwise => raw::FrontFace::Cw,
@@ -379,6 +384,7 @@ impl Resources {
             has_vertex_buffer: desc.vertex_buffer().is_some(),
             has_depth,
             empty_groups: self.empty_groups(desc.layout())?,
+            topology: desc.topology(),
         });
         self.programmable
             .render
@@ -429,6 +435,14 @@ impl Resources {
         reference: ir::BindGroupRef<'_>,
     ) -> Result<Arc<raw::BindGroup>> {
         let desc: BindGroupDesc = self.resources.bind_group(reference)?;
+        if let Some((_, group)) = self
+            .programmable
+            .groups
+            .iter()
+            .find(|(id, _)| *id == reference.id())
+        {
+            return Ok(Arc::clone(group));
+        }
         let table = Rc::clone(&self.resources);
         let layout = self.programmable_layout(desc.layout())?;
         enum Resource {
@@ -496,8 +510,9 @@ impl Resources {
                 },
             })
             .collect::<Vec<_>>();
-        // Bind groups are rebuilt so remapped presentation images are never stale.
-        validated(self.context.raw_device(), || {
+        // Immutable descriptors retain their physical group until a presentation
+        // mapping changes. map_image/unmap_image invalidate this cache.
+        let group = validated(self.context.raw_device(), || {
             Ok(Arc::new(self.context.raw_device().create_bind_group(
                 &raw::BindGroupDescriptor {
                     label: Some("sgfx programmable bind group"),
@@ -505,7 +520,11 @@ impl Resources {
                     entries: &entries,
                 },
             )))
-        })
+        })?;
+        self.programmable
+            .groups
+            .push((reference.id(), Arc::clone(&group)));
+        Ok(group)
     }
 }
 

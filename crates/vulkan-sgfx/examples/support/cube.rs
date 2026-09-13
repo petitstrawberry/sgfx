@@ -51,6 +51,8 @@ pub struct Options {
     pub angle: f32,
     pub reverse_triangles: bool,
     pub index_u32: bool,
+    pub base_vertex: i32,
+    pub triangle_strip: bool,
     pub depth_test: bool,
     pub cull_back: bool,
     pub front_clockwise: bool,
@@ -68,6 +70,8 @@ impl Default for Options {
             angle: 0.58,
             reverse_triangles: false,
             index_u32: false,
+            base_vertex: 0,
+            triangle_strip: false,
             depth_test: true,
             cull_back: false,
             front_clockwise: false,
@@ -146,6 +150,7 @@ pub(crate) fn cube_indices(options: Options) -> Vec<u8> {
     }
     let mut bytes = Vec::new();
     for index in triangles.into_iter().flatten() {
+        let index = index as u32 + options.base_vertex.saturating_neg().max(0) as u32;
         if options.index_u32 {
             bytes.extend_from_slice(&(index as u32).to_le_bytes());
         } else {
@@ -492,7 +497,24 @@ unsafe fn upload_texture(
 
 // Handles are used only with their creating device. Readback follows the
 // transfer-to-host barrier and fence wait, and preserves exact RGBA bytes.
+unsafe fn draw_cube(device: &ash::Device, command: vk::CommandBuffer, options: Options) {
+    unsafe {
+        if options.triangle_strip {
+            for face in 0..6 {
+                device.cmd_draw(command, 4, 1, face * 4, 0);
+            }
+        } else {
+            device.cmd_draw_indexed(command, 36, 1, 0, options.base_vertex, 0);
+        }
+    }
+}
+
 pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>> {
+    if !(-1024..=1024).contains(&options.base_vertex)
+        || (options.triangle_strip && options.base_vertex != 0)
+    {
+        return Err("unsupported cube verification base vertex".into());
+    }
     let source = if options.push_constants && options.textured {
         include_str!("../assets/push_constant_textured_cube.wgsl")
     } else if options.push_constants {
@@ -654,15 +676,32 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             None,
         )?;
         resources.views.push(depth_view);
+        let mut vertex_bytes = if options.textured {
+            textured_vertices()
+        } else {
+            cube_vertices()
+        };
+        if options.triangle_strip {
+            let stride = if options.textured { 32 } else { 24 };
+            vertex_bytes = vertex_bytes
+                .chunks_exact(4 * stride)
+                .flat_map(|face| {
+                    [1, 2, 0, 3]
+                        .into_iter()
+                        .flat_map(move |i| face[i * stride..(i + 1) * stride].iter().copied())
+                })
+                .collect();
+        }
+        if options.base_vertex > 0 {
+            let stride = if options.textured { 32 } else { 24 };
+            let prefix = vec![0; options.base_vertex as usize * stride];
+            vertex_bytes = [prefix, vertex_bytes].concat();
+        }
         let vertex_buffer = upload_buffer(
             &device,
             &memory_properties,
             vk::BufferUsageFlags::VERTEX_BUFFER,
-            &if options.textured {
-                textured_vertices()
-            } else {
-                cube_vertices()
-            },
+            &vertex_bytes,
             &mut resources,
         )?;
         let index_buffer = upload_buffer(
@@ -938,8 +977,13 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
             .vertex_attribute_descriptions(&vertex_attributes);
-        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(
+            if options.triangle_strip {
+                vk::PrimitiveTopology::TRIANGLE_STRIP
+            } else {
+                vk::PrimitiveTopology::TRIANGLE_LIST
+            },
+        );
         let viewports = [vk::Viewport::default()
             .x(0.0)
             .y(0.0)
@@ -1098,7 +1142,7 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             let mut split = scissors[0];
             split.extent.width /= 2;
             device.cmd_set_scissor(command_buffer, 0, &[split]);
-            device.cmd_draw_indexed(command_buffer, 36, 1, 0, 0, 0);
+            draw_cube(&device, command_buffer, options);
             let bytes = transform(Options {
                 angle: options.angle + 1.0,
                 ..options
@@ -1113,9 +1157,9 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             split.offset.x = split.extent.width as i32;
             split.extent.width = options.size[0] - split.extent.width;
             device.cmd_set_scissor(command_buffer, 0, &[split]);
-            device.cmd_draw_indexed(command_buffer, 36, 1, 0, 0, 0);
+            draw_cube(&device, command_buffer, options);
         } else {
-            device.cmd_draw_indexed(command_buffer, 36, 1, 0, 0, 0);
+            draw_cube(&device, command_buffer, options);
         }
         device.cmd_end_render_pass(command_buffer);
 
@@ -1143,8 +1187,8 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             buffer,
             &[vk::BufferImageCopy::default()
                 .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
+                .buffer_row_length(options.size[0])
+                .buffer_image_height(options.size[1])
                 .image_subresource(
                     vk::ImageSubresourceLayers::default()
                         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1369,6 +1413,35 @@ pub fn verify(entry: &Entry) -> Result<(), Box<dyn Error>> {
     if normal != wide {
         return Err("UINT16 and UINT32 indexed cube images differ".into());
     }
+    let strip = render(
+        entry,
+        Options {
+            triangle_strip: true,
+            ..options
+        },
+    )?;
+    if normal != strip {
+        return Err("triangle-strip and triangle-list cube GPU readbacks differ".into());
+    }
+    println!("PASS: six nonindexed four-vertex triangle strips match the indexed cube exactly");
+    for base_vertex in [-3, 3] {
+        for index_u32 in [false, true] {
+            let rebased = render(
+                entry,
+                Options {
+                    base_vertex,
+                    index_u32,
+                    ..options
+                },
+            )?;
+            if normal != rebased {
+                return Err(
+                    format!("base vertex {base_vertex} changed indexed cube pixels").into(),
+                );
+            }
+        }
+    }
+    println!("PASS: positive/negative base vertex preserves exact UINT16/UINT32 GPU readbacks");
     let rotated = render(
         entry,
         Options {

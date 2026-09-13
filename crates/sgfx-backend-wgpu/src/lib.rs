@@ -110,6 +110,9 @@ pub enum UnsupportedFeature {
     /// A render pipeline uses a format or vertex convention outside WGPU's
     /// current portable lowering.
     Pipeline,
+    /// Indexed strips need explicit restart semantics or a faithful index
+    /// conversion. WGPU's implicit restart must not reinterpret ordinary indices.
+    IndexedTriangleStrip,
     /// A sampled texture format is incompatible with the selected fragment
     /// program.
     TextureFormat,
@@ -833,10 +836,14 @@ impl Resources {
             .iter_mut()
             .find(|(candidate, _)| *candidate == texture)
         {
+            if Arc::ptr_eq(mapped, &image.gpu) {
+                return Ok(());
+            }
             *mapped = Arc::clone(&image.gpu);
         } else {
             self.mapped_images.push((texture, Arc::clone(&image.gpu)));
         }
+        self.programmable.groups.clear();
         Ok(())
     }
 
@@ -844,6 +851,7 @@ impl Resources {
     pub fn unmap_image(&mut self, texture: TextureId) {
         self.mapped_images
             .retain(|(candidate, _)| *candidate != texture);
+        self.programmable.groups.clear();
     }
 
     fn texture(&mut self, reference: TextureRef<'_>) -> Result<Arc<GpuTexture>> {
@@ -1015,6 +1023,32 @@ pub struct Queue {
     context: Context,
 }
 
+fn validate_indexed_topologies(commands: &CommandBuffer<'_, '_>) -> Result<()> {
+    let mut pipeline = None;
+    for command in commands.commands() {
+        match command {
+            Command::BeginRenderPass(_) | Command::EndRenderPass | Command::SetPipeline(_) => {
+                pipeline = None
+            }
+            Command::SetProgrammablePipeline(reference) => {
+                pipeline = Some(
+                    commands
+                        .resources()
+                        .programmable_render_pipeline(*reference)?
+                        .topology(),
+                );
+            }
+            Command::DrawIndexed { .. }
+                if pipeline == Some(ir::PrimitiveTopology::TriangleStrip) =>
+            {
+                return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl Queue {
     /// Bind this queue to a persistent resource cache for command execution.
     ///
@@ -1056,6 +1090,7 @@ impl Queue {
         resources: &mut Resources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<()> {
+        validate_indexed_topologies(commands)?;
         self.submit_inner(resources, commands, None).map(|_| ())
     }
 
@@ -1084,6 +1119,7 @@ impl Queue {
         if !core::ptr::eq(resources.resources.as_ref(), commands.resources()) {
             return Err(SubmitError::Rejected(Error::ResourceTableMismatch));
         }
+        validate_indexed_topologies(commands).map_err(SubmitError::Rejected)?;
         let _ = device.raw_device().poll(raw::Maintain::Poll);
         if device
             .tracker
@@ -1628,6 +1664,9 @@ impl Queue {
         base_vertex: i32,
     ) -> Result<()> {
         if let Some(pipeline) = &state.programmable {
+            if pipeline.topology == ir::PrimitiveTopology::TriangleStrip {
+                return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
+            }
             self.prepare_programmable_draw(render_pass, state, pipeline)?;
             let (buffer, offset, format) =
                 state.index_buffer.as_ref().ok_or(Error::InvalidState)?;

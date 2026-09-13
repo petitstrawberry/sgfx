@@ -285,8 +285,9 @@ non-transactional [backend execution failures](reference.md#execution-and-comple
 | `MAX_BUFFERS` | 1,024 | Per resource table. |
 | `MAX_SAMPLERS` | 256 | Per resource table. |
 | `MAX_RENDER_PIPELINES` | 256 | Per resource table. |
+| `MAX_BIND_GROUP_DEFINITIONS` | 4,096 | Immutable bind-group definitions per resource table. |
 | `MAX_VERTEX_ATTRIBUTES` | 16 | Per vertex layout. |
-| `MAX_COMMANDS` | 4,096 | Per command buffer, including pass begin/end and bindings. |
+| `MAX_COMMANDS` | 65,536 | Per command buffer, including pass begin/end and bindings. |
 
 Beginning a pass reserves room for its end command. These are IR capacity
 bounds, not promises about GPU memory or device limits. Command buffers borrow
@@ -456,7 +457,11 @@ Programmable draws use the existing `draw` and `draw_indexed` commands. They req
 matching descriptor sets but no fixed `DrawUniforms`, texture slot, or sampler
 slot. Vertexless nonindexed draws require no vertex/index buffer. Indexed draws
 always require an index buffer; a backend validates indirect vertex addresses
-against opaque index data. Both draw forms retain positive triangle-list counts.
+against opaque index data, including signed base vertices. Triangle-list counts
+are positive multiples of three; triangle strips require at least three vertices
+or indices. Backend support is narrower: WGPU executes nonindexed programmable
+strips and rejects indexed strips before acceptance; native VirGL currently
+accepts triangle lists only. Primitive restart has no IR representation.
 Copies require distinct buffers, copy usage, nonzero sizes, and four-byte-aligned
 offsets/sizes. All new passes retain the bounded command encoder's reserved end
 slot and explicit `end()` requirement.

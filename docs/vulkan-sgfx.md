@@ -45,10 +45,12 @@ remain incomplete.
   D32 depth testing, front-face/back-face culling, fences, and binary semaphores.
 - Offscreen graphics: RGBA8_UNORM or BGRA8_UNORM color, optional D32_SFLOAT
   depth, optimal 2D images, one layer/sample, at most 2048×2048, one color
-  attachment, triangle lists, one vertex binding, four vertex formats, and one
+  attachment, triangle lists and nonindexed triangle strips on Metal, signed
+  base vertices for indexed lists, one vertex binding, four vertex formats, and one
   instance per draw. Common alpha/additive blending and sampled 2D textures
   work. Attachments retain one mip; sampled images can contain a checked chain.
-  Stencil, multisampling, partial/flipped/format-converting blits, indirect drawing,
+  Indexed strips and primitive restart, stencil, multisampling,
+  partial/flipped/format-converting blits, indirect drawing,
   and other dynamic state are absent.
 - macOS WSI exposes `VK_KHR_surface`, `VK_EXT_metal_surface`, `VK_MVK_macos_surface`,
   `VK_KHR_portability_enumeration`, and `VK_KHR_swapchain`. It implements Metal
@@ -247,10 +249,14 @@ and verify the chosen Mesa driver. The Linux check also used
   A test creates/destroys 1250 buffers on an otherwise idle device, then performs
   real compute work. With long-lived pipelines/resources, unique transient
   resources and descriptor configurations still consume that epoch's table
-  budget (including 1024 buffers and 256 bind-group configurations). Identical
-  descriptor configurations reuse definitions. Exhaustion returns an allocation
+  budget (including 1024 buffers and 4096 bind-group configurations). Identical
+  descriptor configurations reuse definitions and physical groups; GPU image
+  remapping invalidates physical groups. Exhaustion returns an allocation
   error. General reclamation requires generational core/backend slots or a safe
   migration of live resources; this remains a blocker for a general driver.
+- **Command programs are bounded to 65,536 commands.** Vulkan recording uses
+  the canonical IR bound. Lowering may add IR operations, which must also fit
+  this bound. Overflow rejects recording/submission without signaling success.
 - **Scarlet VirGL is executable through the linked test path.** The
   `aarch64-unknown-scarlet` cube uses the same Vulkan frontend, SGFX facade,
   SPIR-V-to-TGSI lowering, `/dev/gpu0`, VirGL submit/completion, GPU readback,
@@ -262,6 +268,11 @@ and verify the chosen Mesa driver. The Linux check also used
   image-to-buffer copies use blocking readback. This establishes functional
   ordering and observable output, not a performance result for a native Vulkan
   driver.
+
+The ordinary-loader vkQuake2 release execution now displays the bundled map,
+weapon and HUD with triangle billboard particles. See the
+[application compatibility record](vulkan-game-compatibility.md) for the exact
+build, game settings, GPU evidence and remaining limitations.
 
 ## ABI references
 

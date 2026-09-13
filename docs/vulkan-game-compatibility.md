@@ -30,6 +30,15 @@ command procedures. This remains a bounded, non-conformant Vulkan 1.0 path.
   one mip. Native VirGL and A618 explicitly reject multi-mip storage and blits.
 - Native VirGL shader sampling: Naga image/sampler pairs reflect SGFX bindings
   into per-stage TGSI slots, with actual `TEX`, `TXL`, and `TXB` instructions.
+- Nonindexed triangle strips on Metal, plus signed base vertices for indexed
+  triangle lists. Indexed strips are rejected before GPU acceptance because
+  WGPU's implicit primitive restart would change ordinary Vulkan indices.
+- Swapchain transitions from `PRESENT_SRC_KHR` to transfer source and full-mip
+  image readback with either implicit or explicitly tightly packed row sizes.
+  Swapchain metadata retains the application's declared image usage.
+- Immutable physical bind groups are cached across draws. Replacing or removing
+  a mapped GPU image invalidates the cache; updates to the same image remain
+  visible without rebuilding its group.
 
 Canonical IR adds `SetViewport`, `SetPushConstants`, `WriteTextureMip` and
 `BlitTexture`, bringing the owned command enum to 26 variants. Texture
@@ -44,6 +53,10 @@ The maximum IR bind-group entries increase from 16 to 32 to accommodate the
 frontend's descriptor expansion. Sampling and upload already had canonical
 IR resource/command types; the Vulkan lowering and VirGL programmable path now
 use those types. Fixed pipelines and programmable pipelines remain independent.
+The canonical command bound is 65,536 and the bind-group definition bound is
+4,096. Vulkan recording uses the canonical command bound; exhausting either
+budget returns an error rather than silently dropping commands. These are
+bounded application capacities, not general resource reclamation.
 
 ## Ordinary-loader textured cube
 
@@ -78,6 +91,12 @@ UINT16/UINT32 index equivalence also pass. A 512-square texture render is saved
 from GPU readback. WGSL and SPIR-V sampling fixtures pass the Mesa TGSI parser
 and VirGLRenderer 1.3.0 shader-object acceptance with no GL error.
 
+Six nonindexed four-vertex strips reproduce the indexed cube exactly. Both
+positive and negative base vertices reproduce the original UINT16/UINT32
+readbacks exactly. A separate GPU test confirms that rejecting an indexed strip
+does not execute its preceding clear. Cached groups observe a red-to-green
+update to one image and a subsequent remapping to a different blue image.
+
 The ordinary-loader mipmap example checks eight actual GPU chains: RGBA/BGRA,
 nearest/linear blits, and 8×8/7×3 dimensions. Every level matches a CPU reference
 within one UNORM unit. Compute sampling verifies explicit LOD, nearest/linear
@@ -86,7 +105,7 @@ uploads to mip 1 change only the selected pixel. A declared 4096-set descriptor
 pool creates without materializing bind groups; its actual one-set descriptor
 capacity correctly rejects a second allocation.
 
-## Upstream vkQuake2 probe
+## Upstream vkQuake2 execution on macOS
 
 Upstream [vkQuake2](https://github.com/kondrak/vkQuake2/tree/6763f207229f97cffabb6fc2da72017a794b139b)
 at commit `6763f207229f97cffabb6fc2da72017a794b139b` builds on macOS against the
@@ -99,24 +118,44 @@ With `VK_DRIVER_FILES` selecting this ICD, the game identifies
 synchronization, three render passes, world/UI depth images, intermediate
 color images, framebuffers, command pools and command buffers.
 
-**No gameplay frame has been verified.** The game now passes particle-texture
-mipmap generation, initializes its renderer and loads the bundled `demo1` map.
-An optimized build with the upstream `_DEBUG` Vulkan result logging enabled
-identifies the remaining failures without modifying game source: point/strip/
-line pipeline creation is unsupported, and its first frame exceeds the current
-4000 recorded-command limit. `vkEndCommandBuffer` returns
-`VK_ERROR_OUT_OF_HOST_MEMORY`, followed by a rejected submit. Ordinary release
-mode discards these errors and waits indefinitely in present for a semaphore
-that the failed submit did not signal. LLDB confirms this wait; reaching present
-is not a successfully presented frame. Descriptor-pool declaration capacity
-no longer prevents initialization, while live-object/table budgets still apply.
+The bundled `demo1` map now renders its textured world, first-person weapon,
+crosshair and HUD at 640×480. The renderer's frame counter reached 1,193 while
+the game continued submitting frames. The game's own `screenshot` command saved
+two GPU-read TGA images with different views and no loading overlay. The actual
+macOS window was also visually checked. This is a verified game rendering path.
+Movement and combat have not been systematically tested, and sustained
+performance has not been benchmarked.
+
+The checked game executable uses upstream release optimization. Its Vulkan
+renderer was built with `-O3 -g -D_DEBUG -DNDEBUG` to retain upstream Vulkan
+result logging during diagnosis; source, shader modules and game data were
+unmodified. The SGFX driver uses Cargo's release profile. Use the game's ordinary
+`vk_point_particles=0` setting to select triangle billboard particles because
+PointSize shaders and point pipelines remain unsupported. Optional line
+pipelines are also rejected; the default filled rendering path does not use
+them. Their creation errors remain visible in the diagnostic renderer's log.
+
+After building this ICD and selecting its manifest as above, run from the
+game's `macos/release` directory:
+
+```sh
+./quake2 +set vid_ref vk +set vid_fullscreen 0 +set vk_validation 0 \
+  +set vk_mode 3 +set vk_point_particles 0 +map demo1
+```
+
+No game-specific loader or SGFX command interface is used by the game. It links
+the installed Khronos Vulkan loader, which discovers the ICD from
+`VK_DRIVER_FILES`. One of the game's TGA readbacks is serialized as the local
+diagnostic artifact `target/vkquake2-sgfx-demo1-release.png`; game assets are not
+bundled with SGFX.
 
 The ordinary-loader `shader_probe` example accepts 22 of the game's 23
 unmodified SPIR-V modules, including combined-sampler fragments and push-constant
 transforms. The PointSize vertex module triggers a Naga 24 writer/parser
 interface-structure layout regression. A post-normalization validation rejects
 it before WGPU, preserving device usability for subsequent modules. An authored
-minimal SPIR-V interface fixture covers this regression. Broader primitive
-topologies, larger command programs, and durable resource/descriptor reuse are
-still required for this game's renderer. Procedure counts
-and successful initialization are not evidence of gameplay compatibility.
+minimal SPIR-V interface fixture covers this regression. Point/line rendering,
+indexed strips, general resource reclamation and wider Vulkan coverage remain
+incomplete. Native VirGL still lacks the mip/blit and push-constant capabilities
+used by this game, and this macOS result does not establish Scarlet game
+compatibility.

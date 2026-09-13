@@ -705,7 +705,7 @@ impl Recording {
             self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
-        if self.commands.len() >= 4000 {
+        if self.commands.len() >= ir::MAX_COMMANDS {
             self.fail(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
             return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
         }
@@ -1193,8 +1193,9 @@ impl RecordedCommand {
                 }
                 for region in regions {
                     let extent = image_data.mip_extent(region.image_subresource.mip_level)?;
-                    if region.buffer_row_length != 0
-                        || region.buffer_image_height != 0
+                    if (region.buffer_row_length != 0 && region.buffer_row_length != extent.width)
+                        || (region.buffer_image_height != 0
+                            && region.buffer_image_height != extent.height)
                         || region.image_offset != vk::Offset3D::default()
                         || region.image_extent != extent
                         || region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
@@ -1396,14 +1397,26 @@ impl RecordedCommand {
                         .checked_add(level_count)
                         .filter(|end| *end <= image_data.mip_levels)
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    let after = texture_access(*new_layout)?;
+                    // Presentation is outside command IR. These persistent
+                    // swapchain images retain color-attachment storage while
+                    // presented and can be transitioned back to transfer use.
+                    let access = |layout| {
+                        if layout == vk::ImageLayout::PRESENT_SRC_KHR
+                            && image_data.swapchain.is_some()
+                        {
+                            Ok(ir::TextureAccess::RenderAttachment)
+                        } else {
+                            texture_access(layout)
+                        }
+                    };
+                    let after = access(*new_layout)?;
                     if *old_layout != vk::ImageLayout::UNDEFINED {
                         for mip_level in range.base_mip_level..end {
                             rec.ops.push(ir::OwnedCommand::ResourceBarrier(
                                 ir::OwnedResourceBarrier::TextureMip {
                                     mip_level,
                                     texture: image_data.id,
-                                    before: texture_access(*old_layout)?,
+                                    before: access(*old_layout)?,
                                     after,
                                 },
                             ));
@@ -2191,7 +2204,7 @@ unsafe extern "system" fn cmd_draw_indexed(
     base_vertex: i32,
     first_instance: u32,
 ) {
-    if instances > 1 || base_vertex != 0 || first_instance != 0 {
+    if instances > 1 || first_instance != 0 {
         record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
         return;
     }
@@ -3436,6 +3449,24 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_accepts_application_programs_and_rejects_capacity_overflow() {
+        let mut recording = Recording::new(1);
+        recording.state = RecordingState::Recording;
+        for _ in 0..ir::MAX_COMMANDS {
+            recording
+                .push(RecordedCommand::Dispatch { x: 1, y: 1, z: 1 })
+                .unwrap();
+        }
+        assert!(recording.error.is_none());
+        assert_eq!(recording.commands.len(), ir::MAX_COMMANDS);
+        assert_eq!(
+            recording.push(RecordedCommand::Dispatch { x: 1, y: 1, z: 1 }),
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        );
+        assert_eq!(recording.commands.len(), ir::MAX_COMMANDS);
+    }
 
     #[test]
     fn command_recording_stays_on_the_calling_thread() {

@@ -343,6 +343,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
     let extent = info.image_extent;
     let surface_handle = info.surface;
     let usage = swapchain_usage(info.image_usage);
+    let image_usage = info.image_usage;
     let old_swapchain = info.old_swapchain;
     let swapchain = vk::SwapchainKHR::from_raw(next_id());
     let result = with_device(device, move |runtime| {
@@ -408,8 +409,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
                         height: extent.height,
                         depth: 1,
                     },
-                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
-                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                    usage: image_usage,
                     bound: None,
                     swapchain: Some(swapchain),
                 },
