@@ -22,6 +22,7 @@ pub(crate) struct Runtime {
     pub table: Rc<ir::ResourceTable>,
     pub resources: Resources,
     pub(crate) device: driver::Device,
+    pub(crate) capabilities: driver::Capabilities,
 
     pub cache: driver::Resources,
     pub queue: driver::Queue,
@@ -40,6 +41,7 @@ impl Runtime {
         fences: crate::api::Fences,
         device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ash::vk::Result> {
+        let capabilities = adapter.capabilities();
         let device = adapter.create_device().map_err(backend_failure)?;
         let table = Rc::new(ir::ResourceTable::new());
         let cache = device
@@ -50,6 +52,7 @@ impl Runtime {
             table,
             resources: Resources::new(),
             device,
+            capabilities,
             cache,
             queue,
             recordings,

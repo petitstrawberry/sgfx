@@ -24,6 +24,9 @@ remain incomplete.
 - SPIR-V shader modules, compute pipelines, and vertex/fragment pipelines.
   Naga validates and normalizes Vulkan coordinate conventions before SGFX
   shader definition; backend shader/pipeline validation occurs at creation.
+- Stage-specific push constants up to 128 bytes on capable Metal adapters,
+  with incremental updates and a value snapshot per draw/dispatch. Native
+  VirGL reports no push-constant support and rejects nonempty ranges.
 - Descriptor sets for uniform/storage buffers (including dynamic offsets),
   separate images/samplers and combined image samplers; four sets with 16
   logical bindings each, one descriptor per binding. Arrays are unsupported.
@@ -102,7 +105,7 @@ From the repository root, run:
 scripts/run-vulkan-demo.sh target/vulkan-demo.png
 ```
 
-This builds a fresh host ICD and `render_demo`, writes its absolute-path driver
+This builds a fresh release host ICD and `render_demo`, writes its absolute-path driver
 manifest, finds an installed Vulkan loader, and renders a 1024×768 procedural
 RGB triangle with a grid and orbital details. The fragment shader produces the
 image; after real Vulkan submission, fence completion, image-to-buffer copy,
@@ -135,7 +138,7 @@ From the repository root, run:
 scripts/run-vulkan-windowed.sh
 ```
 
-Use `--frames 120` for a finite automated run. The runner builds the ICD and
+Use `--frames 120` for a finite automated run. The runner builds the release ICD and
 the `windowed` example, writes an absolute ICD manifest, finds an installed
 Khronos loader, sets only the standard loader and dynamic-library search
 variables, and starts the application. The application itself calls
@@ -173,51 +176,37 @@ packaging difference is below the Vulkan calls exercised by the test program.
 
 ## Run the examples
 
-From the repository root:
+From the repository root, with an installed Khronos loader:
 
 ```sh
-cargo build -p vulkan-sgfx --lib --examples
-cargo run -p vulkan-sgfx --example headless
-cargo run -p vulkan-sgfx --example offscreen
-cargo test -p vulkan-sgfx --lib
-cargo test -p vulkan-sgfx --test contracts -- --ignored
-```
-
-The diagnostic `headless` and `offscreen` examples load the freshly built ICD
-directly by default. An optional first argument or `SGFX_ICD_LIBRARY` selects
-another ICD library. `headless` compiles a
-compute shader, verifies all 256 output words, and reports CPU recording and
-submit durations. `offscreen` compiles vertex/fragment SPIR-V, renders a 64×64
-triangle, and checks center, corner, and asymmetric pixels after readback.
-GPU contract tests are ignored by default so CPU-only CI can run library tests;
-run them explicitly on a machine with a supported host backend.
-
-To exercise the real Khronos loader instead, first write a manifest with an
-absolute library path (use `libvulkan_sgfx.so` on Linux):
-
-```sh
+cargo build --locked --release -p vulkan-sgfx --lib --examples
 python3 crates/vulkan-sgfx/tools/write_icd_manifest.py \
-  target/debug/libvulkan_sgfx.dylib target/sgfx_icd.json
+  target/release/libvulkan_sgfx.dylib target/sgfx_icd.json
 export VK_DRIVER_FILES="$PWD/target/sgfx_icd.json"
-export SGFX_VULKAN_LOADER=/absolute/path/to/libvulkan.1.dylib
-cargo run -p vulkan-sgfx --example loader_probe
-cargo run -p vulkan-sgfx --example headless
-cargo run -p vulkan-sgfx --example offscreen
+# Use the normal platform lookup path when the installed loader is elsewhere:
+export DYLD_LIBRARY_PATH=/path/to/installed/vulkan-loader/lib
+cargo run --locked --release -p vulkan-sgfx --example headless -- 16
+cargo run --locked --release -p vulkan-sgfx --example headless -- 16 --push-constants
+cargo test --locked -p vulkan-sgfx --lib
+SGFX_ICD_LIBRARY="$PWD/target/release/libvulkan_sgfx.dylib" \
+  cargo test --locked -p vulkan-sgfx --test contracts -- --ignored
 ```
 
-`loader_probe` verifies loader discovery, reported device properties, logical
-device and queue creation, idle, and destruction. The other two examples use
-the real loader's normal `vkGetInstanceProcAddr` when `SGFX_VULKAN_LOADER` is set,
-exercising loader dispatch for resource, command, and submission APIs as well.
-The ICD accepts the loader's private device creation records while rejecting
-unsupported application feature chains.
+Use `libvulkan_sgfx.so` and `LD_LIBRARY_PATH` on Linux. The `headless` example
+uses `ash::Entry::load()` exclusively. It checks 256 compute output words and
+reports CPU recording and submission durations. Its push-constant mode uses two
+dispatches with distinct incremental values, including an update before pipeline
+binding, and changes the values across submissions.
 
-`SGFX_VULKAN_LOADER` belongs only to these repository diagnostics: it tells a
-test harness which loader dynamic library to open with `libloading`. It is not
-read by the ICD, is not required by Vulkan applications, and is not used by
-`render_demo`, `windowed`, or the host `vulkan-cube` executable. Those applications use `ash::Entry::load()` and the
-operating system's normal Vulkan loader; ICD selection is external through the
-standard manifest mechanism.
+The separate `offscreen`, `loader_probe`, and defensive GPU contract diagnostics
+can load the ICD directly. `SGFX_ICD_LIBRARY` selects the ICD library in those
+test harnesses. `offscreen` checks a 64-square triangle. The two older examples
+also accept `SGFX_VULKAN_LOADER` to open a specified real loader with `libloading`;
+that setting is not read by the ICD or ordinary applications. `headless`,
+`render_demo`, `windowed`, `shader_probe` and host `vulkan-cube` use the installed
+Vulkan loader's standard entry point and external `VK_DRIVER_FILES` selection.
+GPU contract tests are ignored by default for CPU-only CI; explicitly run them
+against a built ICD on a machine with a supported GPU backend.
 
 The host backend mask is fixed: Metal on macOS, GL on other host platforms.
 The ICD never enables WGPU's Vulkan backend or reads WGPU backend-selection
@@ -239,13 +228,12 @@ and verify the chosen Mesa driver. The Linux check also used
 
 ## Limits and remaining work
 
-- **Not Vulkan conformant.** The ICD exposes 102 procedure names on macOS,
-  including 15 `vkCmd*` operations, but this is only a bounded executable
+- **Not Vulkan conformant.** The ICD exposes 103 procedure names on macOS,
+  including 16 `vkCmd*` operations, but this is only a bounded executable
   subset. WSI currently covers macOS Metal, FIFO mode, opaque composition, and
   fixed-size swapchains. Other platform surfaces, window-resize handling in the
   example, timeline semaphores, secondary command buffers, descriptor indexing,
-  push constants, pipeline
-  caches, queries, events, sparse resources, external memory, multisampling,
+  pipeline caches, queries, events, sparse resources, external memory, multisampling,
   multiple subpasses, indirect operations, mipmaps, image blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent

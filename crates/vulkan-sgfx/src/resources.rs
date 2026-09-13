@@ -357,7 +357,7 @@ fn supported_descriptor_type(ty: vk::DescriptorType) -> bool {
             | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
     )
 }
-fn stages(flags: vk::ShaderStageFlags) -> Result<ir::ShaderStages, vk::Result> {
+pub(crate) fn stages(flags: vk::ShaderStageFlags) -> Result<ir::ShaderStages, vk::Result> {
     let allowed = vk::ShaderStageFlags::VERTEX
         | vk::ShaderStageFlags::FRAGMENT
         | vk::ShaderStageFlags::COMPUTE;
@@ -744,7 +744,7 @@ pub(crate) fn normalize_spirv(words: Vec<u32>) -> Result<ir::ShaderModuleDesc, v
     }
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
+        naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(&module)
     .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
@@ -757,6 +757,22 @@ pub(crate) fn normalize_spirv(words: Vec<u32>) -> Result<ir::ShaderModuleDesc, v
         .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
     let normalized = naga::back::spv::write_vec(&module, &info, &output, None)
         .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    // Validate the representation consumed by backends, including the SPIR-V
+    // writer/parser round trip. WGPU 24 cannot format SPIR-V validation spans
+    // against its empty text source and would otherwise panic on this path.
+    let options = naga::front::spv::Options {
+        adjust_coordinate_space: false,
+        ..options
+    };
+    let normalized_module = naga::front::spv::Frontend::new(normalized.iter().copied(), &options)
+        .parse()
+        .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::PUSH_CONSTANT,
+    )
+    .validate(&normalized_module)
+    .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
     ir::ShaderModuleDesc::spirv(normalized).map_err(failure)
 }
 unsafe extern "system" fn create_shader_module(
@@ -915,7 +931,7 @@ unsafe extern "system" fn create_pipeline_layout(
         if i.s_type != vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        if !i.p_next.is_null() || !i.flags.is_empty() || i.push_constant_range_count != 0 {
+        if !i.p_next.is_null() || !i.flags.is_empty() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let handles = copied(
@@ -923,7 +939,18 @@ unsafe extern "system" fn create_pipeline_layout(
             i.set_layout_count as usize,
             ir::MAX_BIND_GROUPS,
         )?;
-        let handle = crate::api::with_device(device, move |r| {
+        let push_ranges = copied(
+            i.p_push_constant_ranges,
+            i.push_constant_range_count as usize,
+            3,
+        )?
+        .into_iter()
+        .map(|range| {
+            ir::PushConstantRange::new(stages(range.stage_flags)?, range.offset, range.size)
+                .map_err(failure)
+        })
+        .collect::<Result<Vec<_>, vk::Result>>()?;
+        let (handle, metadata) = crate::api::with_device(device, move |r| {
             if r.resources.pipeline_layouts.len() >= LIMIT {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
@@ -937,11 +964,20 @@ unsafe extern "system" fn create_pipeline_layout(
                         .ok_or(vk::Result::ERROR_UNKNOWN)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let desc = ir::PipelineLayoutDesc::new(groups).map_err(failure)?;
+            if push_ranges.iter().any(|range| {
+                range.offset() + range.size() > r.capabilities.limits().max_push_constants_size
+            }) {
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
+            let desc = ir::PipelineLayoutDesc::new(groups)
+                .map_err(failure)?
+                .with_push_constant_ranges(push_ranges)
+                .map_err(failure)?;
             let handle = vk::PipelineLayout::from_raw(crate::api::next_id());
-            r.resources.pipeline_layouts.insert(handle, desc);
-            Ok(handle)
+            r.resources.pipeline_layouts.insert(handle, desc.clone());
+            Ok((handle, desc))
         })?;
+        crate::api::set_pipeline_layout_metadata(device, handle, Some(metadata))?;
         out.write(handle);
         Ok(())
     })
@@ -955,6 +991,7 @@ unsafe extern "system" fn destroy_pipeline_layout(
         r.resources.pipeline_layouts.remove(&handle);
         Ok(())
     });
+    let _ = crate::api::set_pipeline_layout_metadata(device, handle, None);
 }
 unsafe extern "system" fn create_descriptor_pool(
     device: vk::Device,
@@ -1926,6 +1963,66 @@ mod tests {
             .unwrap();
         assert!(ir::ShaderEntryPoint::new(shader, ir::ShaderStage::Compute, "m-!?".into()).is_ok());
         assert!(normalize_spirv(vec![0; 5]).is_err());
+    }
+
+    #[test]
+    fn spirv_round_trip_rejects_the_point_size_interface_layout_regression() {
+        // An authored gl_PerVertex block with Position and PointSize, plus a
+        // separate color output. Naga 24 validates the input but its writer/
+        // parser round trip produces an undersized private output structure.
+        let mut words = vec![0x07230203, 0x00010000, 0, 21, 0];
+        for (opcode, operands) in [
+            (17, vec![1]),
+            (14, vec![0, 1]),
+            (15, vec![0, 17, u32::from_le_bytes(*b"main"), 0, 15, 16]),
+            (71, vec![6, 2]),
+            (72, vec![6, 0, 11, 0]),
+            (72, vec![6, 1, 11, 1]),
+            (71, vec![16, 30, 0]),
+            (19, vec![1]),
+            (33, vec![2, 1]),
+            (22, vec![3, 32]),
+            (23, vec![4, 3, 4]),
+            (30, vec![6, 4, 3]),
+            (32, vec![7, 3, 6]),
+            (32, vec![8, 3, 3]),
+            (32, vec![9, 3, 4]),
+            (21, vec![10, 32, 0]),
+            (43, vec![10, 11, 0]),
+            (43, vec![10, 12, 1]),
+            (43, vec![3, 13, 1f32.to_bits()]),
+            (44, vec![4, 14, 13, 13, 13, 13]),
+            (59, vec![7, 15, 3]),
+            (59, vec![9, 16, 3]),
+            (54, vec![1, 17, 0, 2]),
+            (248, vec![18]),
+            (65, vec![8, 19, 15, 12]),
+            (62, vec![19, 13]),
+            (65, vec![9, 20, 15, 11]),
+            (62, vec![20, 14]),
+            (62, vec![16, 14]),
+            (253, vec![]),
+            (56, vec![]),
+        ] {
+            words.push(((operands.len() as u32 + 1) << 16) | opcode);
+            words.extend(operands);
+        }
+        let input = naga::front::spv::Frontend::new(
+            words.iter().copied(),
+            &naga::front::spv::Options::default(),
+        )
+        .parse()
+        .unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&input)
+        .unwrap();
+        assert_eq!(
+            normalize_spirv(words),
+            Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+        );
     }
 
     #[test]

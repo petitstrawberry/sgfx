@@ -1,25 +1,27 @@
-//! Headless Vulkan compute/readback smoke test, using the ICD or Vulkan loader.
+//! Headless Vulkan compute/readback smoke test through the installed Vulkan loader.
 //!
-//! Build the driver first: `cargo build -p vulkan-sgfx`.
-//! Run: `cargo run -p vulkan-sgfx --example headless -- [ICD_LIBRARY] [ITERATIONS]`.
-//! `SGFX_ICD_LIBRARY` can also select the library; iterations default to 16.
-//! To exercise loader discovery, set `SGFX_VULKAN_LOADER` to a Vulkan loader
-//! library and `VK_DRIVER_FILES` to the SGFX ICD manifest instead.
+//! Build the driver first, then select its manifest externally with VK_DRIVER_FILES.
+//! Run: `headless [ITERATIONS] [--push-constants]`; iterations default to 16.
 //! This checks actual shader output, then reports CPU wall time spent recording
 //! commands and inside vkQueueSubmit. Submission time includes any synchronous
 //! work performed by the driver; it is not a GPU execution timestamp.
 
 use ash::{Entry, vk};
-use std::{error::Error, path::PathBuf, time::Duration, time::Instant};
+use std::{error::Error, time::Duration, time::Instant};
 
 const WORD_COUNT: usize = 256;
 const BUFFER_BYTES: vk::DeviceSize = (WORD_COUNT * size_of::<u32>()) as vk::DeviceSize;
 
-fn shader_words() -> Result<Vec<u32>, Box<dyn Error>> {
-    let module = naga::front::wgsl::parse_str(include_str!("../tests/assets/fill.wgsl"))?;
+fn shader_words(push_constants: bool) -> Result<Vec<u32>, Box<dyn Error>> {
+    let source = if push_constants {
+        include_str!("../tests/assets/fill_push_constants.wgsl")
+    } else {
+        include_str!("../tests/assets/fill.wgsl")
+    };
+    let module = naga::front::wgsl::parse_str(source)?;
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
+        naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(&module)?;
     let pipeline = naga::back::spv::PipelineOptions {
@@ -34,63 +36,35 @@ fn shader_words() -> Result<Vec<u32>, Box<dyn Error>> {
     )?)
 }
 
-fn default_library() -> Result<PathBuf, Box<dyn Error>> {
-    let executable = std::env::current_exe()?;
-    let profile_dir = executable
-        .parent()
-        .and_then(|examples| examples.parent())
-        .ok_or("cannot locate the Cargo profile directory")?;
-    Ok(profile_dir.join(format!(
-        "{}vulkan_sgfx{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX,
-    )))
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args_os().skip(1);
-    let direct_library = args
-        .next()
-        .or_else(|| std::env::var_os("SGFX_ICD_LIBRARY"))
-        .map(PathBuf::from);
-    let loader_path = std::env::var_os("SGFX_VULKAN_LOADER").map(PathBuf::from);
-    let use_loader = loader_path.is_some();
-    let library_path = loader_path
-        .or(direct_library)
-        .map(Ok)
-        .unwrap_or_else(default_library)?;
-    let iterations = args
-        .next()
-        .map(|arg| arg.to_string_lossy().parse::<u32>())
-        .transpose()?
-        .unwrap_or(16);
-    if iterations == 0 || args.next().is_some() {
-        return Err("usage: headless [ICD_LIBRARY] [ITERATIONS > 0]".into());
+    let mut iterations = None;
+    let mut push_constants = false;
+    for arg in std::env::args().skip(1) {
+        if arg == "--push-constants" && !push_constants {
+            push_constants = true;
+        } else if iterations.is_none() && !arg.starts_with('-') {
+            iterations = Some(arg.parse::<u32>()?);
+        } else {
+            return Err("usage: headless [ITERATIONS > 0] [--push-constants]".into());
+        }
     }
-    let words = shader_words()?;
-
-    // The library is kept alive through every call and resource destruction.
-    let library = unsafe { libloading::Library::new(&library_path)? };
-    let symbol: &[u8] = if use_loader {
-        b"vkGetInstanceProcAddr\0"
-    } else {
-        b"vk_icdGetInstanceProcAddr\0"
-    };
-    let get_instance_proc_addr = unsafe { *library.get::<vk::PFN_vkGetInstanceProcAddr>(symbol)? };
-    let entry = unsafe {
-        Entry::from_static_fn(ash::StaticFn {
-            get_instance_proc_addr,
-        })
-    };
-    run(&entry, &words, iterations)?;
-    let source = if use_loader { "Vulkan loader" } else { "ICD" };
-    println!("{source}: {}", library_path.display());
-    Ok(())
+    let iterations = iterations.unwrap_or(16);
+    if iterations == 0 {
+        return Err("iterations must be greater than zero".into());
+    }
+    let words = shader_words(push_constants)?;
+    let entry = unsafe { Entry::load()? };
+    run(&entry, &words, iterations, push_constants)
 }
 
 // Vulkan handles below are used only with their creating instance/device.
 // Host access is bounded by BUFFER_BYTES and waits for the submission fence.
-fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Error>> {
+fn run(
+    entry: &Entry,
+    words: &[u32],
+    iterations: u32,
+    push_constants: bool,
+) -> Result<(), Box<dyn Error>> {
     unsafe {
         let application = vk::ApplicationInfo::default()
             .application_name(c"sgfx-headless-smoke")
@@ -114,6 +88,11 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
                     .map(|(index, _)| (physical, index as u32))
             })
             .ok_or("no Vulkan compute queue is available")?;
+        let properties = instance.get_physical_device_properties(physical_device);
+        println!(
+            "Device: {}",
+            std::ffi::CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy()
+        );
         let queue_priorities = [1.0];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
@@ -158,7 +137,8 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
         device.unmap_memory(memory);
 
         let shader = device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)?;
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+            .map_err(|error| format!("shader-module creation failed: {error:?}"))?;
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -169,10 +149,17 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
             None,
         )?;
         let descriptor_layouts = [descriptor_layout];
-        let pipeline_layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_layouts),
-            None,
-        )?;
+        let ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .size(16)];
+        let pipeline_layout = device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&descriptor_layouts)
+                    .push_constant_ranges(if push_constants { &ranges } else { &[] }),
+                None,
+            )
+            .map_err(|error| format!("pipeline-layout creation failed: {error:?}"))?;
         let pipeline_info = [vk::ComputePipelineCreateInfo::default()
             .stage(
                 vk::PipelineShaderStageCreateInfo::default()
@@ -183,7 +170,7 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
             .layout(pipeline_layout)];
         let pipeline = device
             .create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
-            .map_err(|(_, error)| error)?[0];
+            .map_err(|(_, error)| format!("compute-pipeline creation failed: {error:?}"))?[0];
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)];
@@ -238,6 +225,19 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
+            if push_constants {
+                let values = [0u32, 128, 3, 7 + iteration];
+                device.cmd_push_constants(
+                    command_buffer,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &values
+                        .into_iter()
+                        .flat_map(u32::to_ne_bytes)
+                        .collect::<Vec<_>>(),
+                );
+            }
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
                 command_buffer,
@@ -247,7 +247,42 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
                 &[descriptor_set],
                 &[],
             );
-            device.cmd_dispatch(command_buffer, WORD_COUNT as u32 / 64, 1, 1);
+            if push_constants {
+                device.cmd_dispatch(command_buffer, 2, 1, 1);
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    &[],
+                    &[],
+                );
+                device.cmd_push_constants(
+                    command_buffer,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &128u32.to_ne_bytes(),
+                );
+                device.cmd_push_constants(
+                    command_buffer,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    8,
+                    &[5u32, 19 + iteration]
+                        .into_iter()
+                        .flat_map(u32::to_ne_bytes)
+                        .collect::<Vec<_>>(),
+                );
+                device.cmd_dispatch(command_buffer, 2, 1, 1);
+            } else {
+                device.cmd_dispatch(command_buffer, WORD_COUNT as u32 / 64, 1, 1);
+            }
             device.cmd_pipeline_barrier(
                 command_buffer,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -259,12 +294,16 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
                 &[],
                 &[],
             );
-            device.end_command_buffer(command_buffer)?;
+            device
+                .end_command_buffer(command_buffer)
+                .map_err(|error| format!("command recording failed: {error:?}"))?;
             recording += recording_start.elapsed();
             let command_buffers = [command_buffer];
             let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
             let submission_start = Instant::now();
-            device.queue_submit(queue, &submits, fence)?;
+            device
+                .queue_submit(queue, &submits, fence)
+                .map_err(|error| format!("queue submission failed: {error:?}"))?;
             submission += submission_start.elapsed();
             // Fence waits are excluded from both timing measurements above.
             device.wait_for_fences(&[fence], true, u64::MAX)?;
@@ -279,7 +318,12 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
             .enumerate()
             .find_map(|(index, bytes)| {
                 let observed = u32::from_ne_bytes(bytes.try_into().unwrap());
-                let expected = index as u32 * 3 + 7;
+                let expected = if push_constants {
+                    let (multiplier, bias) = if index < 128 { (3, 7) } else { (5, 19) };
+                    index as u32 * multiplier + bias + iterations - 1
+                } else {
+                    index as u32 * 3 + 7
+                };
                 (observed != expected).then_some((index, observed, expected))
             });
         device.unmap_memory(memory);
@@ -303,7 +347,12 @@ fn run(entry: &Entry, words: &[u32], iterations: u32) -> Result<(), Box<dyn Erro
             .into());
         }
         println!("PASS: SPIR-V compute wrote all {WORD_COUNT} expected u32 values");
-        println!("iterations: {iterations}; dispatch: 4 workgroups × 64 invocations");
+        if push_constants {
+            println!(
+                "PASS: two dispatches retain distinct incremental push constants, including a value set before pipeline binding"
+            );
+        }
+        println!("iterations: {iterations}; total work: 4 workgroups × 64 invocations");
         println!(
             "command_record_cpu_ns: total={} mean={} (begin/bind/dispatch/barrier/end; excludes reset)",
             recording.as_nanos(),

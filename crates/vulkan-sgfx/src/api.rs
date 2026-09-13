@@ -541,10 +541,39 @@ struct Recording {
 pub(crate) struct CommandRegistry {
     commands: HashMap<u64, RecordingCell>,
     pools: HashMap<u64, vk::CommandPoolCreateFlags>,
+    // Immutable metadata permits recording without waiting for the GPU worker.
+    pipeline_layouts: HashMap<vk::PipelineLayout, ir::PipelineLayoutDesc>,
+}
+
+pub(crate) fn set_pipeline_layout_metadata(
+    device: vk::Device,
+    handle: vk::PipelineLayout,
+    layout: Option<ir::PipelineLayoutDesc>,
+) -> VkResult<()> {
+    let owner = driver(device.as_raw(), Kind::Device)?;
+    let mut recordings = owner
+        .recordings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match layout {
+        Some(layout) => {
+            recordings.pipeline_layouts.insert(handle, layout);
+        }
+        None => {
+            recordings.pipeline_layouts.remove(&handle);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
 enum RecordedCommand {
+    PushConstants {
+        layout: ir::PipelineLayoutDesc,
+        stages: ir::ShaderStages,
+        offset: u32,
+        data: Vec<u8>,
+    },
     BindPipeline {
         point: vk::PipelineBindPoint,
         pipeline: vk::Pipeline,
@@ -623,6 +652,7 @@ enum RecordedCommand {
 
 #[derive(Clone)]
 struct ResolvedRecording {
+    push_constants: crate::push_constants::PushConstants,
     ops: Vec<ir::OwnedCommand>,
     descriptors: Vec<DescriptorInsertion>,
     copies: Vec<ReadImage>,
@@ -711,6 +741,7 @@ impl Recording {
 impl ResolvedRecording {
     fn new() -> Self {
         Self {
+            push_constants: Default::default(),
             ops: Vec::new(),
             descriptors: Vec::new(),
             copies: Vec::new(),
@@ -741,6 +772,12 @@ impl ResolvedRecording {
 impl RecordedCommand {
     fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
         match self {
+            Self::PushConstants {
+                layout,
+                stages,
+                offset,
+                data,
+            } => rec.push_constants.update(layout, *stages, *offset, data)?,
             Self::BindPipeline { point, pipeline } => {
                 match (*point, rt.resources.pipelines.get(pipeline)) {
                     (
@@ -830,6 +867,15 @@ impl RecordedCommand {
                 };
                 rec.ops.push(ir::OwnedCommand::BeginComputePass);
                 rec.ops.push(ir::OwnedCommand::SetComputePipeline(*id));
+                let desc = rt
+                    .table
+                    .compute_pipeline(
+                        rt.table
+                            .compute_pipeline_ref(*id)
+                            .map_err(crate::resources::failure)?,
+                    )
+                    .map_err(crate::resources::failure)?;
+                rec.ops.extend(rec.push_constants.snapshot(desc.layout())?);
                 let active_sets = active_sets(
                     rt,
                     crate::resources::Pipeline::Compute(*id),
@@ -1777,6 +1823,49 @@ unsafe extern "system" fn cmd_dispatch(command: vk::CommandBuffer, x: u32, y: u3
     }
     record(command, RecordedCommand::Dispatch { x, y, z })
 }
+unsafe extern "system" fn cmd_push_constants(
+    command: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    flags: vk::ShaderStageFlags,
+    offset: u32,
+    size: u32,
+    values: *const std::ffi::c_void,
+) {
+    let result = (|| {
+        if size == 0
+            || !size.is_multiple_of(4)
+            || !offset.is_multiple_of(4)
+            || offset
+                .checked_add(size)
+                .is_none_or(|end| end > ir::MAX_PUSH_CONSTANT_BYTES)
+        {
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
+        let stages = crate::resources::stages(flags)?;
+        let data = slice(values.cast::<u8>(), size)?.to_vec();
+        let driver = driver(command.as_raw(), Kind::Command)?;
+        let desc = driver
+            .recordings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pipeline_layouts
+            .get(&layout)
+            .cloned()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        desc.validate_push_constants(stages, offset, &data)
+            .map_err(crate::resources::failure)?;
+        Ok(RecordedCommand::PushConstants {
+            layout: desc,
+            stages,
+            offset,
+            data,
+        })
+    })();
+    match result {
+        Ok(command_data) => record(command, command_data),
+        Err(error) => record_error(command, error),
+    }
+}
 unsafe extern "system" fn cmd_begin_render_pass(
     command: vk::CommandBuffer,
     info: *const vk::RenderPassBeginInfo<'_>,
@@ -1958,6 +2047,7 @@ fn graphics_bindings(rt: &Runtime, rec: &mut ResolvedRecording) -> VkResult<bool
         )));
     }
     rec.ops.push(ir::OwnedCommand::SetProgrammablePipeline(*id));
+    rec.ops.extend(rec.push_constants.snapshot(desc.layout())?);
     if desc.vertex_buffer().is_some() {
         let (handle, offset) = rec
             .vertex_buffer
@@ -3128,6 +3218,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkEndCommandBuffer" => entry!(end_command_buffer),
         b"vkCmdBindPipeline" => entry!(cmd_bind_pipeline),
         b"vkCmdBindDescriptorSets" => entry!(cmd_bind_descriptor_sets),
+        b"vkCmdPushConstants" => entry!(cmd_push_constants),
         b"vkCmdDispatch" => entry!(cmd_dispatch),
         b"vkCmdDraw" => entry!(cmd_draw),
         b"vkCmdDrawIndexed" => entry!(cmd_draw_indexed),
@@ -3293,6 +3384,28 @@ mod tests {
             .insert(command.as_raw(), Arc::new(Mutex::new(recording)));
 
         record(command, RecordedCommand::Dispatch { x: 1, y: 2, z: 3 });
+        let layout = vk::PipelineLayout::from_raw(next_id());
+        d.recordings.lock().unwrap().pipeline_layouts.insert(
+            layout,
+            ir::PipelineLayoutDesc::new(vec![])
+                .unwrap()
+                .with_push_constant_ranges(vec![
+                    ir::PushConstantRange::new(ir::ShaderStages::COMPUTE, 0, 4).unwrap(),
+                ])
+                .unwrap(),
+        );
+        let mut values = [7u8; 4];
+        unsafe {
+            cmd_push_constants(
+                command,
+                layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                4,
+                values.as_ptr().cast(),
+            );
+        }
+        values.fill(9);
 
         let recording = d
             .recordings
@@ -3304,7 +3417,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             recording.lock().unwrap().commands.as_slice(),
-            [RecordedCommand::Dispatch { x: 1, y: 2, z: 3 }]
+            [RecordedCommand::Dispatch { x: 1, y: 2, z: 3 }, RecordedCommand::PushConstants { data, offset: 0, .. }] if data == &[7; 4]
         ));
         remove_handle(command.as_raw());
     }

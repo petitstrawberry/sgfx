@@ -645,6 +645,7 @@ unsafe extern "system" fn get_physical_device_properties(
             max_vertex_input_attribute_offset: limits.max_vertex_buffer_stride.saturating_sub(1),
             max_vertex_input_binding_stride: limits.max_vertex_buffer_stride,
             max_draw_indexed_index_value: u32::MAX,
+            max_push_constants_size: limits.max_push_constants_size,
             max_vertex_output_components: limits.max_inter_stage_components,
             max_fragment_input_components: limits.max_inter_stage_components,
             max_fragment_output_attachments: limits.max_color_attachments,

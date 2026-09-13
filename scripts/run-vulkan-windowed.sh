@@ -33,9 +33,9 @@ if [ -z "$loader_path" ]; then
 fi
 
 host_target=$(rustc -vV | sed -n 's/^host: //p')
-cargo build --locked -p vulkan-sgfx --lib --example windowed --target "$host_target"
+cargo build --locked --release -p vulkan-sgfx --lib --example windowed --target "$host_target"
 target_dir=$(cargo metadata --locked --format-version=1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-profile_dir=$target_dir/$host_target/debug
+profile_dir=$target_dir/$host_target/release
 manifest=$profile_dir/sgfx-windowed-icd.json
 python3 crates/vulkan-sgfx/tools/write_icd_manifest.py \
     "$profile_dir/libvulkan_sgfx.dylib" "$manifest" >/dev/null

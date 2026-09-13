@@ -8,6 +8,7 @@
 mod api;
 mod images;
 mod instance;
+mod push_constants;
 mod resources;
 mod runtime;
 #[cfg(target_os = "scarlet")]

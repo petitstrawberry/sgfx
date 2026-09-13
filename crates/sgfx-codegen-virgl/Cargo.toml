@@ -7,7 +7,7 @@ repository = "https://github.com/petitstrawberry/sgfx"
 
 [dependencies]
 naga = { version = "24", optional = true, features = ["wgsl-in", "spv-in"] }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "c0dd1621a1fb43d94dd4d4b2af2d7f7af8824c3c", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "2249cc2e4ed09162e08b0398a57f6452d0275a67", default-features = false }
 
 [features]
 default = []

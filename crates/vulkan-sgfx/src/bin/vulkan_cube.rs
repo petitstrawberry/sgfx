@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--textured" => options.textured = true,
             "--dynamic-viewport" => options.dynamic_viewport = true,
             "--dynamic-uniform" => options.dynamic_uniform = true,
+            "--push-constants" => options.push_constants = true,
             "--verify" => verify = true,
             "--display" => display_requested = true,
             "--output" => {
@@ -80,6 +81,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         if options.textured {
             render::verify_textured(&entry)?;
         }
+        if options.push_constants {
+            render::verify_push_constants(&entry)?;
+        }
     }
     for frame in 0..frames {
         let frame_options = render::Options {
@@ -111,7 +115,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             write_png(&output, &pixels, options.size)?;
             println!(
-                "PASS: indexed cube, 24 vertices / 36 indices, uniform MVP, D32 LESS depth; {}x{} PNG: {}",
+                "PASS: indexed cube, 24 vertices / 36 indices, MVP transform, D32 LESS depth; {}x{} PNG: {}",
                 options.size[0],
                 options.size[1],
                 output.canonicalize()?.display()
@@ -137,6 +141,8 @@ fn print_help() {
          --angle RADIANS   Set the initial rotation (default: 0.58).\n\
          --textured        Sample a staged checkerboard texture.\n\
          --dynamic-viewport Use Vulkan dynamic viewport and scissor.\n\
+         --dynamic-uniform Use a dynamic uniform descriptor with offset 256.\n\
+         --push-constants  Use Vulkan push constants for the MVP transform.\n\
          --linked          Scarlet compatibility option (already automatic).\n\
          --verify          Check indexed rendering and depth before rendering.\n\
          --help, -h        Show this help.\n\

@@ -58,9 +58,9 @@ if [ -z "$host_target" ]; then
     exit 1
 fi
 # Explicit host selection avoids inheriting a Scarlet cross-compilation target.
-cargo build --locked -p vulkan-sgfx --lib --example render_demo --target "$host_target"
+cargo build --locked --release -p vulkan-sgfx --lib --example render_demo --target "$host_target"
 target_dir=$(cargo metadata --locked --format-version=1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-profile_dir=$target_dir/$host_target/debug
+profile_dir=$target_dir/$host_target/release
 manifest=$profile_dir/sgfx-demo-icd.json
 python3 crates/vulkan-sgfx/tools/write_icd_manifest.py "$profile_dir/$library_name" "$manifest"
 export VK_DRIVER_FILES=$manifest

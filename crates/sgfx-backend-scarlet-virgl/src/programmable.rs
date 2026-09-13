@@ -138,6 +138,11 @@ fn compile_pipeline(
 ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
     let reference = resources.programmable_render_pipeline_ref(id)?;
     let pipeline = resources.programmable_render_pipeline(reference)?;
+    if !pipeline.layout().push_constant_ranges().is_empty() {
+        return Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::PushConstants,
+        ));
+    }
     if !matches!(
         pipeline.target_format(),
         TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm

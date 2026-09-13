@@ -1,6 +1,6 @@
 # Vulkan application compatibility
 
-The current development ICD exposes 102 procedures on macOS, including 15
+The current development ICD exposes 103 procedures on macOS, including 16
 command procedures. This remains a bounded, non-conformant Vulkan 1.0 path.
 
 ## Executable additions
@@ -24,7 +24,12 @@ command procedures. This remains a bounded, non-conformant Vulkan 1.0 path.
 - Native VirGL shader sampling: Naga image/sampler pairs reflect SGFX bindings
   into per-stage TGSI slots, with actual `TEX`, `TXL`, and `TXB` instructions.
 
-Canonical IR adds `SetViewport`, bringing the owned command enum to 23 variants.
+Canonical IR adds `SetViewport` and `SetPushConstants`, bringing the owned
+command enum to 24 variants. Pipeline layouts declare validated, stage-specific
+push-constant ranges, bounded to 128 bytes. Incremental updates retain owned
+bytes and compatible-layout information at every draw and dispatch. Metal
+executes push constants; native VirGL currently reports a zero-byte limit and
+rejects nonempty push-constant layouts.
 The maximum IR bind-group entries increase from 16 to 32 to accommodate the
 frontend's descriptor expansion. Sampling and upload already had canonical
 IR resource/command types; the Vulkan lowering and VirGL programmable path now
@@ -35,14 +40,15 @@ use those types. Fixed pipelines and programmable pipelines remain independent.
 Build with the host Rust toolchain and an installed Khronos Vulkan loader:
 
 ```sh
-cargo build --locked -p vulkan-sgfx --features cube-demo --lib --bin vulkan-cube
+cargo build --locked --release -p vulkan-sgfx --features cube-demo --lib --bin vulkan-cube --example headless
 python3 crates/vulkan-sgfx/tools/write_icd_manifest.py \
-  target/debug/libvulkan_sgfx.dylib target/sgfx-textured-icd.json
+  target/release/libvulkan_sgfx.dylib target/sgfx-textured-icd.json
 export VK_DRIVER_FILES="$PWD/target/sgfx-textured-icd.json"
 # If the system loader is outside the normal macOS lookup paths:
 export DYLD_LIBRARY_PATH=/path/to/installed/vulkan-loader/lib
-target/debug/vulkan-cube --textured --dynamic-viewport --dynamic-uniform \
-  --verify --output target/vulkan-textured-cube.png
+target/release/vulkan-cube --textured --dynamic-viewport --dynamic-uniform \
+  --push-constants --verify --output target/vulkan-textured-cube.png
+target/release/examples/headless 16 --push-constants
 ```
 
 Use `libvulkan_sgfx.so` and the system library lookup path on Linux. The host
@@ -53,7 +59,10 @@ diagnostics, never by this host application.
 On Apple M3 Pro, the 256-square GPU readbacks match exactly between static and
 dynamic viewport/scissor and between ordinary and dynamic uniform descriptors.
 Texture sampling changes 18,002 foreground pixels relative to the colored cube.
-Depth draw-order invariance, a depth-disabled control, rotation, culling and
+Incremental vertex push constants produce the same pixels as the uniform
+transform. Two draws with different transforms match an exact split-image
+control, and two compute dispatches preserve different incremental values across
+16 submissions, checking all 256 output words. Depth draw-order invariance, a depth-disabled control, rotation, culling and
 UINT16/UINT32 index equivalence also pass. A 512-square texture render is saved
 from GPU readback. WGSL and SPIR-V sampling fixtures pass the Mesa TGSI parser
 and VirGLRenderer 1.3.0 shader-object acceptance with no GL error.
@@ -77,9 +86,12 @@ image creation is also unsupported. Release-mode game assertions do not stop
 at those earlier failed creations, and the missing command produces a null
 dispatch call; LLDB locates it in `generateMipmaps`.
 
-The ordinary-loader `shader_probe` example accepts 10 of the game's 23
-unmodified SPIR-V modules, including combined-sampler fragments. The remaining
-13 contain push constants, which are currently rejected. Mip storage/blits,
-sampler LOD behavior, push constants, more vertex formats/topologies and durable
-resource reuse are still required for this game's renderer. Procedure counts
+The ordinary-loader `shader_probe` example accepts 22 of the game's 23
+unmodified SPIR-V modules, including combined-sampler fragments and push-constant
+transforms. The PointSize vertex module triggers a Naga 24 writer/parser
+interface-structure layout regression. A post-normalization validation rejects
+it before WGPU, preserving device usability for subsequent modules. An authored
+minimal SPIR-V interface fixture covers this regression. Mip storage/blits,
+sampler LOD behavior, more vertex formats/topologies and durable resource reuse
+are still required for this game's renderer. Procedure counts
 and successful initialization are not evidence of gameplay compatibility.

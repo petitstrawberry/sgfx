@@ -12,7 +12,7 @@ pub fn shader_words(
     let module = naga::front::wgsl::parse_str(source)?;
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
+        naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(&module)?;
     let pipeline = naga::back::spv::PipelineOptions {
@@ -57,6 +57,8 @@ pub struct Options {
     pub textured: bool,
     pub dynamic_viewport: bool,
     pub dynamic_uniform: bool,
+    pub push_constants: bool,
+    pub push_constant_split: bool,
 }
 
 impl Default for Options {
@@ -72,6 +74,8 @@ impl Default for Options {
             textured: false,
             dynamic_viewport: false,
             dynamic_uniform: false,
+            push_constants: false,
+            push_constant_split: false,
         }
     }
 }
@@ -489,7 +493,11 @@ unsafe fn upload_texture(
 // Handles are used only with their creating device. Readback follows the
 // transfer-to-host barrier and fence wait, and preserves exact RGBA bytes.
 pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>> {
-    let source = if options.textured {
+    let source = if options.push_constants && options.textured {
+        include_str!("../assets/push_constant_textured_cube.wgsl")
+    } else if options.push_constants {
+        include_str!("../assets/push_constant_cube.wgsl")
+    } else if options.textured {
         include_str!("../assets/textured_cube.wgsl")
     } else {
         include_str!("../assets/cube.wgsl")
@@ -814,8 +822,19 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
         )?;
         resources.descriptor_layouts.push(descriptor_layout);
         let set_layouts = [descriptor_layout];
+        let push_ranges = if options.push_constants {
+            vec![vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::VERTEX,
+                offset: 0,
+                size: 64,
+            }]
+        } else {
+            vec![]
+        };
         let pipeline_layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push_ranges),
             None,
         )?;
         resources.pipeline_layouts.push(pipeline_layout);
@@ -1017,6 +1036,24 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
                 },
             },
         ];
+        if options.push_constants {
+            let bytes = transform(options);
+            // Incremental updates before binding a pipeline are valid Vulkan.
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &bytes[..32],
+            );
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                32,
+                &bytes[32..],
+            );
+        }
         // Binding before the render pass is legal and must survive its begin.
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
         device.cmd_bind_descriptor_sets(
@@ -1051,7 +1088,35 @@ pub fn render(entry: &Entry, options: Options) -> Result<Vec<u8>, Box<dyn Error>
             device.cmd_set_viewport(command_buffer, 0, &viewports);
             device.cmd_set_scissor(command_buffer, 0, &scissors);
         }
-        device.cmd_draw_indexed(command_buffer, 36, 1, 0, 0, 0);
+        if options.push_constant_split {
+            if !options.push_constants || !options.dynamic_viewport {
+                return Err(
+                    "split push-constant verification requires dynamic viewport and push constants"
+                        .into(),
+                );
+            }
+            let mut split = scissors[0];
+            split.extent.width /= 2;
+            device.cmd_set_scissor(command_buffer, 0, &[split]);
+            device.cmd_draw_indexed(command_buffer, 36, 1, 0, 0, 0);
+            let bytes = transform(Options {
+                angle: options.angle + 1.0,
+                ..options
+            });
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &bytes,
+            );
+            split.offset.x = split.extent.width as i32;
+            split.extent.width = options.size[0] - split.extent.width;
+            device.cmd_set_scissor(command_buffer, 0, &[split]);
+            device.cmd_draw_indexed(command_buffer, 36, 1, 0, 0, 0);
+        } else {
+            device.cmd_draw_indexed(command_buffer, 36, 1, 0, 0, 0);
+        }
         device.cmd_end_render_pass(command_buffer);
 
         device.cmd_pipeline_barrier(
@@ -1156,6 +1221,57 @@ pub fn validate_image(pixels: &[u8], size: [u32; 2]) -> Result<(), Box<dyn Error
     if is_clear(&pixels[center..center + 4]) {
         return Err("cube center is empty".into());
     }
+    Ok(())
+}
+
+pub fn verify_push_constants(entry: &Entry) -> Result<(), Box<dyn Error>> {
+    let options = Options {
+        size: [256, 256],
+        textured: true,
+        ..Options::default()
+    };
+    let ordinary = render(entry, options)?;
+    let pushed = render(
+        entry,
+        Options {
+            push_constants: true,
+            ..options
+        },
+    )?;
+    if ordinary != pushed {
+        return Err("push-constant and uniform transform readbacks differ".into());
+    }
+    let rotated = render(
+        entry,
+        Options {
+            angle: options.angle + 1.0,
+            ..options
+        },
+    )?;
+    let mut expected = ordinary.clone();
+    for row in 0..options.size[1] as usize {
+        let start = (row * options.size[0] as usize + options.size[0] as usize / 2) * 4;
+        let end = (row + 1) * options.size[0] as usize * 4;
+        expected[start..end].copy_from_slice(&rotated[start..end]);
+    }
+    let split = render(
+        entry,
+        Options {
+            push_constants: true,
+            push_constant_split: true,
+            dynamic_viewport: true,
+            ..options
+        },
+    )?;
+    if split != expected {
+        return Err("successive draws did not retain their own push-constant transforms".into());
+    }
+    if split == ordinary || split == rotated {
+        return Err("push-constant split control is ineffective".into());
+    }
+    println!(
+        "PASS: incremental push constants match uniform MVP; two draws retain distinct transforms with exact split-image GPU readback"
+    );
     Ok(())
 }
 

@@ -230,13 +230,28 @@ impl Resources {
         Ok(layout)
     }
 
-    fn pipeline_layout(&mut self, desc: &ir::PipelineLayoutDesc) -> Result<raw::PipelineLayout> {
+    fn pipeline_layout(
+        &mut self,
+        desc: &ir::PipelineLayoutDesc,
+        active: raw::ShaderStages,
+    ) -> Result<raw::PipelineLayout> {
         let layouts = desc
             .bind_groups()
             .iter()
             .map(|desc| self.programmable_layout(desc))
             .collect::<Result<Vec<_>>>()?;
         let refs = layouts.iter().map(Arc::as_ref).collect::<Vec<_>>();
+        let push_constant_ranges = desc
+            .push_constant_ranges()
+            .iter()
+            .filter_map(|range| {
+                let stages = shader_stages(range.stages()) & active;
+                (!stages.is_empty()).then_some(raw::PushConstantRange {
+                    stages,
+                    range: range.offset()..range.offset() + range.size(),
+                })
+            })
+            .collect::<Vec<_>>();
         validated(self.context.raw_device(), || {
             Ok(self
                 .context
@@ -244,7 +259,7 @@ impl Resources {
                 .create_pipeline_layout(&raw::PipelineLayoutDescriptor {
                     label: Some("sgfx programmable pipeline layout"),
                     bind_group_layouts: &refs,
-                    push_constant_ranges: &[],
+                    push_constant_ranges: &push_constant_ranges,
                 }))
         })
     }
@@ -270,7 +285,10 @@ impl Resources {
             .programmable_render_pipeline(self.resources.programmable_render_pipeline_ref(id)?)?;
         let vertex = self.shader(desc.vertex().module())?;
         let fragment = self.shader(desc.fragment().module())?;
-        let layout = self.pipeline_layout(desc.layout())?;
+        let layout = self.pipeline_layout(
+            desc.layout(),
+            raw::ShaderStages::VERTEX | raw::ShaderStages::FRAGMENT,
+        )?;
         let attributes = desc
             .vertex_buffer()
             .map(|layout| {
@@ -384,7 +402,7 @@ impl Resources {
             .resources
             .compute_pipeline(self.resources.compute_pipeline_ref(id)?)?;
         let shader = self.shader(desc.shader().module())?;
-        let layout = self.pipeline_layout(desc.layout())?;
+        let layout = self.pipeline_layout(desc.layout(), raw::ShaderStages::COMPUTE)?;
         let pipeline = validated(self.context.raw_device(), || {
             Ok(self
                 .context
@@ -519,6 +537,15 @@ impl Queue {
                         bind_groups.push((*index, group));
                     }
                 }
+                Command::SetPushConstants {
+                    stages,
+                    offset,
+                    data,
+                } => {
+                    if stages.contains(ir::ShaderStages::COMPUTE) {
+                        pass.set_push_constants(*offset, data);
+                    }
+                }
                 Command::Dispatch { x, y, z } => {
                     let limit = self
                         .context
@@ -545,4 +572,18 @@ impl Queue {
         }
         Ok(())
     }
+}
+
+pub(super) fn shader_stages(stages: ir::ShaderStages) -> raw::ShaderStages {
+    let mut raw_stages = raw::ShaderStages::empty();
+    for (logical, raw_stage) in [
+        (ir::ShaderStages::VERTEX, raw::ShaderStages::VERTEX),
+        (ir::ShaderStages::FRAGMENT, raw::ShaderStages::FRAGMENT),
+        (ir::ShaderStages::COMPUTE, raw::ShaderStages::COMPUTE),
+    ] {
+        if stages.contains(logical) {
+            raw_stages |= raw_stage;
+        }
+    }
+    raw_stages
 }

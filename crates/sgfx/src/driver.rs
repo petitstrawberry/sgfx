@@ -70,6 +70,7 @@ impl AdapterInfo {
 /// Resource and shader limits enforced by a complete SGFX backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
+    pub max_push_constants_size: u32,
     pub max_image_dimension_2d: u32,
     pub max_uniform_buffer_range: u32,
     pub max_storage_buffer_range: u32,
@@ -766,7 +767,16 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
         .into_iter()
         .map(|adapter| {
             let raw_info = adapter.get_info();
-            let runtime = wgpu_runtime_limits(adapter.limits());
+            let mut runtime = wgpu_runtime_limits(adapter.limits());
+            runtime.max_push_constants_size =
+                if adapter.features().contains(wgpu::Features::PUSH_CONSTANTS) {
+                    adapter
+                        .limits()
+                        .max_push_constant_size
+                        .min(ir::MAX_PUSH_CONSTANT_BYTES)
+                } else {
+                    0
+                };
             let downlevel = adapter.get_downlevel_capabilities();
             let compute = downlevel
                 .flags
@@ -823,6 +833,7 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
 fn wgpu_runtime_limits(adapter: wgpu::Limits) -> Limits {
     let requested = wgpu::Limits::downlevel_defaults().using_resolution(adapter.clone());
     Limits {
+        max_push_constants_size: 0,
         max_image_dimension_2d: requested.max_texture_dimension_2d,
         max_uniform_buffer_range: requested.max_uniform_buffer_binding_size,
         max_storage_buffer_range: requested.max_storage_buffer_binding_size,
@@ -857,10 +868,19 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
     required_limits.max_compute_workgroup_storage_size = adapter_limits
         .max_compute_workgroup_storage_size
         .min(16 * 1024);
+    let required_features = adapter.features() & wgpu::Features::PUSH_CONSTANTS;
+    required_limits.max_push_constant_size =
+        if required_features.contains(wgpu::Features::PUSH_CONSTANTS) {
+            adapter_limits
+                .max_push_constant_size
+                .min(ir::MAX_PUSH_CONSTANT_BYTES)
+        } else {
+            0
+        };
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("SGFX common execution device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits,
             memory_hints: wgpu::MemoryHints::MemoryUsage,
         },
@@ -926,6 +946,7 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                 depth32_attachment: capabilities.supports_depth(),
                 image_readback: capabilities.supports_image_readback(),
                 limits: Limits {
+                    max_push_constants_size: 0,
                     max_image_dimension_2d: 2048,
                     max_uniform_buffer_range: 16 * 1024,
                     max_storage_buffer_range: 0,

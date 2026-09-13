@@ -1489,6 +1489,17 @@ impl Queue {
                     let [x, y, width, height, min_depth, max_depth] = viewport.components();
                     render_pass.set_viewport(x, y, width, height, min_depth, max_depth);
                 }
+                Command::SetPushConstants {
+                    stages,
+                    offset,
+                    data,
+                } => {
+                    let stages = programmable::shader_stages(*stages)
+                        & (raw::ShaderStages::VERTEX | raw::ShaderStages::FRAGMENT);
+                    if !stages.is_empty() {
+                        render_pass.set_push_constants(stages, *offset, data);
+                    }
+                }
                 Command::Draw {
                     vertex_count,
                     first_vertex,

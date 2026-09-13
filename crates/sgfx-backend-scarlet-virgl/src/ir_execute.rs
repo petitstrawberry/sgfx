@@ -28,6 +28,8 @@ use crate::{Context, HandleError, Image, Queue, Submission, Texture};
 /// An IR feature that the active backend facade cannot lower faithfully yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedIrFeature {
+    /// Shader push-constant blocks have not been lowered by this native backend.
+    PushConstants,
     /// The command sequence is outside the one-upload-phase, one-pass subset.
     CommandSequence,
     /// More than one buffer upload was recorded.
@@ -967,6 +969,7 @@ impl ExecutionPlan {
                 | Command::EndComputePass
                 | Command::SetComputePipeline(_)
                 | Command::Dispatch { .. } => UnsupportedIrFeature::ProgrammableExecution,
+                Command::SetPushConstants { .. } => UnsupportedIrFeature::PushConstants,
 
                 _ => continue,
             };
