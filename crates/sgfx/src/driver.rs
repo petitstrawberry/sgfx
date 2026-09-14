@@ -285,6 +285,7 @@ impl Instance {
                 BackendPreference::Metal => BackendKind::Metal,
                 BackendPreference::ScarletVirgl => BackendKind::ScarletVirgl,
                 BackendPreference::ScarletAdreno => BackendKind::ScarletAdreno,
+                BackendPreference::ScarletMaxwell => BackendKind::ScarletMaxwell,
             };
             return Err(Error::BackendUnavailable(kind));
         }
