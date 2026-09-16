@@ -1,0 +1,12 @@
+[package]
+name = "sgfx-virgl-compare"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep the benchmark's lockfile independent of the SGFX product workspace.
+[workspace]
+
+[dependencies]
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "a18b5a585616f05cf5df0fa5be1977752ceca1ea" }
+sgfx-backend-scarlet-virgl = { path = "../../crates/sgfx-backend-scarlet-virgl" }
