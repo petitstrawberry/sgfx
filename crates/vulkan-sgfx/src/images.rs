@@ -11,6 +11,8 @@ pub(crate) struct Image {
     pub format: vk::Format,
     pub extent: vk::Extent3D,
     pub mip_levels: u32,
+    pub array_layers: u32,
+    pub flags: vk::ImageCreateFlags,
     pub usage: vk::ImageUsageFlags,
     pub bound: Option<(vk::DeviceMemory, u64)>,
     pub swapchain: Option<vk::SwapchainKHR>,
@@ -33,13 +35,23 @@ impl Image {
         (0..self.mip_levels)
             .map(|mip| {
                 let size = self.mip_extent(mip).expect("validated image mip count");
-                u64::from(size.width) * u64::from(size.height) * 4
+                u64::from(size.width)
+                    * u64::from(size.height)
+                    * u64::from(texture_format(self.format).unwrap().bytes_per_pixel())
+                    * u64::from(self.array_layers)
             })
             .sum()
     }
     pub(crate) fn usable(&self) -> bool {
         self.bound.is_some() || self.swapchain.is_some()
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImageView {
+    pub image: vk::Image,
+    pub desc: ir::TextureViewDesc,
+    pub components: [u8; 4],
 }
 
 pub(crate) struct RenderPass {
@@ -67,21 +79,50 @@ const INVALID: vk::Result = vk::Result::ERROR_INITIALIZATION_FAILED;
 
 pub(crate) fn image_usage(format: vk::Format) -> vk::ImageUsageFlags {
     match format {
-        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM => {
-            vk::ImageUsageFlags::COLOR_ATTACHMENT
+        vk::Format::R8G8B8A8_UNORM
+        | vk::Format::B8G8R8A8_UNORM
+        | vk::Format::R8G8B8A8_SRGB
+        | vk::Format::B8G8R8A8_SRGB
+        | vk::Format::R8_UNORM => {
+            (if format == vk::Format::R8G8B8A8_UNORM {
+                vk::ImageUsageFlags::STORAGE
+            } else {
+                vk::ImageUsageFlags::empty()
+            }) | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::INPUT_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
                 | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST
         }
-        vk::Format::D32_SFLOAT => vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        vk::Format::D32_SFLOAT => {
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::INPUT_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
+        }
         _ => vk::ImageUsageFlags::empty(),
     }
+}
+
+pub(crate) fn valid_image_usage(usage: vk::ImageUsageFlags) -> bool {
+    // Transient attachments can use ordinary device memory. Lazy allocation is
+    // an optional memory type, not a requirement on the image's backing store.
+    !usage.contains(vk::ImageUsageFlags::TRANSIENT_ATTACHMENT)
+        || (vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+            | vk::ImageUsageFlags::INPUT_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT)
+            .contains(usage)
 }
 
 pub(crate) fn texture_format(format: vk::Format) -> Option<ir::TextureFormat> {
     match format {
         vk::Format::R8G8B8A8_UNORM => Some(ir::TextureFormat::Rgba8Unorm),
+        vk::Format::R8G8B8A8_SRGB => Some(ir::TextureFormat::Rgba8UnormSrgb),
         vk::Format::B8G8R8A8_UNORM => Some(ir::TextureFormat::Bgra8Unorm),
+        vk::Format::B8G8R8A8_SRGB => Some(ir::TextureFormat::Bgra8UnormSrgb),
+        vk::Format::R8_UNORM => Some(ir::TextureFormat::R8Unorm),
         vk::Format::D32_SFLOAT => Some(ir::TextureFormat::Depth32Float),
         _ => None,
     }
@@ -113,7 +154,8 @@ unsafe extern "system" fn create_image(
     let supported = image_usage(info.format);
     if !allocator.is_null()
         || !info.p_next.is_null()
-        || !info.flags.is_empty()
+        || !(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::CUBE_COMPATIBLE)
+            .contains(info.flags)
         || info.s_type != vk::StructureType::IMAGE_CREATE_INFO
         || info.image_type != vk::ImageType::TYPE_2D
         || supported.is_empty()
@@ -125,7 +167,9 @@ unsafe extern "system" fn create_image(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             ))
-        || info.array_layers != 1
+        || info.array_layers == 0
+        || (info.flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)
+            && (info.array_layers < 6 || info.extent.width != info.extent.height))
         || info.extent.depth != 1
         || info.extent.width == 0
         || info.extent.height == 0
@@ -133,6 +177,7 @@ unsafe extern "system" fn create_image(
         || info.extent.height > 2048
         || info.usage.is_empty()
         || !supported.contains(info.usage)
+        || !valid_image_usage(info.usage)
         || info.sharing_mode != vk::SharingMode::EXCLUSIVE
         || info.initial_layout != vk::ImageLayout::UNDEFINED
     {
@@ -140,14 +185,21 @@ unsafe extern "system" fn create_image(
     }
     let extent = info.extent;
     let mip_levels = info.mip_levels;
+    let array_layers = info.array_layers;
+    let flags = info.flags;
     let format = info.format;
     let image_usage = info.usage;
     let mut usage = ir::TextureUsage::empty();
+    if info.usage.contains(vk::ImageUsageFlags::STORAGE) {
+        usage |= ir::TextureUsage::STORAGE;
+    }
     if info.usage.contains(vk::ImageUsageFlags::SAMPLED) {
         usage |= ir::TextureUsage::SAMPLED;
     }
     if info.usage.intersects(
-        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+            | vk::ImageUsageFlags::INPUT_ATTACHMENT,
     ) {
         usage |= ir::TextureUsage::RENDER_ATTACHMENT;
     }
@@ -159,13 +211,31 @@ unsafe extern "system" fn create_image(
     }
     match with_device(device, move |runtime| {
         let size = ir::Extent2D::new(extent.width, extent.height).map_err(|_| INVALID)?;
+        if image_usage.contains(vk::ImageUsageFlags::STORAGE)
+            && !runtime.capabilities.supports_storage_images()
+        {
+            return Err(UNSUPPORTED);
+        }
         let ir_format = texture_format(format).ok_or(UNSUPPORTED)?;
-        if mip_levels > runtime.capabilities.limits().max_image_mip_levels {
+        if !runtime.capabilities.supports_typed_texture_views()
+            && (matches!(
+                format,
+                vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+            ) || (format == vk::Format::D32_SFLOAT
+                && image_usage.contains(vk::ImageUsageFlags::SAMPLED)))
+        {
+            return Err(UNSUPPORTED);
+        }
+        if mip_levels > runtime.capabilities.limits().max_image_mip_levels
+            || array_layers > runtime.capabilities.limits().max_image_array_layers
+        {
             return Err(UNSUPPORTED);
         }
         let desc = ir::TextureDesc::new(ir_format, size, usage)
             .map_err(|_| INVALID)?
             .with_mip_level_count(mip_levels)
+            .map_err(|_| UNSUPPORTED)?
+            .with_array_layer_count(array_layers)
             .map_err(|_| UNSUPPORTED)?;
         let id = runtime
             .table
@@ -180,6 +250,8 @@ unsafe extern "system" fn create_image(
                 format,
                 extent,
                 mip_levels,
+                array_layers,
+                flags,
                 usage: image_usage,
                 bound: None,
                 swapchain: None,
@@ -284,38 +356,107 @@ unsafe extern "system" fn create_image_view(
         || !info.p_next.is_null()
         || !info.flags.is_empty()
         || info.s_type != vk::StructureType::IMAGE_VIEW_CREATE_INFO
-        || info.view_type != vk::ImageViewType::TYPE_2D
+        || !matches!(
+            info.view_type,
+            vk::ImageViewType::TYPE_2D | vk::ImageViewType::TYPE_2D_ARRAY | vk::ImageViewType::CUBE
+        )
         || image_usage(info.format).is_empty()
         || range.aspect_mask != image_aspect(info.format)
-        || range.base_mip_level != 0
         || range.level_count == 0
-        || range.base_array_layer != 0
-        || !matches!(range.layer_count, 1 | vk::REMAINING_ARRAY_LAYERS)
-        || [
-            info.components.r,
-            info.components.g,
-            info.components.b,
-            info.components.a,
-        ]
-        .iter()
-        .any(|&component| component != vk::ComponentSwizzle::IDENTITY)
     {
         return UNSUPPORTED;
     }
+    let mut components = [0, 1, 2, 3];
+    for (slot, value) in [
+        info.components.r,
+        info.components.g,
+        info.components.b,
+        info.components.a,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        components[slot] = match value {
+            vk::ComponentSwizzle::IDENTITY => slot as u8,
+            vk::ComponentSwizzle::R => 0,
+            vk::ComponentSwizzle::G => 1,
+            vk::ComponentSwizzle::B => 2,
+            vk::ComponentSwizzle::A => 3,
+            vk::ComponentSwizzle::ZERO => 4,
+            vk::ComponentSwizzle::ONE => 5,
+            _ => return UNSUPPORTED,
+        };
+    }
+    if components != [0, 1, 2, 3] && info.format == vk::Format::D32_SFLOAT {
+        return UNSUPPORTED;
+    }
     let image = info.image;
+    let view_type = info.view_type;
     let format = info.format;
     match with_device(device, move |runtime| {
         let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
-        if !data.usable() || data.format != format {
+        if !data.usable()
+            || (data.format != format && !data.flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT))
+        {
             return Err(INVALID);
         }
-        // Sampled views currently cover the complete chain. Attachment images
-        // have one level, so no partial view is silently expanded.
-        if range.level_count != data.mip_levels && range.level_count != vk::REMAINING_MIP_LEVELS {
+        if view_type == vk::ImageViewType::CUBE
+            && !data.flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)
+        {
             return Err(UNSUPPORTED);
         }
+        let desc = runtime
+            .table
+            .texture(runtime.table.texture_ref(data.id).map_err(|_| INVALID)?)
+            .map_err(|_| INVALID)?;
+        let levels = if range.level_count == vk::REMAINING_MIP_LEVELS {
+            data.mip_levels
+                .checked_sub(range.base_mip_level)
+                .ok_or(INVALID)?
+        } else {
+            range.level_count
+        };
+        let layers = if range.layer_count == vk::REMAINING_ARRAY_LAYERS {
+            data.array_layers
+                .checked_sub(range.base_array_layer)
+                .ok_or(INVALID)?
+        } else {
+            range.layer_count
+        };
+        if !runtime.capabilities.supports_typed_texture_views()
+            && (view_type != vk::ImageViewType::TYPE_2D
+                || data.format != format
+                || range.base_mip_level != 0
+                || levels != data.mip_levels
+                || range.base_array_layer != 0
+                || layers != 1
+                || components != [0, 1, 2, 3])
+        {
+            return Err(UNSUPPORTED);
+        }
+        let view = ir::TextureViewDesc::new(
+            desc,
+            texture_format(format).ok_or(UNSUPPORTED)?,
+            match view_type {
+                vk::ImageViewType::TYPE_2D_ARRAY => ir::TextureViewDimension::D2Array,
+                vk::ImageViewType::CUBE => ir::TextureViewDimension::Cube,
+                _ => ir::TextureViewDimension::D2,
+            },
+            range.base_mip_level,
+            levels,
+            range.base_array_layer,
+            layers,
+        )
+        .map_err(|_| UNSUPPORTED)?;
         let handle = vk::ImageView::from_raw(next_id());
-        runtime.resources.views.insert(handle, image);
+        runtime.resources.views.insert(
+            handle,
+            ImageView {
+                image,
+                desc: view,
+                components,
+            },
+        );
         Ok(handle)
     }) {
         Ok(handle) => {
@@ -582,25 +723,32 @@ unsafe extern "system" fn create_framebuffer(
             return Err(INVALID);
         }
         for (index, view) in views.iter().enumerate() {
-            let image = runtime
-                .resources
-                .views
-                .get(view)
-                .and_then(|image| runtime.resources.images.get(image))
-                .ok_or(INVALID)?;
+            let view = runtime.resources.views.get(view).ok_or(INVALID)?;
+            let image = runtime.resources.images.get(&view.image).ok_or(INVALID)?;
             if image.format != pass.attachment_formats[index] || !image.usable() {
                 return Err(INVALID);
+            }
+            if view.components != [0, 1, 2, 3]
+                || image.array_layers != 1
+                || view.desc.dimension() != ir::TextureViewDimension::D2
+                || view.desc.base_mip_level() != 0
+                || view.desc.mip_level_count() != 1
+                || view.desc.base_array_layer() != 0
+                || view.desc.array_layer_count() != 1
+                || Some(view.desc.format()) != texture_format(image.format)
+            {
+                return Err(UNSUPPORTED);
             }
         }
         let view = views[pass.color_index as usize];
         let depth_view = pass.depth_index.map(|index| views[index as usize]);
-        let image = *runtime.resources.views.get(&view).ok_or(INVALID)?;
+        let image = runtime.resources.views.get(&view).ok_or(INVALID)?.image;
         if depth_view.is_some() != pass.depth_load_op.is_some() {
             return Err(UNSUPPORTED);
         }
         let depth = depth_view
             .map(|view| {
-                let image = *runtime.resources.views.get(&view).ok_or(INVALID)?;
+                let image = runtime.resources.views.get(&view).ok_or(INVALID)?.image;
                 let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
                 if !data.usable()
                     || data.format != vk::Format::D32_SFLOAT
@@ -663,7 +811,7 @@ unsafe extern "system" fn destroy_framebuffer(
 /// Copies shader names and handles before crossing the device worker boundary.
 unsafe fn shader_stages(
     info: &vk::GraphicsPipelineCreateInfo<'_>,
-) -> Result<[(vk::ShaderModule, String); 2], vk::Result> {
+) -> Result<[(vk::ShaderModule, String, crate::resources::Specialization); 2], vk::Result> {
     if info.stage_count != 2 || info.p_stages.is_null() {
         return Err(UNSUPPORTED);
     }
@@ -675,7 +823,6 @@ unsafe fn shader_stages(
             || !stage.p_next.is_null()
             || !stage.flags.is_empty()
             || stage.p_name.is_null()
-            || !stage.p_specialization_info.is_null()
         {
             return Err(UNSUPPORTED);
         }
@@ -690,7 +837,14 @@ unsafe fn shader_stages(
         } else {
             return Err(UNSUPPORTED);
         };
-        if slot.replace((stage.module, name)).is_some() {
+        if slot
+            .replace((
+                stage.module,
+                name,
+                crate::resources::specialization(stage.p_specialization_info)?,
+            ))
+            .is_some()
+        {
             return Err(INVALID);
         }
     }
@@ -707,13 +861,13 @@ struct GraphicsState {
     dynamic: GraphicsDynamicState,
     blend: ir::BlendState,
     extent: vk::Extent2D,
-    vertex: Option<ir::VertexBufferLayout>,
+    vertex: Vec<ir::VertexBufferLayout>,
     depth: Option<ir::DepthState>,
     raster: ir::RasterState,
     topology: ir::PrimitiveTopology,
 }
 
-fn compare(op: vk::CompareOp) -> Result<ir::CompareFunction, vk::Result> {
+pub(crate) fn compare(op: vk::CompareOp) -> Result<ir::CompareFunction, vk::Result> {
     Ok(match op {
         vk::CompareOp::NEVER => ir::CompareFunction::Never,
         vk::CompareOp::LESS => ir::CompareFunction::Less,
@@ -729,13 +883,14 @@ fn compare(op: vk::CompareOp) -> Result<ir::CompareFunction, vk::Result> {
 
 unsafe fn vertex_layout(
     vertex: &vk::PipelineVertexInputStateCreateInfo<'_>,
-) -> Result<Option<ir::VertexBufferLayout>, vk::Result> {
+) -> Result<Vec<ir::VertexBufferLayout>, vk::Result> {
     if vertex.vertex_binding_description_count == 0
         && vertex.vertex_attribute_description_count == 0
     {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    if vertex.vertex_binding_description_count != 1
+    if vertex.vertex_binding_description_count == 0
+        || vertex.vertex_binding_description_count > ir::MAX_VERTEX_BUFFERS as u32
         || vertex.p_vertex_binding_descriptions.is_null()
         || vertex.vertex_attribute_description_count == 0
         || vertex.vertex_attribute_description_count > 16
@@ -743,19 +898,27 @@ unsafe fn vertex_layout(
     {
         return Err(UNSUPPORTED);
     }
-    let binding = &*vertex.p_vertex_binding_descriptions;
-    if binding.binding != 0
-        || binding.input_rate != vk::VertexInputRate::VERTEX
-        || binding.stride > 2048
-        || !binding.stride.is_multiple_of(4)
-    {
-        return Err(UNSUPPORTED);
+    let mut buffers = std::collections::BTreeMap::new();
+    for binding in std::slice::from_raw_parts(
+        vertex.p_vertex_binding_descriptions,
+        vertex.vertex_binding_description_count as usize,
+    ) {
+        if binding.binding >= ir::MAX_VERTEX_BUFFERS as u32
+            || binding.input_rate != vk::VertexInputRate::VERTEX
+            || binding.stride > 2048
+            || !binding.stride.is_multiple_of(4)
+            || buffers
+                .insert(binding.binding, (binding.stride, Vec::new()))
+                .is_some()
+        {
+            return Err(UNSUPPORTED);
+        }
     }
-    let mut attributes = Vec::new();
-    for index in 0..vertex.vertex_attribute_description_count as usize {
-        let attribute = &*vertex.p_vertex_attribute_descriptions.add(index);
-        if attribute.binding != 0
-            || attribute.location >= 16
+    for attribute in std::slice::from_raw_parts(
+        vertex.p_vertex_attribute_descriptions,
+        vertex.vertex_attribute_description_count as usize,
+    ) {
+        if attribute.location >= 16
             || attribute.offset > 2047
             || !attribute.offset.is_multiple_of(4)
         {
@@ -765,18 +928,35 @@ unsafe fn vertex_layout(
             vk::Format::R32G32_SFLOAT => ir::VertexFormat::Float32x2,
             vk::Format::R32G32B32_SFLOAT => ir::VertexFormat::Float32x3,
             vk::Format::R32G32B32A32_SFLOAT => ir::VertexFormat::Float32x4,
-            vk::Format::R8G8B8A8_UNORM => ir::VertexFormat::Unorm8x4,
+            vk::Format::R8G8B8A8_UNORM | vk::Format::A8B8G8R8_UNORM_PACK32 => {
+                ir::VertexFormat::Unorm8x4
+            }
+            vk::Format::R32_SINT => ir::VertexFormat::Sint32,
+            vk::Format::R32_UINT => ir::VertexFormat::Uint32,
+            vk::Format::R16G16_SFLOAT => ir::VertexFormat::Float16x2,
+            vk::Format::R16G16B16A16_SFLOAT => ir::VertexFormat::Float16x4,
+            vk::Format::R16G16B16A16_SINT => ir::VertexFormat::Sint16x4,
+            vk::Format::A2B10G10R10_SNORM_PACK32 => ir::VertexFormat::Snorm10_10_10_2,
             _ => return Err(UNSUPPORTED),
         };
+
+        let (_, attributes) = buffers.get_mut(&attribute.binding).ok_or(UNSUPPORTED)?;
         attributes.push(ir::VertexAttribute::new(
             attribute.location,
             format,
             attribute.offset,
         ));
     }
-    ir::VertexBufferLayout::new(binding.stride, attributes)
-        .map(Some)
-        .map_err(|_| UNSUPPORTED)
+    buffers
+        .into_iter()
+        .enumerate()
+        .map(|(index, (slot, (stride, attributes)))| {
+            if slot != index as u32 {
+                return Err(UNSUPPORTED);
+            }
+            ir::VertexBufferLayout::new(stride, attributes).map_err(|_| UNSUPPORTED)
+        })
+        .collect()
 }
 
 unsafe fn graphics_state(
@@ -1026,8 +1206,8 @@ unsafe extern "system" fn create_graphics_pipelines(
         let (
             state,
             [
-                (vertex_module, vertex_name),
-                (fragment_module, fragment_name),
+                (vertex_module, vertex_name, vertex_values),
+                (fragment_module, fragment_name, fragment_values),
             ],
         ) = match parsed {
             Ok(parsed) => parsed,
@@ -1053,16 +1233,18 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .get(&layout)
                 .ok_or(INVALID)?
                 .clone();
-            let vertex_id = *runtime
+            let vertex_id = runtime
                 .resources
                 .shaders
-                .get(&vertex_module)
-                .ok_or(INVALID)?;
-            let fragment_id = *runtime
+                .get_mut(&vertex_module)
+                .ok_or(INVALID)?
+                .variant(&runtime.table, &vertex_values)?;
+            let fragment_id = runtime
                 .resources
                 .shaders
-                .get(&fragment_module)
-                .ok_or(INVALID)?;
+                .get_mut(&fragment_module)
+                .ok_or(INVALID)?
+                .variant(&runtime.table, &fragment_values)?;
             let vertex = ir::ShaderEntryPoint::new(
                 runtime
                     .table
@@ -1082,15 +1264,17 @@ unsafe extern "system" fn create_graphics_pipelines(
             )
             .map_err(|_| INVALID)?;
             let mut desc = ir::ProgrammableRenderPipelineDesc::new(
-                vertex,
-                fragment,
-                layout,
+                vertex.clone(),
+                fragment.clone(),
+                crate::spirv::specialize_layout(&runtime.table, &layout, &[&vertex, &fragment])?,
                 target_format,
-                state.vertex,
+                None,
                 state.topology,
                 state.blend,
                 state.raster,
             )
+            .map_err(|_| INVALID)?
+            .with_vertex_buffers(state.vertex)
             .map_err(|_| INVALID)?;
             if pass.depth_load_op.is_some() {
                 desc = desc
@@ -1189,7 +1373,7 @@ mod tests {
         let info = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings)
             .vertex_attribute_descriptions(&attributes);
-        let parsed = unsafe { vertex_layout(&info) }.unwrap().unwrap();
+        let parsed = unsafe { vertex_layout(&info) }.unwrap().remove(0);
         assert_eq!(parsed.stride(), 28);
         assert_eq!(parsed.attributes()[0].format(), ir::VertexFormat::Float32x3);
         assert_eq!(parsed.attributes()[1].offset(), 12);

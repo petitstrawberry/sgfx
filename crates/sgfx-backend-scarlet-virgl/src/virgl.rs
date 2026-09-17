@@ -3469,6 +3469,7 @@ fn push_programmable_vertex_elements(
                 crate::ir::VertexFormat::Float32x3 => VIRGL_FORMAT_R32G32B32_FLOAT,
                 crate::ir::VertexFormat::Float32x4 => VIRGL_FORMAT_R32G32B32A32_FLOAT,
                 crate::ir::VertexFormat::Unorm8x4 => VIRGL_FORMAT_R8G8B8A8_UNORM,
+                _ => return Err(HandleError::InvalidParameter),
             },
         );
     }

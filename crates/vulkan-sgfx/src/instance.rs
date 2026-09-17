@@ -617,7 +617,12 @@ unsafe extern "system" fn get_physical_device_properties(
         let graphics = capabilities.supports_graphics();
         properties.limits = vk::PhysicalDeviceLimits {
             max_image_dimension2_d: limits.max_image_dimension_2d,
-            max_image_array_layers: 1,
+            max_image_array_layers: limits.max_image_array_layers,
+            max_image_dimension_cube: if limits.max_image_array_layers >= 6 {
+                limits.max_image_dimension_2d.min(2048)
+            } else {
+                0
+            },
             max_uniform_buffer_range: limits.max_uniform_buffer_range,
             max_storage_buffer_range: if storage_buffers {
                 limits.max_storage_buffer_range
@@ -631,6 +636,8 @@ unsafe extern "system" fn get_physical_device_properties(
             max_per_stage_descriptor_sampled_images: if graphics { 16 } else { 0 },
             max_descriptor_set_samplers: if graphics { 16 } else { 0 },
             max_descriptor_set_sampled_images: if graphics { 16 } else { 0 },
+            max_per_stage_descriptor_storage_images: limits.max_storage_images_per_stage,
+            max_descriptor_set_storage_images: limits.max_storage_images_per_stage,
             max_per_stage_descriptor_uniform_buffers: limits.max_uniform_buffers_per_stage,
             max_per_stage_descriptor_storage_buffers: if storage_buffers {
                 limits.max_storage_buffers_per_stage
@@ -715,7 +722,7 @@ unsafe extern "system" fn get_physical_device_properties(
             max_framebuffer_layers: 1,
             framebuffer_color_sample_counts: vk::SampleCountFlags::TYPE_1,
             framebuffer_depth_sample_counts: vk::SampleCountFlags::TYPE_1,
-            max_color_attachments: limits.max_color_attachments,
+            max_color_attachments: limits.max_color_attachments.min(1),
             max_sample_mask_words: 1,
             discrete_queue_priorities: 1,
             point_size_range: [1.0, 1.0],
@@ -810,21 +817,66 @@ unsafe extern "system" fn get_physical_device_format_properties(
         return;
     };
     let capabilities = adapter.capabilities();
-    if (capabilities.supports_rgba8_color_attachment() && format == vk::Format::R8G8B8A8_UNORM)
-        || (capabilities.supports_bgra8_color_attachment() && format == vk::Format::B8G8R8A8_UNORM)
+    if !capabilities.supports_typed_texture_views()
+        && matches!(
+            format,
+            vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+        )
+    {
+        unsafe { *output = properties };
+        return;
+    }
+    if (capabilities.supports_rgba8_color_attachment()
+        && matches!(
+            format,
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::R8_UNORM
+        ))
+        || (capabilities.supports_bgra8_color_attachment()
+            && matches!(
+                format,
+                vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB
+            ))
     {
         // In Vulkan 1.0, transfer support follows image-format support; the
         // TRANSFER_SRC/DST format-feature bits belong to maintenance1 / 1.1.
         properties.optimal_tiling_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
             | vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
     }
-    if capabilities.supports_image_blits() && !properties.optimal_tiling_features.is_empty() {
+    if capabilities.supports_image_blits()
+        && matches!(
+            format,
+            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+        )
+    {
         properties.optimal_tiling_features |=
             vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
     }
     if capabilities.supports_depth32_attachment() && format == vk::Format::D32_SFLOAT {
-        properties.optimal_tiling_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT;
+        properties.optimal_tiling_features = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+            | if capabilities.supports_typed_texture_views() {
+                vk::FormatFeatureFlags::SAMPLED_IMAGE
+            } else {
+                vk::FormatFeatureFlags::empty()
+            };
+    }
+    if capabilities.supports_storage_images() && format == vk::Format::R8G8B8A8_UNORM {
+        properties.optimal_tiling_features |= vk::FormatFeatureFlags::STORAGE_IMAGE;
+    }
+    if capabilities.supports_extended_vertex_formats()
+        && matches!(
+            format,
+            vk::Format::R32_SINT
+                | vk::Format::R32_UINT
+                | vk::Format::R16G16_SFLOAT
+                | vk::Format::R16G16B16A16_SFLOAT
+                | vk::Format::R16G16B16A16_SINT
+                | vk::Format::A2B10G10R10_SNORM_PACK32
+                | vk::Format::A8B8G8R8_UNORM_PACK32
+        )
+    {
+        properties.buffer_features = vk::FormatFeatureFlags::VERTEX_BUFFER;
     }
     if capabilities.supports_vertex_buffers()
         && matches!(
@@ -858,13 +910,34 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
     };
     let capabilities = adapter.capabilities();
     let mut supported_usage = crate::images::image_usage(format);
+    if !capabilities.supports_storage_images() {
+        supported_usage &= !vk::ImageUsageFlags::STORAGE;
+    }
+    if !capabilities.supports_typed_texture_views() {
+        if matches!(
+            format,
+            vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+        ) {
+            supported_usage = vk::ImageUsageFlags::empty();
+        } else if format == vk::Format::D32_SFLOAT {
+            supported_usage &= !vk::ImageUsageFlags::SAMPLED;
+        }
+    }
     if matches!(
         format,
-        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+        vk::Format::R8G8B8A8_UNORM
+            | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+            | vk::Format::B8G8R8A8_SRGB
+            | vk::Format::R8_UNORM
     ) {
         let color_attachment = match format {
-            vk::Format::R8G8B8A8_UNORM => capabilities.supports_rgba8_color_attachment(),
-            vk::Format::B8G8R8A8_UNORM => capabilities.supports_bgra8_color_attachment(),
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::R8_UNORM => {
+                capabilities.supports_rgba8_color_attachment()
+            }
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
+                capabilities.supports_bgra8_color_attachment()
+            }
             _ => false,
         };
         if !color_attachment {
@@ -883,9 +956,13 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
     if supported_usage.is_empty()
         || image_type != vk::ImageType::TYPE_2D
         || tiling != vk::ImageTiling::OPTIMAL
-        || !flags.is_empty()
+        || !(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::CUBE_COMPATIBLE)
+            .contains(flags)
+        || (flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)
+            && capabilities.limits().max_image_array_layers < 6)
         || usage.is_empty()
         || !supported_usage.contains(usage)
+        || !crate::images::valid_image_usage(usage)
     {
         return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
     }
@@ -908,7 +985,7 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
                     .max_image_mip_levels
                     .min(max_dimension.ilog2() + 1)
             },
-            max_array_layers: 1,
+            max_array_layers: capabilities.limits().max_image_array_layers,
             sample_counts: vk::SampleCountFlags::TYPE_1,
             max_resource_size: u64::from(max_dimension).pow(2) * 4 * 2,
         }
@@ -1109,7 +1186,7 @@ mod tests {
                     vk::ImageType::TYPE_2D,
                     vk::ImageTiling::OPTIMAL,
                     vk::ImageUsageFlags::STORAGE,
-                    vk::ImageCreateFlags::empty(),
+                    vk::ImageCreateFlags::SPARSE_BINDING,
                     &mut image
                 ),
                 vk::Result::ERROR_FORMAT_NOT_SUPPORTED
@@ -1120,6 +1197,7 @@ mod tests {
             assert_eq!(
                 formats.optimal_tiling_features,
                 vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+                    | vk::FormatFeatureFlags::SAMPLED_IMAGE
             );
             assert_eq!(
                 get_physical_device_image_format_properties(

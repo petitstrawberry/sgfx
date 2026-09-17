@@ -107,25 +107,29 @@ pub(crate) fn upload(
     if !buffer.usage.contains(vk::BufferUsageFlags::TRANSFER_SRC)
         || !target.usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
         || !target.usable()
-        || !matches!(
-            target.format,
-            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
-        )
+        || target.format == vk::Format::D32_SFLOAT
     {
         return Err(invalid);
     }
     let (memory, binding) = buffer.bound.ok_or(invalid)?;
     let memory = resources.memories.get(&memory).ok_or(invalid)?;
+    let bpp = crate::images::texture_format(target.format)
+        .ok_or(unsupported)?
+        .bytes_per_pixel();
     let mut ops = Vec::with_capacity(regions.len());
     for region in regions {
         if region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
-            || region.image_subresource.base_array_layer != 0
-            || region.image_subresource.layer_count != 1
+            || region.image_subresource.layer_count == 0
+            || region
+                .image_subresource
+                .base_array_layer
+                .checked_add(region.image_subresource.layer_count)
+                .is_none_or(|end| end > target.array_layers)
             || region.image_extent.depth != 1
             || region.image_offset.z != 0
             || region.image_offset.x < 0
             || region.image_offset.y < 0
-            || !region.buffer_offset.is_multiple_of(4)
+            || !region.buffer_offset.is_multiple_of(u64::from(bpp))
         {
             return Err(unsupported);
         }
@@ -154,27 +158,51 @@ pub(crate) fn upload(
         {
             return Err(invalid);
         }
-        let stride = row.checked_mul(4).ok_or(invalid)?;
+        let stride = row.checked_mul(bpp).ok_or(invalid)?;
         let length = u64::from(stride)
             .checked_mul(u64::from(destination.height() - 1))
-            .and_then(|v| v.checked_add(u64::from(destination.width()) * 4))
+            .and_then(|v| v.checked_add(u64::from(destination.width()) * u64::from(bpp)))
             .ok_or(invalid)?;
-        let end = region
-            .buffer_offset
-            .checked_add(length)
-            .filter(|end| *end <= buffer.size)
-            .ok_or(invalid)?;
-        let start = usize::try_from(binding.checked_add(region.buffer_offset).ok_or(invalid)?)
-            .map_err(|_| invalid)?;
-        let end = usize::try_from(binding.checked_add(end).ok_or(invalid)?).map_err(|_| invalid)?;
-        let data = memory.bytes.get(start..end).ok_or(invalid)?.to_vec();
-        ops.push(ir::OwnedCommand::WriteTextureMip {
-            mip_level,
-            texture: target.id,
-            destination,
-            bytes_per_row: stride,
-            data,
-        });
+        let rows_per_layer = if region.buffer_image_height == 0 {
+            destination.height()
+        } else {
+            region.buffer_image_height
+        };
+        let layer_stride = u64::from(stride) * u64::from(rows_per_layer);
+        for layer in 0..region.image_subresource.layer_count {
+            let offset = region
+                .buffer_offset
+                .checked_add(layer_stride.checked_mul(u64::from(layer)).ok_or(invalid)?)
+                .ok_or(invalid)?;
+            let end = offset
+                .checked_add(length)
+                .filter(|end| *end <= buffer.size)
+                .ok_or(invalid)?;
+            let start = usize::try_from(binding.checked_add(offset).ok_or(invalid)?)
+                .map_err(|_| invalid)?;
+            let end =
+                usize::try_from(binding.checked_add(end).ok_or(invalid)?).map_err(|_| invalid)?;
+            let data = memory.bytes.get(start..end).ok_or(invalid)?.to_vec();
+            let array_layer = region.image_subresource.base_array_layer + layer;
+            if target.array_layers == 1 {
+                ops.push(ir::OwnedCommand::WriteTextureMip {
+                    mip_level,
+                    texture: target.id,
+                    destination,
+                    bytes_per_row: stride,
+                    data,
+                });
+            } else {
+                ops.push(ir::OwnedCommand::WriteTextureLayer {
+                    mip_level,
+                    array_layer,
+                    texture: target.id,
+                    destination,
+                    bytes_per_row: stride,
+                    data,
+                });
+            }
+        }
     }
     Ok(ops)
 }

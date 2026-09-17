@@ -436,6 +436,8 @@ pub(crate) unsafe extern "system" fn create_swapchain(
                 image,
                 crate::images::Image {
                     mip_levels: 1,
+                    array_layers: 1,
+                    flags: vk::ImageCreateFlags::empty(),
                     id,
                     format,
                     extent: vk::Extent3D {

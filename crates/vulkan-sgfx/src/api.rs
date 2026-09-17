@@ -523,6 +523,7 @@ enum RecordingState {
 }
 #[derive(Clone)]
 struct DescriptorInsertion {
+    layout: ir::BindGroupLayoutDesc,
     position: usize,
     index: u32,
     set: vk::DescriptorSet,
@@ -531,7 +532,7 @@ struct DescriptorInsertion {
 #[derive(Clone)]
 struct DeferredBarrier {
     position: usize,
-    sets: Vec<vk::DescriptorSet>,
+    buffers: Vec<vk::Buffer>,
     after: ir::BufferAccess,
 }
 #[derive(Clone)]
@@ -654,6 +655,7 @@ enum RecordedCommand {
     SetViewport(vk::Viewport),
     SetScissor(vk::Rect2D),
     BindVertexBuffer {
+        slot: u32,
         buffer: vk::Buffer,
         offset: u64,
     },
@@ -711,10 +713,10 @@ struct ResolvedRecording {
     descriptors: Vec<DescriptorInsertion>,
     copies: Vec<ReadImage>,
     barriers: Vec<DeferredBarrier>,
-    written_sets: Vec<vk::DescriptorSet>,
+    written_buffers: Vec<vk::Buffer>,
     compute: Option<vk::Pipeline>,
     graphics: Option<vk::Pipeline>,
-    vertex_buffer: Option<(vk::Buffer, u64)>,
+    vertex_buffers: [Option<(vk::Buffer, u64)>; ir::MAX_VERTEX_BUFFERS],
     index_buffer: Option<(vk::Buffer, u64, ir::IndexFormat)>,
     bound_sets: Vec<vk::DescriptorSet>,
     compute_sets: BTreeMap<u32, vk::DescriptorSet>,
@@ -741,7 +743,7 @@ struct EmittedGraphics {
     scissor: Option<ir::PixelRect>,
     pipeline: Option<ir::ProgrammableRenderPipelineId>,
     push_constants: Option<(ir::ProgrammableRenderPipelineId, u64)>,
-    vertex_buffer: Option<(ir::BufferId, u64)>,
+    vertex_buffers: [Option<(ir::BufferId, u64)>; ir::MAX_VERTEX_BUFFERS],
     index_buffer: Option<(ir::BufferId, u64, ir::IndexFormat)>,
     descriptors: BTreeMap<u32, (vk::DescriptorSet, Vec<u32>)>,
 }
@@ -829,10 +831,10 @@ impl ResolvedRecording {
             descriptors: Vec::new(),
             copies: Vec::new(),
             barriers: Vec::new(),
-            written_sets: Vec::new(),
+            written_buffers: Vec::new(),
             compute: None,
             graphics: None,
-            vertex_buffer: None,
+            vertex_buffers: [None; ir::MAX_VERTEX_BUFFERS],
             index_buffer: None,
             bound_sets: Vec::new(),
             compute_sets: BTreeMap::new(),
@@ -969,18 +971,18 @@ impl RecordedCommand {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
                 let pipeline = rec.compute.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                let Some(crate::resources::Pipeline::Compute(id)) =
-                    rt.resources.pipelines.get(&pipeline)
-                else {
-                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                };
+                let id = rt.resources.compute_pipeline_for_views(
+                    &rt.table,
+                    pipeline,
+                    &rec.compute_sets,
+                )?;
                 rec.ops.push(ir::OwnedCommand::BeginComputePass);
-                rec.ops.push(ir::OwnedCommand::SetComputePipeline(*id));
+                rec.ops.push(ir::OwnedCommand::SetComputePipeline(id));
                 let desc = rt
                     .table
                     .compute_pipeline(
                         rt.table
-                            .compute_pipeline_ref(*id)
+                            .compute_pipeline_ref(id)
                             .map_err(crate::resources::failure)?,
                     )
                     .map_err(crate::resources::failure)?;
@@ -988,6 +990,7 @@ impl RecordedCommand {
                 let active_sets = active_sets(&rt.resources, desc.layout(), &rec.compute_sets)?;
                 for &(index, set) in &active_sets {
                     rec.descriptors.push(DescriptorInsertion {
+                        layout: desc.layout().bind_groups()[index as usize].clone(),
                         position: rec.ops.len(),
                         index,
                         set,
@@ -998,9 +1001,7 @@ impl RecordedCommand {
                             .unwrap_or_default(),
                     });
                 }
-                mark_writable_descriptor_buffers(&rt.resources, rec, &active_sets)?;
-                rec.written_sets
-                    .extend(active_sets.into_iter().map(|(_, set)| set));
+                mark_writable_descriptor_buffers(&rt.resources, rec, &active_sets, desc.layout())?;
                 if *x != 0 && *y != 0 && *z != 0 {
                     rec.ops.push(ir::OwnedCommand::Dispatch {
                         x: *x,
@@ -1138,7 +1139,11 @@ impl RecordedCommand {
             }
             Self::SetViewport(viewport) => rec.viewport = Some(*viewport),
             Self::SetScissor(scissor) => rec.scissor = Some(*scissor),
-            Self::BindVertexBuffer { buffer, offset } => {
+            Self::BindVertexBuffer {
+                slot,
+                buffer,
+                offset,
+            } => {
                 let data = rt
                     .resources
                     .buffers
@@ -1151,7 +1156,7 @@ impl RecordedCommand {
                 {
                     return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                 }
-                rec.vertex_buffer = Some((*buffer, *offset));
+                rec.vertex_buffers[*slot as usize] = Some((*buffer, *offset));
                 rec.used_buffers.push(*buffer);
             }
             Self::BindIndexBuffer {
@@ -1185,14 +1190,23 @@ impl RecordedCommand {
                 first,
                 first_instance,
             } => {
-                if *instances > 1 || *first_instance != 0 {
+                if first_instance.checked_add(*instances).is_none() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
-                let visible = graphics_bindings(&rt.table, &rt.resources, rec)?;
+                let visible = graphics_bindings(&rt.table, &mut rt.resources, rec)?;
                 if visible && *vertices != 0 && *instances != 0 {
-                    rec.ops.push(ir::OwnedCommand::Draw {
-                        vertex_count: *vertices,
-                        first_vertex: *first,
+                    rec.ops.push(if *instances == 1 && *first_instance == 0 {
+                        ir::OwnedCommand::Draw {
+                            vertex_count: *vertices,
+                            first_vertex: *first,
+                        }
+                    } else {
+                        ir::OwnedCommand::DrawInstanced {
+                            vertex_count: *vertices,
+                            first_vertex: *first,
+                            instance_count: *instances,
+                            first_instance: *first_instance,
+                        }
                     });
                 }
             }
@@ -1203,10 +1217,10 @@ impl RecordedCommand {
                 base_vertex,
                 first_instance,
             } => {
-                if *instances > 1 || *first_instance != 0 {
+                if first_instance.checked_add(*instances).is_none() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
-                let visible = graphics_bindings(&rt.table, &rt.resources, rec)?;
+                let visible = graphics_bindings(&rt.table, &mut rt.resources, rec)?;
                 let (handle, offset, format) = rec
                     .index_buffer
                     .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -1226,10 +1240,20 @@ impl RecordedCommand {
                     },
                 );
                 if visible && *indices != 0 && *instances != 0 {
-                    rec.ops.push(ir::OwnedCommand::DrawIndexed {
-                        index_count: *indices,
-                        first_index: *first,
-                        base_vertex: *base_vertex,
+                    rec.ops.push(if *instances == 1 && *first_instance == 0 {
+                        ir::OwnedCommand::DrawIndexed {
+                            index_count: *indices,
+                            first_index: *first,
+                            base_vertex: *base_vertex,
+                        }
+                    } else {
+                        ir::OwnedCommand::DrawIndexedInstanced {
+                            index_count: *indices,
+                            first_index: *first,
+                            base_vertex: *base_vertex,
+                            instance_count: *instances,
+                            first_instance: *first_instance,
+                        }
                     });
                 }
             }
@@ -1389,10 +1413,9 @@ impl RecordedCommand {
                     {
                         rec.barriers.push(DeferredBarrier {
                             position: rec.ops.len(),
-                            sets: rec.written_sets.clone(),
+                            buffers: std::mem::take(&mut rec.written_buffers),
                             after: buffer_access(*destination)?,
                         });
-                        rec.written_sets.clear();
                     } else if !(vk::AccessFlags::TRANSFER_WRITE
                         | vk::AccessFlags::HOST_WRITE
                         | vk::AccessFlags::MEMORY_WRITE)
@@ -1438,8 +1461,8 @@ impl RecordedCommand {
                 }
                 for (
                     extended,
-                    _source,
-                    _destination,
+                    source_access,
+                    destination_access,
                     source_queue,
                     destination_queue,
                     image,
@@ -1451,8 +1474,6 @@ impl RecordedCommand {
                     if *extended
                         || !(*source_queue == vk::QUEUE_FAMILY_IGNORED
                             && *destination_queue == vk::QUEUE_FAMILY_IGNORED)
-                        || range.base_array_layer != 0
-                        || range.layer_count != 1
                     {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
@@ -1463,6 +1484,20 @@ impl RecordedCommand {
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
                     if range.aspect_mask != crate::images::image_aspect(image_data.format) {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    let layers = if range.layer_count == vk::REMAINING_ARRAY_LAYERS {
+                        image_data.array_layers.checked_sub(range.base_array_layer)
+                    } else {
+                        Some(range.layer_count)
+                    }
+                    .filter(|count| *count > 0)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    if range
+                        .base_array_layer
+                        .checked_add(layers)
+                        .is_none_or(|end| end > image_data.array_layers)
+                    {
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                     }
                     let level_count = if range.level_count == vk::REMAINING_MIP_LEVELS {
                         image_data.mip_levels.checked_sub(range.base_mip_level)
@@ -1479,23 +1514,35 @@ impl RecordedCommand {
                     // Presentation is outside command IR. These persistent
                     // swapchain images retain color-attachment storage while
                     // presented and can be transitioned back to transfer use.
-                    let access = |layout| {
+                    let access = |layout, mask: vk::AccessFlags| {
                         if layout == vk::ImageLayout::PRESENT_SRC_KHR
                             && image_data.swapchain.is_some()
                         {
                             Ok(ir::TextureAccess::RenderAttachment)
+                        } else if layout == vk::ImageLayout::GENERAL {
+                            if mask.intersects(
+                                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE,
+                            ) {
+                                Ok(ir::TextureAccess::StorageWrite)
+                            } else if mask.contains(vk::AccessFlags::TRANSFER_WRITE) {
+                                Ok(ir::TextureAccess::CopyDestination)
+                            } else if mask.contains(vk::AccessFlags::TRANSFER_READ) {
+                                Ok(ir::TextureAccess::CopySource)
+                            } else {
+                                Ok(ir::TextureAccess::Sampled)
+                            }
                         } else {
                             texture_access(layout)
                         }
                     };
-                    let after = access(*new_layout)?;
+                    let after = access(*new_layout, *destination_access)?;
                     if *old_layout != vk::ImageLayout::UNDEFINED {
                         for mip_level in range.base_mip_level..end {
                             rec.ops.push(ir::OwnedCommand::ResourceBarrier(
                                 ir::OwnedResourceBarrier::TextureMip {
                                     mip_level,
                                     texture: image_data.id,
-                                    before: access(*old_layout)?,
+                                    before: access(*old_layout, *source_access)?,
                                     after,
                                 },
                             ));
@@ -2084,19 +2131,34 @@ unsafe extern "system" fn cmd_bind_vertex_buffers(
     buffers: *const vk::Buffer,
     offsets: *const vk::DeviceSize,
 ) {
-    if first != 0 || count != 1 || buffers.is_null() || offsets.is_null() {
+    if count == 0 {
+        return;
+    }
+    if first
+        .checked_add(count)
+        .is_none_or(|end| end > ir::MAX_VERTEX_BUFFERS as u32)
+        || buffers.is_null()
+        || offsets.is_null()
+    {
         record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
         return;
     }
-    let (buffer, offset) = (*buffers, *offsets);
-    if !offset.is_multiple_of(4) {
+    let buffers = std::slice::from_raw_parts(buffers, count as usize);
+    let offsets = std::slice::from_raw_parts(offsets, count as usize);
+    if offsets.iter().any(|offset| !offset.is_multiple_of(4)) {
         record_error(command, vk::Result::ERROR_INITIALIZATION_FAILED);
         return;
     }
-    record(
-        command,
-        RecordedCommand::BindVertexBuffer { buffer, offset },
-    )
+    for (index, (&buffer, &offset)) in buffers.iter().zip(offsets).enumerate() {
+        record(
+            command,
+            RecordedCommand::BindVertexBuffer {
+                slot: first + index as u32,
+                buffer,
+                offset,
+            },
+        );
+    }
 }
 
 unsafe extern "system" fn cmd_bind_index_buffer(
@@ -2129,16 +2191,14 @@ unsafe extern "system" fn cmd_bind_index_buffer(
 
 fn graphics_bindings(
     table: &ir::ResourceTable,
-    resources: &crate::resources::Resources,
+    resources: &mut crate::resources::Resources,
     rec: &mut ResolvedRecording,
 ) -> VkResult<bool> {
     let extent = rec.render.ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
     let pipeline = rec
         .graphics
         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-    let Some(crate::resources::Pipeline::Graphics(id)) = resources.pipelines.get(&pipeline) else {
-        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-    };
+    let id = resources.graphics_pipeline_for_views(table, pipeline, &rec.graphics_sets)?;
     let state = resources
         .graphics_state
         .get(&pipeline)
@@ -2172,7 +2232,7 @@ fn graphics_bindings(
     let desc = table
         .programmable_render_pipeline_shared(
             table
-                .programmable_render_pipeline_ref(*id)
+                .programmable_render_pipeline_ref(id)
                 .map_err(crate::resources::failure)?,
         )
         .map_err(crate::resources::failure)?;
@@ -2192,30 +2252,55 @@ fn graphics_bindings(
             |rect| ir::OwnedCommand::SetScissor(Some(rect)),
         );
     }
+    if let Some(previous) = rec
+        .emitted_graphics
+        .pipeline
+        .filter(|previous| *previous != id)
+    {
+        let previous = table
+            .programmable_render_pipeline_shared(
+                table
+                    .programmable_render_pipeline_ref(previous)
+                    .map_err(crate::resources::failure)?,
+            )
+            .map_err(crate::resources::failure)?;
+        if previous.layout() != desc.layout() {
+            rec.emitted_graphics.descriptors.clear();
+        }
+    }
     emit_changed(
         &mut rec.emitted_graphics.pipeline,
-        *id,
+        id,
         &mut rec.ops,
         ir::OwnedCommand::SetProgrammablePipeline,
     );
-    let push_key = (*id, rec.push_constants_revision);
+    let push_key = (id, rec.push_constants_revision);
     if rec.emitted_graphics.push_constants != Some(push_key) {
         rec.ops.extend(rec.push_constants.snapshot(desc.layout())?);
         rec.emitted_graphics.push_constants = Some(push_key);
     }
-    if desc.vertex_buffer().is_some() {
-        let (handle, offset) = rec
-            .vertex_buffer
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+    for (slot, _) in desc.vertex_buffers().iter().enumerate() {
+        let (handle, offset) =
+            rec.vertex_buffers[slot].ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         let buffer = resources
             .buffers
             .get(&handle)
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         emit_changed(
-            &mut rec.emitted_graphics.vertex_buffer,
+            &mut rec.emitted_graphics.vertex_buffers[slot],
             (buffer.id, offset),
             &mut rec.ops,
-            |(buffer, offset)| ir::OwnedCommand::SetVertexBuffer { buffer, offset },
+            |(buffer, offset)| {
+                if slot == 0 {
+                    ir::OwnedCommand::SetVertexBuffer { buffer, offset }
+                } else {
+                    ir::OwnedCommand::SetVertexBufferSlot {
+                        slot: slot as u32,
+                        buffer,
+                        offset,
+                    }
+                }
+            },
         );
     }
     let active_sets = active_sets(resources, desc.layout(), &rec.graphics_sets)?;
@@ -2236,15 +2321,14 @@ fn graphics_bindings(
             .descriptors
             .insert(index, (set, dynamic_offsets.clone()));
         rec.descriptors.push(DescriptorInsertion {
+            layout: desc.layout().bind_groups()[index as usize].clone(),
             position: rec.ops.len(),
             index,
             set,
             dynamic_offsets,
         });
     }
-    mark_writable_descriptor_buffers(resources, rec, &active_sets)?;
-    rec.written_sets
-        .extend(active_sets.into_iter().map(|(_, set)| set));
+    mark_writable_descriptor_buffers(resources, rec, &active_sets, desc.layout())?;
     Ok(visible)
 }
 
@@ -2252,24 +2336,31 @@ fn mark_writable_descriptor_buffers(
     resources: &crate::resources::Resources,
     rec: &mut ResolvedRecording,
     sets: &[(u32, vk::DescriptorSet)],
+    layout: &ir::PipelineLayoutDesc,
 ) -> VkResult<()> {
-    for (_, handle) in sets {
+    for (index, handle) in sets {
         let set = resources
             .descriptor_sets
             .get(handle)
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         for (&binding, resource) in &set.bindings {
-            let writable = set.layout.entries().iter().any(|entry| {
-                entry.binding() == binding * 2
-                    && matches!(
-                        entry.ty(),
-                        ir::BindingType::StorageBuffer { read_only: false }
-                    )
-            });
+            let writable = layout.bind_groups()[*index as usize]
+                .entries()
+                .iter()
+                .any(|entry| {
+                    entry.binding() == binding * 2
+                        && matches!(
+                            entry.ty(),
+                            ir::BindingType::StorageBuffer { read_only: false }
+                        )
+                });
             if writable {
                 let crate::resources::DescriptorBinding::Buffer { buffer, .. } = resource else {
                     continue;
                 };
+                if !rec.written_buffers.contains(buffer) {
+                    rec.written_buffers.push(*buffer);
+                }
                 if !rec.readback_buffers.contains(buffer) {
                     rec.readback_buffers.push(*buffer);
                 }
@@ -2286,7 +2377,7 @@ unsafe extern "system" fn cmd_draw(
     first: u32,
     first_instance: u32,
 ) {
-    if instances > 1 || first_instance != 0 {
+    if first_instance.checked_add(instances).is_none() {
         record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
         return;
     }
@@ -2309,7 +2400,7 @@ unsafe extern "system" fn cmd_draw_indexed(
     base_vertex: i32,
     first_instance: u32,
 ) {
-    if instances > 1 || first_instance != 0 {
+    if first_instance.checked_add(instances).is_none() {
         record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
         return;
     }
@@ -2592,7 +2683,8 @@ fn texture_access(layout: vk::ImageLayout) -> VkResult<ir::TextureAccess> {
         }
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL => Ok(ir::TextureAccess::CopySource),
         vk::ImageLayout::TRANSFER_DST_OPTIMAL => Ok(ir::TextureAccess::CopyDestination),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => Ok(ir::TextureAccess::Sampled),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        | vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL => Ok(ir::TextureAccess::Sampled),
         _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
     }
 }
@@ -3024,6 +3116,7 @@ unsafe extern "system" fn queue_submit(
                     for state in &signal_semaphores {
                         state.store(0, Ordering::Release);
                     }
+
                     return Err(error);
                 }
             }
@@ -3128,10 +3221,10 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
     if rec.used_framebuffers.iter().any(|f| {
         rt.resources.framebuffers.get(f).is_none_or(|fb| {
             fb.attachments.iter().any(|view| {
-                !rt.resources.views.get(view).is_some_and(|image| {
+                !rt.resources.views.get(view).is_some_and(|view| {
                     rt.resources
                         .images
-                        .get(image)
+                        .get(&view.image)
                         .is_some_and(|image| image.usable())
                 })
             }) || fb
@@ -3290,9 +3383,12 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
     let mut copies = rec.copies.as_slice();
     for position in 0..=rec.ops.len() {
         for d in take_positioned(&mut descriptors, position, |d| d.position) {
-            let group = rt
-                .resources
-                .descriptor_group(&rt.table, d.set, &d.dynamic_offsets)?;
+            let group = rt.resources.descriptor_group_with_layout(
+                &rt.table,
+                d.set,
+                &d.dynamic_offsets,
+                &d.layout,
+            )?;
             ops.push(ir::OwnedCommand::SetBindGroup {
                 index: d.index,
                 bind_group: group,
@@ -3300,26 +3396,14 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
         }
         for barrier in take_positioned(&mut barriers, position, |b| b.position) {
             let mut ids = Vec::new();
-            for set in &barrier.sets {
-                let set = rt
+            for buffer in &barrier.buffers {
+                let buffer = rt
                     .resources
-                    .descriptor_sets
-                    .get(set)
+                    .buffers
+                    .get(buffer)
                     .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                for binding in set.bindings.values() {
-                    let crate::resources::DescriptorBinding::Buffer { buffer, .. } = binding else {
-                        continue;
-                    };
-                    let b = rt
-                        .resources
-                        .buffers
-                        .get(buffer)
-                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    if b.usage.contains(vk::BufferUsageFlags::STORAGE_BUFFER)
-                        && !ids.contains(&b.id)
-                    {
-                        ids.push(b.id);
-                    }
+                if !ids.contains(&buffer.id) {
+                    ids.push(buffer.id);
                 }
             }
             for buffer in ids {
@@ -3525,7 +3609,7 @@ fn active_sets(
         if resources
             .descriptor_sets
             .get(&set)
-            .is_none_or(|s| &s.layout != expected)
+            .is_none_or(|s| !crate::resources::specialized_layout_matches(&s.layout, expected))
         {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
@@ -3695,7 +3779,7 @@ mod tests {
         let mut rec = ResolvedRecording::new();
         rec.render = Some((32, 32));
         rec.graphics = Some(vk::Pipeline::from_raw(1));
-        rec.vertex_buffer = Some((buffer, 0));
+        rec.vertex_buffers[0] = Some((buffer, 0));
         rec.viewport = Some(vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -3719,11 +3803,11 @@ mod tests {
     #[test]
     fn repeated_graphics_draws_keep_state_and_still_validate_live_bindings() {
         let (table, mut resources, mut rec, _) = graphics_fixture();
-        assert!(graphics_bindings(&table, &resources, &mut rec).unwrap());
+        assert!(graphics_bindings(&table, &mut resources, &mut rec).unwrap());
         assert_eq!(rec.ops.len(), 5);
         assert_eq!(rec.descriptors.len(), 1);
         for _ in 0..1000 {
-            assert!(graphics_bindings(&table, &resources, &mut rec).unwrap());
+            assert!(graphics_bindings(&table, &mut resources, &mut rec).unwrap());
             rec.ops.push(ir::OwnedCommand::Draw {
                 vertex_count: 3,
                 first_vertex: 0,
@@ -3736,33 +3820,33 @@ mod tests {
             .descriptor_sets
             .remove(&vk::DescriptorSet::from_raw(5));
         assert_eq!(
-            graphics_bindings(&table, &resources, &mut rec),
+            graphics_bindings(&table, &mut resources, &mut rec),
             Err(vk::Result::ERROR_INITIALIZATION_FAILED)
         );
         resources.buffers.remove(&vk::Buffer::from_raw(3));
         assert_eq!(
-            graphics_bindings(&table, &resources, &mut rec),
+            graphics_bindings(&table, &mut resources, &mut rec),
             Err(vk::Result::ERROR_INITIALIZATION_FAILED)
         );
     }
 
     #[test]
     fn graphics_state_changes_emit_selective_updates_and_reseed_new_passes() {
-        let (table, resources, mut rec, layout) = graphics_fixture();
-        graphics_bindings(&table, &resources, &mut rec).unwrap();
+        let (table, mut resources, mut rec, layout) = graphics_fixture();
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
         rec.graphics_offsets.insert(0, vec![256]);
-        graphics_bindings(&table, &resources, &mut rec).unwrap();
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
         assert_eq!(rec.ops.len(), 5);
         assert_eq!(rec.descriptors.len(), 2);
         assert_eq!(rec.descriptors[1].dynamic_offsets, [256]);
         rec.graphics_sets.insert(0, vk::DescriptorSet::from_raw(6));
-        graphics_bindings(&table, &resources, &mut rec).unwrap();
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
         assert_eq!(rec.descriptors.len(), 3);
         assert_eq!(rec.descriptors[2].set, vk::DescriptorSet::from_raw(6));
         rec.viewport.as_mut().unwrap().width = 16.0;
         rec.scissor.as_mut().unwrap().extent.width = 16;
-        rec.vertex_buffer.as_mut().unwrap().1 = 4;
-        graphics_bindings(&table, &resources, &mut rec).unwrap();
+        rec.vertex_buffers[0].as_mut().unwrap().1 = 4;
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
         assert!(matches!(
             &rec.ops[5..],
             [
@@ -3775,19 +3859,19 @@ mod tests {
             .update(&layout, ir::ShaderStages::VERTEX, 0, &[9; 4])
             .unwrap();
         rec.push_constants_revision += 1;
-        graphics_bindings(&table, &resources, &mut rec).unwrap();
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
         assert!(
             matches!(rec.ops.last().unwrap(), ir::OwnedCommand::SetPushConstants { data, .. } if data == &[9; 4])
         );
         rec.graphics = Some(vk::Pipeline::from_raw(2));
         let previous = rec.ops.len();
-        graphics_bindings(&table, &resources, &mut rec).unwrap();
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
         assert!(
             matches!(&rec.ops[previous..], [ir::OwnedCommand::SetProgrammablePipeline(_), ir::OwnedCommand::SetPushConstants { data, .. }] if data == &[9; 4])
         );
         rec.emitted_graphics = Default::default();
         let previous = rec.ops.len();
-        graphics_bindings(&table, &resources, &mut rec).unwrap();
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
         assert_eq!(rec.ops.len() - previous, 5);
         assert_eq!(rec.descriptors.len(), 4);
     }
@@ -3795,11 +3879,11 @@ mod tests {
     #[test]
     fn cached_graphics_state_preserves_invisible_draw_and_push_layout_errors() {
         let (table, mut resources, mut rec, layout) = graphics_fixture();
-        graphics_bindings(&table, &resources, &mut rec).unwrap();
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
         rec.scissor.as_mut().unwrap().extent.width = 0;
-        assert!(!graphics_bindings(&table, &resources, &mut rec).unwrap());
+        assert!(!graphics_bindings(&table, &mut resources, &mut rec).unwrap());
         rec.scissor.as_mut().unwrap().extent.width = 8;
-        assert!(graphics_bindings(&table, &resources, &mut rec).unwrap());
+        assert!(graphics_bindings(&table, &mut resources, &mut rec).unwrap());
         assert!(
             matches!(rec.ops.last().unwrap(), ir::OwnedCommand::SetScissor(Some(rect)) if rect.width() == 8)
         );
@@ -3815,12 +3899,12 @@ mod tests {
         rec.push_constants_revision += 1;
         assert_ne!(incompatible, layout);
         assert_eq!(
-            graphics_bindings(&table, &resources, &mut rec),
+            graphics_bindings(&table, &mut resources, &mut rec),
             Err(vk::Result::ERROR_INITIALIZATION_FAILED)
         );
         resources.pipelines.remove(&vk::Pipeline::from_raw(1));
         assert_eq!(
-            graphics_bindings(&table, &resources, &mut rec),
+            graphics_bindings(&table, &mut resources, &mut rec),
             Err(vk::Result::ERROR_INITIALIZATION_FAILED)
         );
     }
@@ -4052,10 +4136,12 @@ mod tests {
             indexing: &mut vk::PhysicalDeviceDescriptorIndexingFeatures<'_>,
             draw: &mut vk::PhysicalDeviceShaderDrawParametersFeatures<'_>,
         ) -> bool {
-            indexing.p_next = (draw as *mut vk::PhysicalDeviceShaderDrawParametersFeatures<'_>).cast();
+            indexing.p_next =
+                (draw as *mut vk::PhysicalDeviceShaderDrawParametersFeatures<'_>).cast();
             let loader = vk::BaseInStructure {
                 s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
-                p_next: (indexing as *const vk::PhysicalDeviceDescriptorIndexingFeatures<'_>).cast(),
+                p_next: (indexing as *const vk::PhysicalDeviceDescriptorIndexingFeatures<'_>)
+                    .cast(),
                 ..Default::default()
             };
             unsafe { device_chain_supported((&loader as *const vk::BaseInStructure<'_>).cast()) }
@@ -4078,7 +4164,9 @@ mod tests {
         };
         loader.p_next = &loader;
         unsafe {
-            assert!(!device_chain_supported((&loader as *const vk::BaseInStructure<'_>).cast()));
+            assert!(!device_chain_supported(
+                (&loader as *const vk::BaseInStructure<'_>).cast()
+            ));
         }
     }
 }

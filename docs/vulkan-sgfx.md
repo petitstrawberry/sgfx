@@ -23,8 +23,8 @@ remain incomplete.
   is exposed according to that adapter's SGFX capabilities. Optional core
   physical-device features are not advertised.
 - SPIR-V shader modules, compute pipelines, and vertex/fragment pipelines.
-  Naga validates and normalizes Vulkan coordinate conventions before SGFX
-  shader definition; backend shader/pipeline validation occurs at creation.
+  Pipeline creation resolves specialization constants and uses Naga to validate
+  and normalize Vulkan coordinate conventions before backend compilation.
 - Stage-specific push constants up to 128 bytes on capable Metal and native
   programmable VirGL adapters, with incremental updates and a value snapshot
   per draw/dispatch. VirGL stores its stage snapshot after UBO constants.
@@ -34,9 +34,15 @@ remain incomplete.
   uploads/samples color mip chains and emits full-mip color blits when the kernel
   reports real mip storage. Multi-mip readback remains unsupported there. Older
   kernels and A618 reject unsupported mip storage and blits.
+- Metal supports R8 uploads, layered textures, cube and array sampling, mutable
+  UNORM/sRGB views, component swizzles, and sampled D32 depth with comparison
+  samplers. Swizzles and packed vertex decoding execute in shaders and retain
+  the original texture/buffer allocations. Write-only RGBA8 storage images can
+  select one 2D layer and mip; image barriers order writes before later sampling.
 - Descriptor sets for uniform/storage buffers (including dynamic offsets),
-  separate images/samplers and combined image samplers; four sets with 16
-  logical bindings each, one descriptor per binding. Arrays are unsupported.
+  separate images/samplers, combined image samplers and write-only storage images;
+  four sets with 16 logical bindings each, one descriptor per binding. Updates
+  can span consecutive compatible bindings. Descriptor arrays are unsupported.
 - Host-visible coherent memory with stable, aligned mappings; buffer memory
   binding, host upload/readback, and nonoverlapping allocations. Buffers have
   four-byte sizes; binding offsets use the reported alignment. Uniform ranges
@@ -49,13 +55,16 @@ remain incomplete.
 - Offscreen graphics: RGBA8_UNORM or BGRA8_UNORM color, optional D32_SFLOAT
   depth, optimal 2D images, one layer/sample, at most 2048×2048, one color
   attachment, triangle lists and nonindexed triangle strips on Metal, signed
-  base vertices for indexed lists, one vertex binding, four vertex formats, and one
-  instance per draw. Common alpha/additive blending and sampled 2D textures
+  base vertices for indexed lists, up to eight vertex bindings, integer/half-float
+  and packed signed-normal inputs on Metal, and instanced draws with a first
+  instance index. Vertex attributes currently advance per vertex. Common alpha/additive blending and sampled 2D textures
   work. Attachments retain one mip; sampled images can contain a checked chain.
   Native VirGL also supports indexed strips without primitive restart. Indexed
   strips on WGPU, primitive restart, stencil, multisampling,
   partial/flipped/format-converting blits, indirect drawing,
   and other dynamic state are absent.
+  Native VirGL retains its existing single-stream, single-instance subset;
+  unsupported typed views and new vertex formats are rejected explicitly.
 - macOS WSI exposes `VK_KHR_surface`, `VK_EXT_metal_surface`, `VK_MVK_macos_surface`,
   `VK_KHR_portability_enumeration`, and `VK_KHR_swapchain`. It implements Metal
   surface creation, surface capability/format/mode queries, FIFO swapchains,

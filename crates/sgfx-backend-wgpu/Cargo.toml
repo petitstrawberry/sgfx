@@ -9,8 +9,9 @@ repository = "https://github.com/petitstrawberry/sgfx"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 raw-window-handle = "0.6"
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "a18b5a585616f05cf5df0fa5be1977752ceca1ea", default-features = false }
-wgpu = { version = "24", features = ["spirv"] }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "bff3dc8ec3a1cf9d0c47a6b64ea541eca5028b47", default-features = false }
+wgpu = { version = "24", features = ["spirv", "naga-ir"] }
+naga = { version = "24", features = ["spv-in", "wgsl-in"] }
 
 [lib]
 name = "sgfx_backend_wgpu"

@@ -1,0 +1,206 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ee4ab78..7908566 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -31,9 +31,11 @@ CMAKE_DEPENDENT_OPTION(USE_IPV6 "Allow create or connect to game server with IPv
+ option(USE_SYSTEM_WIIUSE "Use system WiiUse instead of the built-in version, when available." OFF)
+ option(USE_SQLITE3 "Use sqlite to manage server stats and ban list." ON)
+ 
++option(USE_VULKAN_LOADER "Use the SDL Vulkan loader on macOS instead of direct MoltenVK loading." OFF)
++
+ if(APPLE)
+     CMAKE_DEPENDENT_OPTION(DLOPEN_MOLTENVK "Use dlopen to load MoltenVK for Apple." ON
+-        "NOT IOS;NOT SERVER_ONLY" OFF)
++        "NOT IOS;NOT SERVER_ONLY;NOT USE_VULKAN_LOADER" OFF)
+ endif()
+ 
+ CMAKE_DEPENDENT_OPTION(USE_CRYPTO_OPENSSL "Use OpenSSL instead of MbedTLS for cryptography in STK." ON
+@@ -47,6 +49,10 @@ CMAKE_DEPENDENT_OPTION(USE_WIIUSE "Support for wiimote input devices" ON
+ CMAKE_DEPENDENT_OPTION(USE_DNS_C "Build bundled dns resolver" OFF "NOT CYGWIN;NOT USE_SWITCH" ON)
+ CMAKE_DEPENDENT_OPTION(USE_MOJOAL "Use bundled MojoAL instead of system OpenAL" OFF "NOT APPLE" ON)
+ 
++if (USE_VULKAN_LOADER)
++    ADD_DEFINITIONS(-DUSE_VULKAN_LOADER)
++endif()
++
+ if (DLOPEN_MOLTENVK)
+     ADD_DEFINITIONS(-DDLOPEN_MOLTENVK)
+ endif()
+@@ -770,7 +776,7 @@ elseif(NOT USE_APPLE_NETWORK_LIBRARIES)
+ endif()
+ 
+ if(NOT SERVER_ONLY)
+-    if (APPLE AND NOT DLOPEN_MOLTENVK)
++    if (APPLE AND NOT DLOPEN_MOLTENVK AND NOT USE_VULKAN_LOADER)
+         find_library(MOLTENVK_LIBRARY NAMES MoltenVK libMoltenVK REQUIRED)
+         target_link_libraries(supertuxkart "-framework Metal -weak_framework IOSurface -framework QuartzCore ${MOLTENVK_LIBRARY}")
+     endif()
+diff --git a/lib/graphics_engine/CMakeLists.txt b/lib/graphics_engine/CMakeLists.txt
+index 081629b..5916493 100644
+--- a/lib/graphics_engine/CMakeLists.txt
++++ b/lib/graphics_engine/CMakeLists.txt
+@@ -48,7 +48,7 @@ else()
+     include_directories("${SDL2_INCLUDEDIR}")
+ endif()
+ 
+-if(APPLE AND NOT DLOPEN_MOLTENVK)
++if(APPLE AND NOT DLOPEN_MOLTENVK AND NOT USE_VULKAN_LOADER)
+     find_path(VULKAN_INCLUDEDIR NAMES vulkan/vulkan.h PATHS)
+     if (NOT VULKAN_INCLUDEDIR)
+         message(FATAL_ERROR "Vulkan not found.")
+@@ -102,7 +102,7 @@ set(GE_SOURCES
+     src/ge_spm_buffer.cpp
+ )
+ 
+-if(NOT APPLE OR DLOPEN_MOLTENVK)
++if(NOT APPLE OR DLOPEN_MOLTENVK OR USE_VULKAN_LOADER)
+     set(GE_SOURCES ${GE_SOURCES} src/vulkan.c)
+ endif()
+ 
+diff --git a/lib/graphics_engine/include/ge_vma.hpp b/lib/graphics_engine/include/ge_vma.hpp
+index b8831f2..cc9d8cf 100644
+--- a/lib/graphics_engine/include/ge_vma.hpp
++++ b/lib/graphics_engine/include/ge_vma.hpp
+@@ -6,7 +6,7 @@
+ #define VMA_NULLABLE
+ #define VMA_NOT_NULL
+ 
+-#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK)
++#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK) || defined(USE_VULKAN_LOADER)
+ #define VMA_STATIC_VULKAN_FUNCTIONS 0
+ #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+ 
+diff --git a/lib/graphics_engine/include/vulkan_wrapper.h b/lib/graphics_engine/include/vulkan_wrapper.h
+index 3708453..4df6387 100644
+--- a/lib/graphics_engine/include/vulkan_wrapper.h
++++ b/lib/graphics_engine/include/vulkan_wrapper.h
+@@ -1,7 +1,7 @@
+ #ifndef HEADER_VULKAN_WRAPPER_HPP
+ #define HEADER_VULKAN_WRAPPER_HPP
+ 
+-#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK)
++#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK) || defined(USE_VULKAN_LOADER)
+ #include <glad/vulkan.h>
+ 
+ #ifdef DLOPEN_MOLTENVK
+diff --git a/lib/graphics_engine/src/ge_vulkan_driver.cpp b/lib/graphics_engine/src/ge_vulkan_driver.cpp
+index 4086f59..d85108e 100644
+--- a/lib/graphics_engine/src/ge_vulkan_driver.cpp
++++ b/lib/graphics_engine/src/ge_vulkan_driver.cpp
+@@ -74,7 +74,7 @@ extern "C" VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
+     return VK_FALSE;
+ };
+ 
+-#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK)
++#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK) || defined(USE_VULKAN_LOADER)
+ struct GE_VK_UserPointer
+ {
+     VkInstance instance;
+@@ -541,7 +541,7 @@ GEVulkanDriver::GEVulkanDriver(const SIrrlichtCreationParameters& params,
+ 
+     createInstance(window);
+ 
+-#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK)
++#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK) || defined(USE_VULKAN_LOADER)
+     GE_VK_UserPointer user_ptr = {};
+     user_ptr.instance = m_vk->instance;
+     if (gladLoadVulkanUserPtr(NULL,
+@@ -576,7 +576,7 @@ GEVulkanDriver::GEVulkanDriver(const SIrrlichtCreationParameters& params,
+     findPhysicalDevice();
+     vkGetPhysicalDeviceProperties(m_physical_device, &m_properties);
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(USE_VULKAN_LOADER)
+     // Debug usage only
+     MVKPhysicalDeviceMetalFeatures mvk_features = {};
+     size_t mvk_features_size = sizeof(MVKPhysicalDeviceMetalFeatures);
+@@ -586,7 +586,7 @@ GEVulkanDriver::GEVulkanDriver(const SIrrlichtCreationParameters& params,
+     GEVulkanFeatures::init(this);
+     createDevice();
+ 
+-#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK)
++#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK) || defined(USE_VULKAN_LOADER)
+     user_ptr.device = m_vk->device;
+     if (gladLoadVulkanUserPtr(m_physical_device,
+         (GLADuserptrloadfunc)loader, &user_ptr) == 0)
+@@ -601,7 +601,7 @@ GEVulkanDriver::GEVulkanDriver(const SIrrlichtCreationParameters& params,
+     allocator_create_info.device = m_vk->device;
+     allocator_create_info.instance = m_vk->instance;
+ 
+-#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK)
++#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK) || defined(USE_VULKAN_LOADER)
+     VmaVulkanFunctions vulkan_functions = {};
+     vulkan_functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+     vulkan_functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+@@ -734,7 +734,7 @@ void GEVulkanDriver::createUnicolorTextures()
+ // ----------------------------------------------------------------------------
+ void GEVulkanDriver::createInstance(SDL_Window* window)
+ {
+-#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK)
++#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK) || defined(USE_VULKAN_LOADER)
+     if (gladLoadVulkanUserPtr(NULL, (GLADuserptrloadfunc)loader, NULL) == 0)
+     {
+         throw std::runtime_error("gladLoadVulkanUserPtr failed 1st time");
+@@ -750,7 +750,7 @@ void GEVulkanDriver::createInstance(SDL_Window* window)
+ 
+     uint32_t vk_version = 0;
+     bool vulkan_1_1 = false;
+-#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK)
++#if !defined(__APPLE__) || defined(DLOPEN_MOLTENVK) || defined(USE_VULKAN_LOADER)
+     PFN_vkEnumerateInstanceVersion e_ver = (PFN_vkEnumerateInstanceVersion)
+         vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceVersion");
+     vulkan_1_1 = (e_ver && e_ver(&vk_version) == VK_SUCCESS &&
+@@ -813,7 +813,7 @@ void GEVulkanDriver::createInstance(SDL_Window* window)
+     extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+ #endif
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(USE_VULKAN_LOADER)
+     // We need these to persist until after vkCreateInstance
+     static VkLayerSettingsCreateInfoEXT layer_settings_create_info = {};
+     static VkBool32 setting_false = VK_FALSE;
+@@ -1255,11 +1255,10 @@ found_mode:
+         std::max(
+             std::min((unsigned)h, max_extent.height), min_extent.height)
+     };
+-#if defined(__APPLE__)
+-    // MoltenVK stores the correctly rounded, high-dpi screen size in
+-    // currentExtent using half-to-even rounding
+-    actual_extent = m_surface_capabilities.currentExtent;
+-#endif
++    // A fixed surface extent takes precedence over SDL's drawable size.
++    // UINT32_MAX means that the application selects the extent.
++    if (m_surface_capabilities.currentExtent.width != UINT32_MAX)
++        actual_extent = m_surface_capabilities.currentExtent;
+ 
+     VkSwapchainCreateInfoKHR create_info = {};
+     create_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+diff --git a/lib/graphics_engine/src/ge_vulkan_features.cpp b/lib/graphics_engine/src/ge_vulkan_features.cpp
+index 1e0fea2..4713237 100644
+--- a/lib/graphics_engine/src/ge_vulkan_features.cpp
++++ b/lib/graphics_engine/src/ge_vulkan_features.cpp
+@@ -70,11 +70,13 @@ void GEVulkanFeatures::init(GEVulkanDriver* vk)
+     VkFormatProperties format_properties = {};
+     vkGetPhysicalDeviceFormatProperties(vk->getPhysicalDevice(),
+         VK_FORMAT_R8G8B8A8_UNORM, &format_properties);
+-    g_supports_rgba8_blit = format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
++    const VkFormatFeatureFlags blit_features = VK_FORMAT_FEATURE_BLIT_SRC_BIT |
++        VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
++    g_supports_rgba8_blit = (format_properties.optimalTilingFeatures & blit_features) == blit_features;
+     format_properties = {};
+     vkGetPhysicalDeviceFormatProperties(vk->getPhysicalDevice(),
+         VK_FORMAT_R8_UNORM, &format_properties);
+-    g_supports_r8_blit = format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
++    g_supports_r8_blit = (format_properties.optimalTilingFeatures & blit_features) == blit_features;
+     format_properties = {};
+     vkGetPhysicalDeviceFormatProperties(vk->getPhysicalDevice(),
+         VK_FORMAT_BC3_UNORM_BLOCK, &format_properties);
+@@ -178,7 +180,7 @@ void GEVulkanFeatures::init(GEVulkanDriver* vk)
+     g_supports_shader_draw_parameters = (shader_draw
+         .shaderDrawParameters == VK_TRUE);
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(USE_VULKAN_LOADER)
+     bool missing_vkGetPhysicalDeviceProperties2 =
+         !vkGetPhysicalDeviceProperties2;
+     if (!missing_vkGetPhysicalDeviceProperties2 &&

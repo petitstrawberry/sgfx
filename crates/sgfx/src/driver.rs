@@ -73,11 +73,13 @@ pub struct Limits {
     pub max_push_constants_size: u32,
     pub max_image_dimension_2d: u32,
     pub max_image_mip_levels: u32,
+    pub max_image_array_layers: u32,
     pub max_uniform_buffer_range: u32,
     pub max_storage_buffer_range: u32,
     pub max_bound_descriptor_sets: u32,
     pub max_uniform_buffers_per_stage: u32,
     pub max_storage_buffers_per_stage: u32,
+    pub max_storage_images_per_stage: u32,
     pub max_vertex_attributes: u32,
     pub max_vertex_buffers: u32,
     pub max_vertex_buffer_stride: u32,
@@ -104,6 +106,9 @@ pub struct Capabilities {
     index_buffers: bool,
     uniform_buffers: bool,
     storage_buffers: bool,
+    storage_images: bool,
+    typed_texture_views: bool,
+    extended_vertex_formats: bool,
     rgba8_color_attachment: bool,
     bgra8_color_attachment: bool,
     depth32_attachment: bool,
@@ -143,6 +148,18 @@ impl Capabilities {
 
     pub const fn supports_storage_buffers(&self) -> bool {
         self.storage_buffers
+    }
+    /// Whether RGBA8 write-only storage image bindings execute on this backend.
+    pub const fn supports_storage_images(&self) -> bool {
+        self.storage_images
+    }
+    /// Whether typed views, sRGB reinterpretation and sampled depth execute.
+    pub const fn supports_typed_texture_views(&self) -> bool {
+        self.typed_texture_views
+    }
+    /// Whether integer, half-float and packed signed-normal vertex inputs execute.
+    pub const fn supports_extended_vertex_formats(&self) -> bool {
+        self.extended_vertex_formats
     }
 
     pub const fn supports_rgba8_color_attachment(&self) -> bool {
@@ -1043,6 +1060,12 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                     index_buffers: true,
                     uniform_buffers: runtime.max_uniform_buffers_per_stage != 0,
                     storage_buffers: compute && runtime.max_storage_buffers_per_stage != 0,
+                    storage_images: compute
+                        && rgba
+                            .allowed_usages
+                            .contains(wgpu::TextureUsages::STORAGE_BINDING),
+                    typed_texture_views: true,
+                    extended_vertex_formats: true,
                     rgba8_color_attachment: rgba
                         .allowed_usages
                         .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
@@ -1072,11 +1095,13 @@ fn wgpu_runtime_limits(adapter: wgpu::Limits) -> Limits {
         max_push_constants_size: 0,
         max_image_dimension_2d: requested.max_texture_dimension_2d,
         max_image_mip_levels: requested.max_texture_dimension_2d.ilog2() + 1,
+        max_image_array_layers: requested.max_texture_array_layers,
         max_uniform_buffer_range: requested.max_uniform_buffer_binding_size,
         max_storage_buffer_range: requested.max_storage_buffer_binding_size,
         max_bound_descriptor_sets: requested.max_bind_groups,
         max_uniform_buffers_per_stage: requested.max_uniform_buffers_per_shader_stage,
         max_storage_buffers_per_stage: requested.max_storage_buffers_per_shader_stage,
+        max_storage_images_per_stage: requested.max_storage_textures_per_shader_stage,
         max_vertex_attributes: requested.max_vertex_attributes,
         max_vertex_buffers: requested.max_vertex_buffers,
         max_vertex_buffer_stride: requested.max_vertex_buffer_array_stride,
@@ -1190,6 +1215,9 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                 index_buffers: true,
                 uniform_buffers: true,
                 storage_buffers: false,
+                storage_images: false,
+                typed_texture_views: false,
+                extended_vertex_formats: false,
                 rgba8_color_attachment: true,
                 bgra8_color_attachment: true,
                 depth32_attachment: capabilities.supports_depth(),
@@ -1202,6 +1230,7 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                         0
                     },
                     max_image_dimension_2d: 2048,
+                    max_image_array_layers: 1,
                     max_image_mip_levels: if capabilities.supports_image_mips() {
                         12
                     } else {
@@ -1212,6 +1241,7 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                     max_bound_descriptor_sets: 4,
                     max_uniform_buffers_per_stage: 12,
                     max_storage_buffers_per_stage: 0,
+                    max_storage_images_per_stage: 0,
                     max_vertex_attributes: 16,
                     max_vertex_buffers: 1,
                     max_vertex_buffer_stride: 2048,

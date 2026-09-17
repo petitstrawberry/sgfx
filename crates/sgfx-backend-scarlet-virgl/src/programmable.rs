@@ -157,6 +157,11 @@ fn compile_pipeline(
             UnsupportedIrFeature::PrimitiveTopology,
         ));
     }
+    if pipeline.vertex_buffers().len() > 1 {
+        return Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::VertexLayout,
+        ));
+    }
     if let Some(layout) = pipeline.vertex_buffer()
         && layout
             .attributes()
@@ -183,6 +188,10 @@ fn compile_pipeline(
                 binding.ty(),
                 ir::BindingType::UniformBuffer
                     | ir::BindingType::SampledTexture
+                    | ir::BindingType::SampledTextureView {
+                        dimension: ir::TextureViewDimension::D2,
+                        depth: false
+                    }
                     | ir::BindingType::Sampler
             )
         }) {
@@ -317,7 +326,15 @@ fn compile_pipeline(
                             .find(|entry| entry.binding() == binding)
                     })
                     .ok_or(ir::Error::BindingLayoutMismatch)?;
-                if entry.ty() != ty || !entry.visibility().contains(visibility) {
+                if !(entry.ty() == ty
+                    || (ty == ir::BindingType::SampledTexture
+                        && entry.ty()
+                            == ir::BindingType::SampledTextureView {
+                                dimension: ir::TextureViewDimension::D2,
+                                depth: false,
+                            }))
+                    || !entry.visibility().contains(visibility)
+                {
                     return Err(ir::Error::BindingLayoutMismatch.into());
                 }
             }
@@ -362,7 +379,7 @@ impl Context {
                 UnsupportedIrFeature::TargetFormat,
             ));
         }
-        let spec = texture_spec(reference, descriptor);
+        let spec = texture_spec(reference, descriptor)?;
         let mut bytes = match resources.mapped_image(reference) {
             Ok(image) => {
                 let length = usize::try_from(descriptor.byte_size()?)
@@ -554,10 +571,26 @@ pub(super) fn decode_draw(
         };
         for shader in [&compiled.vertex, &compiled.fragment] {
             for binding in &shader.textures {
-                let ir::BindingResource::Texture(texture) =
-                    resource(binding.image_group, binding.image_binding)?
-                else {
-                    return Err(ir::Error::BindingLayoutMismatch.into());
+                let texture = match resource(binding.image_group, binding.image_binding)? {
+                    ir::BindingResource::Texture(texture) => texture,
+                    ir::BindingResource::TextureView { texture, view } => {
+                        let desc = resources
+                            .resources
+                            .texture(resources.resources.texture_ref(texture)?)?;
+                        if view.dimension() != ir::TextureViewDimension::D2
+                            || view.format() != desc.format()
+                            || view.base_mip_level() != 0
+                            || view.mip_level_count() != desc.mip_level_count()
+                            || view.base_array_layer() != 0
+                            || view.array_layer_count() != 1
+                        {
+                            return Err(IrSubmitError::Unsupported(
+                                UnsupportedIrFeature::ResourceBindings,
+                            ));
+                        }
+                        texture
+                    }
+                    _ => return Err(ir::Error::BindingLayoutMismatch.into()),
                 };
                 let ir::BindingResource::Sampler(sampler) =
                     resource(binding.sampler_group, binding.sampler_binding)?
@@ -576,7 +609,7 @@ pub(super) fn decode_draw(
                 textures.push(driver::IrTextureBinding {
                     stage: shader.stage,
                     slot: binding.slot,
-                    texture: texture_spec(texture, descriptor),
+                    texture: texture_spec(texture, descriptor)?,
                     sampler: sampler_state(resources.resources.sampler(sampler)?, sampler.slot()),
                 });
             }

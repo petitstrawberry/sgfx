@@ -21,7 +21,7 @@ pub(super) struct Cache {
 
 pub(super) struct RenderPipeline {
     pub pipeline: raw::RenderPipeline,
-    pub has_vertex_buffer: bool,
+    pub vertex_buffer_count: usize,
     pub has_depth: bool,
     pub empty_groups: Vec<Option<Arc<raw::BindGroup>>>,
     pub topology: ir::PrimitiveTopology,
@@ -197,8 +197,22 @@ impl Resources {
                         view_dimension: raw::TextureViewDimension::D2,
                         multisampled: false,
                     },
+                    BindingType::SampledTextureView { dimension, depth } => {
+                        raw::BindingType::Texture {
+                            sample_type: if depth {
+                                raw::TextureSampleType::Depth
+                            } else {
+                                raw::TextureSampleType::Float { filterable: true }
+                            },
+                            view_dimension: texture_view_dimension(dimension),
+                            multisampled: false,
+                        }
+                    }
                     BindingType::Sampler => {
                         raw::BindingType::Sampler(raw::SamplerBindingType::Filtering)
+                    }
+                    BindingType::ComparisonSampler => {
+                        raw::BindingType::Sampler(raw::SamplerBindingType::Comparison)
                     }
                     BindingType::StorageTexture {
                         format,
@@ -285,14 +299,42 @@ impl Resources {
         let desc = self
             .resources
             .programmable_render_pipeline(self.resources.programmable_render_pipeline_ref(id)?)?;
-        let vertex = self.shader(desc.vertex().module())?;
+        let locations = desc
+            .vertex_buffers()
+            .iter()
+            .flat_map(|buffer| buffer.attributes())
+            .filter(|attribute| attribute.format() == VertexFormat::Snorm10_10_10_2)
+            .map(|attribute| attribute.location())
+            .collect::<Vec<_>>();
+        let vertex = if locations.is_empty() {
+            self.shader(desc.vertex().module())?
+        } else {
+            let shader = self
+                .resources
+                .shader_module(self.resources.shader_module_ref(desc.vertex().module())?)?;
+            let module = vertex_input::lower_packed_inputs(
+                shader.source(),
+                desc.vertex().entry_point(),
+                &locations,
+            )?;
+            Arc::new(validated(self.context.raw_device(), || {
+                Ok(self
+                    .context
+                    .raw_device()
+                    .create_shader_module(raw::ShaderModuleDescriptor {
+                        label: Some("sgfx packed vertex fetch"),
+                        source: raw::ShaderSource::Naga(Cow::Owned(module)),
+                    }))
+            })?)
+        };
         let fragment = self.shader(desc.fragment().module())?;
         let layout = self.pipeline_layout(
             desc.layout(),
             raw::ShaderStages::VERTEX | raw::ShaderStages::FRAGMENT,
         )?;
         let attributes = desc
-            .vertex_buffer()
+            .vertex_buffers()
+            .iter()
             .map(|layout| {
                 layout
                     .attributes()
@@ -300,15 +342,16 @@ impl Resources {
                     .map(raw_vertex_attribute)
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .collect::<Vec<_>>();
         let vertex_buffers = desc
-            .vertex_buffer()
-            .map(|layout| raw::VertexBufferLayout {
+            .vertex_buffers()
+            .iter()
+            .zip(&attributes)
+            .map(|(layout, attributes)| raw::VertexBufferLayout {
                 array_stride: u64::from(layout.stride()),
                 step_mode: raw::VertexStepMode::Vertex,
-                attributes: &attributes,
+                attributes,
             })
-            .into_iter()
             .collect::<Vec<_>>();
         let pipeline = validated(self.context.raw_device(), || {
             Ok(self
@@ -381,7 +424,7 @@ impl Resources {
         })?;
         let pipeline = Arc::new(RenderPipeline {
             pipeline,
-            has_vertex_buffer: desc.vertex_buffer().is_some(),
+            vertex_buffer_count: desc.vertex_buffers().len(),
             has_depth,
             empty_groups: self.empty_groups(desc.layout())?,
             topology: desc.topology(),
@@ -448,6 +491,7 @@ impl Resources {
         enum Resource {
             Buffer(Arc<GpuBuffer>, u64, u64),
             Texture(Arc<GpuTexture>),
+            TextureView(raw::TextureView),
             Sampler(Arc<raw::Sampler>),
         }
         let mut resources = Vec::new();
@@ -485,6 +529,21 @@ impl Resources {
                 BindingResource::Texture(id) => {
                     Resource::Texture(self.texture(table.texture_ref(id)?)?)
                 }
+                BindingResource::TextureView { texture, view } => {
+                    let texture = self.texture(table.texture_ref(texture)?)?;
+                    Resource::TextureView(validated(self.context.raw_device(), || {
+                        Ok(texture.texture.create_view(&raw::TextureViewDescriptor {
+                            label: Some("sgfx sampled texture view"),
+                            format: raw_format(view.format()),
+                            dimension: Some(texture_view_dimension(view.dimension())),
+                            base_mip_level: view.base_mip_level(),
+                            mip_level_count: Some(view.mip_level_count()),
+                            base_array_layer: view.base_array_layer(),
+                            array_layer_count: Some(view.array_layer_count()),
+                            ..Default::default()
+                        }))
+                    })?)
+                }
                 BindingResource::Sampler(id) => {
                     Resource::Sampler(self.sampler(table.sampler_ref(id)?)?)
                 }
@@ -506,6 +565,7 @@ impl Resources {
                     Resource::Texture(texture) => {
                         raw::BindingResource::TextureView(&texture.sampled_view)
                     }
+                    Resource::TextureView(view) => raw::BindingResource::TextureView(view),
                     Resource::Sampler(sampler) => raw::BindingResource::Sampler(sampler),
                 },
             })
@@ -607,4 +667,12 @@ pub(super) fn shader_stages(stages: ir::ShaderStages) -> raw::ShaderStages {
         }
     }
     raw_stages
+}
+
+fn texture_view_dimension(dimension: ir::TextureViewDimension) -> raw::TextureViewDimension {
+    match dimension {
+        ir::TextureViewDimension::D2 => raw::TextureViewDimension::D2,
+        ir::TextureViewDimension::D2Array => raw::TextureViewDimension::D2Array,
+        ir::TextureViewDimension::Cube => raw::TextureViewDimension::Cube,
+    }
 }

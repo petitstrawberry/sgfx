@@ -234,3 +234,290 @@ pub(crate) fn separate_combined_samplers(words: Vec<u32>) -> Result<Vec<u32>, vk
     output[3] = next;
     Ok(output)
 }
+
+/// Vulkan descriptor layouts do not encode image dimensionality or comparison
+/// sampling. Recover these types from the selected SPIR-V entry points.
+pub(crate) fn specialize_layout(
+    table: &sgfx::ir::ResourceTable,
+    layout: &sgfx::ir::PipelineLayoutDesc,
+    shaders: &[&sgfx::ir::ShaderEntryPoint],
+) -> Result<sgfx::ir::PipelineLayoutDesc, vk::Result> {
+    use sgfx::ir;
+    let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
+    let unsupported = vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    let mut bindings = std::collections::BTreeMap::new();
+    for shader in shaders {
+        let desc = table
+            .shader_module(
+                table
+                    .shader_module_ref(shader.module())
+                    .map_err(|_| invalid)?,
+            )
+            .map_err(|_| invalid)?;
+        let ir::ShaderSource::SpirV(words) = desc.source() else {
+            return Err(unsupported);
+        };
+        let module = naga::front::spv::Frontend::new(
+            words.iter().copied(),
+            &naga::front::spv::Options {
+                adjust_coordinate_space: false,
+                ..Default::default()
+            },
+        )
+        .parse()
+        .map_err(|_| unsupported)?;
+        let stage = match shader.stage() {
+            ir::ShaderStage::Vertex => naga::ShaderStage::Vertex,
+            ir::ShaderStage::Fragment => naga::ShaderStage::Fragment,
+            ir::ShaderStage::Compute => naga::ShaderStage::Compute,
+        };
+        let entry = module
+            .entry_points
+            .iter()
+            .position(|entry| entry.name == shader.entry_point() && entry.stage == stage)
+            .ok_or(invalid)?;
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::PUSH_CONSTANT,
+        )
+        .validate(&module)
+        .map_err(|_| unsupported)?;
+        for (handle, global) in module.global_variables.iter() {
+            let Some(binding) = &global.binding else {
+                continue;
+            };
+            if info.get_entry_point(entry)[handle].is_empty() {
+                continue;
+            }
+            let original = layout
+                .bind_groups()
+                .get(binding.group as usize)
+                .ok_or(invalid)?
+                .entries()
+                .iter()
+                .find(|entry| entry.binding() == binding.binding)
+                .ok_or(invalid)?;
+            let ty = if let naga::AddressSpace::Storage { access } = global.space {
+                ir::BindingType::StorageBuffer {
+                    read_only: !access.contains(naga::StorageAccess::STORE),
+                }
+            } else {
+                match module.types[global.ty].inner {
+                    naga::TypeInner::Image {
+                        dim,
+                        arrayed,
+                        class,
+                    } => {
+                        let depth = match class {
+                            naga::ImageClass::Sampled {
+                                kind: naga::ScalarKind::Float,
+                                multi: false,
+                            } => false,
+                            naga::ImageClass::Depth { multi: false } => true,
+                            naga::ImageClass::Storage {
+                                format: naga::StorageFormat::Rgba8Unorm,
+                                access,
+                            } if dim == naga::ImageDimension::D2
+                                && !arrayed
+                                && access == naga::StorageAccess::STORE =>
+                            {
+                                let ty = ir::BindingType::StorageTexture {
+                                    format: ir::TextureFormat::Rgba8Unorm,
+                                    access: ir::StorageTextureAccess::WriteOnly,
+                                };
+                                if original.ty() != ty {
+                                    return Err(invalid);
+                                }
+                                bindings.insert((binding.group, binding.binding), ty);
+                                continue;
+                            }
+                            _ => return Err(unsupported),
+                        };
+                        let dimension = match (dim, arrayed) {
+                            (naga::ImageDimension::D2, false) => ir::TextureViewDimension::D2,
+                            (naga::ImageDimension::D2, true) => ir::TextureViewDimension::D2Array,
+                            (naga::ImageDimension::Cube, false) => ir::TextureViewDimension::Cube,
+                            _ => return Err(unsupported),
+                        };
+                        ir::BindingType::SampledTextureView { dimension, depth }
+                    }
+                    naga::TypeInner::Sampler { comparison: true } => {
+                        ir::BindingType::ComparisonSampler
+                    }
+                    _ => original.ty(),
+                }
+            };
+            if let Some(previous) = bindings.insert((binding.group, binding.binding), ty) {
+                match (previous, ty) {
+                    (
+                        ir::BindingType::StorageBuffer { read_only: a },
+                        ir::BindingType::StorageBuffer { read_only: b },
+                    ) => {
+                        bindings.insert(
+                            (binding.group, binding.binding),
+                            ir::BindingType::StorageBuffer { read_only: a && b },
+                        );
+                    }
+                    _ if previous != ty => return Err(invalid),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let groups = layout
+        .bind_groups()
+        .iter()
+        .enumerate()
+        .map(|(set, group)| {
+            ir::BindGroupLayoutDesc::new(
+                group
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| {
+                        bindings.get(&(set as u32, entry.binding())).map(|ty| {
+                            ir::BindGroupLayoutEntry::new(entry.binding(), entry.visibility(), *ty)
+                        })
+                    })
+                    .collect(),
+            )
+            .map_err(|_| invalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !layout
+        .bind_groups()
+        .iter()
+        .zip(&groups)
+        .all(|(declared, used)| crate::resources::specialized_layout_matches(declared, used))
+    {
+        return Err(invalid);
+    }
+    ir::PipelineLayoutDesc::new(groups)
+        .and_then(|layout_out| {
+            layout_out.with_push_constant_ranges(layout.push_constant_ranges().to_vec())
+        })
+        .map_err(|_| invalid)
+}
+
+/// Non-identity component maps by normalized SGFX group/binding. Components
+/// 0..3 select RGBA; 4 and 5 select the constants zero and one.
+pub(crate) type TextureSwizzles = Vec<(u32, u32, [u8; 4])>;
+
+/// Lower view component mapping into sampling instructions. The result stays
+/// on the GPU and preserves allocation aliases, mip selection and sRGB decode.
+pub(crate) fn sampled_image_swizzles(
+    words: &[u32],
+    views: &TextureSwizzles,
+) -> Result<Vec<u32>, vk::Result> {
+    let unsupported = vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    let ops = instructions(words)?;
+    let mut groups = HashMap::new();
+    let mut bindings = HashMap::new();
+    let mut vectors = HashMap::new();
+    let mut floats = Vec::new();
+    for op in &ops {
+        match op[0] & 0xffff {
+            DECORATE if op.len() == 4 && op[2] == 34 => {
+                groups.insert(op[1], op[3]);
+            }
+            DECORATE if op.len() == 4 && op[2] == 33 => {
+                bindings.insert(op[1], op[3]);
+            }
+            22 if op.len() == 3 && op[2] == 32 => floats.push(op[1]),
+            23 if op.len() == 4 && op[3] == 4 => {
+                vectors.insert(op[1], op[2]);
+            }
+            _ => {}
+        }
+    }
+    let mut roots = HashMap::new();
+    for (&id, &binding) in &bindings {
+        if let Some(&group) = groups.get(&id) {
+            if let Some((_, _, mapping)) =
+                views.iter().find(|(g, b, _)| *g == group && *b == binding)
+            {
+                if mapping.iter().any(|v| *v > 5) {
+                    return Err(unsupported);
+                }
+                roots.insert(id, *mapping);
+            }
+        }
+    }
+    let mut next = words[3];
+    let mut id = || {
+        let value = next;
+        next = next
+            .checked_add(1)
+            .filter(|v| *v <= 0x3fffff)
+            .ok_or(unsupported)?;
+        Ok::<u32, vk::Result>(value)
+    };
+    let mut constants = Vec::new();
+    let mut constant_vectors = HashMap::new();
+    let mut lowered = Vec::new();
+    for op in &ops {
+        let opcode = op[0] & 0xffff;
+        if matches!(opcode, LOAD | SAMPLED_IMAGE | 83 | 100) && op.len() >= 4 {
+            if let Some(mapping) = roots.get(&op[3]).copied() {
+                roots.insert(op[2], mapping);
+            }
+        }
+        if (87..=98).contains(&opcode) && op.len() >= 4 {
+            if let Some(mapping) = roots.get(&op[3]) {
+                if !matches!(opcode, 87 | 88 | 91 | 92 | 95 | 98) {
+                    return Err(unsupported);
+                }
+                let ty = op[1];
+                let scalar = *vectors
+                    .get(&ty)
+                    .filter(|scalar| floats.contains(scalar))
+                    .ok_or(unsupported)?;
+                let constant = if let Some(value) = constant_vectors.get(&ty) {
+                    *value
+                } else {
+                    let zero = id()?;
+                    let one = id()?;
+                    let value = id()?;
+                    emit(&mut constants, 43, &[scalar, zero, 0]);
+                    emit(&mut constants, 43, &[scalar, one, 1.0f32.to_bits()]);
+                    emit(&mut constants, 44, &[ty, value, zero, one, zero, one]);
+                    constant_vectors.insert(ty, value);
+                    value
+                };
+                let raw = id()?;
+                let mut sample = op.to_vec();
+                sample[2] = raw;
+                lowered.extend(sample);
+                emit(
+                    &mut lowered,
+                    79,
+                    &[
+                        ty,
+                        op[2],
+                        raw,
+                        constant,
+                        u32::from(mapping[0]),
+                        u32::from(mapping[1]),
+                        u32::from(mapping[2]),
+                        u32::from(mapping[3]),
+                    ],
+                );
+                continue;
+            }
+        }
+        lowered.extend_from_slice(op);
+    }
+    if constants.is_empty() {
+        return Ok(words.to_vec());
+    }
+    let mut result = words[..5].to_vec();
+    let mut inserted = false;
+    for op in instructions(&[words[..5].to_vec(), lowered].concat())? {
+        if !inserted && op[0] & 0xffff == 54 {
+            result.extend_from_slice(&constants);
+            inserted = true;
+        }
+        result.extend_from_slice(op);
+    }
+    result[3] = next;
+    Ok(result)
+}

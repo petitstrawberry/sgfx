@@ -272,6 +272,11 @@ fn vertex_and_index_bindings_reject_wrong_usage_alignment_and_dead_handles() {
         context.reset();
         device.begin_command_buffer(command, &begin).unwrap();
         device.cmd_bind_vertex_buffers(command, 1, &[vertex.buffer], &[0]);
+        device.end_command_buffer(command).unwrap();
+        context.submit(vk::Fence::null()).unwrap();
+        context.reset();
+        device.begin_command_buffer(command, &begin).unwrap();
+        device.cmd_bind_vertex_buffers(command, 8, &[vertex.buffer], &[0]);
         assert_eq!(
             device.end_command_buffer(command),
             Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)

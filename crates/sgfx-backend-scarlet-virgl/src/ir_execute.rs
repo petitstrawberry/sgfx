@@ -287,7 +287,7 @@ impl IrResources {
         let image = Rc::clone(&self.images[index].image);
         if self.images[index].backend_registered {
             self.backend.unmap_ir_image(
-                texture_spec(texture_ref, descriptor),
+                texture_spec(texture_ref, descriptor)?,
                 &image.as_ref().backend,
             )?;
         }
@@ -317,7 +317,7 @@ impl IrResources {
         }
         context.backend.map_ir_texture(
             &mut self.backend,
-            texture_spec(texture_ref, descriptor),
+            texture_spec(texture_ref, descriptor)?,
             &image.backend,
         )?;
         Ok(())
@@ -333,7 +333,7 @@ impl IrResources {
         let descriptor = self.resources.texture(texture_ref)?;
         context.backend.unmap_ir_texture(
             &mut self.backend,
-            texture_spec(texture_ref, descriptor),
+            texture_spec(texture_ref, descriptor)?,
             &image.backend,
         )?;
         Ok(())
@@ -1070,7 +1070,7 @@ fn register_mapped_images(
             let descriptor = resource_table.texture(texture)?;
             context.backend.map_ir_image(
                 &mut resources.backend,
-                texture_spec(texture, descriptor),
+                texture_spec(texture, descriptor)?,
                 &image.as_ref().backend,
             )?;
             if let Some(mapping) = resources.images.get_mut(index) {
@@ -1171,14 +1171,14 @@ impl ExecutionPlan {
                         .try_reserve(1)
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
                     events.push(ExecutionEvent::Copy(driver::IrTextureCopy {
-                        source: texture_spec(*source, source_desc),
+                        source: texture_spec(*source, source_desc)?,
                         source_rect: IrRect {
                             x: 0,
                             y: 0,
                             width: source_extent.width(),
                             height: source_extent.height(),
                         },
-                        destination: texture_spec(*destination, destination_desc),
+                        destination: texture_spec(*destination, destination_desc)?,
                         destination_rect: IrRect {
                             x: 0,
                             y: 0,
@@ -1210,8 +1210,8 @@ impl ExecutionPlan {
                     {
                         return Err(IrSubmitError::InvalidIr(ir::Error::InvalidUsage));
                     }
-                    let source_spec = texture_spec(*source, source_desc);
-                    let destination_spec = texture_spec(*destination, destination_desc);
+                    let source_spec = texture_spec(*source, source_desc)?;
+                    let destination_spec = texture_spec(*destination, destination_desc)?;
                     if !materializable_texture(source_spec)
                         || !materializable_texture(destination_spec)
                     {
@@ -1244,7 +1244,7 @@ impl ExecutionPlan {
                     if !descriptor.usage().contains(TextureUsage::COPY_DST) {
                         return Err(IrSubmitError::InvalidIr(ir::Error::InvalidUsage));
                     }
-                    let spec = texture_spec(*texture, descriptor);
+                    let spec = texture_spec(*texture, descriptor)?;
                     if !materializable_texture(spec) {
                         return Err(IrSubmitError::Unsupported(
                             UnsupportedIrFeature::TargetUsage,
@@ -1285,7 +1285,7 @@ impl ExecutionPlan {
                             ExecutionTarget::Mapped(image)
                         }
                         Err(IrSubmitError::ImageNotMapped) => {
-                            let spec = texture_spec(desc.target(), descriptor);
+                            let spec = texture_spec(desc.target(), descriptor)?;
                             if spec.present || !spec.render_attachment {
                                 return Err(IrSubmitError::ImageNotMapped);
                             }
@@ -1299,7 +1299,7 @@ impl ExecutionPlan {
                     let depth_attachment = desc.depth_attachment();
                     let depth_spec = if let Some(depth) = depth_attachment {
                         let depth_descriptor = resources.resources().texture(depth.target())?;
-                        Some(texture_spec(depth.target(), depth_descriptor))
+                        Some(texture_spec(depth.target(), depth_descriptor)?)
                     } else {
                         None
                     };
@@ -2332,7 +2332,7 @@ fn texture_binding(
     }
     let sampler_descriptor = resources.sampler(sampler)?;
     Ok((
-        Some(texture_spec(texture, descriptor)),
+        Some(texture_spec(texture, descriptor)?),
         Some(sampler_state(sampler_descriptor, sampler.slot())),
     ))
 }
@@ -2468,7 +2468,7 @@ fn decode_position(record: &[u8], attribute: VertexAttribute) -> Result<[f32; 4]
             read_f32(record, offset + 8)?,
             read_f32(record, offset + 12)?,
         ],
-        VertexFormat::Unorm8x4 => return Err(IrSubmitError::InvalidVertexData),
+        _ => return Err(IrSubmitError::InvalidVertexData),
     };
     if !position.iter().all(|value| value.is_finite()) {
         return Err(IrSubmitError::InvalidVertexData);
@@ -2508,7 +2508,7 @@ fn decode_secondary(
                     read_u8(record, offset + 2)? as f32 / 255.0,
                     read_u8(record, offset + 3)? as f32 / 255.0,
                 ],
-                VertexFormat::Float32x2 => return Err(IrSubmitError::InvalidVertexData),
+                _ => return Err(IrSubmitError::InvalidVertexData),
             };
             if !color
                 .iter()
@@ -2552,7 +2552,7 @@ fn decode_secondary(
                     read_u8(record, offset + 2)? as f32 / 255.0,
                     read_u8(record, offset + 3)? as f32 / 255.0,
                 ],
-                VertexFormat::Float32x2 => return Err(IrSubmitError::InvalidVertexData),
+                _ => return Err(IrSubmitError::InvalidVertexData),
             };
             if !color
                 .iter()
@@ -2811,10 +2811,18 @@ fn ir_rect(rectangle: ir::PixelRect) -> IrRect {
     }
 }
 
-fn texture_spec(texture: TextureRef<'_>, descriptor: TextureDesc) -> driver::IrTextureSpec {
+fn texture_spec(
+    texture: TextureRef<'_>,
+    descriptor: TextureDesc,
+) -> Result<driver::IrTextureSpec, IrSubmitError> {
+    if descriptor.array_layer_count() != 1 || descriptor.usage().contains(TextureUsage::STORAGE) {
+        return Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::TargetUsage,
+        ));
+    }
     let extent = descriptor.extent();
     let usage = descriptor.usage();
-    driver::IrTextureSpec {
+    Ok(driver::IrTextureSpec {
         slot: texture.slot(),
         width: extent.width(),
         height: extent.height(),
@@ -2828,8 +2836,13 @@ fn texture_spec(texture: TextureRef<'_>, descriptor: TextureDesc) -> driver::IrT
             TextureFormat::Rgba8Unorm => IrTextureFormat::Rgba8,
             TextureFormat::R8Unorm => IrTextureFormat::R8,
             TextureFormat::Depth32Float => IrTextureFormat::Depth32Float,
+            TextureFormat::Bgra8UnormSrgb | TextureFormat::Rgba8UnormSrgb => {
+                return Err(IrSubmitError::Unsupported(
+                    UnsupportedIrFeature::TargetFormat,
+                ));
+            }
         },
-    }
+    })
 }
 
 fn materializable_texture(spec: driver::IrTextureSpec) -> bool {

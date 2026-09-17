@@ -22,6 +22,7 @@ mod blit;
 mod completion;
 mod programmable;
 mod readback;
+mod vertex_input;
 pub use completion::Submission;
 
 use sgfx_core::ir::{
@@ -265,6 +266,7 @@ impl Context {
             width,
             height,
             format,
+            1,
             1,
             raw::TextureUsages::TEXTURE_BINDING
                 | raw::TextureUsages::RENDER_ATTACHMENT
@@ -879,6 +881,7 @@ impl Resources {
             descriptor.extent().height(),
             descriptor.format(),
             descriptor.mip_level_count(),
+            descriptor.array_layer_count(),
             usage,
         )?;
         self.textures.push((id, Arc::clone(&texture)));
@@ -948,6 +951,7 @@ impl Resources {
                 // maxima are equivalent to this physical clamp.
                 lod_min_clamp: descriptor.min_lod().min(32.0),
                 lod_max_clamp: descriptor.max_lod().min(32.0),
+                compare: descriptor.compare().map(compare_function),
                 ..raw::SamplerDescriptor::default()
             },
         ));
@@ -1040,7 +1044,7 @@ fn validate_indexed_topologies(commands: &CommandBuffer<'_, '_>) -> Result<()> {
                         .topology(),
                 );
             }
-            Command::DrawIndexed { .. }
+            Command::DrawIndexed { .. } | Command::DrawIndexedInstanced { .. }
                 if pipeline == Some(ir::PrimitiveTopology::TriangleStrip) =>
             {
                 return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
@@ -1457,7 +1461,7 @@ impl Queue {
         let mut state = PassState {
             pipeline: None,
             pipeline_id: None,
-            vertex_buffer: None,
+            vertex_buffers: std::array::from_fn(|_| None),
             index_buffer: None,
             texture: None,
             sampler: None,
@@ -1506,7 +1510,15 @@ impl Queue {
                     }
                 }
                 Command::SetVertexBuffer { buffer, offset } => {
-                    state.vertex_buffer = Some((resources.buffer(*buffer)?, *offset));
+                    state.vertex_buffers[0] = Some((resources.buffer(*buffer)?, *offset));
+                }
+                Command::SetVertexBufferSlot {
+                    slot,
+                    buffer,
+                    offset,
+                } => {
+                    state.vertex_buffers[*slot as usize] =
+                        Some((resources.buffer(*buffer)?, *offset));
                 }
                 Command::SetIndexBuffer {
                     buffer,
@@ -1569,7 +1581,7 @@ impl Queue {
                     vertex_count,
                     first_vertex,
                 } => {
-                    self.encode_draw(&mut render_pass, &state, *vertex_count, *first_vertex)?;
+                    self.encode_draw(&mut render_pass, &state, *vertex_count, *first_vertex, 0..1)?;
                 }
                 Command::DrawIndexed {
                     index_count,
@@ -1582,6 +1594,37 @@ impl Queue {
                         *index_count,
                         *first_index,
                         *base_vertex,
+                        0..1,
+                    )?;
+                }
+                Command::DrawInstanced {
+                    vertex_count,
+                    first_vertex,
+                    instance_count,
+                    first_instance,
+                } => {
+                    self.encode_draw(
+                        &mut render_pass,
+                        &state,
+                        *vertex_count,
+                        *first_vertex,
+                        *first_instance..*first_instance + *instance_count,
+                    )?;
+                }
+                Command::DrawIndexedInstanced {
+                    index_count,
+                    first_index,
+                    base_vertex,
+                    instance_count,
+                    first_instance,
+                } => {
+                    self.encode_indexed_draw(
+                        &mut render_pass,
+                        &state,
+                        *index_count,
+                        *first_index,
+                        *base_vertex,
+                        *first_instance..*first_instance + *instance_count,
                     )?;
                 }
                 _ => return Err(Error::InvalidState),
@@ -1641,14 +1684,17 @@ impl Queue {
         state: &PassState,
         vertex_count: u32,
         first_vertex: u32,
+        instances: core::ops::Range<u32>,
     ) -> Result<()> {
         if let Some(pipeline) = &state.programmable {
             self.prepare_programmable_draw(render_pass, state, pipeline)?;
-            render_pass.draw(first_vertex..first_vertex + vertex_count, 0..1);
+            render_pass.draw(first_vertex..first_vertex + vertex_count, instances);
             return Ok(());
         }
         let pipeline = state.pipeline.as_ref().ok_or(Error::InvalidState)?;
-        let (vertex_buffer, offset) = state.vertex_buffer.as_ref().ok_or(Error::InvalidState)?;
+        let (vertex_buffer, offset) = state.vertex_buffers[0]
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
         let uniforms = state.uniforms.ok_or(Error::InvalidState)?;
         let bind_group = self.create_bind_group(pipeline, uniforms, state)?;
         render_pass.set_bind_group(0, &bind_group, &[]);
@@ -1664,6 +1710,7 @@ impl Queue {
         index_count: u32,
         first_index: u32,
         base_vertex: i32,
+        instances: core::ops::Range<u32>,
     ) -> Result<()> {
         if let Some(pipeline) = &state.programmable {
             if pipeline.topology == ir::PrimitiveTopology::TriangleStrip {
@@ -1673,12 +1720,17 @@ impl Queue {
             let (buffer, offset, format) =
                 state.index_buffer.as_ref().ok_or(Error::InvalidState)?;
             render_pass.set_index_buffer(buffer.buffer.slice(*offset..), index_format(*format));
-            render_pass.draw_indexed(first_index..first_index + index_count, base_vertex, 0..1);
+            render_pass.draw_indexed(
+                first_index..first_index + index_count,
+                base_vertex,
+                instances,
+            );
             return Ok(());
         }
         let pipeline = state.pipeline.as_ref().ok_or(Error::InvalidState)?;
-        let (vertex_buffer, vertex_offset) =
-            state.vertex_buffer.as_ref().ok_or(Error::InvalidState)?;
+        let (vertex_buffer, vertex_offset) = state.vertex_buffers[0]
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
         let (index_buffer, index_offset, index_kind) =
             state.index_buffer.as_ref().ok_or(Error::InvalidState)?;
         let uniforms = state.uniforms.ok_or(Error::InvalidState)?;
@@ -1699,9 +1751,11 @@ impl Queue {
         state: &PassState,
         pipeline: &programmable::RenderPipeline,
     ) -> Result<()> {
-        if pipeline.has_vertex_buffer {
-            let (buffer, offset) = state.vertex_buffer.as_ref().ok_or(Error::InvalidState)?;
-            pass.set_vertex_buffer(0, buffer.buffer.slice(*offset..));
+        for slot in 0..pipeline.vertex_buffer_count {
+            let (buffer, offset) = state.vertex_buffers[slot]
+                .as_ref()
+                .ok_or(Error::InvalidState)?;
+            pass.set_vertex_buffer(slot as u32, buffer.buffer.slice(*offset..));
         }
         for (index, empty) in pipeline.empty_groups.iter().enumerate() {
             let group = state
@@ -1809,7 +1863,7 @@ impl CommandSubmitter for Executor<'_> {
 struct PassState {
     pipeline: Option<Arc<GpuPipeline>>,
     pipeline_id: Option<RenderPipelineId>,
-    vertex_buffer: Option<(Arc<GpuBuffer>, u64)>,
+    vertex_buffers: [Option<(Arc<GpuBuffer>, u64)>; ir::MAX_VERTEX_BUFFERS],
     index_buffer: Option<(Arc<GpuBuffer>, u64, IndexFormat)>,
     texture: Option<Arc<GpuTexture>>,
     sampler: Option<Arc<raw::Sampler>>,
@@ -1941,7 +1995,7 @@ fn encode_texture_upload(
             origin: raw::Origin3d {
                 x: area.x(),
                 y: area.y(),
-                z: 0,
+                z: write.array_layer(),
             },
             aspect: raw::TextureAspect::All,
         },
@@ -1960,10 +2014,14 @@ fn create_gpu_texture(
     height: u32,
     format: TextureFormat,
     mip_level_count: u32,
+    array_layer_count: u32,
     usage: raw::TextureUsages,
 ) -> Result<Arc<GpuTexture>> {
     let max_dimension = device.limits().max_texture_dimension_2d;
-    if width > max_dimension || height > max_dimension {
+    if width > max_dimension
+        || height > max_dimension
+        || array_layer_count > device.limits().max_texture_array_layers
+    {
         return Err(Error::Unsupported(UnsupportedFeature::ResourceSize));
     }
     let raw_format =
@@ -1973,17 +2031,29 @@ fn create_gpu_texture(
         size: raw::Extent3d {
             width,
             height,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: array_layer_count,
         },
         mip_level_count,
         sample_count: 1,
         dimension: raw::TextureDimension::D2,
         format: raw_format,
         usage,
-        view_formats: &[],
+        view_formats: match format {
+            TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => &[
+                raw::TextureFormat::Rgba8Unorm,
+                raw::TextureFormat::Rgba8UnormSrgb,
+            ],
+            TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => &[
+                raw::TextureFormat::Bgra8Unorm,
+                raw::TextureFormat::Bgra8UnormSrgb,
+            ],
+            _ => &[],
+        },
     });
     let view = texture.create_view(&raw::TextureViewDescriptor {
         mip_level_count: Some(1),
+        dimension: Some(raw::TextureViewDimension::D2),
+        array_layer_count: Some(1),
         ..Default::default()
     });
     let sampled_view = texture.create_view(&raw::TextureViewDescriptor::default());
@@ -2037,7 +2107,9 @@ fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
 fn raw_format(format: TextureFormat) -> Option<raw::TextureFormat> {
     match format {
         TextureFormat::Bgra8Unorm => Some(raw::TextureFormat::Bgra8Unorm),
+        TextureFormat::Bgra8UnormSrgb => Some(raw::TextureFormat::Bgra8UnormSrgb),
         TextureFormat::Rgba8Unorm => Some(raw::TextureFormat::Rgba8Unorm),
+        TextureFormat::Rgba8UnormSrgb => Some(raw::TextureFormat::Rgba8UnormSrgb),
         TextureFormat::R8Unorm => Some(raw::TextureFormat::R8Unorm),
         TextureFormat::Depth32Float => Some(raw::TextureFormat::Depth32Float),
     }
@@ -2493,6 +2565,11 @@ fn raw_vertex_attribute(attribute: &VertexAttribute) -> raw::VertexAttribute {
             VertexFormat::Float32x3 => raw::VertexFormat::Float32x3,
             VertexFormat::Float32x4 => raw::VertexFormat::Float32x4,
             VertexFormat::Unorm8x4 => raw::VertexFormat::Unorm8x4,
+            VertexFormat::Sint32 => raw::VertexFormat::Sint32,
+            VertexFormat::Uint32 | VertexFormat::Snorm10_10_10_2 => raw::VertexFormat::Uint32,
+            VertexFormat::Float16x2 => raw::VertexFormat::Float16x2,
+            VertexFormat::Float16x4 => raw::VertexFormat::Float16x4,
+            VertexFormat::Sint16x4 => raw::VertexFormat::Sint16x4,
         },
         offset: u64::from(attribute.offset()),
         shader_location: attribute.location(),
@@ -2650,9 +2727,12 @@ fn find_attribute(attributes: &[VertexAttribute], location: u32) -> Option<Verte
 
 fn wgsl_vertex_type(format: VertexFormat) -> &'static str {
     match format {
-        VertexFormat::Float32x2 => "vec2<f32>",
+        VertexFormat::Sint32 => "i32",
+        VertexFormat::Uint32 | VertexFormat::Snorm10_10_10_2 => "u32",
+        VertexFormat::Sint16x4 => "vec4<i32>",
+        VertexFormat::Float16x2 | VertexFormat::Float32x2 => "vec2<f32>",
         VertexFormat::Float32x3 => "vec3<f32>",
-        VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => "vec4<f32>",
+        VertexFormat::Float16x4 | VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => "vec4<f32>",
     }
 }
 
@@ -2665,6 +2745,7 @@ fn position_expression(attribute: VertexAttribute) -> String {
         VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => {
             format!("input.attr{}", attribute.location())
         }
+        _ => unreachable!("fixed pipeline validates float vertex inputs"),
     }
 }
 
@@ -2677,6 +2758,7 @@ fn color_expression(attribute: VertexAttribute) -> String {
         VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => {
             format!("input.attr{}", attribute.location())
         }
+        _ => unreachable!("fixed pipeline validates float vertex inputs"),
     }
 }
 
