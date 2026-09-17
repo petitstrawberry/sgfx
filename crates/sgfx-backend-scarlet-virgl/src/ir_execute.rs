@@ -687,6 +687,7 @@ struct ActivePass<'r> {
     textures_scratch: Vec<driver::IrTextureBinding>,
     bind_groups: [Option<ir::BindGroupRef<'r>>; ir::MAX_BIND_GROUPS],
     vertex_buffer: Option<(BufferRef<'r>, u64)>,
+    vertex_buffers: [Option<(BufferRef<'r>, u64)>; 8],
     index_buffer: Option<(BufferRef<'r>, u64, IndexFormat)>,
     texture: Option<TextureRef<'r>>,
     sampler: Option<SamplerRef<'r>>,
@@ -727,8 +728,13 @@ impl ProgrammableDrawCache<'_> {
             return Ok(None);
         }
         for shader in [&self.draw.pipeline.vertex, &self.draw.pipeline.fragment] {
-            for binding in &shader.uniform_buffers {
-                let group_index = binding.group as usize;
+            for (group, binding) in shader
+                .uniform_buffers
+                .iter()
+                .map(|b| (b.group, b.binding))
+                .chain(shader.storage_buffers.iter().map(|b| (b.group, b.binding)))
+            {
+                let group_index = group as usize;
                 let previous = self
                     .key
                     .bind_groups
@@ -754,7 +760,7 @@ impl ProgrammableDrawCache<'_> {
                     group
                         .entries()
                         .iter()
-                        .find(|entry| entry.binding() == binding.binding)
+                        .find(|entry| entry.binding() == binding)
                         .map(|entry| entry.resource())
                 };
                 let current = entry(&current).ok_or(ir::Error::BindingLayoutMismatch)?;
@@ -949,14 +955,24 @@ impl Queue {
                 continue;
             };
             for draw in &pass.submission.draws {
-                let bindings = [
-                    draw.vertex_buffer.map(|binding| binding.buffer),
-                    draw.programmable
-                        .as_ref()
-                        .and_then(|draw| draw.index_buffer)
-                        .map(|binding| binding.buffer),
-                ];
-                for binding in bindings.into_iter().flatten() {
+                let bindings = draw
+                    .vertex_buffers
+                    .iter()
+                    .flatten()
+                    .map(|binding| binding.buffer)
+                    .chain(draw.vertex_buffer.map(|binding| binding.buffer))
+                    .chain(
+                        draw.programmable
+                            .as_ref()
+                            .and_then(|p| p.index_buffer)
+                            .map(|b| b.buffer),
+                    )
+                    .chain(
+                        draw.programmable
+                            .iter()
+                            .flat_map(|p| p.storage_buffers.iter().map(|b| b.buffer)),
+                    );
+                for binding in bindings {
                     if prepared_buffers.contains(&binding.slot) {
                         continue;
                     }
@@ -1161,7 +1177,9 @@ impl ExecutionPlan {
                         || source_desc.format() != destination_desc.format()
                         || !matches!(
                             source_desc.format(),
-                            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+                            TextureFormat::Bgra8Unorm
+                                | TextureFormat::Rgba8Unorm
+                                | TextureFormat::R8Unorm
                         )
                         || source.id() == destination.id() && source_mip == destination_mip
                     {
@@ -1346,6 +1364,7 @@ impl ExecutionPlan {
                         push_constants: [[0; 128]; 2],
                         bind_groups: [None; ir::MAX_BIND_GROUPS],
                         vertex_buffer: None,
+                        vertex_buffers: [None; 8],
                         index_buffer: None,
                         texture: None,
                         sampler: None,
@@ -1432,7 +1451,23 @@ impl ExecutionPlan {
                     )?;
                 }
                 Command::SetVertexBuffer { buffer, offset } => {
-                    active_pass_mut(&mut active)?.vertex_buffer = Some((*buffer, *offset));
+                    let pass = active_pass_mut(&mut active)?;
+                    pass.vertex_buffer = Some((*buffer, *offset));
+                    pass.vertex_buffers[0] = Some((*buffer, *offset));
+                }
+                Command::SetVertexBufferSlot {
+                    slot,
+                    buffer,
+                    offset,
+                } => {
+                    let pass = active_pass_mut(&mut active)?;
+                    *pass
+                        .vertex_buffers
+                        .get_mut(*slot as usize)
+                        .ok_or(ir::Error::OutOfBounds)? = Some((*buffer, *offset));
+                    if *slot == 0 {
+                        pass.vertex_buffer = Some((*buffer, *offset));
+                    }
                 }
                 Command::SetIndexBuffer {
                     buffer,
@@ -1468,6 +1503,45 @@ impl ExecutionPlan {
                     }
                     pass.viewport = Some(*value);
                 }
+                Command::DrawInstanced {
+                    vertex_count,
+                    first_vertex,
+                    instance_count,
+                    first_instance,
+                } => {
+                    let pass = active_pass_mut(&mut active)?;
+                    let draw = programmable::decode_draw(
+                        resources,
+                        &pending_buffers,
+                        pass,
+                        *first_vertex,
+                        *vertex_count,
+                        None,
+                        *instance_count,
+                        *first_instance,
+                    )?;
+                    pass.submission.draws.push(draw);
+                }
+                Command::DrawIndexedInstanced {
+                    index_count,
+                    first_index,
+                    base_vertex,
+                    instance_count,
+                    first_instance,
+                } => {
+                    let pass = active_pass_mut(&mut active)?;
+                    let draw = programmable::decode_draw(
+                        resources,
+                        &pending_buffers,
+                        pass,
+                        *first_index,
+                        *index_count,
+                        Some(*base_vertex),
+                        *instance_count,
+                        *first_instance,
+                    )?;
+                    pass.submission.draws.push(draw);
+                }
                 Command::Draw {
                     vertex_count,
                     first_vertex,
@@ -1481,6 +1555,8 @@ impl ExecutionPlan {
                             *first_vertex,
                             *vertex_count,
                             None,
+                            1,
+                            0,
                         )?;
                         pass.submission.draws.push(draw);
                         continue;
@@ -1508,6 +1584,8 @@ impl ExecutionPlan {
                             *first_index,
                             *index_count,
                             Some(*base_vertex),
+                            1,
+                            0,
                         )?;
                         pass.submission.draws.push(draw);
                         continue;
@@ -1889,6 +1967,9 @@ fn append_draw(pass: &mut ActivePass<'_>, draw: DecodedDraw) -> Result<(), IrSub
         .try_reserve(1)
         .map_err(|_| IrSubmitError::OutOfMemory)?;
     pass.submission.draws.push(IrDraw {
+        instance_count: 1,
+        first_instance: 0,
+        vertex_buffers: [None; 8],
         programmable: None,
         start_vertex,
         vertex_count,
@@ -1964,7 +2045,8 @@ fn programmable_draw_bytes(draw: &driver::IrProgrammableDraw) -> Option<usize> {
         .checked_mul(core::mem::size_of::<u32>())?
         .checked_add(IR_DRAW_COMMAND_BUDGET)?
         // Includes first-use sampler/view creation and both stage bindings.
-        .checked_add(draw.textures.len().checked_mul(160)?)
+        .checked_add(draw.textures.len().checked_mul(160)?)?
+        .checked_add(draw.storage_buffers.len().checked_mul(80)?)
 }
 
 fn programmable_chunk_bytes<'draw>(
@@ -1972,13 +2054,9 @@ fn programmable_chunk_bytes<'draw>(
 ) -> Option<usize> {
     let mut draws = draws.into_iter();
     let first = draws.next()?.programmable.as_ref()?;
-    // Reserve setup, surfaces, pipeline state and vertex elements once. Shader
-    // source is also sent at most once for this immutable pipeline in a chunk.
+    // Shader creation is staged separately using VirGL continuation packets.
+    // Reserve surfaces, pipeline state and vertex elements once per pass chunk.
     let mut bytes = 2 * IR_COMMAND_FIXED_BUDGET + 128;
-    #[cfg(feature = "programmable")]
-    for source in [&first.pipeline.vertex.tgsi, &first.pipeline.fragment.tgsi] {
-        bytes = bytes.checked_add(source.len().checked_add(4)? & !3)?;
-    }
     bytes = bytes.checked_add(programmable_draw_bytes(first)?)?;
     for draw in draws {
         let programmable = draw.programmable.as_ref()?;
@@ -2355,6 +2433,7 @@ fn sampler_state(descriptor: SamplerDesc, slot: usize) -> IrSamplerState {
         },
         min_lod: descriptor.min_lod(),
         max_lod: descriptor.max_lod(),
+        compare: descriptor.compare(),
         min_filter: match descriptor.min_filter() {
             FilterMode::Nearest => IrFilterMode::Nearest,
             FilterMode::Linear => IrFilterMode::Linear,
@@ -2657,7 +2736,8 @@ fn convert_texture_upload(
         ));
     }
     let destination = write.destination();
-    if write.mip_level() >= texture.mip_levels
+    if write.array_layer() >= texture.array_layers
+        || write.mip_level() >= texture.mip_levels
         || !destination.is_within(ir::Extent2D::new(
             (texture.width >> write.mip_level()).max(1),
             (texture.height >> write.mip_level()).max(1),
@@ -2724,6 +2804,7 @@ fn convert_texture_upload(
     }
     Ok(IrTextureUpload {
         mip_level: write.mip_level(),
+        array_layer: write.array_layer(),
         texture,
         destination: IrRect {
             x: destination.x(),
@@ -2824,7 +2905,11 @@ fn texture_spec(
     texture: TextureRef<'_>,
     descriptor: TextureDesc,
 ) -> Result<driver::IrTextureSpec, IrSubmitError> {
-    if descriptor.array_layer_count() != 1 || descriptor.usage().contains(TextureUsage::STORAGE) {
+    if descriptor.usage().contains(TextureUsage::STORAGE)
+        && !descriptor.usage().contains(TextureUsage::SAMPLED)
+        && !descriptor.usage().contains(TextureUsage::COPY_DST)
+        && !descriptor.usage().contains(TextureUsage::RENDER_ATTACHMENT)
+    {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::TargetUsage,
         ));
@@ -2836,6 +2921,8 @@ fn texture_spec(
         width: extent.width(),
         height: extent.height(),
         mip_levels: descriptor.mip_level_count(),
+        array_layers: descriptor.array_layer_count(),
+        cube: descriptor.cube_compatible(),
         sampled: usage.contains(TextureUsage::SAMPLED),
         render_attachment: usage.contains(TextureUsage::RENDER_ATTACHMENT),
         copy_destination: usage.contains(TextureUsage::COPY_DST),
@@ -2971,6 +3058,8 @@ mod tests {
             width: 64,
             height: 64,
             mip_levels: 1,
+            array_layers: 1,
+            cube: false,
             sampled: false,
             render_attachment: true,
             copy_destination: false,
@@ -2986,6 +3075,9 @@ mod tests {
             operation: IrBlendOp::Add,
         };
         IrDraw {
+            instance_count: 1,
+            first_instance: 0,
+            vertex_buffers: [None; 8],
             programmable: None,
             start_vertex,
             vertex_count,
@@ -3043,6 +3135,8 @@ mod tests {
             width: 64,
             height: 64,
             mip_levels: 1,
+            array_layers: 1,
+            cube: false,
             sampled: false,
             render_attachment: true,
             copy_destination: false,
@@ -3180,13 +3274,13 @@ mod tests {
             slot,
             vertex: compile_shader(&module, ir::ShaderStage::Vertex, "vs").unwrap(),
             fragment: compile_shader(&module, ir::ShaderStage::Fragment, "fs").unwrap(),
-            vertex_buffer: Some(
+            vertex_buffers: vec![
                 ir::VertexBufferLayout::new(
                     16,
                     vec![VertexAttribute::new(0, VertexFormat::Float32x4, 0)],
                 )
                 .unwrap(),
-            ),
+            ],
             topology: PrimitiveTopology::TriangleList,
         })
     }
@@ -3213,6 +3307,7 @@ mod tests {
             }]
             .into(),
             textures: Vec::new().into(),
+            storage_buffers: Vec::new().into(),
         }));
         draw
     }

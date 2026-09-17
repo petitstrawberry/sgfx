@@ -56,13 +56,13 @@ pub(crate) unsafe extern "system" fn create_macos_surface(
     create_metal_surface(instance, &metal, allocator, output)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Surface {
     instance: usize,
     #[cfg(target_os = "macos")]
     layer: usize,
     #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-    extent: vk::Extent2D,
+    window: std::sync::Arc<crate::display::SurfaceWindow>,
 }
 
 fn surfaces() -> MutexGuard<'static, HashMap<vk::SurfaceKHR, Surface>> {
@@ -77,7 +77,7 @@ fn surface_for_physical(
     physical: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
 ) -> Result<Surface, vk::Result> {
-    let surface = surfaces().get(&surface).copied().ok_or(INVALID)?;
+    let surface = surfaces().get(&surface).cloned().ok_or(INVALID)?;
     if crate::instance::physical_instance(physical) != Some(surface.instance) {
         return Err(INVALID);
     }
@@ -173,32 +173,37 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_capabilities(
     let Some(_adapter) = crate::instance::physical_adapter(physical) else {
         return INVALID;
     };
+    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    let current_extent = match crate::display::current_extent() {
+        Ok(extent) => extent,
+        Err(error) => return error,
+    };
     #[cfg(target_os = "macos")]
     let maximum = _adapter
         .capabilities()
         .limits()
         .max_image_dimension_2d
-        .min(2048);
+        .min(crate::images::MAX_IMAGE_DIMENSION);
     unsafe {
         *output = vk::SurfaceCapabilitiesKHR {
             min_image_count: 2,
             max_image_count: MAX_SWAPCHAIN_IMAGES,
             #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-            current_extent: surface_for_physical(physical, surface).unwrap().extent,
+            current_extent: current_extent,
             #[cfg(target_os = "macos")]
             current_extent: vk::Extent2D {
                 width: u32::MAX,
                 height: u32::MAX,
             },
             #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-            min_image_extent: surface_for_physical(physical, surface).unwrap().extent,
+            min_image_extent: current_extent,
             #[cfg(target_os = "macos")]
             min_image_extent: vk::Extent2D {
                 width: 1,
                 height: 1,
             },
             #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-            max_image_extent: surface_for_physical(physical, surface).unwrap().extent,
+            max_image_extent: current_extent,
             #[cfg(target_os = "macos")]
             max_image_extent: vk::Extent2D {
                 width: maximum,
@@ -336,7 +341,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
         return INVALID;
     }
     let info = unsafe { &*info };
-    let Some(surface) = surfaces().get(&info.surface).copied() else {
+    let Some(surface) = surfaces().get(&info.surface).cloned() else {
         return vk::Result::ERROR_SURFACE_LOST_KHR;
     };
     let supported_usage = crate::images::image_usage(info.image_format);
@@ -351,8 +356,8 @@ pub(crate) unsafe extern "system" fn create_swapchain(
         || info.image_color_space != vk::ColorSpaceKHR::SRGB_NONLINEAR
         || info.image_extent.width == 0
         || info.image_extent.height == 0
-        || info.image_extent.width > 2048
-        || info.image_extent.height > 2048
+        || info.image_extent.width > crate::images::MAX_IMAGE_DIMENSION
+        || info.image_extent.height > crate::images::MAX_IMAGE_DIMENSION
         || info.image_array_layers != 1
         || info.image_usage.is_empty()
         || !supported_usage.contains(info.image_usage)
@@ -366,8 +371,14 @@ pub(crate) unsafe extern "system" fn create_swapchain(
         return UNSUPPORTED;
     }
     #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-    if info.image_extent != surface.extent || info.image_format != vk::Format::B8G8R8A8_UNORM {
-        return vk::Result::ERROR_OUT_OF_DATE_KHR;
+    {
+        let extent = match crate::display::current_extent() {
+            Ok(extent) => extent,
+            Err(error) => return error,
+        };
+        if info.image_extent != extent || info.image_format != vk::Format::B8G8R8A8_UNORM {
+            return vk::Result::ERROR_OUT_OF_DATE_KHR;
+        }
     }
     let image_count = info.min_image_count;
     let format = info.image_format;
@@ -400,7 +411,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
         }
         .map_err(crate::runtime::backend_failure)?;
         #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-        let mut window = crate::display::Window::new(extent)?;
+        let mut window = crate::display::Window::new(surface.window, extent)?;
         let size = ir::Extent2D::new(extent.width, extent.height).map_err(|_| INVALID)?;
         let mut images = Vec::with_capacity(image_count as usize);
         let mut physical_images = Vec::with_capacity(image_count as usize);
@@ -828,14 +839,15 @@ mod tests {
 pub(crate) fn insert_display_surface(
     instance: vk::Instance,
     extent: vk::Extent2D,
-) -> vk::SurfaceKHR {
+) -> Result<vk::SurfaceKHR, vk::Result> {
+    let window = crate::display::SurfaceWindow::new(extent)?;
     let handle = vk::SurfaceKHR::from_raw(next_id());
     surfaces().insert(
         handle,
         Surface {
             instance: instance.as_raw() as usize,
-            extent,
+            window,
         },
     );
-    handle
+    Ok(handle)
 }

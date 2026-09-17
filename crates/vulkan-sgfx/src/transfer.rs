@@ -43,7 +43,7 @@ pub(crate) fn blit(
     if src.format != dst.format
         || !matches!(
             src.format,
-            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
         )
     {
         return Err(unsupported);

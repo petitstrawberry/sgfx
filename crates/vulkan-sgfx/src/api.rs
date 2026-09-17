@@ -961,7 +961,27 @@ impl RecordedCommand {
                     let values = dynamic_offsets
                         .get(dynamic_index..end)
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    if values.iter().any(|offset| !offset.is_multiple_of(256)) {
+                    let dynamic_types = descriptor.types.values().filter(|ty| {
+                        matches!(
+                            **ty,
+                            vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                                | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                        )
+                    });
+                    if values.iter().zip(dynamic_types).any(|(offset, ty)| {
+                        let limit = if *ty == vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC {
+                            rt.capabilities
+                                .limits()
+                                .min_uniform_buffer_offset_alignment
+                                .max(16)
+                        } else {
+                            rt.capabilities
+                                .limits()
+                                .min_storage_buffer_offset_alignment
+                                .max(4)
+                        };
+                        !offset.is_multiple_of(limit)
+                    }) {
                         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                     }
                     offsets.insert(*first + index as u32, values.to_vec());
@@ -3306,6 +3326,14 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
                 d.set,
                 &d.dynamic_offsets,
                 &d.layout,
+                rt.capabilities
+                    .limits()
+                    .min_uniform_buffer_offset_alignment
+                    .max(16),
+                rt.capabilities
+                    .limits()
+                    .min_storage_buffer_offset_alignment
+                    .max(4),
             )?;
             ops.push(ir::OwnedCommand::SetBindGroup {
                 index: d.index,

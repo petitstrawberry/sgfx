@@ -367,7 +367,7 @@ impl Resources {
             .ok_or(vk::Result::ERROR_UNKNOWN)?
             .layout
             .clone();
-        self.descriptor_group_with_layout(table, handle, dynamic_offsets, &layout)
+        self.descriptor_group_with_layout(table, handle, dynamic_offsets, &layout, 256, 256)
     }
 
     pub fn descriptor_group_with_layout(
@@ -376,6 +376,8 @@ impl Resources {
         handle: vk::DescriptorSet,
         dynamic_offsets: &[u32],
         layout: &ir::BindGroupLayoutDesc,
+        uniform_alignment: u32,
+        storage_alignment: u32,
     ) -> Result<ir::BindGroupId, vk::Result> {
         let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
         let set = self.descriptor_sets.get(&handle).ok_or(invalid)?;
@@ -392,12 +394,20 @@ impl Resources {
                         | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
                 )
             })
-            .map(|(&binding, _)| binding)
+            .map(|(&binding, ty)| (binding, *ty))
             .collect::<Vec<_>>();
         if dynamic_bindings.len() != dynamic_offsets.len()
             || dynamic_offsets
                 .iter()
-                .any(|offset| !offset.is_multiple_of(256))
+                .zip(&dynamic_bindings)
+                .any(|(offset, (_, ty))| {
+                    let alignment = if *ty == vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC {
+                        uniform_alignment
+                    } else {
+                        storage_alignment
+                    };
+                    !offset.is_multiple_of(alignment)
+                })
         {
             return Err(invalid);
         }
@@ -424,7 +434,7 @@ impl Resources {
                     };
                     let dynamic = dynamic_bindings
                         .iter()
-                        .position(|b| *b == binding)
+                        .position(|(b, _)| *b == binding)
                         .map(|index| u64::from(dynamic_offsets[index]))
                         .unwrap_or(0);
                     if range == vk::WHOLE_SIZE && dynamic != 0 {
@@ -1715,7 +1725,23 @@ unsafe extern "system" fn update_descriptor_sets(
                                     128 * 1024 * 1024
                                 }
                             && size.is_multiple_of(4)
-                            && offset.is_multiple_of(256)
+                            && offset.is_multiple_of(u64::from(
+                                if matches!(
+                                    write.ty,
+                                    vk::DescriptorType::UNIFORM_BUFFER
+                                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                                ) {
+                                    r.capabilities
+                                        .limits()
+                                        .min_uniform_buffer_offset_alignment
+                                        .max(16)
+                                } else {
+                                    r.capabilities
+                                        .limits()
+                                        .min_storage_buffer_offset_alignment
+                                        .max(4)
+                                },
+                            ))
                             && offset.checked_add(size).is_some_and(|end| end <= b.size)
                             && b.usage.contains(
                                 if matches!(

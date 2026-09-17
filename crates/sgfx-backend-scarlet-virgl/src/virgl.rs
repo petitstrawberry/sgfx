@@ -39,6 +39,9 @@ use crate::{
 };
 
 const VIRGL_CCMD_CREATE_OBJECT: u32 = 1;
+// The sampler view covers the whole allocation even when a descriptor exposes
+// a smaller range; STK places several storage slices in one buffer.
+pub(crate) const MAX_STORAGE_VIEW_BYTES: u64 = 1024 * 1024;
 const VIRGL_CCMD_BIND_OBJECT: u32 = 2;
 const VIRGL_CCMD_SET_VIEWPORT_STATE: u32 = 4;
 const VIRGL_CCMD_SET_FRAMEBUFFER_STATE: u32 = 5;
@@ -468,10 +471,10 @@ impl Context {
             resource_id,
             width,
             height,
-            mip_levels: 1,
             context_handle: self.handle_id(),
             sampler_view_handle: self.allocate_object_handle()?,
             sampler_view_initialized: Cell::new(false),
+            r8_sampler_view_handle: 0,
             ir_surface_handle: self.allocate_object_handle()?,
             ir_surface_initialized: Cell::new(false),
         })
@@ -502,10 +505,10 @@ impl Context {
             resource_id,
             width,
             height,
-            mip_levels: 1,
             context_handle: self.handle_id(),
             sampler_view_handle: self.allocate_object_handle()?,
             sampler_view_initialized: Cell::new(false),
+            r8_sampler_view_handle: 0,
             ir_surface_handle: self.allocate_object_handle()?,
             ir_surface_initialized: Cell::new(false),
         })
@@ -530,10 +533,10 @@ impl Context {
             resource_id,
             width: info.width,
             height: info.height,
-            mip_levels: 1,
             context_handle: self.handle_id(),
             sampler_view_handle: self.allocate_object_handle()?,
             sampler_view_initialized: Cell::new(false),
+            r8_sampler_view_handle: 0,
             ir_surface_handle: self.allocate_object_handle()?,
             ir_surface_initialized: Cell::new(false),
         };
@@ -576,7 +579,8 @@ impl Context {
             usage |= GPU_IMAGE_USAGE_TRANSFER_DST;
         }
         if matches!(spec.format, IrTextureFormat::Depth32Float) {
-            usage = GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT;
+            usage &= !GPU_IMAGE_USAGE_RENDER_TARGET;
+            usage |= GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT;
         } else {
             usage |= GPU_IMAGE_USAGE_TRANSFER_SRC;
         }
@@ -588,12 +592,14 @@ impl Context {
         } else {
             GPU_IMAGE_FORMAT_BGRA8_UNORM
         };
-        let raw = self.device.raw.create_mip_image_with_format_and_usage(
+        let raw = self.device.raw.create_layered_image_with_format_and_usage(
             format,
             spec.width,
             spec.height,
             usage,
             spec.mip_levels,
+            spec.array_layers,
+            spec.cube,
         )?;
         let resource_id = resource_id_from_token(self.raw.attach_image(&raw)?)?;
         Ok(Texture {
@@ -601,10 +607,14 @@ impl Context {
             resource_id,
             width: spec.width,
             height: spec.height,
-            mip_levels: spec.mip_levels,
             context_handle: self.handle_id(),
             sampler_view_handle: self.allocate_object_handle()?,
             sampler_view_initialized: Cell::new(false),
+            r8_sampler_view_handle: if spec.format == IrTextureFormat::R8 {
+                self.allocate_object_handle()?
+            } else {
+                0
+            },
             ir_surface_handle: self.allocate_object_handle()?,
             ir_surface_initialized: Cell::new(false),
         })
@@ -1000,6 +1010,8 @@ struct IrBuffer {
     resource_id: u32,
     size: u64,
     uploaded_revision: Option<u64>,
+    sampler_view_handle: u32,
+    sampler_view_initialized: Cell<bool>,
 }
 
 // RESOURCE_INLINE_WRITE maps PIPE_BUFFER storage with UNSYNCHRONIZED even
@@ -1015,6 +1027,7 @@ pub(crate) struct UploadArena {
 pub(crate) struct IrStateSnapshot {
     initialized: bool,
     buffers: Vec<Option<u64>>,
+    buffer_views: Vec<bool>,
     textures: Vec<(bool, bool)>,
     samplers: Vec<bool>,
     pipelines: Vec<bool>,
@@ -1070,6 +1083,14 @@ impl IrResources {
                     .iter()
                     .map(|value| value.as_ref().and_then(|buffer| buffer.uploaded_revision)),
             )?,
+            buffer_views: collect(
+                self.buffers.len(),
+                self.buffers.iter().map(|buffer| {
+                    buffer
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.sampler_view_initialized.get())
+                }),
+            )?,
             textures: collect(
                 self.textures.len(),
                 self.textures.iter().map(|value| {
@@ -1113,6 +1134,9 @@ impl IrResources {
         for (index, buffer) in self.buffers.iter_mut().enumerate() {
             if let Some(buffer) = buffer {
                 buffer.uploaded_revision = snapshot.buffers.get(index).copied().flatten();
+                buffer
+                    .sampler_view_initialized
+                    .set(snapshot.buffer_views.get(index).copied().unwrap_or(false));
             }
         }
         for (index, texture) in self.textures.iter().enumerate() {
@@ -1209,12 +1233,6 @@ struct IrPassDepthTarget {
 }
 
 impl IrTexture {
-    fn mip_levels(&self) -> u32 {
-        match self {
-            Self::Internal(texture) => texture.mip_levels,
-            Self::Mapped(_) => 1,
-        }
-    }
     fn resource_id(&self) -> u32 {
         match self {
             Self::Internal(texture) => texture.resource_id,
@@ -1233,6 +1251,15 @@ impl IrTexture {
         match self {
             Self::Internal(texture) => texture.sampler_view_handle,
             Self::Mapped(texture) => texture.sampler_view_handle,
+        }
+    }
+
+    fn programmable_sampler_view_handle(&self) -> u32 {
+        match self {
+            Self::Internal(texture) if texture.r8_sampler_view_handle != 0 => {
+                texture.r8_sampler_view_handle
+            }
+            _ => self.sampler_view_handle(),
         }
     }
 
@@ -1366,7 +1393,13 @@ impl Queue {
             ir_texture(context, resources, upload.texture)?;
         }
         for draw in &submission.draws {
-            if let Some(binding) = draw.vertex_buffer {
+            for binding in draw
+                .vertex_buffers
+                .iter()
+                .flatten()
+                .copied()
+                .chain(draw.vertex_buffer)
+            {
                 ir_buffer(context, resources, binding.buffer)?;
             }
             if let Some(programmable) = &draw.programmable
@@ -1378,6 +1411,9 @@ impl Queue {
                 ir_texture(context, resources, texture)?;
             }
             if let Some(programmable) = &draw.programmable {
+                for binding in programmable.storage_buffers.iter() {
+                    ir_buffer(context, resources, binding.buffer)?;
+                }
                 for binding in programmable.textures.iter() {
                     ir_texture(context, resources, binding.texture)?;
                 }
@@ -1525,7 +1561,7 @@ impl Queue {
         let IrTexture::Internal(texture) = texture else {
             return Err(HandleError::InvalidParameter);
         };
-        if !mode.is_tracked() && upload.mip_level == 0 {
+        if !mode.is_tracked() && upload.mip_level == 0 && upload.texture.array_layers == 1 {
             return context.upload_texture_bgra(
                 texture,
                 &upload.pixels,
@@ -1718,6 +1754,22 @@ impl Queue {
             None
         };
 
+        // Shader creation is ordered before the pass, but may occupy several
+        // transport packets independently of the draw/constant budget.
+        for draw in &submission.draws {
+            if let Some(programmable) = &draw.programmable {
+                let native = ir_programmable_pipeline(context, resources, &programmable.pipeline)?;
+                if !native.initialized.get() {
+                    let mut setup = Vec::new();
+                    push_programmable_pipeline(&mut setup, native)?;
+                    for range in command_packet_ranges(&setup, self.max_command_size())? {
+                        mode.prepare_packet(self.max_command_size())?;
+                        mode.submit(&self.raw, &setup[range])?;
+                    }
+                    native.initialized.set(true);
+                }
+            }
+        }
         mode.prepare_packet(self.max_command_size())?;
         if !submission.vertices.is_empty() {
             self.prepare_ir_upload_arena(context, resources, mode)?;
@@ -1755,12 +1807,7 @@ impl Queue {
             let texture = ir_texture(context, resources, IrTextureSpec { ..upload.texture })?;
             let view_is_pending = initialized_views.contains(&upload.texture.slot);
             if !texture.sampler_view_initialized() && !view_is_pending {
-                push_sampler_mip_view(
-                    &mut commands,
-                    texture.sampler_view_handle(),
-                    texture.resource_id(),
-                    texture.mip_levels(),
-                );
+                push_ir_sampler_views(&mut commands, texture, upload.texture);
                 initialized_views.push(upload.texture.slot);
             }
         }
@@ -1786,25 +1833,33 @@ impl Queue {
                     push_programmable_pipeline(&mut commands, native)?;
                     initialized_programmable_pipelines.push(slot);
                 }
+                for binding in programmable.storage_buffers.iter() {
+                    let buffer = ir_buffer(context, resources, binding.buffer)?;
+                    if !buffer.sampler_view_initialized.get() {
+                        push_buffer_sampler_view(
+                            &mut commands,
+                            buffer.sampler_view_handle,
+                            buffer.resource_id,
+                            buffer.size,
+                        )?;
+                        buffer.sampler_view_initialized.set(true);
+                    }
+                }
                 for binding in programmable.textures.iter() {
                     let texture = ir_texture(context, resources, binding.texture)?;
                     if !texture.sampler_view_initialized()
                         && !initialized_views.contains(&binding.texture.slot)
                     {
-                        push_sampler_mip_view(
-                            &mut commands,
-                            texture.sampler_view_handle(),
-                            texture.resource_id(),
-                            texture.mip_levels(),
-                        );
+                        push_ir_sampler_views(&mut commands, texture, binding.texture);
                         initialized_views.push(binding.texture.slot);
                     }
-                    let sampler = ir_sampler(context, resources, binding.sampler)?;
-                    if !sampler.initialized.get()
-                        && !initialized_samplers.contains(&sampler.state.slot)
-                    {
-                        push_ir_sampler(&mut commands, sampler);
-                        initialized_samplers.push(sampler.state.slot);
+                    if let Some(state) = binding.sampler {
+                        let sampler = ir_sampler(context, resources, state)?;
+                        if !sampler.initialized.get() && !initialized_samplers.contains(&state.slot)
+                        {
+                            push_ir_sampler(&mut commands, sampler);
+                            initialized_samplers.push(state.slot);
+                        }
                     }
                 }
             }
@@ -1812,12 +1867,7 @@ impl Queue {
                 let texture = ir_texture(context, resources, texture_spec)?;
                 let view_is_pending = initialized_views.contains(&texture_spec.slot);
                 if !texture.sampler_view_initialized() && !view_is_pending {
-                    push_sampler_mip_view(
-                        &mut commands,
-                        texture.sampler_view_handle(),
-                        texture.resource_id(),
-                        texture.mip_levels(),
-                    );
+                    push_ir_sampler_views(&mut commands, texture, texture_spec);
                     initialized_views.push(texture_spec.slot);
                 }
                 let sampler = ir_sampler(context, resources, sampler)?;
@@ -2336,9 +2386,9 @@ pub(crate) struct Texture {
     resource_id: u32,
     width: u32,
     height: u32,
-    mip_levels: u32,
     context_handle: i32,
     sampler_view_handle: u32,
+    r8_sampler_view_handle: u32,
     sampler_view_initialized: Cell<bool>,
     ir_surface_handle: u32,
     ir_surface_initialized: Cell<bool>,
@@ -2408,6 +2458,8 @@ fn ir_buffer<'resources>(
             resource_id,
             size: spec.size,
             uploaded_revision: None,
+            sampler_view_handle: context.allocate_object_handle()?,
+            sampler_view_initialized: Cell::new(false),
         });
     }
     let buffer = slot.as_mut().ok_or(HandleError::InvalidParameter)?;
@@ -2504,6 +2556,7 @@ fn ir_pipeline<'resources>(
 
 fn ir_sampler_states_equal(left: IrSamplerState, right: IrSamplerState) -> bool {
     left.slot == right.slot
+        && left.compare == right.compare
         && ir_filter_modes_equal(left.min_filter, right.min_filter)
         && ir_filter_modes_equal(left.mag_filter, right.mag_filter)
         && ir_filter_modes_equal(left.mip_filter, right.mip_filter)
@@ -2565,22 +2618,28 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
         .start_vertex
         .checked_add(draw.vertex_count)
         .ok_or(HandleError::InvalidParameter)?;
-    match (&programmable.pipeline.vertex_buffer, draw.vertex_buffer) {
-        (Some(layout), Some(binding)) => {
-            uploaded_ir_buffer(resources, binding.buffer)?;
-            let byte_end = if programmable.index_buffer.is_some() {
-                u64::from(binding.offset).checked_add(u64::from(layout.stride()))
-            } else {
-                (end as u64)
-                    .checked_mul(u64::from(layout.stride()))
-                    .and_then(|size| size.checked_add(u64::from(binding.offset)))
-            };
-            if byte_end.is_none_or(|end| end > binding.buffer.size) {
-                return Err(HandleError::InvalidParameter);
-            }
+    for (slot, layout) in programmable.pipeline.vertex_buffers.iter().enumerate() {
+        let binding = draw.vertex_buffers[slot].ok_or(HandleError::InvalidParameter)?;
+        uploaded_ir_buffer(resources, binding.buffer)?;
+        let elements = if programmable.index_buffer.is_some() {
+            1
+        } else {
+            end as u64
+        };
+        let attribute_end = layout
+            .attributes()
+            .iter()
+            .map(|a| u64::from(a.offset()) + u64::from(a.format().byte_size()))
+            .max()
+            .unwrap_or(0);
+        let byte_end = elements
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(u64::from(layout.stride())))
+            .and_then(|n| n.checked_add(u64::from(binding.offset)))
+            .and_then(|n| n.checked_add(attribute_end));
+        if byte_end.is_none_or(|end| end > binding.buffer.size) {
+            return Err(HandleError::InvalidParameter);
         }
-        (None, None) => {}
-        _ => return Err(HandleError::InvalidParameter),
     }
     if let Some(binding) = programmable.index_buffer {
         uploaded_ir_buffer(resources, binding.buffer)?;
@@ -2608,6 +2667,12 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
         {
             return Err(HandleError::InvalidParameter);
         }
+    }
+    for binding in programmable.storage_buffers.iter() {
+        if binding.slot >= 16 || binding.buffer.size > MAX_STORAGE_VIEW_BYTES {
+            return Err(HandleError::InvalidParameter);
+        }
+        uploaded_ir_buffer(resources, binding.buffer)?;
     }
     for binding in programmable.textures.iter() {
         if !matches!(
@@ -3157,6 +3222,72 @@ fn push_sampler_mip_view(commands: &mut Vec<u8>, handle: u32, resource_id: u32, 
     );
 }
 
+fn push_ir_sampler_views(commands: &mut Vec<u8>, texture: &IrTexture, spec: IrTextureSpec) {
+    push_ir_sampler_view(
+        commands,
+        texture.sampler_view_handle(),
+        texture.resource_id(),
+        spec,
+    );
+    if spec.format == IrTextureFormat::R8 {
+        // R8 storage uses BGRA alpha for the fixed alpha-mask path. Expose the
+        // Vulkan/IR value (r, 0, 0, 1) through a distinct programmable view.
+        push_ir_sampler_view_swizzled(
+            commands,
+            texture.programmable_sampler_view_handle(),
+            texture.resource_id(),
+            spec,
+            PIPE_SWIZZLE_W | (4 << 3) | (4 << 6) | (5 << 9),
+        );
+    }
+}
+
+fn push_ir_sampler_view(
+    commands: &mut Vec<u8>,
+    handle: u32,
+    resource_id: u32,
+    spec: IrTextureSpec,
+) {
+    push_ir_sampler_view_swizzled(
+        commands,
+        handle,
+        resource_id,
+        spec,
+        PIPE_SWIZZLE_X | (PIPE_SWIZZLE_Y << 3) | (PIPE_SWIZZLE_Z << 6) | (PIPE_SWIZZLE_W << 9),
+    );
+}
+
+fn push_ir_sampler_view_swizzled(
+    commands: &mut Vec<u8>,
+    handle: u32,
+    resource_id: u32,
+    spec: IrTextureSpec,
+    swizzle: u32,
+) {
+    let format = if spec.format == IrTextureFormat::Depth32Float {
+        VIRGL_FORMAT_Z32_FLOAT
+    } else {
+        VIRGL_FORMAT_B8G8R8A8_UNORM
+    };
+    let target = if spec.cube {
+        4
+    } else if spec.array_layers > 1 {
+        7
+    } else {
+        2
+    };
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6),
+    );
+    push_dword(commands, handle);
+    push_dword(commands, resource_id);
+    push_dword(commands, format | (target << 24));
+    push_dword(commands, (spec.array_layers - 1) << 16);
+    push_dword(commands, (spec.mip_levels - 1) << 8);
+    push_dword(commands, swizzle);
+}
+
 fn push_sampler_view_binding(commands: &mut Vec<u8>, handle: u32) {
     push_dword(commands, command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3));
     push_dword(commands, PIPE_SHADER_FRAGMENT);
@@ -3405,7 +3536,7 @@ fn push_programmable_pipeline(
         push_programmable_vertex_elements(
             commands,
             pipeline.vertex_elements_handle,
-            description.vertex_buffer.as_ref(),
+            &description.vertex_buffers,
         )
     }
 }
@@ -3417,26 +3548,89 @@ fn push_programmable_shader(
     stage: u32,
     source: &str,
 ) -> HandleResult<()> {
-    if source.is_empty() || source.len() > 32 * 1024 || source.as_bytes().contains(&0) {
+    if source.is_empty() || source.len() > 256 * 1024 || source.as_bytes().contains(&0) {
         return Err(HandleError::InvalidParameter);
     }
     // TGSI text is translated into binary tokens by the renderer. The fixed
     // shader's 300-token allocation is too small for arbitrary compiled code;
     // text byte length conservatively bounds the compiler's token count.
-    push_shader_with_token_count(commands, handle, stage, source, source.len() as u32);
+    let mut text = source.as_bytes().to_vec();
+    text.push(0);
+    let length = text.len();
+    text.resize(length.div_ceil(4) * 4, 0);
+    for (index, part) in text.chunks(16 * 1024).enumerate() {
+        push_dword(
+            commands,
+            command_header(
+                VIRGL_CCMD_CREATE_OBJECT,
+                VIRGL_OBJECT_SHADER,
+                5 + part.len() as u32 / 4,
+            ),
+        );
+        for word in [
+            handle,
+            stage,
+            if index == 0 {
+                length as u32
+            } else {
+                (1 << 31) | (index as u32 * 16 * 1024)
+            },
+            source.len() as u32,
+            0,
+        ] {
+            push_dword(commands, word);
+        }
+        commands.extend_from_slice(part);
+    }
     Ok(())
+}
+
+fn command_packet_ranges(
+    commands: &[u8],
+    maximum: usize,
+) -> HandleResult<Vec<core::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut offset = 0;
+    while offset < commands.len() {
+        let header = commands
+            .get(offset..offset + 4)
+            .ok_or(HandleError::InvalidParameter)?;
+        let length = ((u32::from_ne_bytes(header.try_into().unwrap()) >> 16) as usize + 1) * 4;
+        if length > maximum || offset + length > commands.len() {
+            return Err(HandleError::InvalidParameter);
+        }
+        if offset + length - start > maximum {
+            ranges.push(start..offset);
+            start = offset;
+        }
+        offset += length;
+    }
+    if start < offset {
+        ranges.push(start..offset);
+    }
+    Ok(ranges)
 }
 
 #[cfg(feature = "programmable")]
 fn push_programmable_vertex_elements(
     commands: &mut Vec<u8>,
     handle: u32,
-    layout: Option<&crate::ir::VertexBufferLayout>,
+    layouts: &[crate::ir::VertexBufferLayout],
 ) -> HandleResult<()> {
-    let attributes = layout.map_or(&[][..], crate::ir::VertexBufferLayout::attributes);
+    let attributes: Vec<_> = layouts
+        .iter()
+        .enumerate()
+        .flat_map(|(slot, layout)| {
+            layout
+                .attributes()
+                .iter()
+                .map(move |attribute| (slot, layout, attribute))
+        })
+        .collect();
     let count = attributes
         .iter()
-        .map(|attribute| attribute.location() + 1)
+        .map(|(_, _, attribute)| attribute.location() + 1)
         .max()
         .unwrap_or(0);
     if count > 16 {
@@ -3454,14 +3648,14 @@ fn push_programmable_vertex_elements(
     for location in 0..count {
         // Shader IN numbers correspond to locations, independently of the
         // application's attribute order. Fill unused holes with a valid fetch.
-        let attribute = attributes
+        let (slot, _layout, attribute) = attributes
             .iter()
-            .find(|attribute| attribute.location() == location)
+            .find(|(_, _, attribute)| attribute.location() == location)
             .or_else(|| attributes.first())
             .ok_or(HandleError::InvalidParameter)?;
         push_dword(commands, attribute.offset());
         push_dword(commands, 0);
-        push_dword(commands, 0);
+        push_dword(commands, *slot as u32);
         push_dword(
             commands,
             match attribute.format() {
@@ -3469,7 +3663,12 @@ fn push_programmable_vertex_elements(
                 crate::ir::VertexFormat::Float32x3 => VIRGL_FORMAT_R32G32B32_FLOAT,
                 crate::ir::VertexFormat::Float32x4 => VIRGL_FORMAT_R32G32B32A32_FLOAT,
                 crate::ir::VertexFormat::Unorm8x4 => VIRGL_FORMAT_R8G8B8A8_UNORM,
-                _ => return Err(HandleError::InvalidParameter),
+                crate::ir::VertexFormat::Sint32 => 197,
+                crate::ir::VertexFormat::Uint32 => 193,
+                crate::ir::VertexFormat::Sint16x4 => 192,
+                crate::ir::VertexFormat::Float16x2 => 92,
+                crate::ir::VertexFormat::Float16x4 => 94,
+                crate::ir::VertexFormat::Snorm10_10_10_2 => 173,
             },
         );
     }
@@ -3482,7 +3681,7 @@ fn push_programmable_vertex_elements(
 #[derive(Default)]
 struct ProgrammableBindings {
     pipeline: Option<(u32, u32, u32, u32)>,
-    vertex_buffer: Option<(u32, u32, u32)>,
+    vertex_buffers: Option<[(u32, u32, u32); 8]>,
     constants: Option<Rc<[IrConstantBuffer]>>,
     vertex_constants: Vec<u32>,
     fragment_constants: Vec<u32>,
@@ -3544,15 +3743,22 @@ fn push_programmable_texture_binding(
 ) -> HandleResult<()> {
     let previous = bindings
         .textures
-        .iter_mut()
-        .find(|entry| entry.0 == (stage, slot));
-    if previous.as_ref().is_none_or(|entry| entry.1.0 != view) {
+        .iter()
+        .find(|entry| entry.0 == (stage, slot))
+        .map(|entry| entry.1);
+    if previous.is_none_or(|entry| entry.0 != view) {
         push_dword(commands, command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3));
         push_dword(commands, stage);
         push_dword(commands, slot);
         push_dword(commands, view);
+        // SET_SAMPLER_VIEWS unbinds every view after the end of this
+        // update. Draw bindings are emitted in ascending slot order, so
+        // those views must be emitted again even if their handles match.
+        bindings
+            .textures
+            .retain(|entry| entry.0.0 != stage || entry.0.1 <= slot);
     }
-    if previous.as_ref().is_none_or(|entry| entry.1.1 != sampler) {
+    if previous.is_none_or(|entry| entry.1 != sampler) {
         push_dword(
             commands,
             command_header(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3),
@@ -3561,7 +3767,11 @@ fn push_programmable_texture_binding(
         push_dword(commands, slot);
         push_dword(commands, sampler);
     }
-    if let Some(previous) = previous {
+    if let Some(previous) = bindings
+        .textures
+        .iter_mut()
+        .find(|entry| entry.0 == (stage, slot))
+    {
         previous.1 = (view, sampler);
     } else {
         bindings
@@ -3609,29 +3819,42 @@ fn push_programmable_draw(
     }
     push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
     push_bind_object(commands, VIRGL_OBJECT_DSA, state.dsa_handle.unwrap_or(0));
-    if let (Some(layout), Some(binding)) =
-        (&programmable.pipeline.vertex_buffer, draw.vertex_buffer)
-    {
+    let mut vertex_bindings = [(0, 0, 0); 8];
+    for (slot, layout) in programmable.pipeline.vertex_buffers.iter().enumerate() {
+        let binding = draw.vertex_buffers[slot].ok_or(HandleError::InvalidParameter)?;
         let buffer = uploaded_ir_buffer(resources, binding.buffer)?;
-        let key = (buffer.resource_id, layout.stride(), binding.offset);
-        if bindings.vertex_buffer != Some(key) {
-            push_dword(
-                commands,
-                command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3),
-            );
-            push_dword(commands, layout.stride());
-            push_dword(commands, binding.offset);
-            push_dword(commands, buffer.resource_id);
-            bindings.vertex_buffer = Some(key);
-        }
-    } else if bindings.vertex_buffer != Some((0, 0, 0)) {
+        vertex_bindings[slot] = (buffer.resource_id, layout.stride(), binding.offset);
+    }
+    if bindings.vertex_buffers != Some(vertex_bindings) {
+        let count = programmable.pipeline.vertex_buffers.len();
         push_dword(
             commands,
-            command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 0),
+            command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, count as u32 * 3),
         );
-        bindings.vertex_buffer = Some((0, 0, 0));
+        for (resource, stride, offset) in vertex_bindings.iter().take(count) {
+            push_dword(commands, *stride);
+            push_dword(commands, *offset);
+            push_dword(commands, *resource);
+        }
+        bindings.vertex_buffers = Some(vertex_bindings);
     }
     push_programmable_constants(commands, &programmable.constants, bindings)?;
+    for binding in programmable.storage_buffers.iter() {
+        let stage = match binding.stage {
+            crate::ir::ShaderStage::Vertex => PIPE_SHADER_VERTEX,
+            crate::ir::ShaderStage::Fragment => PIPE_SHADER_FRAGMENT,
+            _ => return Err(HandleError::InvalidParameter),
+        };
+        let buffer = uploaded_ir_buffer(resources, binding.buffer)?;
+        push_programmable_texture_binding(
+            commands,
+            bindings,
+            stage,
+            binding.slot,
+            buffer.sampler_view_handle,
+            0,
+        )?;
+    }
     for binding in programmable.textures.iter() {
         let stage = match binding.stage {
             crate::ir::ShaderStage::Vertex => PIPE_SHADER_VERTEX,
@@ -3643,21 +3866,26 @@ fn push_programmable_draw(
             .get(binding.texture.slot)
             .and_then(Option::as_ref)
             .ok_or(HandleError::InvalidParameter)?;
-        let sampler = resources
-            .samplers
-            .get(binding.sampler.slot)
-            .and_then(Option::as_ref)
-            .ok_or(HandleError::InvalidParameter)?;
-        if !ir_sampler_states_equal(sampler.state, binding.sampler) {
-            return Err(HandleError::InvalidParameter);
-        }
+        let sampler_handle = if let Some(state) = binding.sampler {
+            let sampler = resources
+                .samplers
+                .get(state.slot)
+                .and_then(Option::as_ref)
+                .ok_or(HandleError::InvalidParameter)?;
+            if !ir_sampler_states_equal(sampler.state, state) {
+                return Err(HandleError::InvalidParameter);
+            }
+            sampler.handle
+        } else {
+            0
+        };
         push_programmable_texture_binding(
             commands,
             bindings,
             stage,
             binding.slot,
-            texture.sampler_view_handle(),
-            sampler.handle,
+            texture.programmable_sampler_view_handle(),
+            sampler_handle,
         )?;
     }
     let scissor = ir_rect_to_pixel_rect(draw.scissor)?;
@@ -3670,30 +3898,77 @@ fn push_programmable_draw(
         let key = (
             buffer.resource_id,
             binding.format.byte_size() as u32,
-            binding.offset,
+            indexed_byte_offset(
+                binding.offset,
+                draw.start_vertex,
+                binding.format.byte_size(),
+            )?,
         );
         if bindings.index_buffer != Some(key) {
             push_index_buffer(commands, key.0, key.1, key.2);
             bindings.index_buffer = Some(key);
         }
-        push_draw_topology_parameters(
+        push_instanced_draw_parameters(
             commands,
-            draw.start_vertex,
+            0,
             draw.vertex_count,
             true,
             binding.base_vertex,
             programmable.pipeline.topology,
+            draw.instance_count,
+            draw.first_instance,
         )
     } else {
-        push_draw_topology_parameters(
+        push_instanced_draw_parameters(
             commands,
             draw.start_vertex,
             draw.vertex_count,
             false,
             0,
             programmable.pipeline.topology,
+            draw.instance_count,
+            draw.first_instance,
         )
     }
+}
+
+fn indexed_byte_offset(offset: u32, first: usize, index_size: u64) -> HandleResult<u32> {
+    // VirGL's indexed draw consumes SET_INDEX_BUFFER.offset directly; DRAW_VBO
+    // start only applies to non-indexed draws. Fold Vulkan firstIndex into the
+    // byte offset, including it in the binding cache key for every draw.
+    (first as u64)
+        .checked_mul(index_size)
+        .and_then(|bytes| bytes.checked_add(u64::from(offset)))
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(HandleError::InvalidParameter)
+}
+
+fn push_buffer_sampler_view(
+    commands: &mut Vec<u8>,
+    handle: u32,
+    resource: u32,
+    size: u64,
+) -> HandleResult<()> {
+    if size == 0 || size > MAX_STORAGE_VIEW_BYTES || !size.is_multiple_of(4) {
+        return Err(HandleError::InvalidParameter);
+    }
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6),
+    );
+    // PIPE_BUFFER = 0. The shader applies descriptor offsets itself so this
+    // also works on renderers without GL_ARB_texture_buffer_range.
+    for word in [
+        handle,
+        resource,
+        193, /* R32_UINT */
+        0,
+        (size / 4 - 1) as u32,
+        0 | (1 << 3) | (2 << 6) | (3 << 9),
+    ] {
+        push_dword(commands, word);
+    }
+    Ok(())
 }
 
 fn push_index_buffer(commands: &mut Vec<u8>, resource_id: u32, index_size: u32, offset: u32) {
@@ -3776,7 +4051,18 @@ fn push_ir_sampler(commands: &mut Vec<u8>, sampler: &IrSampler) {
             | (PIPE_TEX_WRAP_CLAMP_TO_EDGE << 6)
             | (ir_filter_mode(state.min_filter) << 9)
             | (ir_filter_mode(state.mip_filter) << 11)
-            | (ir_filter_mode(state.mag_filter) << 13),
+            | (ir_filter_mode(state.mag_filter) << 13)
+            | (u32::from(state.compare.is_some()) << 15)
+            | (state.compare.map_or(0, |compare| match compare {
+                crate::ir::CompareFunction::Never => 0,
+                crate::ir::CompareFunction::Less => 1,
+                crate::ir::CompareFunction::Equal => 2,
+                crate::ir::CompareFunction::LessEqual => 3,
+                crate::ir::CompareFunction::Greater => 4,
+                crate::ir::CompareFunction::NotEqual => 5,
+                crate::ir::CompareFunction::GreaterEqual => 6,
+                crate::ir::CompareFunction::Always => 7,
+            }) << 16),
     );
     push_float(commands, 0.0);
     push_float(commands, state.min_lod);
@@ -4066,6 +4352,7 @@ fn submit_ir_texture_inline_write(
         .checked_mul(rect.height as usize)
         .ok_or(HandleError::InvalidParameter)?;
     if resource_id == 0
+        || upload.array_layer >= upload.texture.array_layers
         || upload.mip_level >= upload.texture.mip_levels
         || upload.mip_level >= 32
         || !ir_rect_is_within(
@@ -4118,7 +4405,7 @@ fn submit_ir_texture_inline_write(
             push_dword(&mut commands, length as u32); // layer stride
             push_dword(&mut commands, rect.x + x);
             push_dword(&mut commands, rect.y + y);
-            push_dword(&mut commands, 0);
+            push_dword(&mut commands, upload.array_layer);
             push_dword(&mut commands, width);
             push_dword(&mut commands, rows);
             push_dword(&mut commands, 1);
@@ -4352,6 +4639,32 @@ fn push_draw_topology_parameters(
     base_vertex: i32,
     topology: crate::ir::PrimitiveTopology,
 ) -> HandleResult<()> {
+    push_instanced_draw_parameters(
+        commands,
+        start_vertex,
+        vertex_count,
+        indexed,
+        base_vertex,
+        topology,
+        1,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_instanced_draw_parameters(
+    commands: &mut Vec<u8>,
+    start_vertex: usize,
+    vertex_count: usize,
+    indexed: bool,
+    base_vertex: i32,
+    topology: crate::ir::PrimitiveTopology,
+    instance_count: u32,
+    first_instance: u32,
+) -> HandleResult<()> {
+    if instance_count == 0 || first_instance.checked_add(instance_count).is_none() {
+        return Err(HandleError::InvalidParameter);
+    }
     let start_vertex = u32::try_from(start_vertex).map_err(|_| HandleError::InvalidParameter)?;
     let vertex_count = u32::try_from(vertex_count).map_err(|_| HandleError::InvalidParameter)?;
     let primitive = match topology {
@@ -4368,9 +4681,9 @@ fn push_draw_topology_parameters(
     push_dword(commands, vertex_count);
     push_dword(commands, primitive);
     push_dword(commands, u32::from(indexed));
-    push_dword(commands, 1);
+    push_dword(commands, instance_count);
     push_dword(commands, base_vertex as u32);
-    push_dword(commands, 0);
+    push_dword(commands, first_instance);
     push_dword(commands, 0);
     push_dword(commands, 0);
     push_dword(commands, 0);
@@ -4664,6 +4977,38 @@ mod tests {
     }
 
     #[test]
+    fn indexed_first_vertex_is_folded_into_the_index_buffer_byte_offset() {
+        assert_eq!(indexed_byte_offset(2400, 6, 2), Ok(2412));
+        assert_eq!(indexed_byte_offset(128, 726, 4), Ok(3032));
+        assert_eq!(
+            indexed_byte_offset(u32::MAX - 3, 1, 4),
+            Err(HandleError::InvalidParameter)
+        );
+        let mut commands = Vec::new();
+        push_index_buffer(
+            &mut commands,
+            23,
+            2,
+            indexed_byte_offset(2400, 6, 2).unwrap(),
+        );
+        assert_eq!(&dwords(&commands)[1..], &[23, 2, 2412]);
+    }
+
+    #[test]
+    fn storage_buffer_view_preserves_raw_words_and_full_buffer_range() {
+        let mut commands = Vec::new();
+        push_buffer_sampler_view(&mut commands, 31, 9, 4096).unwrap();
+        assert_eq!(&dwords(&commands)[1..6], &[31, 9, 193, 0, 1023]);
+        commands.clear();
+        push_buffer_sampler_view(&mut commands, 31, 9, 332928).unwrap();
+        assert_eq!(&dwords(&commands)[1..6], &[31, 9, 193, 0, 83231]);
+        assert_eq!(
+            push_buffer_sampler_view(&mut commands, 31, 9, MAX_STORAGE_VIEW_BYTES + 4),
+            Err(HandleError::InvalidParameter)
+        );
+    }
+
+    #[test]
     fn mip_upload_uses_real_subresource_and_rejects_base_extent() {
         let mut upload = texture_upload(1, 1);
         upload.texture.width = 7;
@@ -4710,7 +5055,8 @@ mod tests {
         )
         .unwrap();
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 67, Some(&layout)).unwrap();
+        push_programmable_vertex_elements(&mut commands, 67, core::slice::from_ref(&layout))
+            .unwrap();
         let words = dwords(&commands);
         assert_eq!(
             words[0],
@@ -4723,7 +5069,7 @@ mod tests {
         assert_eq!(&words[6..10], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
         assert_eq!(&words[10..14], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
         commands.clear();
-        push_programmable_vertex_elements(&mut commands, 68, None).unwrap();
+        push_programmable_vertex_elements(&mut commands, 68, &[]).unwrap();
         assert_eq!(
             dwords(&commands),
             alloc::vec![
@@ -4890,6 +5236,64 @@ mod tests {
     }
 
     #[test]
+    fn changing_a_lower_texture_slot_rebinds_higher_views() {
+        let mut bindings = ProgrammableBindings::default();
+        let mut commands = Vec::new();
+        for (stage, slot, view) in [
+            (PIPE_SHADER_VERTEX, 1, 40),
+            (PIPE_SHADER_FRAGMENT, 0, 17),
+            (PIPE_SHADER_FRAGMENT, 1, 19),
+        ] {
+            push_programmable_texture_binding(&mut commands, &mut bindings, stage, slot, view, 23)
+                .unwrap();
+        }
+        commands.clear();
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_FRAGMENT,
+            0,
+            18,
+            23,
+        )
+        .unwrap();
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_FRAGMENT,
+            1,
+            19,
+            23,
+        )
+        .unwrap();
+        let encoded = dwords(&commands);
+        assert_eq!(
+            &encoded[..8],
+            &[
+                command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3),
+                PIPE_SHADER_FRAGMENT,
+                0,
+                18,
+                command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3),
+                PIPE_SHADER_FRAGMENT,
+                1,
+                19,
+            ]
+        );
+        commands.clear();
+        push_programmable_texture_binding(
+            &mut commands,
+            &mut bindings,
+            PIPE_SHADER_VERTEX,
+            1,
+            40,
+            23,
+        )
+        .unwrap();
+        assert!(commands.is_empty());
+    }
+
+    #[test]
     fn programmable_constants_use_the_legacy_inline_constant_bank() {
         let mut commands = Vec::new();
         push_constant_words(&mut commands, PIPE_SHADER_VERTEX, &[1, 2, 3, 4]).unwrap();
@@ -4928,7 +5332,7 @@ mod tests {
         for invalid in [
             alloc::string::String::new(),
             "VERT\0END".into(),
-            "x".repeat(32 * 1024 + 1),
+            "x".repeat(256 * 1024 + 1),
         ] {
             let mut rejected = Vec::new();
             assert!(
@@ -4936,6 +5340,38 @@ mod tests {
             );
             assert!(rejected.is_empty());
         }
+    }
+
+    #[test]
+    fn large_shader_continuations_reconstruct_exact_text_across_transport_packets() {
+        let source = "MOV TEMP[0], TEMP[1]\n".repeat(4000);
+        let mut commands = Vec::new();
+        push_programmable_shader(&mut commands, 71, PIPE_SHADER_VERTEX, &source).unwrap();
+        let packets = command_packet_ranges(&commands, 65536).unwrap();
+        assert!(packets.len() > 1);
+        let mut recovered = Vec::new();
+        let mut offset = 0;
+        for packet in packets {
+            assert!(packet.len() <= 65536);
+            while offset < packet.end {
+                let header = u32::from_ne_bytes(commands[offset..offset + 4].try_into().unwrap());
+                let bytes = ((header >> 16) as usize + 1) * 4;
+                let words = dwords(&commands[offset..offset + 24]);
+                assert_eq!(words[1], 71);
+                assert_eq!(
+                    words[3],
+                    if recovered.is_empty() {
+                        source.len() as u32 + 1
+                    } else {
+                        (1 << 31) | recovered.len() as u32
+                    }
+                );
+                recovered.extend_from_slice(&commands[offset + 24..offset + bytes]);
+                offset += bytes;
+            }
+        }
+        assert_eq!(&recovered[..source.len()], source.as_bytes());
+        assert!(recovered[source.len()..].iter().all(|&byte| byte == 0));
     }
 
     #[test]
@@ -5116,6 +5552,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn layered_views_and_uploads_preserve_the_selected_layer() {
+        let mut upload = texture_upload(1, 1);
+        upload.texture.array_layers = 6;
+        upload.texture.cube = true;
+        upload.texture.mip_levels = 3;
+        upload.array_layer = 5;
+        let mut commands = Vec::new();
+        push_ir_sampler_view(&mut commands, 9, 7, upload.texture);
+        assert_eq!(&dwords(&commands)[3..6], &[1 | (4 << 24), 5 << 16, 2 << 8]);
+        upload.texture.cube = false;
+        upload.texture.format = IrTextureFormat::Depth32Float;
+        commands.clear();
+        push_ir_sampler_view(&mut commands, 9, 7, upload.texture);
+        assert_eq!(dwords(&commands)[3], VIRGL_FORMAT_Z32_FLOAT | (7 << 24));
+        upload.texture.format = IrTextureFormat::Bgra8;
+        submit_ir_texture_inline_write(7, &upload, 128, |packet| {
+            assert_eq!(dwords(packet)[8], 5);
+            Ok(())
+        })
+        .unwrap();
+        upload.array_layer = 6;
+        assert_eq!(
+            submit_ir_texture_inline_write(7, &upload, 128, |_| panic!(
+                "out-of-range layer submitted"
+            )),
+            Err(HandleError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn programmable_vertex_elements_keep_integer_and_half_inputs_in_separate_buffers() {
+        use crate::ir::{VertexAttribute, VertexBufferLayout, VertexFormat};
+        let layouts = [
+            VertexBufferLayout::new(
+                4,
+                alloc::vec![VertexAttribute::new(0, VertexFormat::Uint32, 0)],
+            )
+            .unwrap(),
+            VertexBufferLayout::new(
+                12,
+                alloc::vec![
+                    VertexAttribute::new(1, VertexFormat::Sint16x4, 0),
+                    VertexAttribute::new(2, VertexFormat::Float16x2, 8),
+                ],
+            )
+            .unwrap(),
+        ];
+        let mut commands = Vec::new();
+        push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
+        assert_eq!(
+            &dwords(&commands)[2..],
+            &[0, 0, 0, 193, 0, 0, 1, 192, 8, 0, 1, 92]
+        );
+    }
+
+    #[test]
+    fn instanced_draw_keeps_instance_count_and_rejects_overflow() {
+        let mut commands = Vec::new();
+        push_instanced_draw_parameters(
+            &mut commands,
+            2,
+            6,
+            true,
+            -1,
+            crate::ir::PrimitiveTopology::TriangleList,
+            17,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            &dwords(&commands)[1..8],
+            &[2, 6, PIPE_PRIM_TRIANGLES, 1, 17, u32::MAX, 0]
+        );
+        commands.clear();
+        assert_eq!(
+            push_instanced_draw_parameters(
+                &mut commands,
+                0,
+                3,
+                false,
+                0,
+                crate::ir::PrimitiveTopology::TriangleList,
+                2,
+                u32::MAX
+            ),
+            Err(HandleError::InvalidParameter)
+        );
+        assert!(commands.is_empty());
+    }
+
     fn texture_upload(width: u32, height: u32) -> IrTextureUpload {
         IrTextureUpload {
             texture: IrTextureSpec {
@@ -5123,6 +5650,8 @@ mod tests {
                 width: width + 3,
                 height: height + 5,
                 mip_levels: 1,
+                array_layers: 1,
+                cube: false,
                 sampled: true,
                 render_attachment: false,
                 copy_destination: true,
@@ -5130,6 +5659,7 @@ mod tests {
                 format: IrTextureFormat::Bgra8,
             },
             mip_level: 0,
+            array_layer: 0,
             destination: crate::driver::IrRect {
                 x: 3,
                 y: 5,

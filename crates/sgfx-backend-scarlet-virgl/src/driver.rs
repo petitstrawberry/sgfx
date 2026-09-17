@@ -627,6 +627,7 @@ pub(crate) struct IrSamplerState {
     pub(crate) mip_filter: IrFilterMode,
     pub(crate) min_lod: f32,
     pub(crate) max_lod: f32,
+    pub(crate) compare: Option<crate::ir::CompareFunction>,
 }
 
 /// Draw-uniform constants sent to the GPU without CPU vertex transformation.
@@ -641,6 +642,9 @@ pub(crate) struct IrUniforms {
 pub(crate) struct IrDraw {
     pub(crate) programmable: Option<Rc<IrProgrammableDraw>>,
     pub(crate) start_vertex: usize,
+    pub(crate) instance_count: u32,
+    pub(crate) first_instance: u32,
+    pub(crate) vertex_buffers: [Option<IrVertexBufferBinding>; 8],
     pub(crate) vertex_count: usize,
     pub(crate) vertex_buffer: Option<IrVertexBufferBinding>,
     pub(crate) pipeline: IrPipelineState,
@@ -669,7 +673,7 @@ pub(crate) struct IrProgrammablePipeline {
     pub(crate) vertex: sgfx_codegen_virgl::programmable::CompiledShader,
     #[cfg(feature = "programmable")]
     pub(crate) fragment: sgfx_codegen_virgl::programmable::CompiledShader,
-    pub(crate) vertex_buffer: Option<crate::ir::VertexBufferLayout>,
+    pub(crate) vertex_buffers: Vec<crate::ir::VertexBufferLayout>,
     pub(crate) topology: crate::ir::PrimitiveTopology,
 }
 
@@ -742,6 +746,14 @@ pub(crate) struct IrProgrammableDraw {
     pub(crate) index_buffer: Option<IrIndexBufferBinding>,
     pub(crate) constants: Rc<[IrConstantBuffer]>,
     pub(crate) textures: Rc<[IrTextureBinding]>,
+    pub(crate) storage_buffers: Rc<[IrStorageBufferBinding]>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IrStorageBufferBinding {
+    pub(crate) stage: crate::ir::ShaderStage,
+    pub(crate) slot: u32,
+    pub(crate) buffer: IrBufferSpec,
 }
 
 #[derive(Clone, Copy)]
@@ -749,7 +761,7 @@ pub(crate) struct IrTextureBinding {
     pub(crate) stage: crate::ir::ShaderStage,
     pub(crate) slot: u32,
     pub(crate) texture: IrTextureSpec,
-    pub(crate) sampler: IrSamplerState,
+    pub(crate) sampler: Option<IrSamplerState>,
 }
 
 /// Converted BGRA texture upload retained until all stream validation succeeds.
@@ -759,6 +771,7 @@ pub(crate) struct IrTextureUpload {
     pub(crate) destination: IrRect,
     pub(crate) pixels: Vec<u8>,
     pub(crate) mip_level: u32,
+    pub(crate) array_layer: u32,
 }
 
 /// Logical texture materialization requirements without backend identifiers.
@@ -768,6 +781,8 @@ pub(crate) struct IrTextureSpec {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) mip_levels: u32,
+    pub(crate) array_layers: u32,
+    pub(crate) cube: bool,
     pub(crate) sampled: bool,
     pub(crate) render_attachment: bool,
     pub(crate) copy_destination: bool,

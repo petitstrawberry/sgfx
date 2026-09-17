@@ -1,5 +1,8 @@
 //! Bounded offscreen color/depth attachments and graphics pipeline state.
 
+// Bound image storage and readback to 64 MiB for four-byte pixels.
+pub(crate) const MAX_IMAGE_DIMENSION: u32 = 4096;
+
 use ash::vk::{self, Handle};
 use sgfx::ir;
 use std::ffi::CStr;
@@ -162,8 +165,8 @@ unsafe extern "system" fn create_image(
         || info.extent.depth != 1
         || info.extent.width == 0
         || info.extent.height == 0
-        || info.extent.width > 2048
-        || info.extent.height > 2048
+        || info.extent.width > MAX_IMAGE_DIMENSION
+        || info.extent.height > MAX_IMAGE_DIMENSION
         || info.usage.is_empty()
         || !supported.contains(info.usage)
         || !valid_image_usage(info.usage)
@@ -203,22 +206,33 @@ unsafe extern "system" fn create_image(
     }
     match with_device(device, move |runtime| {
         let size = ir::Extent2D::new(extent.width, extent.height).map_err(|_| INVALID)?;
+        // Some applications create a sampled image with STORAGE usage even
+        // when this device exposes no storage-image shader support. The
+        // resource can still be uploaded and sampled; an actual storage
+        // binding remains subject to the backend's capability check.
         if image_usage.contains(vk::ImageUsageFlags::STORAGE)
             && !runtime.capabilities.supports_storage_images()
+            && !(format == vk::Format::R8G8B8A8_UNORM
+                && image_usage
+                    .contains(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST))
         {
             return Err(UNSUPPORTED);
         }
         let ir_format = texture_format(format).ok_or(UNSUPPORTED)?;
-        if !runtime.capabilities.supports_typed_texture_views()
-            && (matches!(
+        if (!runtime.capabilities.supports_srgb_texture_views()
+            && matches!(
                 format,
                 vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
-            ) || (format == vk::Format::D32_SFLOAT
-                && image_usage.contains(vk::ImageUsageFlags::SAMPLED)))
+            ))
+            || (!runtime.capabilities.supports_typed_texture_views()
+                && format == vk::Format::D32_SFLOAT
+                && image_usage.contains(vk::ImageUsageFlags::SAMPLED))
         {
             return Err(UNSUPPORTED);
         }
-        if mip_levels > runtime.capabilities.limits().max_image_mip_levels
+        if extent.width > runtime.capabilities.limits().max_image_dimension_2d
+            || extent.height > runtime.capabilities.limits().max_image_dimension_2d
+            || mip_levels > runtime.capabilities.limits().max_image_mip_levels
             || array_layers > runtime.capabilities.limits().max_image_array_layers
         {
             return Err(UNSUPPORTED);
@@ -228,6 +242,8 @@ unsafe extern "system" fn create_image(
             .with_mip_level_count(mip_levels)
             .map_err(|_| UNSUPPORTED)?
             .with_array_layer_count(array_layers)
+            .map_err(|_| UNSUPPORTED)?
+            .with_cube_compatible(flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE))
             .map_err(|_| UNSUPPORTED)?;
         let id = runtime
             .table
@@ -415,6 +431,14 @@ unsafe extern "system" fn create_image_view(
         } else {
             range.layer_count
         };
+        if !runtime.capabilities.supports_srgb_texture_views()
+            && matches!(
+                format,
+                vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+            )
+        {
+            return Err(UNSUPPORTED);
+        }
         if !runtime.capabilities.supports_typed_texture_views()
             && (view_type != vk::ImageViewType::TYPE_2D
                 || data.format != format
@@ -933,7 +957,7 @@ unsafe fn graphics_state(
             view.max_depth,
         )
         .map_err(|_| UNSUPPORTED)?;
-        if view.width > 2048.0 || view.height > 2048.0 {
+        if view.width > MAX_IMAGE_DIMENSION as f32 || view.height > MAX_IMAGE_DIMENSION as f32 {
             return Err(UNSUPPORTED);
         }
     }

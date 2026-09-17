@@ -10,7 +10,9 @@ use naga::{
     AddressSpace, BinaryOperator as B, Binding, BuiltIn, Expression as E, Handle, Literal,
     ScalarKind as K, Statement as S, TypeInner as T,
 };
-use sgfx_core::ir::{ShaderModuleDesc, ShaderSource, ShaderStage, VertexFormat};
+use sgfx_core::ir::{
+    ShaderModuleDesc, ShaderSource, ShaderStage, TextureViewDimension, VertexFormat,
+};
 
 type Result<T> = core::result::Result<T, ShaderCompileError>;
 
@@ -39,6 +41,16 @@ pub struct UniformBufferBinding {
     pub size: u32,
 }
 
+/// A read-only storage buffer lowered to an integer buffer texture. The inline
+/// constant register contains the descriptor's byte offset and byte length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageBufferBinding {
+    pub group: u32,
+    pub binding: u32,
+    pub slot: u32,
+    pub first_register: u32,
+}
+
 /// Push-constant byte layout and its separate inline constant-register span.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushConstantBinding {
@@ -59,6 +71,22 @@ pub struct TextureSamplerBinding {
     pub sampler_group: u32,
     /// Sampler binding.
     pub sampler_binding: u32,
+    /// Texel loads have no sampler descriptor.
+    pub uses_sampler: bool,
+    pub dimension: TextureViewDimension,
+    pub depth: bool,
+    pub comparison: bool,
+}
+
+fn texture_target(binding: &TextureSamplerBinding) -> &'static str {
+    match (binding.dimension, binding.comparison) {
+        (TextureViewDimension::D2, false) => "2D",
+        (TextureViewDimension::D2Array, false) => "2D_ARRAY",
+        (TextureViewDimension::Cube, false) => "CUBE",
+        (TextureViewDimension::D2, true) => "SHADOW2D",
+        (TextureViewDimension::D2Array, true) => "SHADOW2D_ARRAY",
+        (TextureViewDimension::Cube, true) => "SHADOWCUBE",
+    }
 }
 
 /// Numeric type of a stage interface location.
@@ -86,6 +114,7 @@ pub struct CompiledShader {
     pub tgsi: String,
     /// Used uniform buffers, flattened into an inline constant bank per stage.
     pub uniform_buffers: Vec<UniformBufferBinding>,
+    pub storage_buffers: Vec<StorageBufferBinding>,
     /// Push constants occupy a distinct span after every uniform buffer.
     pub push_constants: Option<PushConstantBinding>,
     /// Sampling pairs bound independently for each shader stage.
@@ -109,7 +138,7 @@ pub struct CompiledShader {
 /// zero-to-one clip range to Gallium's negative-one-to-one range at the output.
 /// Uniform buffers keep their declared byte layout and are flattened into each
 /// stage's bounded inline constant bank.
-/// Compute, storage buffers, loops, dynamic indexing stores and early returns
+/// Compute, storage writes, loops, dynamic indexing stores and early returns
 /// are currently rejected. See the tests for executable examples of the subset.
 pub fn compile_shader(
     desc: &ShaderModuleDesc,
@@ -187,8 +216,14 @@ enum Shape {
     Vector(K, usize),
     Matrix(usize, usize),
     Aggregate(Vec<Shape>),
-    Image(u32, u32),
+    Image(u32, u32, TextureViewDimension, bool),
     Sampler(u32, u32),
+    StoragePointer {
+        inner: Box<T>,
+        slot: u32,
+        metadata: u32,
+        offset: Lane,
+    },
 }
 impl Shape {
     fn len(&self) -> usize {
@@ -197,7 +232,7 @@ impl Shape {
             Self::Vector(_, n) => *n,
             Self::Matrix(c, r) => c * r,
             Self::Aggregate(items) => items.iter().map(Self::len).sum(),
-            Self::Image(..) | Self::Sampler(..) => 0,
+            Self::Image(..) | Self::Sampler(..) | Self::StoragePointer { .. } => 0,
         }
     }
     fn kind(&self) -> Result<K> {
@@ -278,6 +313,7 @@ struct Compiler<'a> {
     temp_lanes: usize,
     globals: Vec<Option<Value>>,
     uniforms: Vec<UniformBufferBinding>,
+    storage_buffers: Vec<StorageBufferBinding>,
     push_constants: Option<PushConstantBinding>,
     textures: Vec<TextureSamplerBinding>,
     input_locations: Vec<u32>,
@@ -303,6 +339,7 @@ impl<'a> Compiler<'a> {
             temp_lanes: 0,
             globals: vec![None; module.global_variables.len()],
             uniforms: Vec::new(),
+            storage_buffers: Vec::new(),
             push_constants: None,
             textures: Vec::new(),
             input_locations: Vec::new(),
@@ -423,6 +460,15 @@ impl<'a> Compiler<'a> {
         })
     }
     fn snapshot(&mut self, value: &Value) -> Result<Value> {
+        if let Shape::StoragePointer {
+            inner,
+            slot,
+            metadata,
+            offset,
+        } = &value.shape
+        {
+            return self.storage_load(inner, *slot, *metadata, offset);
+        }
         if let Some(read) = &value.indirect {
             let result = self.allocate(value.shape.clone(), false)?;
             let zero = self.immediate(Literal::U32(0))?;
@@ -600,6 +646,9 @@ impl<'a> Compiler<'a> {
                 }
                 if input && self.stage == ShaderStage::Vertex {
                     let format = match (scalar, shape.len()) {
+                        (IoScalar::Sint, 1) => VertexFormat::Sint32,
+                        (IoScalar::Uint, 1) => VertexFormat::Uint32,
+                        (IoScalar::Sint, 4) => VertexFormat::Sint16x4,
                         (IoScalar::Float, 2) => VertexFormat::Float32x2,
                         (IoScalar::Float, 3) => VertexFormat::Float32x3,
                         (IoScalar::Float, 4) => VertexFormat::Float32x4,
@@ -679,6 +728,7 @@ impl<'a> Compiler<'a> {
         let entry = &self.module.entry_points[index];
         let entry_info = self.info.get_entry_point(index);
         let mut uniform_handles = Vec::new();
+        let mut storage_handles = Vec::new();
         let mut push_constant_handle = None;
         for (handle, global) in self.module.global_variables.iter() {
             if entry_info[handle].is_empty() {
@@ -692,22 +742,28 @@ impl<'a> Compiler<'a> {
                         .ok_or_else(|| unsupported("unbound texture/sampler"))?;
                     let shape = match self.module.types[global.ty].inner {
                         T::Image {
-                            dim: naga::ImageDimension::D2,
-                            arrayed: false,
-                            class:
+                            dim,
+                            arrayed,
+                            class,
+                        } => {
+                            let dimension = match (dim, arrayed) {
+                                (naga::ImageDimension::D2, false) => TextureViewDimension::D2,
+                                (naga::ImageDimension::D2, true) => TextureViewDimension::D2Array,
+                                (naga::ImageDimension::Cube, false) => TextureViewDimension::Cube,
+                                _ => return Err(unsupported("image dimension")),
+                            };
+                            let depth = match class {
                                 naga::ImageClass::Sampled {
                                     kind: K::Float,
                                     multi: false,
-                                },
-                        } => Shape::Image(binding.group, binding.binding),
-                        T::Sampler { comparison: false } => {
-                            Shape::Sampler(binding.group, binding.binding)
+                                } => false,
+                                naga::ImageClass::Depth { multi: false } => true,
+                                _ => return Err(unsupported("image class")),
+                            };
+                            Shape::Image(binding.group, binding.binding, dimension, depth)
                         }
-                        _ => {
-                            return Err(unsupported(
-                                "only non-comparison samplers and float 2D textures are supported",
-                            ));
-                        }
+                        T::Sampler { .. } => Shape::Sampler(binding.group, binding.binding),
+                        _ => return Err(unsupported("opaque resource type")),
                     };
                     self.globals[handle.index()] = Some(Value {
                         shape,
@@ -723,6 +779,15 @@ impl<'a> Compiler<'a> {
                         .ok_or_else(|| unsupported("uniform without resource binding"))?;
                     uniform_handles.push((binding.group, binding.binding, handle));
                 }
+                AddressSpace::Storage { access }
+                    if !access.contains(naga::StorageAccess::STORE) =>
+                {
+                    let binding = global
+                        .binding
+                        .as_ref()
+                        .ok_or_else(|| unsupported("storage buffer without binding"))?;
+                    storage_handles.push((binding.group, binding.binding, handle));
+                }
                 AddressSpace::PushConstant => {
                     if push_constant_handle.replace(handle).is_some() {
                         return Err(unsupported("multiple push-constant blocks"));
@@ -731,7 +796,7 @@ impl<'a> Compiler<'a> {
                 AddressSpace::Private => {}
                 _ => {
                     return Err(unsupported(
-                        "resource address space (only uniform and private are supported)",
+                        "resource address space or writable storage buffer",
                     ));
                 }
             }
@@ -781,6 +846,43 @@ impl<'a> Compiler<'a> {
                 size,
             });
             self.globals[handle.index()] = Some(self.uniform_value(ty, first_register * 16)?);
+        }
+        if storage_handles.len() > 4 {
+            return Err(unsupported("more than four storage buffers in a stage"));
+        }
+        storage_handles.sort_by_key(|value| (value.0, value.1));
+        for (group, binding, handle) in storage_handles {
+            let slot = self.storage_buffers.len() as u32;
+            let metadata = next_constant_register;
+            next_constant_register += 1;
+            if next_constant_register > 1024 {
+                return Err(unsupported("more than 1024 inline constant registers"));
+            }
+            self.declarations.push(format!("DCL SAMP[{slot}]"));
+            self.declarations
+                .push(format!("DCL SVIEW[{slot}], BUFFER, UINT"));
+            self.storage_buffers.push(StorageBufferBinding {
+                group,
+                binding,
+                slot,
+                first_register: metadata,
+            });
+            let offset = self.immediate(Literal::U32(0))?.lanes[0].clone();
+            self.globals[handle.index()] = Some(Value {
+                shape: Shape::StoragePointer {
+                    inner: Box::new(
+                        self.module.types[self.module.global_variables[handle].ty]
+                            .inner
+                            .clone(),
+                    ),
+                    slot,
+                    metadata,
+                    offset,
+                },
+                lanes: Vec::new(),
+                writable: false,
+                indirect: None,
+            });
         }
         if next_constant_register == 1 {
             self.declarations.push("DCL CONST[0]".into());
@@ -859,6 +961,7 @@ impl<'a> Compiler<'a> {
             stage: self.stage,
             tgsi,
             uniform_buffers: self.uniforms,
+            storage_buffers: self.storage_buffers,
             push_constants: self.push_constants,
             textures: self.textures,
             input_locations: self.input_locations,
@@ -1018,6 +1121,24 @@ impl<'a> Compiler<'a> {
             E::Load { pointer } => {
                 let value = self.expression(frame, pointer)?;
                 Some(self.snapshot(&value)?)
+            }
+            E::AccessIndex { base, index } => {
+                let base = self.expression(frame, base)?;
+                if matches!(base.shape, Shape::StoragePointer { .. }) {
+                    Some(self.storage_access(&base, Some(index), None)?)
+                } else {
+                    None
+                }
+            }
+            E::Access { base, index } => {
+                let base = self.expression(frame, base)?;
+                if matches!(base.shape, Shape::StoragePointer { .. }) {
+                    let constant = self.constant_index(frame, index);
+                    let index = self.expression(frame, index)?;
+                    Some(self.storage_access(&base, constant, Some(&index))?)
+                } else {
+                    None
+                }
             }
             _ => None,
         };
@@ -1203,56 +1324,78 @@ impl<'a> Compiler<'a> {
                 sampler,
                 gather: None,
                 coordinate,
-                array_index: None,
+                array_index,
                 offset: None,
                 level,
-                depth_ref: None,
+                depth_ref,
             } => {
                 let image = self.expression(frame, image)?;
                 let sampler = self.expression(frame, sampler)?;
-                let (
-                    Shape::Image(image_group, image_binding),
-                    Shape::Sampler(sampler_group, sampler_binding),
-                ) = (&image.shape, &sampler.shape)
+                let (Shape::Image(group, binding, dimension, depth), Shape::Sampler(sg, sb)) =
+                    (&image.shape, &sampler.shape)
                 else {
                     return Err(unsupported("sampling handles"));
                 };
-                let mut pair = TextureSamplerBinding {
+                if depth_ref.is_some() && !depth {
+                    return Err(unsupported("comparison image type"));
+                }
+                let pair = TextureSamplerBinding {
                     slot: 0,
-                    image_group: *image_group,
-                    image_binding: *image_binding,
-                    sampler_group: *sampler_group,
-                    sampler_binding: *sampler_binding,
+                    image_group: *group,
+                    image_binding: *binding,
+                    sampler_group: *sg,
+                    sampler_binding: *sb,
+                    uses_sampler: true,
+                    dimension: *dimension,
+                    depth: *depth,
+                    comparison: depth_ref.is_some(),
                 };
-                let slot = if let Some(pair) = self.textures.iter().find(|p| {
-                    p.image_group == pair.image_group
-                        && p.image_binding == pair.image_binding
-                        && p.sampler_group == pair.sampler_group
-                        && p.sampler_binding == pair.sampler_binding
-                }) {
-                    pair.slot
-                } else {
-                    if self.textures.len() >= 16 {
-                        return Err(unsupported("more than 16 sampling pairs"));
-                    }
-                    pair.slot = self.textures.len() as u32;
-                    let slot = pair.slot;
-                    self.textures.push(pair);
-                    self.declarations.push(format!("DCL SAMP[{slot}]"));
-                    self.declarations
-                        .push(format!("DCL SVIEW[{slot}], 2D, FLOAT"));
-                    slot
-                };
+                let target = texture_target(&pair);
+                let slot = self.texture_slot(pair)?;
                 let coordinate = self.expression(frame, coordinate)?;
-                if !matches!(coordinate.shape, Shape::Vector(K::Float, 2)) {
-                    return Err(unsupported("2D sampling coordinates"));
+                let components = if *dimension == TextureViewDimension::Cube {
+                    3
+                } else {
+                    2
+                };
+                if !matches!(coordinate.shape,Shape::Vector(K::Float,n) if n==components)
+                    || array_index.is_some() != (*dimension == TextureViewDimension::D2Array)
+                {
+                    return Err(unsupported("sampling coordinates"));
                 }
                 self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
                 let coords = self.allocate(Shape::Vector(K::Float, 4), false)?;
                 let zero = self.immediate(Literal::F32(0.0))?;
-                for component in 0..4 {
-                    let source = coordinate.lanes.get(component).unwrap_or(&zero.lanes[0]);
-                    self.instruction("MOV", &coords.lanes[component], &[source])?;
+                for i in 0..4 {
+                    self.instruction(
+                        "MOV",
+                        &coords.lanes[i],
+                        &[coordinate.lanes.get(i).unwrap_or(&zero.lanes[0])],
+                    )?;
+                }
+                if let Some(layer) = array_index {
+                    let layer = self.expression(frame, layer)?;
+                    self.instruction(
+                        if layer.shape.kind()? == K::Uint {
+                            "U2F"
+                        } else {
+                            "I2F"
+                        },
+                        &coords.lanes[2],
+                        &[&layer.lanes[0]],
+                    )?;
+                }
+                if let Some(reference) = depth_ref {
+                    let reference = self.expression(frame, reference)?;
+                    let component = if *dimension == TextureViewDimension::D2 {
+                        2
+                    } else {
+                        3
+                    };
+                    self.instruction("MOV", &coords.lanes[component], &[&reference.lanes[0]])?;
+                    if component == 3 && !matches!(level, naga::SampleLevel::Auto) {
+                        return Err(unsupported("array/cube comparison LOD"));
+                    }
                 }
                 let opcode = match level {
                     naga::SampleLevel::Auto if self.stage == ShaderStage::Fragment => "TEX",
@@ -1262,20 +1405,67 @@ impl<'a> Compiler<'a> {
                         self.instruction("MOV", &coords.lanes[3], &[&lod.lanes[0]])?;
                         "TXL"
                     }
-                    naga::SampleLevel::Bias(bias) if self.stage == ShaderStage::Fragment => {
-                        let bias = self.expression(frame, bias)?;
-                        self.instruction("MOV", &coords.lanes[3], &[&bias.lanes[0]])?;
+                    naga::SampleLevel::Bias(lod) if self.stage == ShaderStage::Fragment => {
+                        let lod = self.expression(frame, lod)?;
+                        self.instruction("MOV", &coords.lanes[3], &[&lod.lanes[0]])?;
                         "TXB"
                     }
                     _ => return Err(unsupported("sampling level/gradients")),
                 };
+                self.texture_instruction(opcode, slot, target, &coords, shape)?
+            }
+            E::ImageLoad {
+                image,
+                coordinate,
+                array_index,
+                sample: None,
+                level,
+            } => {
+                let image = self.expression(frame, image)?;
+                let Shape::Image(group, binding, dimension, depth) = image.shape else {
+                    return Err(unsupported("texel load handle"));
+                };
+                if dimension == TextureViewDimension::Cube
+                    || array_index.is_some() != (dimension == TextureViewDimension::D2Array)
+                {
+                    return Err(unsupported("texel load dimension"));
+                }
+                let pair = TextureSamplerBinding {
+                    slot: 0,
+                    image_group: group,
+                    image_binding: binding,
+                    sampler_group: 0,
+                    sampler_binding: 0,
+                    uses_sampler: false,
+                    dimension,
+                    depth,
+                    comparison: false,
+                };
+                let target = texture_target(&pair);
+                let slot = self.texture_slot(pair)?;
+                let coordinate = self.expression(frame, coordinate)?;
+                if !matches!(coordinate.shape, Shape::Vector(K::Sint | K::Uint, 2)) {
+                    return Err(unsupported("texel load coordinates"));
+                }
                 self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
-                let result = self.allocate(Shape::Vector(K::Float, 4), false)?;
-                self.instructions.push(format!(
-                    "{opcode} {}, {}, SAMP[{slot}], 2D",
-                    result.lanes[0].register, coords.lanes[0].register
-                ));
-                result
+                let coords = self.allocate(Shape::Vector(K::Sint, 4), false)?;
+                let zero = self.immediate(Literal::I32(0))?;
+                for i in 0..4 {
+                    self.instruction(
+                        "MOV",
+                        &coords.lanes[i],
+                        &[coordinate.lanes.get(i).unwrap_or(&zero.lanes[0])],
+                    )?;
+                }
+                if let Some(layer) = array_index {
+                    let layer = self.expression(frame, layer)?;
+                    self.instruction("MOV", &coords.lanes[2], &[&layer.lanes[0]])?;
+                }
+                if let Some(lod) = level {
+                    let lod = self.expression(frame, lod)?;
+                    self.instruction("MOV", &coords.lanes[3], &[&lod.lanes[0]])?;
+                }
+                self.texture_instruction("TXF", slot, target, &coords, shape)?
             }
             E::Math {
                 fun,
@@ -1297,6 +1487,207 @@ impl<'a> Compiler<'a> {
         };
         frame.expressions[handle.index()] = Some(value.clone());
         Ok(value)
+    }
+    fn storage_access(
+        &mut self,
+        value: &Value,
+        constant: Option<u32>,
+        index: Option<&Value>,
+    ) -> Result<Value> {
+        let Shape::StoragePointer {
+            inner,
+            slot,
+            metadata,
+            offset,
+        } = &value.shape
+        else {
+            return Err(unsupported("storage pointer"));
+        };
+        let (inner, stride, fixed) = match inner.as_ref() {
+            T::Struct { members, .. } => {
+                let member = constant
+                    .and_then(|i| members.get(i as usize))
+                    .ok_or_else(|| unsupported("storage structure member"))?;
+                (self.module.types[member.ty].inner.clone(), 0, member.offset)
+            }
+            T::Array { base, stride, .. } => (self.module.types[*base].inner.clone(), *stride, 0),
+            T::Vector { scalar, .. } => (T::Scalar(*scalar), u32::from(scalar.width), 0),
+            T::Matrix { rows, scalar, .. } => (
+                T::Vector {
+                    size: *rows,
+                    scalar: *scalar,
+                },
+                if *rows == naga::VectorSize::Bi { 8 } else { 16 },
+                0,
+            ),
+            _ => return Err(unsupported("storage composite indexing")),
+        };
+        let delta = if let Some(index) = constant {
+            self.immediate(Literal::U32(
+                index
+                    .checked_mul(stride)
+                    .and_then(|v| v.checked_add(fixed))
+                    .ok_or_else(|| unsupported("storage offset overflow"))?,
+            ))?
+        } else {
+            let index = index.ok_or_else(|| unsupported("storage array index"))?;
+            if !matches!(index.shape, Shape::Scalar(K::Sint | K::Uint)) {
+                return Err(unsupported("non-integer storage array index"));
+            }
+            let scale = self.immediate(Literal::U32(stride))?;
+            let delta = self.allocate(Shape::Scalar(K::Uint), false)?;
+            self.instruction("UMUL", &delta.lanes[0], &[&index.lanes[0], &scale.lanes[0]])?;
+            delta
+        };
+        let address = self.allocate(Shape::Scalar(K::Uint), false)?;
+        self.instruction("UADD", &address.lanes[0], &[offset, &delta.lanes[0]])?;
+        Ok(Value {
+            shape: Shape::StoragePointer {
+                inner: Box::new(inner),
+                slot: *slot,
+                metadata: *metadata,
+                offset: address.lanes[0].clone(),
+            },
+            lanes: Vec::new(),
+            writable: false,
+            indirect: None,
+        })
+    }
+
+    fn storage_offsets(&self, inner: &T, base: u32, output: &mut Vec<u32>) -> Result<()> {
+        match inner {
+            T::Scalar(scalar) if scalar.width == 4 => output.push(base),
+            T::Vector { size, scalar } if scalar.width == 4 => {
+                output.extend((0..*size as u32).map(|i| base + i * 4));
+            }
+            T::Matrix {
+                columns,
+                rows,
+                scalar,
+            } if scalar.width == 4 => {
+                let stride = if *rows == naga::VectorSize::Bi { 8 } else { 16 };
+                for column in 0..*columns as u32 {
+                    output.extend((0..*rows as u32).map(|row| base + column * stride + row * 4));
+                }
+            }
+            T::Struct { members, .. } => {
+                for member in members {
+                    self.storage_offsets(
+                        &self.module.types[member.ty].inner,
+                        base + member.offset,
+                        output,
+                    )?;
+                }
+            }
+            T::Array {
+                base: element,
+                size: naga::ArraySize::Constant(count),
+                stride,
+            } if count.get() <= 64 => {
+                for i in 0..count.get() {
+                    self.storage_offsets(
+                        &self.module.types[*element].inner,
+                        base + i * stride,
+                        output,
+                    )?;
+                }
+            }
+            _ => return Err(unsupported("storage load layout")),
+        }
+        Ok(())
+    }
+
+    fn storage_load(
+        &mut self,
+        inner: &T,
+        slot: u32,
+        metadata: u32,
+        offset: &Lane,
+    ) -> Result<Value> {
+        let result = self.allocate(self.shape(inner)?, false)?;
+        let mut offsets = Vec::new();
+        self.storage_offsets(inner, 0, &mut offsets)?;
+        let base = Lane {
+            register: format!("CONST[{metadata}]"),
+            component: 0,
+        };
+        let length = Lane {
+            register: format!("CONST[{metadata}]"),
+            component: 1,
+        };
+        let shift = self.immediate(Literal::U32(2))?;
+        let zero = self.immediate(Literal::U32(0))?;
+        self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
+        let coords = self.allocate(Shape::Vector(K::Uint, 4), false)?;
+        let texel = self.allocate(Shape::Vector(K::Uint, 4), false)?;
+        let relative = self.allocate(Shape::Scalar(K::Uint), false)?;
+        let valid = self.allocate(Shape::Scalar(K::Bool), false)?;
+        for lane in &coords.lanes {
+            self.instruction("MOV", lane, &[&zero.lanes[0]])?;
+        }
+        for (destination, extra) in result.lanes.iter().zip(offsets) {
+            let extra = self.immediate(Literal::U32(extra))?;
+            self.instruction("UADD", &relative.lanes[0], &[offset, &extra.lanes[0]])?;
+            self.instruction("USLT", &valid.lanes[0], &[&relative.lanes[0], &length])?;
+            self.instruction("UADD", &coords.lanes[0], &[&base, &relative.lanes[0]])?;
+            self.instruction(
+                "USHR",
+                &coords.lanes[0],
+                &[&coords.lanes[0], &shift.lanes[0]],
+            )?;
+            self.instructions.push(format!(
+                "TXF {}, {}, SAMP[{slot}], BUFFER",
+                texel.lanes[0].register, coords.lanes[0].register
+            ));
+            self.instruction(
+                "UCMP",
+                destination,
+                &[&valid.lanes[0], &texel.lanes[0], &zero.lanes[0]],
+            )?;
+        }
+        Ok(result)
+    }
+
+    fn texture_slot(&mut self, mut pair: TextureSamplerBinding) -> Result<u32> {
+        if let Some(existing) = self.textures.iter().find(|existing| {
+            let mut key = (*existing).clone();
+            key.slot = 0;
+            key == pair
+        }) {
+            return Ok(existing.slot);
+        }
+        if self.textures.len() + self.storage_buffers.len() >= 16 {
+            return Err(unsupported("more than 16 texture bindings"));
+        }
+        let slot = (self.textures.len() + self.storage_buffers.len()) as u32;
+        pair.slot = slot;
+        self.declarations.push(format!("DCL SAMP[{slot}]"));
+        self.declarations.push(format!(
+            "DCL SVIEW[{slot}], {}, FLOAT",
+            texture_target(&pair)
+        ));
+        self.textures.push(pair);
+        Ok(slot)
+    }
+    fn texture_instruction(
+        &mut self,
+        opcode: &str,
+        slot: u32,
+        target: &str,
+        coords: &Value,
+        shape: Shape,
+    ) -> Result<Value> {
+        self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
+        let result = self.allocate(Shape::Vector(K::Float, 4), false)?;
+        self.instructions.push(format!(
+            "{opcode} {}, {}, SAMP[{slot}], {target}",
+            result.lanes[0].register, coords.lanes[0].register
+        ));
+        if matches!(shape, Shape::Scalar(K::Float)) {
+            result.element(0)
+        } else {
+            Ok(result)
+        }
     }
     fn unary_instruction(&mut self, opcode: &str, value: &Value, shape: Shape) -> Result<Value> {
         let result = self.allocate(shape, false)?;
@@ -1417,6 +1808,41 @@ impl<'a> Compiler<'a> {
         shape: Shape,
     ) -> Result<Value> {
         use naga::MathFunction as M;
+        if fun == M::Cross {
+            let b = b.ok_or_else(|| unsupported("cross operands"))?;
+            if a.lanes.len() != 3 || b.lanes.len() != 3 || a.shape.kind()? != K::Float {
+                return Err(unsupported("cross type"));
+            }
+            let result = self.allocate(shape, false)?;
+            let temp = self.allocate(Shape::Vector(K::Float, 2), false)?;
+            for i in 0..3 {
+                let j = (i + 1) % 3;
+                let k = (i + 2) % 3;
+                self.instruction("MUL", &temp.lanes[0], &[&a.lanes[j], &b.lanes[k]])?;
+                self.instruction("MUL", &temp.lanes[1], &[&a.lanes[k], &b.lanes[j]])?;
+                self.instruction("SUB", &result.lanes[i], &[&temp.lanes[0], &temp.lanes[1]])?;
+            }
+            return Ok(result);
+        }
+        if fun == M::Mix {
+            let b = b.ok_or_else(|| unsupported("mix operands"))?;
+            let c = c.ok_or_else(|| unsupported("mix operands"))?;
+            let difference = self.binary(B::Subtract, &b, &a, shape.clone())?;
+            let weighted = self.binary(B::Multiply, &difference, &c, shape.clone())?;
+            return self.binary(B::Add, &a, &weighted, shape);
+        }
+        if fun == M::Step {
+            let x = b.ok_or_else(|| unsupported("step operands"))?;
+            let result = self.allocate(shape, false)?;
+            for (i, destination) in result.lanes.iter().enumerate() {
+                self.instruction(
+                    "SGE",
+                    destination,
+                    &[&x.lanes[i % x.lanes.len()], &a.lanes[i % a.lanes.len()]],
+                )?;
+            }
+            return Ok(result);
+        }
         if matches!(fun, M::Dot | M::Length | M::Normalize) {
             let rhs = b.as_ref().unwrap_or(&a);
             let dot = self.allocate(Shape::Scalar(K::Float), false)?;
@@ -1443,6 +1869,36 @@ impl<'a> Compiler<'a> {
             let limited = self.math(M::Max, a, Some(lower), None, shape.clone())?;
             return self.math(M::Min, limited, Some(upper), None, shape);
         }
+        if matches!(a.shape.kind()?, K::Sint | K::Uint) {
+            let signed = a.shape.kind()? == K::Sint;
+            let opcode = match fun {
+                M::Min => {
+                    if signed {
+                        "IMIN"
+                    } else {
+                        "UMIN"
+                    }
+                }
+                M::Max => {
+                    if signed {
+                        "IMAX"
+                    } else {
+                        "UMAX"
+                    }
+                }
+                M::Abs if signed => "IABS",
+                _ => return Err(unsupported(&format!("integer math builtin {fun:?}"))),
+            };
+            let result = self.allocate(shape, false)?;
+            for (i, dst) in result.lanes.iter().enumerate() {
+                let mut sources = vec![&a.lanes[i % a.lanes.len()]];
+                if let Some(b) = &b {
+                    sources.push(&b.lanes[i % b.lanes.len()]);
+                }
+                self.instruction(opcode, dst, &sources)?;
+            }
+            return Ok(result);
+        }
         let opcode = match fun {
             M::Abs => "ABS",
             M::Floor => "FLR",
@@ -1459,7 +1915,7 @@ impl<'a> Compiler<'a> {
             M::Min => "MIN",
             M::Max => "MAX",
             M::Pow => "POW",
-            _ => return Err(unsupported("math function")),
+            _ => return Err(unsupported(&format!("math function {fun:?}"))),
         };
         if a.shape.kind()? != K::Float {
             return Err(unsupported("integer math builtin"));

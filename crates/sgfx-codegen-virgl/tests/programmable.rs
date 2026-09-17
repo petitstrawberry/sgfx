@@ -26,6 +26,60 @@ fn sample(uv: vec2<f32>) -> vec4<f32> { return textureSample(image, filtering, u
 fn wgsl(source: &str) -> ShaderModuleDesc {
     ShaderModuleDesc::wgsl(source.into()).unwrap()
 }
+
+#[test]
+fn readonly_storage_arrays_preserve_struct_matrix_layout_and_dynamic_indices() {
+    let source = r#"
+struct Object { translation: vec3<f32>, joint: u32, transform: mat3x3<f32> };
+@group(1) @binding(1) var<storage, read> objects: array<Object>;
+@group(1) @binding(2) var<storage, read> joints: array<mat4x4<f32>>;
+@vertex fn main(@location(0) position: vec3<f32>, @builtin(instance_index) instance: u32) -> @builtin(position) vec4<f32> {
+    let object = objects[instance];
+    return joints[object.joint] * vec4<f32>(object.transform * position + object.translation, 1.0);
+}"#;
+    for module in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&module, ShaderStage::Vertex, "main").unwrap();
+        assert_eq!(shader.storage_buffers.len(), 2);
+        assert_eq!(
+            (
+                shader.storage_buffers[0].group,
+                shader.storage_buffers[0].binding
+            ),
+            (1, 1)
+        );
+        assert_eq!(shader.storage_buffers[1].first_register, 1);
+        assert!(shader.tgsi.contains("DCL SVIEW[0], BUFFER, UINT"));
+        assert!(shader.tgsi.contains("DCL SVIEW[1], BUFFER, UINT"));
+        assert!(shader.tgsi.contains("UINT32 { 64, 64, 64, 64 }"));
+        assert!(shader.tgsi.contains("UINT32 { 48, 48, 48, 48 }"));
+        assert!(shader.tgsi.contains("USLT"));
+        assert!(shader.tgsi.contains("TXF"));
+        if let Ok(directory) = std::env::var("SGFX_TGSI_EXPORT_DIR") {
+            std::fs::write(
+                std::path::Path::new(&directory).join("storage.vert.tgsi"),
+                &shader.tgsi,
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn quaternion_color_and_signed_index_math_compile_for_wgsl_and_spirv() {
+    let source = r#"
+@vertex fn main(@location(0) p: vec3<f32>, @location(1) q: vec4<f32>, @location(2) joint: i32) -> @builtin(position) vec4<f32> {
+    let rotated = p + 2.0 * cross(cross(p, q.xyz) + q.w * p, q.xyz);
+    let t = step(0.5, p.x);
+    return vec4<f32>(mix(p, rotated, t), f32(max(joint, 0) + 1));
+}"#;
+    for module in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&module, ShaderStage::Vertex, "main").unwrap();
+        assert!(shader.tgsi.contains("IMAX"));
+        assert!(shader.tgsi.contains("SGE"));
+        assert!(shader.tgsi.contains("MUL"));
+        assert!(shader.tgsi.contains("SUB"));
+    }
+}
 fn spirv(source: &str) -> ShaderModuleDesc {
     let module = naga::front::wgsl::parse_str(source).unwrap();
     let info = naga::valid::Validator::new(
@@ -301,7 +355,7 @@ fn unsupported_shaders_fail_instead_of_emitting_a_compatibility_shader() {
             "compute",
         ),
         (
-            "@group(0) @binding(0) var<storage,read> x:array<vec4<f32>>; @vertex fn main()->@builtin(position) vec4<f32>{return x[0];}",
+            "@group(0) @binding(0) var<storage,read_write> x:array<vec4<f32>>; @vertex fn main()->@builtin(position) vec4<f32>{x[0]=vec4<f32>(1.0); return x[0];}",
             ShaderStage::Vertex,
             "resource address space",
         ),
@@ -331,6 +385,14 @@ fn export_tgsi_acceptance_fixtures() {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/virgl-compiler-shaders");
     std::fs::create_dir_all(&directory).unwrap();
+    for (format, source) in [("wgsl", wgsl(LAYERED)), ("spirv", spirv(LAYERED))] {
+        let shader = compile_shader(&source, ShaderStage::Fragment, "main").unwrap();
+        std::fs::write(
+            directory.join(format!("layered-{format}.frag.tgsi")),
+            shader.tgsi,
+        )
+        .unwrap();
+    }
     for (format, source) in [("wgsl", wgsl(TEXTURED)), ("spirv", spirv(TEXTURED))] {
         let shader = compile_shader(&source, ShaderStage::Fragment, "fs_main").unwrap();
         std::fs::write(
@@ -350,6 +412,54 @@ fn export_tgsi_acceptance_fixtures() {
                 shader.tgsi,
             )
             .unwrap();
+        }
+    }
+}
+
+const LAYERED: &str = r#"
+@group(0) @binding(0) var cube: texture_cube<f32>;
+@group(0) @binding(1) var layers: texture_2d_array<f32>;
+@group(0) @binding(2) var depth: texture_depth_2d;
+@group(0) @binding(3) var linear: sampler;
+@group(0) @binding(4) var compare: sampler_comparison;
+@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let a = textureSample(cube, linear, vec3<f32>(uv, 1.0));
+    let b = textureSample(layers, linear, uv, 2);
+    let c = textureSampleCompare(depth, compare, uv, 0.5);
+    let d = textureLoad(layers, vec2<i32>(uv * 16.0), 1, 0);
+    let e = textureLoad(depth, vec2<i32>(uv * 16.0), 0);
+    return a + b + d + vec4<f32>(c + e);
+}
+"#;
+
+#[test]
+fn cube_array_depth_comparison_and_texel_loads_preserve_binding_types() {
+    use sgfx_core::ir::TextureViewDimension;
+    for module in [wgsl(LAYERED), spirv(LAYERED)] {
+        let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+        assert_eq!(shader.textures.len(), 5);
+        assert!(
+            shader
+                .textures
+                .iter()
+                .any(|b| b.dimension == TextureViewDimension::Cube && b.uses_sampler)
+        );
+        assert!(
+            shader
+                .textures
+                .iter()
+                .any(|b| b.dimension == TextureViewDimension::D2Array && !b.uses_sampler)
+        );
+        assert!(
+            shader
+                .textures
+                .iter()
+                .any(|b| b.depth && b.comparison && b.sampler_binding == 4)
+        );
+        assert!(shader.textures.iter().any(|b| b.depth && !b.uses_sampler));
+        assert_eq!(shader.tgsi.matches("TXF ").count(), 2);
+        for target in ["CUBE", "2D_ARRAY", "SHADOW2D"] {
+            assert!(shader.tgsi.contains(target));
         }
     }
 }

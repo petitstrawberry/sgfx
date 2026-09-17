@@ -108,6 +108,7 @@ pub struct Capabilities {
     storage_buffers: bool,
     storage_images: bool,
     typed_texture_views: bool,
+    srgb_texture_views: bool,
     extended_vertex_formats: bool,
     rgba8_color_attachment: bool,
     bgra8_color_attachment: bool,
@@ -153,9 +154,13 @@ impl Capabilities {
     pub const fn supports_storage_images(&self) -> bool {
         self.storage_images
     }
-    /// Whether typed views, sRGB reinterpretation and sampled depth execute.
+    /// Whether typed texture views and sampled depth execute.
     pub const fn supports_typed_texture_views(&self) -> bool {
         self.typed_texture_views
+    }
+    /// Whether native sRGB sampling and color conversion execute.
+    pub const fn supports_srgb_texture_views(&self) -> bool {
+        self.srgb_texture_views
     }
     /// Whether integer, half-float and packed signed-normal vertex inputs execute.
     pub const fn supports_extended_vertex_formats(&self) -> bool {
@@ -1065,6 +1070,7 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                             .allowed_usages
                             .contains(wgpu::TextureUsages::STORAGE_BINDING),
                     typed_texture_views: true,
+                    srgb_texture_views: true,
                     extended_vertex_formats: true,
                     rgba8_color_attachment: rgba
                         .allowed_usages
@@ -1214,10 +1220,12 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                 vertex_buffers: true,
                 index_buffers: true,
                 uniform_buffers: true,
-                storage_buffers: false,
+                storage_buffers: capabilities.supports_programmable_graphics(),
                 storage_images: false,
-                typed_texture_views: false,
-                extended_vertex_formats: false,
+                typed_texture_views: capabilities.supports_texture_arrays()
+                    && capabilities.supports_depth_sampling(),
+                srgb_texture_views: false,
+                extended_vertex_formats: true,
                 rgba8_color_attachment: true,
                 bgra8_color_attachment: true,
                 depth32_attachment: capabilities.supports_depth(),
@@ -1229,21 +1237,25 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                     } else {
                         0
                     },
-                    max_image_dimension_2d: 2048,
-                    max_image_array_layers: 1,
+                    max_image_dimension_2d: 4096,
+                    max_image_array_layers: if capabilities.supports_texture_arrays() {
+                        2048
+                    } else {
+                        1
+                    },
                     max_image_mip_levels: if capabilities.supports_image_mips() {
-                        12
+                        13
                     } else {
                         1
                     },
                     max_uniform_buffer_range: 16 * 1024,
-                    max_storage_buffer_range: 0,
+                    max_storage_buffer_range: 256 * 1024,
                     max_bound_descriptor_sets: 4,
                     max_uniform_buffers_per_stage: 12,
-                    max_storage_buffers_per_stage: 0,
+                    max_storage_buffers_per_stage: 4,
                     max_storage_images_per_stage: 0,
                     max_vertex_attributes: 16,
-                    max_vertex_buffers: 1,
+                    max_vertex_buffers: 8,
                     max_vertex_buffer_stride: 2048,
                     max_inter_stage_components: 60,
                     max_color_attachments: 1,
@@ -1252,7 +1264,7 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                     max_compute_work_group_invocations: 0,
                     max_compute_work_group_size: [0; 3],
                     min_uniform_buffer_offset_alignment: 16,
-                    min_storage_buffer_offset_alignment: 1,
+                    min_storage_buffer_offset_alignment: 4,
                     max_buffer_size: u64::from(u32::MAX),
                 },
             },

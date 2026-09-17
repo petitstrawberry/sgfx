@@ -166,26 +166,12 @@ fn compile_pipeline(
             UnsupportedIrFeature::PrimitiveTopology,
         ));
     }
-    if pipeline.vertex_buffers().len() > 1 {
-        return Err(IrSubmitError::Unsupported(
-            UnsupportedIrFeature::VertexLayout,
-        ));
-    }
-    if let Some(layout) = pipeline.vertex_buffer()
-        && layout
-            .attributes()
+    if pipeline.vertex_buffers().len() > 8
+        || pipeline
+            .vertex_buffers()
             .iter()
-            .enumerate()
-            .any(|(index, attribute)| {
-                attribute.location() != index as u32
-                    || !matches!(
-                        attribute.format(),
-                        VertexFormat::Float32x2
-                            | VertexFormat::Float32x3
-                            | VertexFormat::Float32x4
-                            | VertexFormat::Unorm8x4
-                    )
-            })
+            .flat_map(|layout| layout.attributes())
+            .any(|a| a.location() >= 16)
     {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::VertexLayout,
@@ -196,12 +182,16 @@ fn compile_pipeline(
             !matches!(
                 binding.ty(),
                 ir::BindingType::UniformBuffer
+                    | ir::BindingType::StorageBuffer { read_only: true }
                     | ir::BindingType::SampledTexture
                     | ir::BindingType::SampledTextureView {
-                        dimension: ir::TextureViewDimension::D2,
-                        depth: false
+                        dimension: ir::TextureViewDimension::D2
+                            | ir::TextureViewDimension::D2Array
+                            | ir::TextureViewDimension::Cube,
+                        depth: _
                     }
                     | ir::BindingType::Sampler
+                    | ir::BindingType::ComparisonSampler
             )
         }) {
             return Err(IrSubmitError::Unsupported(
@@ -216,35 +206,41 @@ fn compile_pipeline(
     };
     let vertex = compile(pipeline.vertex())?;
     let fragment = compile(pipeline.fragment())?;
-    if vertex.input_locations.iter().any(|location| {
-        pipeline.vertex_buffer().is_none_or(|layout| {
-            !layout
-                .attributes()
-                .iter()
-                .any(|attribute| attribute.location() == *location)
-        })
-    }) || fragment
+    let attributes = || {
+        pipeline
+            .vertex_buffers()
+            .iter()
+            .flat_map(|layout| layout.attributes())
+    };
+    if vertex
         .input_locations
         .iter()
-        .any(|location| !vertex.output_locations.contains(location))
-        || fragment.output_locations != [0]
+        .any(|location| !attributes().any(|attribute| attribute.location() == *location))
+        || fragment
+            .input_locations
+            .iter()
+            .any(|location| !vertex.output_locations.contains(location))
+        || fragment
+            .output_locations
+            .iter()
+            .any(|&location| location != 0)
     {
         return Err(ir::Error::InvalidDescriptor.into());
     }
-    for (location, expected) in &vertex.vertex_inputs {
-        let attribute = pipeline
-            .vertex_buffer()
-            .and_then(|layout| {
-                layout
-                    .attributes()
-                    .iter()
-                    .find(|attribute| attribute.location() == *location)
-            })
+    for input in &vertex.inputs {
+        use sgfx_codegen_virgl::programmable::IoScalar;
+        let attribute = attributes()
+            .find(|attribute| attribute.location() == input.location)
             .ok_or(ir::Error::InvalidDescriptor)?;
-        if attribute.format() != *expected
-            && !(attribute.format() == VertexFormat::Unorm8x4
-                && *expected == VertexFormat::Float32x4)
-        {
+        let (scalar, components) = match attribute.format() {
+            VertexFormat::Sint32 => (IoScalar::Sint, 1),
+            VertexFormat::Uint32 => (IoScalar::Uint, 1),
+            VertexFormat::Sint16x4 => (IoScalar::Sint, 4),
+            VertexFormat::Float16x2 | VertexFormat::Float32x2 => (IoScalar::Float, 2),
+            VertexFormat::Float32x3 => (IoScalar::Float, 3),
+            _ => (IoScalar::Float, 4),
+        };
+        if scalar != input.scalar || components != input.components {
             return Err(ir::Error::InvalidDescriptor.into());
         }
     }
@@ -261,8 +257,11 @@ fn compile_pipeline(
             return Err(ir::Error::InvalidDescriptor.into());
         }
     }
-    // Keep setup, both shader texts, bindings and one draw within a native packet.
-    if vertex.tgsi.len().saturating_add(fragment.tgsi.len()) > 32 * 1024 {
+    // Each stage is bounded independently and uses VirGL shader continuations.
+    if [&vertex, &fragment]
+        .iter()
+        .any(|shader| shader.tgsi.len() > 256 * 1024)
+    {
         return Err(IrSubmitError::SubmissionTooLarge);
     }
     for shader in [&vertex, &fragment] {
@@ -286,6 +285,24 @@ fn compile_pipeline(
                 }) {
                     return Err(ir::Error::BindingLayoutMismatch.into());
                 }
+            }
+        }
+        for binding in &shader.storage_buffers {
+            let layout = pipeline
+                .layout()
+                .bind_groups()
+                .get(binding.group as usize)
+                .and_then(|group| {
+                    group
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.binding() == binding.binding)
+                })
+                .ok_or(ir::Error::BindingLayoutMismatch)?;
+            if layout.ty() != (ir::BindingType::StorageBuffer { read_only: true })
+                || !layout.visibility().contains(visibility)
+            {
+                return Err(ir::Error::BindingLayoutMismatch.into());
             }
         }
         for binding in &shader.uniform_buffers {
@@ -316,14 +333,24 @@ fn compile_pipeline(
                 (
                     pair.image_group,
                     pair.image_binding,
-                    ir::BindingType::SampledTexture,
+                    ir::BindingType::SampledTextureView {
+                        dimension: pair.dimension,
+                        depth: pair.depth,
+                    },
                 ),
                 (
                     pair.sampler_group,
                     pair.sampler_binding,
-                    ir::BindingType::Sampler,
+                    if pair.comparison {
+                        ir::BindingType::ComparisonSampler
+                    } else {
+                        ir::BindingType::Sampler
+                    },
                 ),
-            ] {
+            ]
+            .into_iter()
+            .take(if pair.uses_sampler { 2 } else { 1 })
+            {
                 let entry = pipeline
                     .layout()
                     .bind_groups()
@@ -336,8 +363,8 @@ fn compile_pipeline(
                     })
                     .ok_or(ir::Error::BindingLayoutMismatch)?;
                 if !(entry.ty() == ty
-                    || (ty == ir::BindingType::SampledTexture
-                        && entry.ty()
+                    || (entry.ty() == ir::BindingType::SampledTexture
+                        && ty
                             == ir::BindingType::SampledTextureView {
                                 dimension: ir::TextureViewDimension::D2,
                                 depth: false,
@@ -354,7 +381,7 @@ fn compile_pipeline(
         slot: reference.slot(),
         vertex,
         fragment,
-        vertex_buffer: pipeline.vertex_buffer().cloned(),
+        vertex_buffers: pipeline.vertex_buffers().to_vec(),
     });
     Ok(compiled)
 }
@@ -374,7 +401,7 @@ impl Context {
         }
         let reference = resources.resources.texture_ref(id)?;
         let descriptor = resources.resources.texture(reference)?;
-        if descriptor.mip_level_count() != 1 {
+        if descriptor.mip_level_count() != 1 || descriptor.array_layer_count() != 1 {
             return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
         }
         if !descriptor.usage().contains(TextureUsage::COPY_SRC) {
@@ -429,12 +456,9 @@ pub(super) fn validate_barrier(barrier: ir::ResourceBarrier<'_>) -> Result<(), I
     // VirGL context. Shader writes are rejected instead of being treated as no-ops.
     match barrier {
         ir::ResourceBarrier::Buffer { before, after, .. }
-            if [before, after].iter().any(|access| {
-                matches!(
-                    access,
-                    ir::BufferAccess::StorageRead | ir::BufferAccess::StorageReadWrite
-                )
-            }) =>
+            if [before, after]
+                .iter()
+                .any(|access| matches!(access, ir::BufferAccess::StorageReadWrite)) =>
         {
             Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::ExplicitBarrier,
@@ -516,6 +540,8 @@ pub(super) fn decode_draw(
     first: u32,
     count: u32,
     base_vertex: Option<i32>,
+    instance_count: u32,
+    first_instance: u32,
 ) -> Result<IrDraw, IrSubmitError> {
     let reference = pass.programmable.ok_or(ir::Error::PipelineNotSet)?;
     let pipeline = resources
@@ -557,6 +583,7 @@ pub(super) fn decode_draw(
     let mut textures = core::mem::take(&mut pass.textures_scratch);
     constants.clear();
     textures.clear();
+    let mut storage_buffers = Vec::new();
     if cached.is_none() {
         let resource = |group_index: u32,
                         binding: u32|
@@ -579,6 +606,43 @@ pub(super) fn decode_draw(
                 .ok_or_else(|| ir::Error::BindingLayoutMismatch.into())
         };
         for shader in [&compiled.vertex, &compiled.fragment] {
+            for binding in &shader.storage_buffers {
+                let ir::BindingResource::Buffer {
+                    buffer,
+                    offset,
+                    size,
+                } = resource(binding.group, binding.binding)?
+                else {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                };
+                let buffer = resources.resources.buffer_ref(buffer)?;
+                let desc = resources.resources.buffer(buffer)?;
+                if !desc.usage().contains(ir::BufferUsage::STORAGE)
+                    || desc.size() > crate::virgl::MAX_STORAGE_VIEW_BYTES
+                    || size == 0
+                    || size > 256 * 1024
+                    || !offset.is_multiple_of(4)
+                    || !size.is_multiple_of(4)
+                    || offset.checked_add(size).is_none_or(|end| end > desc.size())
+                {
+                    return Err(ir::Error::InvalidDescriptor.into());
+                }
+                storage_buffers.push(driver::IrStorageBufferBinding {
+                    stage: shader.stage,
+                    slot: binding.slot,
+                    buffer: buffer_spec(resources, pending, buffer)?,
+                });
+                if cached_constants.is_none() {
+                    let mut words = [0; 32];
+                    words[0] = offset as u32;
+                    words[1] = size as u32;
+                    constants.push(driver::IrConstantBuffer {
+                        stage: shader.stage,
+                        first_register: binding.first_register,
+                        words: driver::IrConstantWords::Inline { words, len: 4 },
+                    });
+                }
+            }
             for binding in &shader.textures {
                 let texture = match resource(binding.image_group, binding.image_binding)? {
                     ir::BindingResource::Texture(texture) => texture,
@@ -586,12 +650,12 @@ pub(super) fn decode_draw(
                         let desc = resources
                             .resources
                             .texture(resources.resources.texture_ref(texture)?)?;
-                        if view.dimension() != ir::TextureViewDimension::D2
+                        if view.dimension() != binding.dimension
                             || view.format() != desc.format()
                             || view.base_mip_level() != 0
                             || view.mip_level_count() != desc.mip_level_count()
                             || view.base_array_layer() != 0
-                            || view.array_layer_count() != 1
+                            || view.array_layer_count() != desc.array_layer_count()
                         {
                             return Err(IrSubmitError::Unsupported(
                                 UnsupportedIrFeature::ResourceBindings,
@@ -601,11 +665,6 @@ pub(super) fn decode_draw(
                     }
                     _ => return Err(ir::Error::BindingLayoutMismatch.into()),
                 };
-                let ir::BindingResource::Sampler(sampler) =
-                    resource(binding.sampler_group, binding.sampler_binding)?
-                else {
-                    return Err(ir::Error::BindingLayoutMismatch.into());
-                };
                 let texture = resources.resources.texture_ref(texture)?;
                 let descriptor = resources.resources.texture(texture)?;
                 if !descriptor.usage().contains(TextureUsage::SAMPLED)
@@ -614,12 +673,38 @@ pub(super) fn decode_draw(
                 {
                     return Err(ir::Error::InvalidUsage.into());
                 }
-                let sampler = resources.resources.sampler_ref(sampler)?;
+                let dimension = if descriptor.cube_compatible() {
+                    ir::TextureViewDimension::Cube
+                } else if descriptor.array_layer_count() > 1 {
+                    ir::TextureViewDimension::D2Array
+                } else {
+                    ir::TextureViewDimension::D2
+                };
+                if binding.dimension != dimension
+                    || binding.depth != (descriptor.format() == TextureFormat::Depth32Float)
+                {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                }
+                let sampler = if binding.uses_sampler {
+                    let ir::BindingResource::Sampler(sampler) =
+                        resource(binding.sampler_group, binding.sampler_binding)?
+                    else {
+                        return Err(ir::Error::BindingLayoutMismatch.into());
+                    };
+                    let sampler = resources.resources.sampler_ref(sampler)?;
+                    let desc = resources.resources.sampler(sampler)?;
+                    if desc.compare().is_some() != binding.comparison {
+                        return Err(ir::Error::BindingLayoutMismatch.into());
+                    }
+                    Some(sampler_state(desc, sampler.slot()))
+                } else {
+                    None
+                };
                 textures.push(driver::IrTextureBinding {
                     stage: shader.stage,
                     slot: binding.slot,
                     texture: texture_spec(texture, descriptor)?,
-                    sampler: sampler_state(resources.resources.sampler(sampler)?, sampler.slot()),
+                    sampler,
                 });
             }
             if let Some(push) = shader
@@ -740,31 +825,33 @@ pub(super) fn decode_draw(
     } else {
         None
     };
-    let vertex_buffer = if let Some(layout) = pipeline.vertex_buffer() {
-        let (buffer, offset) = pass.vertex_buffer.ok_or(ir::Error::VertexBufferNotSet)?;
+    if instance_count == 0 || first_instance.checked_add(instance_count).is_none() {
+        return Err(ir::Error::InvalidValue.into());
+    }
+    let mut vertex_buffers = [None; 8];
+    for (slot, layout) in pipeline.vertex_buffers().iter().enumerate() {
+        let (buffer, offset) = pass.vertex_buffers[slot].ok_or(ir::Error::VertexBufferNotSet)?;
         let bytes = pending.bytes(resources, buffer)?;
         let attribute_end = layout
             .attributes()
             .iter()
-            .map(|attribute| {
-                u64::from(attribute.offset()) + u64::from(attribute.format().byte_size())
-            })
+            .map(|a| u64::from(a.offset()) + u64::from(a.format().byte_size()))
             .max()
             .unwrap_or(0);
+        let maximum = maximum_vertex;
         let end = offset
-            .checked_add(u64::from(maximum_vertex) * u64::from(layout.stride()))
+            .checked_add(u64::from(maximum) * u64::from(layout.stride()))
             .and_then(|start| start.checked_add(attribute_end))
             .ok_or(ir::Error::Overflow)?;
         if end > bytes.as_slice().len() as u64 {
             return Err(ir::Error::OutOfBounds.into());
         }
-        Some(IrVertexBufferBinding {
+        vertex_buffers[slot] = Some(IrVertexBufferBinding {
             buffer: buffer_spec(resources, pending, buffer)?,
             offset: u32::try_from(offset).map_err(|_| ir::Error::Overflow)?,
-        })
-    } else {
-        None
-    };
+        });
+    }
+    let vertex_buffer = vertex_buffers[0];
     let raster = pipeline.raster();
     // Writes are forbidden inside a render pass, so unchanged binding state
     // refers to the same owned constants. Bounds are still checked per draw.
@@ -776,6 +863,7 @@ pub(super) fn decode_draw(
             index_buffer,
             constants: cached_constants.unwrap_or_else(|| Rc::from(constants.as_slice())),
             textures: Rc::from(textures.as_slice()),
+            storage_buffers: storage_buffers.into(),
         })
     };
     pass.constants_scratch = constants;
@@ -785,6 +873,9 @@ pub(super) fn decode_draw(
         draw: Rc::clone(&programmable),
     });
     Ok(IrDraw {
+        instance_count,
+        first_instance,
+        vertex_buffers,
         programmable: Some(programmable),
         start_vertex: first as usize,
         vertex_count: count as usize,
@@ -840,6 +931,7 @@ fn draw_with_index(
         index_buffer,
         constants: Rc::clone(&state.constants),
         textures: Rc::clone(&state.textures),
+        storage_buffers: Rc::clone(&state.storage_buffers),
     })
 }
 
@@ -851,6 +943,8 @@ pub(super) fn decode_draw(
     _first: u32,
     _count: u32,
     _base_vertex: Option<i32>,
+    _instance_count: u32,
+    _first_instance: u32,
 ) -> Result<IrDraw, IrSubmitError> {
     Err(IrSubmitError::Unsupported(
         UnsupportedIrFeature::ProgrammableExecution,
@@ -873,8 +967,17 @@ mod tests {
         vertex_format: VertexFormat,
         uniform_type: ir::BindingType,
     ) -> ir::ProgrammableRenderPipelineId {
+        pipeline_source(table, vertex_format, uniform_type, SHADER)
+    }
+
+    fn pipeline_source(
+        table: &ResourceTable,
+        vertex_format: VertexFormat,
+        uniform_type: ir::BindingType,
+        source: &str,
+    ) -> ir::ProgrammableRenderPipelineId {
         let module = table
-            .define_shader_module(ir::ShaderModuleDesc::wgsl(SHADER.into()).unwrap())
+            .define_shader_module(ir::ShaderModuleDesc::wgsl(source.into()).unwrap())
             .unwrap();
         let layout = ir::PipelineLayoutDesc::new(vec![
             ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
@@ -934,6 +1037,42 @@ mod tests {
         assert_eq!(compiled.vertex.vertex_inputs.len(), 2);
         assert!(compiled.vertex.tgsi.contains("CONST[1]"));
         assert!(compiled.fragment.tgsi.contains("GENERIC[0]"));
+    }
+
+    #[test]
+    fn depth_only_fragment_stage_can_omit_all_color_outputs() {
+        let table = ResourceTable::new();
+        let source = SHADER.replace("@fragment fn fs(input: Output) -> @location(0) vec4<f32> { return vec4<f32>(input.color, 1.0); }", "@fragment fn fs() {}");
+        let id = pipeline_source(
+            &table,
+            VertexFormat::Float32x3,
+            ir::BindingType::UniformBuffer,
+            &source,
+        );
+        assert!(
+            compile_pipeline(&table, id)
+                .unwrap()
+                .fragment
+                .output_locations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn readonly_storage_binding_compiles_as_a_buffer_view_with_descriptor_metadata() {
+        let table = ResourceTable::new();
+        let source = SHADER.replace("var<uniform>", "var<storage, read>");
+        let id = pipeline_source(
+            &table,
+            VertexFormat::Float32x3,
+            ir::BindingType::StorageBuffer { read_only: true },
+            &source,
+        );
+        let compiled = compile_pipeline(&table, id).unwrap();
+        assert!(compiled.vertex.uniform_buffers.is_empty());
+        assert_eq!(compiled.vertex.storage_buffers.len(), 1);
+        assert_eq!(compiled.vertex.storage_buffers[0].first_register, 0);
+        assert!(compiled.vertex.tgsi.contains("BUFFER, UINT"));
     }
 
     #[test]
@@ -1041,6 +1180,7 @@ mod tests {
             }]
             .into(),
             textures: Vec::new().into(),
+            storage_buffers: Vec::new().into(),
         });
         let cache = ProgrammableDrawCache {
             key,
@@ -1155,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_storage_layout_even_when_shader_does_not_write() {
+    fn rejects_storage_layout_for_uniform_shader_binding() {
         let table = ResourceTable::new();
         let id = pipeline(
             &table,
@@ -1164,9 +1304,7 @@ mod tests {
         );
         assert!(matches!(
             compile_pipeline(&table, id),
-            Err(IrSubmitError::Unsupported(
-                UnsupportedIrFeature::ResourceBindings
-            ))
+            Err(IrSubmitError::InvalidIr(ir::Error::BindingLayoutMismatch))
         ));
     }
 

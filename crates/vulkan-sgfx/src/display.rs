@@ -4,7 +4,13 @@
 
 use crate::{api::next_id, instance, wsi};
 use ash::vk::{self, Handle};
-use std::ffi::{CStr, c_char};
+use std::{
+    ffi::{CStr, c_char},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
 const INVALID: vk::Result = vk::Result::ERROR_INITIALIZATION_FAILED;
 const LOST: vk::Result = vk::Result::ERROR_SURFACE_LOST_KHR;
@@ -57,6 +63,9 @@ fn display() -> Result<SwsDisplay, vk::Result> {
         return Err(LOST);
     }
     Ok(display)
+}
+pub(crate) fn current_extent() -> Result<vk::Extent2D, vk::Result> {
+    display().map(|display| extent(&display))
 }
 fn extent(display: &SwsDisplay) -> vk::Extent2D {
     vk::Extent2D {
@@ -257,13 +266,15 @@ unsafe extern "system" fn create_surface(
     {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
-    unsafe {
-        out.write(wsi::insert_display_surface(
-            instance_handle,
-            extent(&display),
-        ));
+    match wsi::insert_display_surface(instance_handle, extent(&display)) {
+        Ok(surface) => {
+            unsafe {
+                out.write(surface);
+            }
+            vk::Result::SUCCESS
+        }
+        Err(error) => error,
     }
-    vk::Result::SUCCESS
 }
 
 pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
@@ -303,25 +314,22 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
     }
 }
 
-pub(crate) struct Window {
+// The native window belongs to VkSurfaceKHR, not a swapchain generation.
+// Recreating image storage must preserve SDL input routing and fullscreen state.
+pub(crate) struct SurfaceWindow {
     id: u32,
     epoch: u32,
-    generation: u32,
-    extent: vk::Extent2D,
-    buffers: Vec<SwsBuffer>,
-    queued: Vec<Option<u64>>,
-    serial: u64,
-    fullscreen: bool,
-    lost: bool,
+    serial: AtomicU64,
+    retired: Mutex<Vec<(SwsBuffer, u64)>>,
+    pending: Mutex<Vec<SwsGpuEvent>>,
+    lost: AtomicBool,
 }
-impl Window {
-    pub fn new(size: vk::Extent2D) -> Result<Self, vk::Result> {
+impl SurfaceWindow {
+    pub fn new(size: vk::Extent2D) -> Result<Arc<Self>, vk::Result> {
         let display = display()?;
         if size != extent(&display) || display.compositor_epoch == 0 {
             return Err(LOST);
         }
-        let generation =
-            u32::try_from(next_id()).map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
         let mut id = 0;
         if unsafe {
             sws_window_create(
@@ -335,32 +343,118 @@ impl Window {
         {
             return Err(LOST);
         }
-        let mut window = Self {
+        let surface = Arc::new(Self {
             id,
             epoch: display.compositor_epoch,
+            serial: AtomicU64::new(0),
+            retired: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            lost: AtomicBool::new(false),
+        });
+        if unsafe { sws_window_fullscreen(id, 1) } < 0 {
+            return Err(LOST);
+        }
+        Ok(surface)
+    }
+    fn release_retired(&self, event: &SwsGpuEvent) -> bool {
+        let mut retired = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(index) = retired
+            .iter()
+            .position(|&(buffer, serial)| buffer == event.buffer && serial == event.commit_serial)
+        {
+            if event.kind == 1 || event.kind == 2 {
+                let (buffer, _) = retired.swap_remove(index);
+                unsafe {
+                    sws_gpu_destroy(buffer);
+                }
+                return true;
+            }
+        }
+        false
+    }
+    fn events(&self, generation: u32) -> Result<Vec<SwsGpuEvent>, vk::Result> {
+        // A surface can have two live swapchains during replacement. Preserve
+        // release events belonging to the other generation instead of consuming
+        // them from the shared SWS queue and leaving its images permanently busy.
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if self.lost.load(Ordering::Relaxed) {
+            return Err(LOST);
+        }
+        loop {
+            let mut event = SwsGpuEvent::default();
+            let result = unsafe { sws_gpu_poll(self.id, &mut event) };
+            if result < 0 || event.kind == 3 {
+                self.lost.store(true, Ordering::Relaxed);
+                return Err(if event.kind == 3 {
+                    vk::Result::ERROR_DEVICE_LOST
+                } else {
+                    LOST
+                });
+            }
+            if result == 0 {
+                break;
+            }
+            if !self.release_retired(&event) {
+                pending.push(event);
+            }
+        }
+        let mut output = Vec::new();
+        let mut index = 0;
+        while index < pending.len() {
+            if pending[index].buffer.generation == generation {
+                output.push(pending.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        Ok(output)
+    }
+}
+impl Drop for SurfaceWindow {
+    fn drop(&mut self) {
+        unsafe {
+            sws_window_destroy(self.id);
+        }
+    }
+}
+
+pub(crate) struct Window {
+    surface: Arc<SurfaceWindow>,
+    generation: u32,
+    extent: vk::Extent2D,
+    buffers: Vec<SwsBuffer>,
+    queued: Vec<Option<u64>>,
+    lost: bool,
+}
+impl Window {
+    pub fn new(surface: Arc<SurfaceWindow>, size: vk::Extent2D) -> Result<Self, vk::Result> {
+        let display = display()?;
+        if surface.epoch != display.compositor_epoch {
+            return Err(LOST);
+        }
+        if size != extent(&display) {
+            return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
+        }
+        let generation =
+            u32::try_from(next_id()).map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+        Ok(Self {
+            surface,
             generation,
             extent: size,
             buffers: Vec::new(),
             queued: Vec::new(),
-            serial: 0,
-            fullscreen: false,
             lost: false,
-        };
-        if unsafe { sws_window_fullscreen(id, 1) } < 0 {
-            return Err(LOST);
-        }
-        window.fullscreen = true;
-        Ok(window)
+        })
     }
     pub fn register(&mut self, image: &sgfx::driver::PresentationImage) -> Result<(), vk::Result> {
         let handle = image
             .duplicate_shared_handle()
             .map_err(crate::runtime::backend_failure)?;
         let buffer = SwsBuffer {
-            window_id: self.id,
+            window_id: self.surface.id,
             buffer_id: self.buffers.len() as u32 + 1,
             generation: self.generation,
-            compositor_epoch: self.epoch,
+            compositor_epoch: self.surface.epoch,
         };
         if unsafe { sws_gpu_register(buffer, image.width(), image.height(), handle.as_raw()) } < 0 {
             return Err(LOST);
@@ -373,20 +467,7 @@ impl Window {
         if self.lost {
             return Err(LOST);
         }
-        loop {
-            let mut event = SwsGpuEvent::default();
-            let result = unsafe { sws_gpu_poll(self.id, &mut event) };
-            if result < 0 {
-                self.lost = true;
-                return Err(LOST);
-            }
-            if result == 0 {
-                return Ok(());
-            }
-            if event.kind == 3 {
-                self.lost = true;
-                return Err(vk::Result::ERROR_DEVICE_LOST);
-            }
+        for event in self.surface.events(self.generation)? {
             let Some(index) = self
                 .buffers
                 .iter()
@@ -409,6 +490,7 @@ impl Window {
                 }
             }
         }
+        Ok(())
     }
     pub fn available(&self, index: usize) -> bool {
         !self.lost && self.queued[index].is_none()
@@ -418,20 +500,18 @@ impl Window {
         if !self.available(index) {
             return Err(INVALID);
         }
-        if !self.fullscreen {
-            if unsafe { sws_window_fullscreen(self.id, 1) } < 0 {
-                return Err(LOST);
-            }
-            self.fullscreen = true;
-        }
-        self.serial = self
+        let serial = self
+            .surface
             .serial
-            .checked_add(1)
-            .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |serial| {
+                serial.checked_add(1)
+            })
+            .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?
+            + 1;
         if unsafe {
             sws_gpu_commit(
                 self.buffers[index],
-                self.serial,
+                serial,
                 self.extent.width,
                 self.extent.height,
             )
@@ -439,28 +519,28 @@ impl Window {
         {
             return Err(LOST);
         }
-        self.queued[index] = Some(self.serial);
+        self.queued[index] = Some(serial);
         Ok(())
     }
 }
 impl Drop for Window {
     fn drop(&mut self) {
-        // SWS retains the last displayed image until replacement or closure.
-        // Waiting for its release before closing would therefore deadlock.
-        // Destroy only released registrations here; window closure retires
-        // retained ones. The server owns independent image capabilities until
-        // its GPU use ends, even after these local capabilities are dropped.
-        if !self.lost {
-            for (index, &buffer) in self.buffers.iter().enumerate() {
-                if self.queued[index].is_none() {
-                    unsafe {
-                        sws_gpu_destroy(buffer);
-                    }
+        let _ = self.dispatch();
+        let mut retired = self
+            .surface
+            .retired
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (index, &buffer) in self.buffers.iter().enumerate() {
+            if let Some(serial) = self.queued[index] {
+                // SWS retains the last displayed image until its replacement.
+                // The next swapchain destroys it after observing its release.
+                retired.push((buffer, serial));
+            } else {
+                unsafe {
+                    sws_gpu_destroy(buffer);
                 }
             }
-        }
-        unsafe {
-            sws_window_destroy(self.id);
         }
     }
 }

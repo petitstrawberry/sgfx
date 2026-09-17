@@ -69,6 +69,8 @@ pub struct Capabilities {
     image_readback: bool,
     depth: bool,
     image_mips: bool,
+    texture_arrays: bool,
+    depth_sampling: bool,
 }
 
 impl Capabilities {
@@ -91,6 +93,10 @@ impl Capabilities {
             image_readback: rendering
                 && info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_READBACK != 0,
             depth: rendering && info.execution_support & GPU_EXECUTION_SUPPORT_DEPTH != 0,
+            texture_arrays: rendering
+                && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_TEXTURE_ARRAYS != 0,
+            depth_sampling: rendering
+                && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_DEPTH_SAMPLING != 0,
             image_mips: rendering
                 && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_IMAGE_MIPS != 0,
         }
@@ -145,6 +151,16 @@ impl Capabilities {
     /// `true` when `Depth32Float` render attachments can be used.
     pub const fn supports_depth(&self) -> bool {
         self.depth
+    }
+
+    /// Return whether the kernel allocates array and cube texture storage.
+    pub const fn supports_texture_arrays(&self) -> bool {
+        self.texture_arrays
+    }
+
+    /// Return whether depth attachments can also be sampled.
+    pub const fn supports_depth_sampling(&self) -> bool {
+        self.depth_sampling
     }
 
     /// Return whether the kernel allocates real image mip storage for VirGL

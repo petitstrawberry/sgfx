@@ -616,10 +616,14 @@ unsafe extern "system" fn get_physical_device_properties(
         let compute = capabilities.supports_compute();
         let graphics = capabilities.supports_graphics();
         properties.limits = vk::PhysicalDeviceLimits {
-            max_image_dimension2_d: limits.max_image_dimension_2d,
+            max_image_dimension2_d: limits
+                .max_image_dimension_2d
+                .min(crate::images::MAX_IMAGE_DIMENSION),
             max_image_array_layers: limits.max_image_array_layers,
             max_image_dimension_cube: if limits.max_image_array_layers >= 6 {
-                limits.max_image_dimension_2d.min(2048)
+                limits
+                    .max_image_dimension_2d
+                    .min(crate::images::MAX_IMAGE_DIMENSION)
             } else {
                 0
             },
@@ -720,17 +724,23 @@ unsafe extern "system" fn get_physical_device_properties(
             sub_texel_precision_bits: 4,
             mipmap_precision_bits: 4,
             max_viewports: 1,
-            max_viewport_dimensions: [limits.max_image_dimension_2d; 2],
+            max_viewport_dimensions: [limits
+                .max_image_dimension_2d
+                .min(crate::images::MAX_IMAGE_DIMENSION); 2],
             viewport_bounds_range: [-8192.0, 8191.0],
             min_memory_map_alignment: 8,
             min_uniform_buffer_offset_alignment: u64::from(
-                limits.min_uniform_buffer_offset_alignment,
+                limits.min_uniform_buffer_offset_alignment.max(16),
             ),
             min_storage_buffer_offset_alignment: u64::from(
-                limits.min_storage_buffer_offset_alignment,
+                limits.min_storage_buffer_offset_alignment.max(4),
             ),
-            max_framebuffer_width: limits.max_image_dimension_2d,
-            max_framebuffer_height: limits.max_image_dimension_2d,
+            max_framebuffer_width: limits
+                .max_image_dimension_2d
+                .min(crate::images::MAX_IMAGE_DIMENSION),
+            max_framebuffer_height: limits
+                .max_image_dimension_2d
+                .min(crate::images::MAX_IMAGE_DIMENSION),
             max_framebuffer_layers: 1,
             framebuffer_color_sample_counts: vk::SampleCountFlags::TYPE_1,
             framebuffer_depth_sample_counts: vk::SampleCountFlags::TYPE_1,
@@ -831,7 +841,7 @@ unsafe extern "system" fn get_physical_device_format_properties(
         return;
     };
     let capabilities = adapter.capabilities();
-    if !capabilities.supports_typed_texture_views()
+    if !capabilities.supports_srgb_texture_views()
         && matches!(
             format,
             vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
@@ -861,7 +871,7 @@ unsafe extern "system" fn get_physical_device_format_properties(
     if capabilities.supports_image_blits()
         && matches!(
             format,
-            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
         )
     {
         properties.optimal_tiling_features |=
@@ -927,15 +937,16 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
     if !capabilities.supports_storage_images() {
         supported_usage &= !vk::ImageUsageFlags::STORAGE;
     }
-    if !capabilities.supports_typed_texture_views() {
-        if matches!(
+    if !capabilities.supports_srgb_texture_views()
+        && matches!(
             format,
             vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
-        ) {
-            supported_usage = vk::ImageUsageFlags::empty();
-        } else if format == vk::Format::D32_SFLOAT {
-            supported_usage &= !vk::ImageUsageFlags::SAMPLED;
-        }
+        )
+    {
+        supported_usage = vk::ImageUsageFlags::empty();
+    }
+    if !capabilities.supports_typed_texture_views() && format == vk::Format::D32_SFLOAT {
+        supported_usage &= !vk::ImageUsageFlags::SAMPLED;
     }
     if matches!(
         format,
@@ -981,7 +992,10 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
     }
     unsafe {
-        let max_dimension = capabilities.limits().max_image_dimension_2d.min(2048);
+        let max_dimension = capabilities
+            .limits()
+            .max_image_dimension_2d
+            .min(crate::images::MAX_IMAGE_DIMENSION);
         *output = vk::ImageFormatProperties {
             max_extent: vk::Extent3D {
                 width: max_dimension,
