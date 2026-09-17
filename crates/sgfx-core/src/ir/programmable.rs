@@ -276,7 +276,7 @@ impl PipelineLayoutDesc {
 /// An owned resource identity and optional byte range used by one binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingResource {
-    /// Uniform or storage buffer range; offsets use portable 256-byte alignment.
+    /// Uniform or storage buffer range; the backend checks its own alignment limit.
     Buffer {
         /// Owning buffer.
         buffer: BufferId,
@@ -361,7 +361,11 @@ impl BindGroupDesc {
                     if !desc.usage().contains(required) {
                         return Err(Error::InvalidUsage);
                     }
-                    if size == 0 || !offset.is_multiple_of(256) || !size.is_multiple_of(4) {
+                    let minimum_alignment = if ty == BindingType::UniformBuffer { 16 } else { 4 };
+                    if size == 0
+                        || !offset.is_multiple_of(minimum_alignment)
+                        || !size.is_multiple_of(4)
+                    {
                         return Err(Error::InvalidValue);
                     }
                     if offset.checked_add(size).ok_or(Error::Overflow)? > desc.size() {

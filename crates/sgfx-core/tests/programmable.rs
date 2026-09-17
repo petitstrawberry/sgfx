@@ -360,6 +360,31 @@ fn binding_validation_checks_ownership_ranges_alignment_and_usage() {
 }
 
 #[test]
+fn storage_offsets_follow_the_ir_minimum_and_backends_enforce_their_own_limit() {
+    let table = ResourceTable::new();
+    let storage = table
+        .define_buffer(BufferDesc::new(256, BufferUsage::STORAGE).unwrap())
+        .unwrap();
+    let layout = layout(BindingType::StorageBuffer { read_only: true });
+    let bind = |offset| {
+        BindGroupDesc::new(
+            &table,
+            layout.clone(),
+            vec![BindGroupEntry::new(
+                0,
+                BindingResource::Buffer {
+                    buffer: storage.id(),
+                    offset,
+                    size: 64,
+                },
+            )],
+        )
+    };
+    assert!(bind(64).is_ok());
+    assert_eq!(bind(2), Err(Error::InvalidValue));
+}
+
+#[test]
 fn descriptor_ownership_is_checked_again_when_defining_resources() {
     let table = ResourceTable::new();
     let other = ResourceTable::new();
