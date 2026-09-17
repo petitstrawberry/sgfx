@@ -136,6 +136,21 @@ impl OwnedResourceBarrier {
 /// retained in the recording, so replayed commands borrow their data safely.
 #[derive(Debug, Clone)]
 pub enum OwnedCommand {
+    /// Upload pixels to one explicitly selected layer and mip level.
+    WriteTextureLayer {
+        /// Destination allocation.
+        texture: TextureId,
+        /// Destination mip level.
+        mip_level: u32,
+        /// Destination array layer.
+        array_layer: u32,
+        /// Destination rectangle.
+        destination: PixelRect,
+        /// Source row stride.
+        bytes_per_row: u32,
+        /// Owned source pixels.
+        data: Vec<u8>,
+    },
     /// Upload owned pixels to an explicitly selected mip level.
     WriteTextureMip {
         /// Destination texture.
@@ -344,6 +359,13 @@ impl OwnedCommandBuffer {
         let mut commands = self.commands.iter();
         while let Some(command) = commands.next() {
             match command {
+                OwnedCommand::WriteTextureLayer {
+                    texture, mip_level, array_layer, destination, bytes_per_row, data,
+                } => encoder.write_texture(
+                    resources.texture_ref(*texture)?,
+                    TextureWrite::new(*destination, *bytes_per_row, data)?
+                        .with_mip_level(*mip_level).with_array_layer(*array_layer),
+                )?,
                 OwnedCommand::WriteTextureMip {
                     texture,
                     mip_level,

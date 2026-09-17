@@ -30,8 +30,12 @@ static NEXT_RESOURCE_TABLE_ID: AtomicUsize = AtomicUsize::new(1);
 pub enum TextureFormat {
     /// Eight-bit blue, green, red, and alpha channels.
     Bgra8Unorm,
+    /// Eight-bit BGRA channels with sRGB transfer for color channels.
+    Bgra8UnormSrgb,
     /// Eight-bit red, green, blue, and alpha channels.
     Rgba8Unorm,
+    /// Eight-bit RGBA channels with sRGB transfer for color channels.
+    Rgba8UnormSrgb,
     /// One eight-bit normalized red channel.
     R8Unorm,
     /// One 32-bit floating-point depth component.
@@ -46,9 +50,19 @@ impl TextureFormat {
     /// The portable byte size for this format.
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
-            Self::Bgra8Unorm | Self::Rgba8Unorm | Self::Depth32Float => 4,
+            Self::Bgra8Unorm | Self::Rgba8Unorm | Self::Bgra8UnormSrgb
+            | Self::Rgba8UnormSrgb | Self::Depth32Float => 4,
             Self::R8Unorm => 1,
         }
+    }
+
+    /// Whether one texture allocation can be viewed in the other format.
+    pub const fn view_compatible(self, other: Self) -> bool {
+        matches!((self, other),
+            (Self::Bgra8Unorm | Self::Bgra8UnormSrgb, Self::Bgra8Unorm | Self::Bgra8UnormSrgb)
+            | (Self::Rgba8Unorm | Self::Rgba8UnormSrgb, Self::Rgba8Unorm | Self::Rgba8UnormSrgb)
+            | (Self::R8Unorm, Self::R8Unorm)
+            | (Self::Depth32Float, Self::Depth32Float))
     }
 }
 
@@ -125,6 +139,7 @@ pub struct TextureDesc {
     extent: Extent2D,
     usage: TextureUsage,
     mip_level_count: u32,
+    array_layer_count: u32,
 }
 
 impl TextureDesc {
@@ -139,13 +154,13 @@ impl TextureDesc {
     /// # Returns
     ///
     /// A descriptor, or [`Error::InvalidDescriptor`] for empty usage or a
-    /// depth format carrying anything except `RENDER_ATTACHMENT` usage.
+    /// depth format carrying usage other than `RENDER_ATTACHMENT` or `SAMPLED`.
     pub const fn new(format: TextureFormat, extent: Extent2D, usage: TextureUsage) -> Result<Self> {
         if usage.0 == 0
             || (usage.contains(TextureUsage::STORAGE)
                 && !matches!(format, TextureFormat::Rgba8Unorm))
             || (matches!(format, TextureFormat::Depth32Float)
-                && usage.0 != TextureUsage::RENDER_ATTACHMENT.0)
+                && usage.0 & !(TextureUsage::RENDER_ATTACHMENT.0 | TextureUsage::SAMPLED.0) != 0)
         {
             Err(Error::InvalidDescriptor)
         } else {
@@ -154,6 +169,7 @@ impl TextureDesc {
                 extent,
                 usage,
                 mip_level_count: 1,
+                array_layer_count: 1,
             })
         }
     }
@@ -204,6 +220,22 @@ impl TextureDesc {
         self.mip_level_count
     }
 
+    /// Set the number of independent 2D layers in this allocation.
+    pub fn with_array_layer_count(mut self, count: u32) -> Result<Self> {
+        if count == 0 || count > 2048
+            || (count != 1 && self.usage.contains(TextureUsage::PRESENT))
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.array_layer_count = count;
+        Ok(self)
+    }
+
+    /// Return the number of 2D layers.
+    pub const fn array_layer_count(self) -> u32 {
+        self.array_layer_count
+    }
+
     /// Return the checked dimensions of a mip level, including odd-sized
     /// chains and dimensions clamped to one texel.
     pub fn mip_extent(self, level: u32) -> Result<Extent2D> {
@@ -227,7 +259,7 @@ impl TextureDesc {
                 .ok_or(Error::Overflow)?;
             size = size.checked_add(bytes).ok_or(Error::Overflow)?;
         }
-        Ok(size)
+        size.checked_mul(u64::from(self.array_layer_count)).ok_or(Error::Overflow)
     }
 }
 
@@ -361,6 +393,7 @@ pub struct SamplerDesc {
     mip_filter: FilterMode,
     min_lod_bits: u32,
     max_lod_bits: u32,
+    compare: Option<super::CompareFunction>,
 }
 
 impl SamplerDesc {
@@ -389,6 +422,7 @@ impl SamplerDesc {
             mip_filter: FilterMode::Nearest,
             min_lod_bits: 0,
             max_lod_bits: 0,
+            compare: None,
         }
     }
     /// Return the minification filter.
@@ -448,6 +482,17 @@ impl SamplerDesc {
     pub const fn max_lod(self) -> f32 {
         f32::from_bits(self.max_lod_bits)
     }
+
+    /// Enable depth-reference comparison, or disable it with `None`.
+    pub const fn with_compare(mut self, compare: Option<super::CompareFunction>) -> Self {
+        self.compare = compare;
+        self
+    }
+
+    /// Return the depth-reference comparison performed during sampling.
+    pub const fn compare(self) -> Option<super::CompareFunction> {
+        self.compare
+    }
 }
 
 /// Borrowed pixel data and layout for one texture upload.
@@ -457,6 +502,7 @@ pub struct TextureWrite<'data> {
     bytes_per_row: u32,
     data: &'data [u8],
     mip_level: u32,
+    array_layer: u32,
 }
 
 impl<'data> TextureWrite<'data> {
@@ -483,6 +529,7 @@ impl<'data> TextureWrite<'data> {
                 bytes_per_row,
                 data,
                 mip_level: 0,
+                array_layer: 0,
             })
         }
     }
@@ -515,6 +562,17 @@ impl<'data> TextureWrite<'data> {
     /// Return the destination mip level.
     pub const fn mip_level(self) -> u32 {
         self.mip_level
+    }
+
+    /// Select one destination layer; recording validates its bounds.
+    pub const fn with_array_layer(mut self, layer: u32) -> Self {
+        self.array_layer = layer;
+        self
+    }
+
+    /// Return the destination layer.
+    pub const fn array_layer(self) -> u32 {
+        self.array_layer
     }
 }
 

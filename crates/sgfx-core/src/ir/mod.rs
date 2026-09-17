@@ -9,6 +9,8 @@ pub(crate) mod command;
 mod pipeline;
 pub(crate) mod resource;
 mod types;
+mod texture_view;
+pub use texture_view::{TextureViewDesc, TextureViewDimension};
 
 pub use command::{
     Command, CommandBuffer, CommandEncoder, ComputePassEncoder, DepthAttachment, DepthLoadOp,

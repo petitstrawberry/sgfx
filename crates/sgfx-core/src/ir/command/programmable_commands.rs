@@ -267,7 +267,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                             return Err(Error::ResourceAccessConflict);
                         }
                     }
-                    BindingResource::Texture(texture) => {
+                    BindingResource::Texture(texture) | BindingResource::TextureView { texture, .. } => {
                         let reference = self.resources.texture_ref(texture)?;
                         self.check_texture_access(
                             reference,
@@ -302,7 +302,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         for (resource, writes) in uses {
             let key = match resource {
                 BindingResource::Buffer { buffer, .. } => PendingWrite::Buffer(buffer),
-                BindingResource::Texture(texture) => PendingWrite::Texture(texture),
+                BindingResource::Texture(texture) | BindingResource::TextureView { texture, .. } => PendingWrite::Texture(texture),
                 BindingResource::Sampler(_) => continue,
             };
             used.push(key);

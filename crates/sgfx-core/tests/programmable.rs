@@ -1,5 +1,30 @@
 use sgfx_core::ir::*;
 
+#[test]
+fn comparison_samplers_require_a_matching_binding_type() {
+    let table = ResourceTable::new();
+    let ordinary = SamplerDesc::new(
+        FilterMode::Linear,
+        FilterMode::Linear,
+        AddressMode::ClampToEdge,
+        AddressMode::ClampToEdge,
+    );
+    assert_eq!(ordinary.compare(), None);
+    for compare in [None, Some(CompareFunction::LessEqual), Some(CompareFunction::Greater)] {
+        let desc = ordinary.with_compare(compare);
+        assert_eq!(desc.compare(), compare);
+        let sampler = table.define_sampler(desc).unwrap();
+        for ty in [BindingType::Sampler, BindingType::ComparisonSampler] {
+            let result = BindGroupDesc::new(
+                &table,
+                layout(ty),
+                vec![BindGroupEntry::new(0, BindingResource::Sampler(sampler.id()))],
+            );
+            assert_eq!(result.is_ok(), compare.is_some() == (ty == BindingType::ComparisonSampler));
+        }
+    }
+}
+
 fn shader(table: &ResourceTable, stage: ShaderStage) -> ShaderEntryPoint {
     let module = table
         .define_shader_module(

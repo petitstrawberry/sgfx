@@ -105,8 +105,17 @@ pub enum BindingType {
     },
     /// A filterable, single-sampled 2D color texture.
     SampledTexture,
+    /// A typed, single-sampled view into a texture allocation.
+    SampledTextureView {
+        /// Coordinate interpretation expected by the shader.
+        dimension: TextureViewDimension,
+        /// Whether the shader expects depth rather than color samples.
+        depth: bool,
+    },
     /// A filtering sampler.
     Sampler,
+    /// A sampler that compares a supplied reference against sampled depth.
+    ComparisonSampler,
     /// A single-mip 2D storage texture.
     StorageTexture {
         /// Texel format.
@@ -278,6 +287,13 @@ pub enum BindingResource {
     },
     /// A whole 2D sampled mip chain, or level zero for a storage binding.
     Texture(TextureId),
+    /// A format and subresource selection from one texture allocation.
+    TextureView {
+        /// Owning allocation.
+        texture: TextureId,
+        /// Selected subresources and their interpretation.
+        view: TextureViewDesc,
+    },
     /// A sampler.
     Sampler(SamplerId),
 }
@@ -357,8 +373,18 @@ impl BindGroupDesc {
                     if !desc.usage().contains(TextureUsage::SAMPLED) {
                         return Err(Error::InvalidUsage);
                     }
-                    if desc.format() == TextureFormat::Depth32Float {
+                    if desc.format() == TextureFormat::Depth32Float || desc.array_layer_count() != 1 {
                         return Err(Error::InvalidDescriptor);
+                    }
+                }
+                (BindingResource::TextureView { texture, view }, BindingType::SampledTextureView { dimension, depth }) => {
+                    let desc = resources.texture(resources.texture_ref(texture)?)?;
+                    view.validate(desc)?;
+                    if !desc.usage().contains(TextureUsage::SAMPLED) {
+                        return Err(Error::InvalidUsage);
+                    }
+                    if view.dimension() != dimension || (view.format() == TextureFormat::Depth32Float) != depth {
+                        return Err(Error::BindingLayoutMismatch);
                     }
                 }
                 (BindingResource::Texture(texture), BindingType::StorageTexture { format, .. }) => {
@@ -370,8 +396,11 @@ impl BindGroupDesc {
                         return Err(Error::BindingLayoutMismatch);
                     }
                 }
-                (BindingResource::Sampler(sampler), BindingType::Sampler) => {
-                    resources.sampler_ref(sampler)?;
+                (BindingResource::Sampler(sampler), ty @ (BindingType::Sampler | BindingType::ComparisonSampler)) => {
+                    let desc = resources.sampler(resources.sampler_ref(sampler)?)?;
+                    if desc.compare().is_some() != (ty == BindingType::ComparisonSampler) {
+                        return Err(Error::BindingLayoutMismatch);
+                    }
                 }
                 _ => return Err(Error::BindingLayoutMismatch),
             }
@@ -404,7 +433,8 @@ pub(crate) fn resource_alias(left: BindingResource, right: BindingResource) -> b
         (BindingResource::Buffer { buffer: a, .. }, BindingResource::Buffer { buffer: b, .. }) => {
             a == b
         }
-        (BindingResource::Texture(a), BindingResource::Texture(b)) => a == b,
+        (BindingResource::Texture(a) | BindingResource::TextureView { texture: a, .. },
+         BindingResource::Texture(b) | BindingResource::TextureView { texture: b, .. }) => a == b,
         _ => false,
     }
 }

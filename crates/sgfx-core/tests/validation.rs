@@ -231,7 +231,7 @@ fn rejects_invalid_values_and_depth_usages() {
         TextureDesc::new(
             TextureFormat::Depth32Float,
             extent(),
-            TextureUsage::RENDER_ATTACHMENT | TextureUsage::SAMPLED
+            TextureUsage::RENDER_ATTACHMENT | TextureUsage::STORAGE
         ),
         Err(Error::InvalidDescriptor)
     );

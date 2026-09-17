@@ -116,7 +116,7 @@ impl<'r> RenderPassDesc<'r> {
         store: StoreOp,
     ) -> Result<Self> {
         let texture = resources.texture(target)?;
-        if texture.format() == TextureFormat::Depth32Float {
+        if texture.format() == TextureFormat::Depth32Float || texture.array_layer_count() != 1 {
             return Err(Error::InvalidDescriptor);
         }
         if !texture.usage().contains(TextureUsage::RENDER_ATTACHMENT) {
@@ -155,7 +155,7 @@ impl<'r> RenderPassDesc<'r> {
     ) -> Result<Self> {
         let texture = resources.texture(target)?;
         let color_texture = resources.texture(self.target)?;
-        if texture.format() != TextureFormat::Depth32Float {
+        if texture.format() != TextureFormat::Depth32Float || texture.array_layer_count() != 1 {
             return Err(Error::InvalidDescriptor);
         }
         if !texture.usage().contains(TextureUsage::RENDER_ATTACHMENT) {
@@ -441,6 +441,9 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         self.ensure_outside_pass()?;
         let desc = self.resources.texture(texture)?;
         Self::require_texture_usage(desc.usage(), TextureUsage::COPY_DST)?;
+        if write.array_layer() >= desc.array_layer_count() {
+            return Err(Error::OutOfBounds);
+        }
         if !write
             .destination()
             .is_within(desc.mip_extent(write.mip_level())?)
@@ -485,6 +488,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         src.mip_extent(source_mip)?;
         dst.mip_extent(destination_mip)?;
         if src.format() != dst.format()
+            || src.array_layer_count() != 1 || dst.array_layer_count() != 1
             || !matches!(
                 src.format(),
                 TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
@@ -534,6 +538,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         Self::require_texture_usage(source_desc.usage(), TextureUsage::COPY_SRC)?;
         Self::require_texture_usage(destination_desc.usage(), TextureUsage::COPY_DST)?;
         if source_desc.format() != destination_desc.format()
+            || source_desc.array_layer_count() != 1 || destination_desc.array_layer_count() != 1
             || !source_rect.same_extent(destination_rect)
         {
             return Err(Error::InvalidDescriptor);
@@ -836,6 +841,9 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     pub fn set_texture(&mut self, texture: TextureRef<'r>) -> Result<()> {
         let desc = self.encoder.resources.texture(texture)?;
         CommandEncoder::require_texture_usage(desc.usage(), TextureUsage::SAMPLED)?;
+        if desc.array_layer_count() != 1 || desc.format() == TextureFormat::Depth32Float {
+            return Err(Error::BindingLayoutMismatch);
+        }
         if self.encoder.resources.same_texture(texture, self.target)? {
             return Err(Error::AttachmentFeedback);
         }
@@ -853,7 +861,9 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     /// # Returns
     /// Success, or an error for table mismatch or capacity.
     pub fn set_sampler(&mut self, sampler: SamplerRef<'r>) -> Result<()> {
-        self.encoder.resources.sampler(sampler)?;
+        if self.encoder.resources.sampler(sampler)?.compare().is_some() {
+            return Err(Error::BindingLayoutMismatch);
+        }
         self.encoder.push(Command::SetSampler(sampler))?;
         self.sampler = Some(sampler);
         Ok(())
