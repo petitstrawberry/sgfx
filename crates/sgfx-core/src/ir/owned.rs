@@ -413,11 +413,17 @@ impl OwnedCommandBuffer {
         while let Some(command) = commands.next() {
             match command {
                 OwnedCommand::WriteTextureLayer {
-                    texture, mip_level, array_layer, destination, bytes_per_row, data,
+                    texture,
+                    mip_level,
+                    array_layer,
+                    destination,
+                    bytes_per_row,
+                    data,
                 } => encoder.write_texture(
                     resources.texture_ref(*texture)?,
                     TextureWrite::new(*destination, *bytes_per_row, data)?
-                        .with_mip_level(*mip_level).with_array_layer(*array_layer),
+                        .with_mip_level(*mip_level)
+                        .with_array_layer(*array_layer),
                 )?,
                 OwnedCommand::WriteTextureMip {
                     texture,
@@ -484,13 +490,26 @@ impl OwnedCommandBuffer {
                 OwnedCommand::ResourceBarrier(barrier) => {
                     encoder.resource_barrier(barrier.resolve(resources)?)?;
                 }
-                OwnedCommand::BeginRenderPass(desc) | OwnedCommand::BeginRenderPassWithAttachments { desc, .. } => {
+                OwnedCommand::BeginRenderPass(desc)
+                | OwnedCommand::BeginRenderPassWithAttachments { desc, .. } => {
                     let mut resolved = desc.resolve(resources)?;
-                    if let OwnedCommand::BeginRenderPassWithAttachments { colors, read_only_depth, .. } = command {
+                    if let OwnedCommand::BeginRenderPassWithAttachments {
+                        colors,
+                        read_only_depth,
+                        ..
+                    } = command
+                    {
                         for color in colors {
-                            resolved = resolved.with_color_attachment(resources, resources.texture_ref(color.target)?, color.load, color.store)?;
+                            resolved = resolved.with_color_attachment(
+                                resources,
+                                resources.texture_ref(color.target)?,
+                                color.load,
+                                color.store,
+                            )?;
                         }
-                        if *read_only_depth { resolved = resolved.with_read_only_depth()?; }
+                        if *read_only_depth {
+                            resolved = resolved.with_read_only_depth()?;
+                        }
                     }
                     let mut pass = encoder.begin_render_pass(resolved)?;
                     let mut ended = false;
@@ -517,8 +536,16 @@ impl OwnedCommandBuffer {
                             OwnedCommand::SetVertexBuffer { buffer, offset } => {
                                 pass.set_vertex_buffer(resources.buffer_ref(*buffer)?, *offset)?;
                             }
-                            OwnedCommand::SetVertexBufferSlot { slot, buffer, offset } => {
-                                pass.set_vertex_buffer_slot(*slot, resources.buffer_ref(*buffer)?, *offset)?;
+                            OwnedCommand::SetVertexBufferSlot {
+                                slot,
+                                buffer,
+                                offset,
+                            } => {
+                                pass.set_vertex_buffer_slot(
+                                    *slot,
+                                    resources.buffer_ref(*buffer)?,
+                                    *offset,
+                                )?;
                             }
                             OwnedCommand::SetIndexBuffer {
                                 buffer,
@@ -552,10 +579,30 @@ impl OwnedCommandBuffer {
                                 first_index,
                                 base_vertex,
                             } => pass.draw_indexed(*index_count, *first_index, *base_vertex)?,
-                            OwnedCommand::DrawInstanced { vertex_count, first_vertex, instance_count, first_instance } =>
-                                pass.draw_instanced(*vertex_count, *first_vertex, *instance_count, *first_instance)?,
-                            OwnedCommand::DrawIndexedInstanced { index_count, first_index, base_vertex, instance_count, first_instance } =>
-                                pass.draw_indexed_instanced(*index_count, *first_index, *base_vertex, *instance_count, *first_instance)?,
+                            OwnedCommand::DrawInstanced {
+                                vertex_count,
+                                first_vertex,
+                                instance_count,
+                                first_instance,
+                            } => pass.draw_instanced(
+                                *vertex_count,
+                                *first_vertex,
+                                *instance_count,
+                                *first_instance,
+                            )?,
+                            OwnedCommand::DrawIndexedInstanced {
+                                index_count,
+                                first_index,
+                                base_vertex,
+                                instance_count,
+                                first_instance,
+                            } => pass.draw_indexed_instanced(
+                                *index_count,
+                                *first_index,
+                                *base_vertex,
+                                *instance_count,
+                                *first_instance,
+                            )?,
                             _ => return Err(Error::InvalidDescriptor),
                         }
                     }
@@ -874,6 +921,47 @@ mod tests {
                 Err(Error::InvalidDescriptor)
             );
         }
+    }
+
+    #[test]
+    fn single_channel_mips_can_be_filtered_on_the_gpu() {
+        let resources = ResourceTable::new();
+        let texture = resources
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::R8Unorm,
+                    Extent2D::new(8, 8).unwrap(),
+                    TextureUsage::COPY_SRC | TextureUsage::COPY_DST | TextureUsage::SAMPLED,
+                )
+                .unwrap()
+                .with_mip_level_count(4)
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let commands = OwnedCommandBuffer::new(vec![
+            OwnedCommand::WriteTextureMip {
+                texture,
+                mip_level: 0,
+                destination: PixelRect::new(0, 0, 8, 8).unwrap(),
+                bytes_per_row: 8,
+                data: vec![128; 64],
+            },
+            OwnedCommand::ResourceBarrier(OwnedResourceBarrier::TextureMip {
+                texture,
+                mip_level: 0,
+                before: TextureAccess::CopyDestination,
+                after: TextureAccess::CopySource,
+            }),
+            OwnedCommand::BlitTexture {
+                source: texture,
+                source_mip: 0,
+                destination: texture,
+                destination_mip: 1,
+                filter: FilterMode::Linear,
+            },
+        ]);
+        assert_eq!(commands.record(&resources).unwrap().command_count(), 3);
     }
 
     #[test]

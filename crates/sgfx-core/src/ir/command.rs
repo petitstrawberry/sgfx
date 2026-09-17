@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 
 mod programmable_commands;
 use super::{
-    BindGroupRef, ComputePipelineRef, MAX_BIND_GROUPS, MAX_VERTEX_BUFFERS, ProgrammableRenderPipelineRef,
-    ResourceBarrier, ShaderStages,
+    BindGroupRef, ComputePipelineRef, MAX_BIND_GROUPS, MAX_VERTEX_BUFFERS,
+    ProgrammableRenderPipelineRef, ResourceBarrier, ShaderStages,
 };
 use super::{BufferAccess, TextureAccess};
 use super::{ColorAttachment, MAX_COLOR_ATTACHMENTS};
@@ -63,7 +63,9 @@ pub struct DepthAttachment<'r> {
 
 impl<'r> DepthAttachment<'r> {
     /// Whether depth may be sampled while the pass uses it for read-only tests.
-    pub const fn read_only(self) -> bool { self.read_only }
+    pub const fn read_only(self) -> bool {
+        self.read_only
+    }
     /// Return the depth attachment reference.
     ///
     /// # Returns
@@ -184,31 +186,54 @@ impl<'r> RenderPassDesc<'r> {
     }
 
     /// Append a color output with matching extent and a distinct allocation.
-    pub fn with_color_attachment(mut self, resources: &'r ResourceTable, target: TextureRef<'r>, load: LoadOp, store: StoreOp) -> Result<Self> {
+    pub fn with_color_attachment(
+        mut self,
+        resources: &'r ResourceTable,
+        target: TextureRef<'r>,
+        load: LoadOp,
+        store: StoreOp,
+    ) -> Result<Self> {
         Self::new(resources, target, self.area, load, store)?;
         if resources.texture(target)?.extent() != resources.texture(self.target)?.extent() {
             return Err(Error::OutOfBounds);
         }
-        if self.color_attachments().any(|attachment| attachment.target() == target) {
+        if self
+            .color_attachments()
+            .any(|attachment| attachment.target() == target)
+        {
             return Err(Error::AttachmentFeedback);
         }
-        let slot = self.extra_colors.iter_mut().find(|slot| slot.is_none()).ok_or(Error::ResourceLimitExceeded)?;
-        *slot = Some(ColorAttachment { target, load, store });
+        let slot = self
+            .extra_colors
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(Error::ResourceLimitExceeded)?;
+        *slot = Some(ColorAttachment {
+            target,
+            load,
+            store,
+        });
         Ok(self)
     }
 
     /// Preserve depth contents and allow simultaneous read-only depth sampling.
     pub fn with_read_only_depth(mut self) -> Result<Self> {
         let depth = self.depth.as_mut().ok_or(Error::InvalidDescriptor)?;
-        if matches!(depth.load, DepthLoadOp::Clear(_)) { return Err(Error::InvalidDescriptor); }
+        if matches!(depth.load, DepthLoadOp::Clear(_)) {
+            return Err(Error::InvalidDescriptor);
+        }
         depth.read_only = true;
         Ok(self)
     }
 
     /// Iterate color outputs in fragment output-location order.
     pub fn color_attachments(self) -> impl Iterator<Item = ColorAttachment<'r>> {
-        core::iter::once(ColorAttachment { target:self.target, load:self.load, store:self.store })
-            .chain(self.extra_colors.into_iter().flatten())
+        core::iter::once(ColorAttachment {
+            target: self.target,
+            load: self.load,
+            store: self.store,
+        })
+        .chain(self.extra_colors.into_iter().flatten())
     }
 
     /// Return the color attachment reference.
@@ -556,10 +581,11 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         src.mip_extent(source_mip)?;
         dst.mip_extent(destination_mip)?;
         if src.format() != dst.format()
-            || src.array_layer_count() != 1 || dst.array_layer_count() != 1
+            || src.array_layer_count() != 1
+            || dst.array_layer_count() != 1
             || !matches!(
                 src.format(),
-                TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
+                TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
             )
         {
             return Err(Error::InvalidDescriptor);
@@ -606,7 +632,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         Self::require_texture_usage(source_desc.usage(), TextureUsage::COPY_SRC)?;
         Self::require_texture_usage(destination_desc.usage(), TextureUsage::COPY_DST)?;
         if source_desc.format() != destination_desc.format()
-            || source_desc.array_layer_count() != 1 || destination_desc.array_layer_count() != 1
+            || source_desc.array_layer_count() != 1
+            || destination_desc.array_layer_count() != 1
             || !source_rect.same_extent(destination_rect)
         {
             return Err(Error::InvalidDescriptor);
@@ -665,9 +692,15 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             color_formats[slot] = Some(self.resources.texture(attachment.target())?.format());
         }
         if let Some(depth) = desc.depth_attachment() {
-            self.check_texture_mip_access(depth.target(), 0, if depth.read_only() {
-                TextureAccess::Sampled
-            } else { TextureAccess::RenderAttachment })?;
+            self.check_texture_mip_access(
+                depth.target(),
+                0,
+                if depth.read_only() {
+                    TextureAccess::Sampled
+                } else {
+                    TextureAccess::RenderAttachment
+                },
+            )?;
         }
         self.reserve_pass_begin()?;
         self.push(Command::BeginRenderPass(desc))?;
@@ -678,7 +711,9 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             target_format: target_desc.format(),
             color_targets,
             color_formats,
-            depth_read_only: desc.depth_attachment().is_some_and(|depth| depth.read_only()),
+            depth_read_only: desc
+                .depth_attachment()
+                .is_some_and(|depth| depth.read_only()),
             depth_format,
             area: desc.area,
             pipeline: None,
@@ -847,10 +882,13 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
                     (
                         descriptor.target_format(),
                         descriptor.depth_state().map(|depth| depth.format()),
-                        descriptor.depth_state().is_some_and(|depth| depth.write_enabled()),
+                        descriptor
+                            .depth_state()
+                            .is_some_and(|depth| depth.write_enabled()),
                     )
                 })?;
-        if self.color_targets[1].is_some() || (self.depth_read_only && depth_write)
+        if self.color_targets[1].is_some()
+            || (self.depth_read_only && depth_write)
             || target_format != self.target_format
             || depth_format.is_some_and(|format| Some(format) != self.depth_format)
         {
@@ -885,13 +923,28 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
 
     /// Bind a numbered programmable vertex buffer. Slot zero is shared with
     /// the fixed pipeline's vertex binding.
-    pub fn set_vertex_buffer_slot(&mut self, slot: u32, buffer: BufferRef<'r>, offset: u64) -> Result<()> {
-        if slot as usize >= MAX_VERTEX_BUFFERS { return Err(Error::OutOfBounds); }
-        if slot == 0 { return self.set_vertex_buffer(buffer, offset); }
+    pub fn set_vertex_buffer_slot(
+        &mut self,
+        slot: u32,
+        buffer: BufferRef<'r>,
+        offset: u64,
+    ) -> Result<()> {
+        if slot as usize >= MAX_VERTEX_BUFFERS {
+            return Err(Error::OutOfBounds);
+        }
+        if slot == 0 {
+            return self.set_vertex_buffer(buffer, offset);
+        }
         let desc = self.encoder.resources.buffer(buffer)?;
         CommandEncoder::require_buffer_usage(desc.usage(), BufferUsage::VERTEX)?;
-        if offset > desc.size() { return Err(Error::OutOfBounds); }
-        self.encoder.push(Command::SetVertexBufferSlot { slot, buffer, offset })?;
+        if offset > desc.size() {
+            return Err(Error::OutOfBounds);
+        }
+        self.encoder.push(Command::SetVertexBufferSlot {
+            slot,
+            buffer,
+            offset,
+        })?;
         self.vertex_buffers[slot as usize] = Some((buffer, offset));
         Ok(())
     }
@@ -1091,7 +1144,8 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .encoder
             .resources
             .with_pipeline(pipeline, |descriptor| descriptor.vertex_buffer().stride())?;
-        let (vertex_buffer, vertex_offset) = self.vertex_buffers[0].ok_or(Error::VertexBufferNotSet)?;
+        let (vertex_buffer, vertex_offset) =
+            self.vertex_buffers[0].ok_or(Error::VertexBufferNotSet)?;
         let vertex_desc = self.encoder.resources.buffer(vertex_buffer)?;
         self.encoder
             .check_buffer_access(vertex_buffer, BufferAccess::Vertex)?;
