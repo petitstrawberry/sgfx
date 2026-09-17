@@ -1261,7 +1261,9 @@ impl RecordedCommand {
                     *layout,
                     regions,
                 )?);
-                rec.used_buffers.push(*source);
+                // upload() already snapshots the source into WriteTexture ops.
+                // No SGFX command reads this buffer, so staging its entire
+                // contents again in execute() is redundant.
                 rec.used_images.push(*image);
             }
             Self::CopyBuffer {
