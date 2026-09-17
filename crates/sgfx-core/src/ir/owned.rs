@@ -39,6 +39,17 @@ pub struct OwnedRenderPassDesc {
     pub depth: Option<OwnedDepthAttachment>,
 }
 
+/// One additional owned color attachment, resolved against the replay table.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnedColorAttachment {
+    /// Allocation identity.
+    pub target: TextureId,
+    /// Initial contents operation.
+    pub load: LoadOp,
+    /// Final contents operation.
+    pub store: StoreOp,
+}
+
 impl OwnedRenderPassDesc {
     fn resolve(self, resources: &ResourceTable) -> Result<RenderPassDesc<'_>> {
         let mut desc = RenderPassDesc::new(
@@ -225,6 +236,15 @@ pub enum OwnedCommand {
     ResourceBarrier(OwnedResourceBarrier),
     /// Begin a render pass.
     BeginRenderPass(OwnedRenderPassDesc),
+    /// Begin a pass with additional color outputs or read-only depth.
+    BeginRenderPassWithAttachments {
+        /// First color output, render area and optional depth.
+        desc: OwnedRenderPassDesc,
+        /// Additional color outputs, in location order.
+        colors: Vec<OwnedColorAttachment>,
+        /// Permit depth reads by shaders and prohibit depth writes.
+        read_only_depth: bool,
+    },
     /// End the active render pass.
     EndRenderPass,
     /// Bind a fixed render pipeline.
@@ -464,8 +484,15 @@ impl OwnedCommandBuffer {
                 OwnedCommand::ResourceBarrier(barrier) => {
                     encoder.resource_barrier(barrier.resolve(resources)?)?;
                 }
-                OwnedCommand::BeginRenderPass(desc) => {
-                    let mut pass = encoder.begin_render_pass(desc.resolve(resources)?)?;
+                OwnedCommand::BeginRenderPass(desc) | OwnedCommand::BeginRenderPassWithAttachments { desc, .. } => {
+                    let mut resolved = desc.resolve(resources)?;
+                    if let OwnedCommand::BeginRenderPassWithAttachments { colors, read_only_depth, .. } = command {
+                        for color in colors {
+                            resolved = resolved.with_color_attachment(resources, resources.texture_ref(color.target)?, color.load, color.store)?;
+                        }
+                        if *read_only_depth { resolved = resolved.with_read_only_depth()?; }
+                    }
+                    let mut pass = encoder.begin_render_pass(resolved)?;
                     let mut ended = false;
                     for command in commands.by_ref() {
                         match command {

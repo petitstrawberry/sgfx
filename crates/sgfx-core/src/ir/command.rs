@@ -8,6 +8,7 @@ use super::{
     ResourceBarrier, ShaderStages,
 };
 use super::{BufferAccess, TextureAccess};
+use super::{ColorAttachment, MAX_COLOR_ATTACHMENTS};
 pub use programmable_commands::ComputePassEncoder;
 use programmable_commands::{AnnouncedAccess, PendingWrite};
 
@@ -57,9 +58,12 @@ pub struct DepthAttachment<'r> {
     pub(crate) target: TextureRef<'r>,
     pub(crate) load: DepthLoadOp,
     pub(crate) store: StoreOp,
+    pub(crate) read_only: bool,
 }
 
 impl<'r> DepthAttachment<'r> {
+    /// Whether depth may be sampled while the pass uses it for read-only tests.
+    pub const fn read_only(self) -> bool { self.read_only }
     /// Return the depth attachment reference.
     ///
     /// # Returns
@@ -93,6 +97,7 @@ pub struct RenderPassDesc<'r> {
     pub(crate) load: LoadOp,
     pub(crate) store: StoreOp,
     pub(crate) depth: Option<DepthAttachment<'r>>,
+    extra_colors: [Option<ColorAttachment<'r>>; MAX_COLOR_ATTACHMENTS - 1],
 }
 
 impl<'r> RenderPassDesc<'r> {
@@ -131,6 +136,7 @@ impl<'r> RenderPassDesc<'r> {
             load,
             store,
             depth: None,
+            extra_colors: [None; MAX_COLOR_ATTACHMENTS - 1],
         })
     }
 
@@ -172,8 +178,37 @@ impl<'r> RenderPassDesc<'r> {
             target,
             load,
             store,
+            read_only: false,
         });
         Ok(self)
+    }
+
+    /// Append a color output with matching extent and a distinct allocation.
+    pub fn with_color_attachment(mut self, resources: &'r ResourceTable, target: TextureRef<'r>, load: LoadOp, store: StoreOp) -> Result<Self> {
+        Self::new(resources, target, self.area, load, store)?;
+        if resources.texture(target)?.extent() != resources.texture(self.target)?.extent() {
+            return Err(Error::OutOfBounds);
+        }
+        if self.color_attachments().any(|attachment| attachment.target() == target) {
+            return Err(Error::AttachmentFeedback);
+        }
+        let slot = self.extra_colors.iter_mut().find(|slot| slot.is_none()).ok_or(Error::ResourceLimitExceeded)?;
+        *slot = Some(ColorAttachment { target, load, store });
+        Ok(self)
+    }
+
+    /// Preserve depth contents and allow simultaneous read-only depth sampling.
+    pub fn with_read_only_depth(mut self) -> Result<Self> {
+        let depth = self.depth.as_mut().ok_or(Error::InvalidDescriptor)?;
+        if matches!(depth.load, DepthLoadOp::Clear(_)) { return Err(Error::InvalidDescriptor); }
+        depth.read_only = true;
+        Ok(self)
+    }
+
+    /// Iterate color outputs in fragment output-location order.
+    pub fn color_attachments(self) -> impl Iterator<Item = ColorAttachment<'r>> {
+        core::iter::once(ColorAttachment { target:self.target, load:self.load, store:self.store })
+            .chain(self.extra_colors.into_iter().flatten())
     }
 
     /// Return the color attachment reference.
@@ -622,9 +657,17 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                     .map(|desc| desc.format())
             })
             .transpose()?;
-        self.check_texture_mip_access(desc.target, 0, TextureAccess::RenderAttachment)?;
+        let mut color_targets = [None; MAX_COLOR_ATTACHMENTS];
+        let mut color_formats = [None; MAX_COLOR_ATTACHMENTS];
+        for (slot, attachment) in desc.color_attachments().enumerate() {
+            self.check_texture_mip_access(attachment.target(), 0, TextureAccess::RenderAttachment)?;
+            color_targets[slot] = Some(attachment.target());
+            color_formats[slot] = Some(self.resources.texture(attachment.target())?.format());
+        }
         if let Some(depth) = desc.depth_attachment() {
-            self.check_texture_mip_access(depth.target(), 0, TextureAccess::RenderAttachment)?;
+            self.check_texture_mip_access(depth.target(), 0, if depth.read_only() {
+                TextureAccess::Sampled
+            } else { TextureAccess::RenderAttachment })?;
         }
         self.reserve_pass_begin()?;
         self.push(Command::BeginRenderPass(desc))?;
@@ -633,6 +676,9 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             encoder: self,
             target: desc.target,
             target_format: target_desc.format(),
+            color_targets,
+            color_formats,
+            depth_read_only: desc.depth_attachment().is_some_and(|depth| depth.read_only()),
             depth_format,
             area: desc.area,
             pipeline: None,
@@ -702,7 +748,9 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                 self.consume_access(PendingWrite::Texture(destination.id()));
             }
             Command::BeginRenderPass(desc) => {
-                self.consume_access(PendingWrite::Texture(desc.target.id()));
+                for attachment in desc.color_attachments() {
+                    self.consume_access(PendingWrite::Texture(attachment.target().id()));
+                }
                 if let Some(depth) = desc.depth_attachment() {
                     self.consume_access(PendingWrite::Texture(depth.target().id()));
                 }
@@ -763,6 +811,9 @@ pub struct RenderPassEncoder<'encoder, 'r, 'data> {
     encoder: &'encoder mut CommandEncoder<'r, 'data>,
     target: TextureRef<'r>,
     target_format: super::TextureFormat,
+    color_targets: [Option<TextureRef<'r>>; MAX_COLOR_ATTACHMENTS],
+    color_formats: [Option<TextureFormat>; MAX_COLOR_ATTACHMENTS],
+    depth_read_only: bool,
     depth_format: Option<TextureFormat>,
     area: PixelRect,
     pipeline: Option<RenderPipelineRef<'r>>,
@@ -789,16 +840,18 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     /// attachment format does not match, or command capacity is exhausted.
     /// A pipeline without depth state does not require a depth attachment.
     pub fn set_pipeline(&mut self, pipeline: RenderPipelineRef<'r>) -> Result<()> {
-        let (target_format, depth_format) =
+        let (target_format, depth_format, depth_write) =
             self.encoder
                 .resources
                 .with_pipeline(pipeline, |descriptor| {
                     (
                         descriptor.target_format(),
                         descriptor.depth_state().map(|depth| depth.format()),
+                        descriptor.depth_state().is_some_and(|depth| depth.write_enabled()),
                     )
                 })?;
-        if target_format != self.target_format
+        if self.color_targets[1].is_some() || (self.depth_read_only && depth_write)
+            || target_format != self.target_format
             || depth_format.is_some_and(|format| Some(format) != self.depth_format)
         {
             return Err(Error::PipelineTargetMismatch);

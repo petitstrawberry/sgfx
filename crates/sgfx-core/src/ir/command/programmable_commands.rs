@@ -468,7 +468,8 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .encoder
             .resources
             .programmable_render_pipeline_shared(pipeline)?;
-        if desc.target_format() != self.target_format
+        if desc.color_targets().map(|target| target.format()).ne(self.color_formats.iter().flatten().copied())
+            || (self.depth_read_only && desc.depth_state().is_some_and(|depth| depth.write_enabled()))
             || desc
                 .depth_state()
                 .is_some_and(|depth| Some(depth.format()) != self.depth_format)
@@ -497,13 +498,16 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         desc: &ProgrammableRenderPipelineDesc,
         indexed: bool,
     ) -> Result<GroupAccesses> {
-        let mut attachments = [self.target, self.target];
-        let attachment_count = if let Some(depth) = self.depth_target {
-            attachments[1] = depth;
-            2
-        } else {
-            1
-        };
+        let mut attachments = [self.target; MAX_COLOR_ATTACHMENTS + 1];
+        let mut attachment_count = 0;
+        for target in self.color_targets.iter().flatten() {
+            attachments[attachment_count] = *target;
+            attachment_count += 1;
+        }
+        if let Some(depth) = self.depth_target.filter(|_| !self.depth_read_only) {
+            attachments[attachment_count] = depth;
+            attachment_count += 1;
+        }
         self.encoder.validate_groups(
             desc.layout(),
             &self.bind_groups,

@@ -31,6 +31,8 @@ pub use resource::{
 pub use types::{Color, Error, Extent2D, PixelRect, Result, Transform, Viewport};
 
 mod programmable;
+mod render_target;
+pub use render_target::{ColorAttachment, ColorTargetState, ColorWriteMask, MAX_COLOR_ATTACHMENTS};
 mod shader;
 pub use programmable::*;
 pub use resource::{
@@ -40,6 +42,6 @@ pub use resource::{
 pub use shader::*;
 mod owned;
 pub use owned::{
-    OwnedCommand, OwnedCommandBuffer, OwnedDepthAttachment, OwnedRenderPassDesc,
+    OwnedColorAttachment, OwnedCommand, OwnedCommandBuffer, OwnedDepthAttachment, OwnedRenderPassDesc,
     OwnedResourceBarrier,
 };

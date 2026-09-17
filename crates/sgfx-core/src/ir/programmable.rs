@@ -478,7 +478,7 @@ impl ComputePipelineDesc {
         &self.layout
     }
 }
-/// Programmable graphics with one color target and up to eight vertex buffers.
+/// Programmable graphics with up to eight color targets and vertex buffers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgrammableRenderPipelineDesc {
     vertex: ShaderEntryPoint,
@@ -490,6 +490,8 @@ pub struct ProgrammableRenderPipelineDesc {
     blend: BlendState,
     raster: RasterState,
     depth: Option<DepthState>,
+    color_write_mask: super::ColorWriteMask,
+    additional_targets: Vec<super::ColorTargetState>,
 }
 impl ProgrammableRenderPipelineDesc {
     /// Construct a programmable graphics pipeline. `None` enables vertex-index-generated geometry.
@@ -520,7 +522,23 @@ impl ProgrammableRenderPipelineDesc {
             blend,
             raster,
             depth: None,
+            color_write_mask: super::ColorWriteMask::ALL,
+            additional_targets: Vec::new(),
         })
+    }
+    /// Replace fragment output formats and per-output blend/write state.
+    pub fn with_color_targets(mut self, targets: Vec<super::ColorTargetState>) -> Result<Self> {
+        if targets.is_empty() || targets.len() > super::MAX_COLOR_ATTACHMENTS { return Err(Error::InvalidDescriptor); }
+        self.target_format = targets[0].format();
+        self.blend = targets[0].blend();
+        self.color_write_mask = targets[0].write_mask();
+        self.additional_targets = targets.into_iter().skip(1).collect();
+        Ok(self)
+    }
+    /// Return fragment outputs in location order.
+    pub fn color_targets(&self) -> impl Iterator<Item = super::ColorTargetState> + '_ {
+        core::iter::once(super::ColorTargetState::new(self.target_format, self.blend, self.color_write_mask).expect("validated color target"))
+            .chain(self.additional_targets.iter().copied())
     }
     /// Replace vertex input with consecutive buffer slots. Attribute locations
     /// must be unique across slots and respect the total attribute limit.
