@@ -202,7 +202,44 @@ unsafe fn device_chain_supported(mut next: *const std::ffi::c_void) -> bool {
             return true;
         }
         let header = &*next.cast::<vk::BaseInStructure<'_>>();
-        if header.s_type != vk::StructureType::LOADER_DEVICE_CREATE_INFO {
+        let supported = match header.s_type {
+            vk::StructureType::LOADER_DEVICE_CREATE_INFO => true,
+            vk::StructureType::PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES => {
+                let features = &*next.cast::<vk::PhysicalDeviceDescriptorIndexingFeatures<'_>>();
+                // Applications may include an extension's feature record with
+                // every feature disabled. This does not enable the extension.
+                [
+                    features.shader_input_attachment_array_dynamic_indexing,
+                    features.shader_uniform_texel_buffer_array_dynamic_indexing,
+                    features.shader_storage_texel_buffer_array_dynamic_indexing,
+                    features.shader_uniform_buffer_array_non_uniform_indexing,
+                    features.shader_sampled_image_array_non_uniform_indexing,
+                    features.shader_storage_buffer_array_non_uniform_indexing,
+                    features.shader_storage_image_array_non_uniform_indexing,
+                    features.shader_input_attachment_array_non_uniform_indexing,
+                    features.shader_uniform_texel_buffer_array_non_uniform_indexing,
+                    features.shader_storage_texel_buffer_array_non_uniform_indexing,
+                    features.descriptor_binding_uniform_buffer_update_after_bind,
+                    features.descriptor_binding_sampled_image_update_after_bind,
+                    features.descriptor_binding_storage_image_update_after_bind,
+                    features.descriptor_binding_storage_buffer_update_after_bind,
+                    features.descriptor_binding_uniform_texel_buffer_update_after_bind,
+                    features.descriptor_binding_storage_texel_buffer_update_after_bind,
+                    features.descriptor_binding_update_unused_while_pending,
+                    features.descriptor_binding_partially_bound,
+                    features.descriptor_binding_variable_descriptor_count,
+                    features.runtime_descriptor_array,
+                ]
+                .into_iter()
+                .all(|feature| feature == vk::FALSE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES => {
+                let features = &*next.cast::<vk::PhysicalDeviceShaderDrawParametersFeatures<'_>>();
+                features.shader_draw_parameters == vk::FALSE
+            }
+            _ => false,
+        };
+        if !supported {
             return false;
         }
         next = header.p_next.cast();
@@ -3991,7 +4028,7 @@ mod tests {
     }
 
     #[test]
-    fn loader_device_chain_accepts_only_transport_records() {
+    fn loader_device_chain_rejects_unknown_records() {
         let mut base = vk::BaseInStructure {
             s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
             ..Default::default()
@@ -4006,6 +4043,42 @@ mod tests {
             assert!(!device_chain_supported(
                 (&base as *const vk::BaseInStructure<'_>).cast()
             ));
+        }
+    }
+
+    #[test]
+    fn device_chain_accepts_disabled_features_without_enabling_them() {
+        fn supported(
+            indexing: &mut vk::PhysicalDeviceDescriptorIndexingFeatures<'_>,
+            draw: &mut vk::PhysicalDeviceShaderDrawParametersFeatures<'_>,
+        ) -> bool {
+            indexing.p_next = (draw as *mut vk::PhysicalDeviceShaderDrawParametersFeatures<'_>).cast();
+            let loader = vk::BaseInStructure {
+                s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+                p_next: (indexing as *const vk::PhysicalDeviceDescriptorIndexingFeatures<'_>).cast(),
+                ..Default::default()
+            };
+            unsafe { device_chain_supported((&loader as *const vk::BaseInStructure<'_>).cast()) }
+        }
+        let mut draw = vk::PhysicalDeviceShaderDrawParametersFeatures::default();
+        let mut indexing = vk::PhysicalDeviceDescriptorIndexingFeatures::default();
+        assert!(supported(&mut indexing, &mut draw));
+        indexing.descriptor_binding_partially_bound = vk::TRUE;
+        assert!(!supported(&mut indexing, &mut draw));
+        indexing.descriptor_binding_partially_bound = vk::FALSE;
+        draw.shader_draw_parameters = vk::TRUE;
+        assert!(!supported(&mut indexing, &mut draw));
+    }
+
+    #[test]
+    fn device_chain_rejects_cycles() {
+        let mut loader = vk::BaseInStructure {
+            s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+            ..Default::default()
+        };
+        loader.p_next = &loader;
+        unsafe {
+            assert!(!device_chain_supported((&loader as *const vk::BaseInStructure<'_>).cast()));
         }
     }
 }
