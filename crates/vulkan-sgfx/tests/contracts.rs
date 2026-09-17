@@ -539,6 +539,53 @@ fn descriptor_update_invalidates_executable_commands_until_rerecorded() {
 
 #[test]
 #[ignore = "requires a built SGFX ICD and a native GPU adapter"]
+fn odd_sized_vulkan_buffers_remain_bindable() {
+    let context = Context::new();
+    unsafe {
+        for size in [1, 7, 24_970] {
+            let buffer = context
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(size)
+                        .usage(
+                            vk::BufferUsageFlags::VERTEX_BUFFER
+                                | vk::BufferUsageFlags::INDEX_BUFFER,
+                        )
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .unwrap();
+            let requirements = context.device.get_buffer_memory_requirements(buffer);
+            assert!(requirements.size >= size);
+            assert_eq!(requirements.size % requirements.alignment, 0);
+            let memory = context
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(requirements.size)
+                        .memory_type_index(0),
+                    None,
+                )
+                .unwrap();
+            context
+                .device
+                .bind_buffer_memory(buffer, memory, 0)
+                .unwrap();
+            let mapping = context
+                .device
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                .unwrap();
+            std::ptr::write_bytes(mapping.cast::<u8>(), 0x7f, size as usize);
+            context.device.unmap_memory(memory);
+            context.device.destroy_buffer(buffer, None);
+            context.device.free_memory(memory, None);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a built SGFX ICD and a native GPU adapter"]
 fn repeated_buffer_destruction_reclaims_idle_resource_capacity() {
     let context = Context::new();
     // Context owns only an empty command pool/buffer. No pipeline, descriptor,

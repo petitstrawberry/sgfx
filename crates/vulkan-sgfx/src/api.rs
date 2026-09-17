@@ -3305,14 +3305,16 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
                 .memories
                 .get(&memory)
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            let bytes = memory
+            let mut bytes = memory
                 .bytes
                 .get(offset as usize..(offset + buffer.size) as usize)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                .to_vec();
+            bytes.resize(bytes.len().next_multiple_of(4), 0);
             ops.push(ir::OwnedCommand::WriteBuffer {
                 buffer: buffer.id,
                 offset: 0,
-                data: bytes.to_vec(),
+                data: bytes,
             });
         }
     }

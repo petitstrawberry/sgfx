@@ -720,7 +720,6 @@ unsafe extern "system" fn create_buffer(
             || !i.flags.is_empty()
             || i.size == 0
             || i.size > MAX_ALLOCATION
-            || !i.size.is_multiple_of(4)
             || i.usage.is_empty()
             || !allowed.contains(i.usage)
             || i.sharing_mode != vk::SharingMode::EXCLUSIVE
@@ -728,6 +727,9 @@ unsafe extern "system" fn create_buffer(
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let size = i.size;
+        // Vulkan buffer sizes are byte counts. Pad only the SGFX backing
+        // buffer for backends that upload in four-byte units.
+        let backing_size = size.next_multiple_of(4);
         let usage = i.usage;
         let mut ir_usage = ir::BufferUsage::COPY_SRC | ir::BufferUsage::COPY_DST;
         for (vk_flag, ir_flag) in [
@@ -752,7 +754,7 @@ unsafe extern "system" fn create_buffer(
             }
             let id = r
                 .table
-                .define_buffer(ir::BufferDesc::new(size, ir_usage).map_err(failure)?)
+                .define_buffer(ir::BufferDesc::new(backing_size, ir_usage).map_err(failure)?)
                 .map_err(failure)?
                 .id();
             let handle = vk::Buffer::from_raw(crate::api::next_id());
@@ -798,7 +800,7 @@ unsafe extern "system" fn buffer_requirements(
             .ok_or(vk::Result::ERROR_UNKNOWN)
     }) {
         out.write(vk::MemoryRequirements {
-            size,
+            size: size.next_multiple_of(256),
             alignment: 256,
             memory_type_bits: 1,
         });
