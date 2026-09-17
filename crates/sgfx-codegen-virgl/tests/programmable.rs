@@ -48,6 +48,10 @@ struct Object { translation: vec3<f32>, joint: u32, transform: mat3x3<f32> };
             (1, 1)
         );
         assert_eq!(shader.storage_buffers[1].first_register, 1);
+        assert_eq!(shader.first_instance_register, Some(2));
+        assert!(shader.tgsi.lines().any(|line| {
+            line.contains("UADD") && line.contains("SV[1]") && line.contains("CONST[2]")
+        }));
         assert!(shader.tgsi.contains("DCL SVIEW[0], BUFFER, UINT"));
         assert!(shader.tgsi.contains("DCL SVIEW[1], BUFFER, UINT"));
         assert!(shader.tgsi.contains("UINT32 { 64, 64, 64, 64 }"));

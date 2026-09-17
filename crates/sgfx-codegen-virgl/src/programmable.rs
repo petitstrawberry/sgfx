@@ -117,6 +117,9 @@ pub struct CompiledShader {
     pub storage_buffers: Vec<StorageBufferBinding>,
     /// Push constants occupy a distinct span after every uniform buffer.
     pub push_constants: Option<PushConstantBinding>,
+    /// Inline constant register added to the vertex instance ID on hosts
+    /// without native base-instance draws.
+    pub first_instance_register: Option<u32>,
     /// Sampling pairs bound independently for each shader stage.
     pub textures: Vec<TextureSamplerBinding>,
     /// Input locations consumed by the shader, for pipeline validation.
@@ -191,6 +194,22 @@ fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo> {
     )
     .validate(module)
     .map_err(|error| ShaderCompileError(format!("shader validation: {error}")))
+}
+
+fn uses_instance_index(
+    module: &naga::Module,
+    ty: Handle<naga::Type>,
+    binding: Option<&Binding>,
+) -> bool {
+    if matches!(binding, Some(Binding::BuiltIn(BuiltIn::InstanceIndex))) {
+        return true;
+    }
+    match &module.types[ty].inner {
+        T::Struct { members, .. } => members
+            .iter()
+            .any(|member| uses_instance_index(module, member.ty, member.binding.as_ref())),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -315,6 +334,7 @@ struct Compiler<'a> {
     uniforms: Vec<UniformBufferBinding>,
     storage_buffers: Vec<StorageBufferBinding>,
     push_constants: Option<PushConstantBinding>,
+    first_instance_register: Option<u32>,
     textures: Vec<TextureSamplerBinding>,
     input_locations: Vec<u32>,
     output_locations: Vec<u32>,
@@ -341,6 +361,7 @@ impl<'a> Compiler<'a> {
             uniforms: Vec::new(),
             storage_buffers: Vec::new(),
             push_constants: None,
+            first_instance_register: None,
             textures: Vec::new(),
             input_locations: Vec::new(),
             output_locations: Vec::new(),
@@ -707,8 +728,24 @@ impl<'a> Compiler<'a> {
             Binding::BuiltIn(BuiltIn::InstanceIndex)
                 if input && self.stage == ShaderStage::Vertex =>
             {
+                if !matches!(&shape, Shape::Scalar(K::Uint)) {
+                    return Err(unsupported("instance index type"));
+                }
                 self.declarations.push("DCL SV[1], INSTANCEID".into());
-                "SV[1]".into()
+                let register = self
+                    .first_instance_register
+                    .ok_or_else(|| unsupported("instance index constant"))?;
+                let instance = Lane {
+                    register: "SV[1]".into(),
+                    component: 0,
+                };
+                let base = Lane {
+                    register: format!("CONST[{register}]"),
+                    component: 0,
+                };
+                let adjusted = self.allocate(shape, false)?;
+                self.instruction("UADD", &adjusted.lanes[0], &[&instance, &base])?;
+                return Ok(adjusted);
             }
             _ => return Err(unsupported("stage builtin")),
         };
@@ -884,6 +921,17 @@ impl<'a> Compiler<'a> {
                 indirect: None,
             });
         }
+        if self.stage == ShaderStage::Vertex
+            && entry.function.arguments.iter().any(|argument| {
+                uses_instance_index(self.module, argument.ty, argument.binding.as_ref())
+            })
+        {
+            self.first_instance_register = Some(next_constant_register);
+            next_constant_register = next_constant_register
+                .checked_add(1)
+                .filter(|&register| register <= 1024)
+                .ok_or_else(|| unsupported("more than 1024 inline constant registers"))?;
+        }
         if next_constant_register == 1 {
             self.declarations.push("DCL CONST[0]".into());
         } else if next_constant_register > 1 {
@@ -963,6 +1011,7 @@ impl<'a> Compiler<'a> {
             uniform_buffers: self.uniforms,
             storage_buffers: self.storage_buffers,
             push_constants: self.push_constants,
+            first_instance_register: self.first_instance_register,
             textures: self.textures,
             input_locations: self.input_locations,
             output_locations: self.output_locations,

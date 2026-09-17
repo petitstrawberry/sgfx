@@ -3683,6 +3683,7 @@ struct ProgrammableBindings {
     pipeline: Option<(u32, u32, u32, u32)>,
     vertex_buffers: Option<[(u32, u32, u32); 8]>,
     constants: Option<Rc<[IrConstantBuffer]>>,
+    first_instance: Option<u32>,
     vertex_constants: Vec<u32>,
     fragment_constants: Vec<u32>,
     textures: Vec<((u32, u32), (u32, u32))>,
@@ -3693,43 +3694,66 @@ struct ProgrammableBindings {
 fn push_programmable_constants(
     commands: &mut Vec<u8>,
     constants: &Rc<[IrConstantBuffer]>,
+    first_instance_register: Option<u32>,
+    first_instance: u32,
     bindings: &mut ProgrammableBindings,
 ) -> HandleResult<()> {
-    if bindings.constants.as_ref().is_some_and(|previous| {
+    let constants_unchanged = bindings.constants.as_ref().is_some_and(|previous| {
         Rc::ptr_eq(previous, constants) || previous.as_ref() == constants.as_ref()
-    }) {
+    });
+    let instance_unchanged =
+        first_instance_register.is_none_or(|_| bindings.first_instance == Some(first_instance));
+    if constants_unchanged && instance_unchanged {
         return Ok(());
     }
-    bindings.vertex_constants.clear();
-    bindings.fragment_constants.clear();
-    for constant in constants.iter() {
-        let values = match constant.stage {
-            crate::ir::ShaderStage::Vertex => &mut bindings.vertex_constants,
-            crate::ir::ShaderStage::Fragment => &mut bindings.fragment_constants,
-            _ => return Err(HandleError::InvalidParameter),
-        };
-        let start = usize::try_from(constant.first_register)
+    if !constants_unchanged {
+        bindings.vertex_constants.clear();
+        bindings.fragment_constants.clear();
+        for constant in constants.iter() {
+            let values = match constant.stage {
+                crate::ir::ShaderStage::Vertex => &mut bindings.vertex_constants,
+                crate::ir::ShaderStage::Fragment => &mut bindings.fragment_constants,
+                _ => return Err(HandleError::InvalidParameter),
+            };
+            let start = usize::try_from(constant.first_register)
+                .ok()
+                .and_then(|register| register.checked_mul(4))
+                .ok_or(HandleError::InvalidParameter)?;
+            let end = start
+                .checked_add(constant.words.len())
+                .ok_or(HandleError::InvalidParameter)?;
+            if values.len() < end {
+                values
+                    .try_reserve(end - values.len())
+                    .map_err(|_| HandleError::OutOfResources)?;
+                values.resize(end, 0);
+            }
+            values[start..end].copy_from_slice(&constant.words);
+        }
+    }
+    if let Some(register) = first_instance_register {
+        let start = usize::try_from(register)
             .ok()
             .and_then(|register| register.checked_mul(4))
             .ok_or(HandleError::InvalidParameter)?;
-        let end = start
-            .checked_add(constant.words.len())
-            .ok_or(HandleError::InvalidParameter)?;
-        if values.len() < end {
-            values
-                .try_reserve(end - values.len())
+        let end = start.checked_add(4).ok_or(HandleError::InvalidParameter)?;
+        if bindings.vertex_constants.len() < end {
+            bindings
+                .vertex_constants
+                .try_reserve(end - bindings.vertex_constants.len())
                 .map_err(|_| HandleError::OutOfResources)?;
-            values.resize(end, 0);
+            bindings.vertex_constants.resize(end, 0);
         }
-        values[start..end].copy_from_slice(&constant.words);
+        bindings.vertex_constants[start..end].copy_from_slice(&[first_instance, 0, 0, 0]);
     }
-    if !bindings.vertex_constants.is_empty() {
+    if (!constants_unchanged || !instance_unchanged) && !bindings.vertex_constants.is_empty() {
         push_constant_words(commands, PIPE_SHADER_VERTEX, &bindings.vertex_constants)?;
     }
-    if !bindings.fragment_constants.is_empty() {
+    if !constants_unchanged && !bindings.fragment_constants.is_empty() {
         push_constant_words(commands, PIPE_SHADER_FRAGMENT, &bindings.fragment_constants)?;
     }
     bindings.constants = Some(Rc::clone(constants));
+    bindings.first_instance = first_instance_register.map(|_| first_instance);
     Ok(())
 }
 
@@ -3838,7 +3862,13 @@ fn push_programmable_draw(
         }
         bindings.vertex_buffers = Some(vertex_bindings);
     }
-    push_programmable_constants(commands, &programmable.constants, bindings)?;
+    push_programmable_constants(
+        commands,
+        &programmable.constants,
+        native.description.vertex.first_instance_register,
+        draw.first_instance,
+        bindings,
+    )?;
     for binding in programmable.storage_buffers.iter() {
         let stage = match binding.stage {
             crate::ir::ShaderStage::Vertex => PIPE_SHADER_VERTEX,
@@ -3916,7 +3946,6 @@ fn push_programmable_draw(
             binding.base_vertex,
             programmable.pipeline.topology,
             draw.instance_count,
-            draw.first_instance,
         )
     } else {
         push_instanced_draw_parameters(
@@ -3927,7 +3956,6 @@ fn push_programmable_draw(
             0,
             programmable.pipeline.topology,
             draw.instance_count,
-            draw.first_instance,
         )
     }
 }
@@ -4647,7 +4675,6 @@ fn push_draw_topology_parameters(
         base_vertex,
         topology,
         1,
-        0,
     )
 }
 
@@ -4660,9 +4687,8 @@ fn push_instanced_draw_parameters(
     base_vertex: i32,
     topology: crate::ir::PrimitiveTopology,
     instance_count: u32,
-    first_instance: u32,
 ) -> HandleResult<()> {
-    if instance_count == 0 || first_instance.checked_add(instance_count).is_none() {
+    if instance_count == 0 {
         return Err(HandleError::InvalidParameter);
     }
     let start_vertex = u32::try_from(start_vertex).map_err(|_| HandleError::InvalidParameter)?;
@@ -4683,7 +4709,9 @@ fn push_instanced_draw_parameters(
     push_dword(commands, u32::from(indexed));
     push_dword(commands, instance_count);
     push_dword(commands, base_vertex as u32);
-    push_dword(commands, first_instance);
+    // VirGL's host may lack GL_ARB_base_instance. The shader constant above
+    // supplies Vulkan's firstInstance to InstanceIndex instead.
+    push_dword(commands, 0);
     push_dword(commands, 0);
     push_dword(commands, 0);
     push_dword(commands, 0);
@@ -5131,23 +5159,50 @@ mod tests {
         let mut bindings = ProgrammableBindings::default();
         let mut commands = Vec::new();
         let first = constants(7);
-        push_programmable_constants(&mut commands, &first, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &first, None, 0, &mut bindings).unwrap();
         let encoded = commands.clone();
         let storage = bindings.vertex_constants.as_ptr();
-        push_programmable_constants(&mut commands, &first, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &first, None, 0, &mut bindings).unwrap();
         let separate_owner = constants(7);
         assert!(!Rc::ptr_eq(&first, &separate_owner));
-        push_programmable_constants(&mut commands, &separate_owner, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &separate_owner, None, 0, &mut bindings)
+            .unwrap();
         assert_eq!(commands, encoded);
         commands.clear();
-        push_programmable_constants(&mut commands, &constants(9), &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants(9), None, 0, &mut bindings).unwrap();
         assert_eq!(bindings.vertex_constants.as_ptr(), storage);
         assert_eq!(&bindings.vertex_constants, &[0, 0, 0, 0, 9, 9, 9, 9]);
         assert_eq!(first[0].words.as_slice(), &[7; 4]);
         let mut fresh_packet = ProgrammableBindings::default();
         commands.clear();
-        push_programmable_constants(&mut commands, &first, &mut fresh_packet).unwrap();
+        push_programmable_constants(&mut commands, &first, None, 0, &mut fresh_packet).unwrap();
         assert_eq!(commands, encoded);
+    }
+
+    #[test]
+    fn first_instance_updates_only_the_vertex_constant_bank() {
+        let constants: Rc<[IrConstantBuffer]> = alloc::vec![IrConstantBuffer {
+            stage: crate::ir::ShaderStage::Fragment,
+            first_register: 0,
+            words: alloc::vec![9; 4].into(),
+        }]
+        .into();
+        let mut bindings = ProgrammableBindings::default();
+        let mut commands = Vec::new();
+        push_programmable_constants(&mut commands, &constants, Some(2), 3, &mut bindings).unwrap();
+        assert_eq!(&bindings.vertex_constants[8..12], &[3, 0, 0, 0]);
+        commands.clear();
+        push_programmable_constants(&mut commands, &constants, Some(2), 5, &mut bindings).unwrap();
+        let words = dwords(&commands);
+        assert_eq!(
+            words[0],
+            command_header(VIRGL_CCMD_SET_CONSTANT_BUFFER, 0, 14)
+        );
+        assert_eq!(&words[1..3], &[PIPE_SHADER_VERTEX, 0]);
+        assert_eq!(&words[11..15], &[5, 0, 0, 0]);
+        commands.clear();
+        push_programmable_constants(&mut commands, &constants, Some(2), 5, &mut bindings).unwrap();
+        assert!(commands.is_empty());
     }
 
     #[test]
@@ -5609,7 +5664,7 @@ mod tests {
     }
 
     #[test]
-    fn instanced_draw_keeps_instance_count_and_rejects_overflow() {
+    fn instanced_draw_keeps_instance_count_and_zeroes_host_base_instance() {
         let mut commands = Vec::new();
         push_instanced_draw_parameters(
             &mut commands,
@@ -5619,7 +5674,6 @@ mod tests {
             -1,
             crate::ir::PrimitiveTopology::TriangleList,
             17,
-            0,
         )
         .unwrap();
         assert_eq!(
@@ -5635,8 +5689,7 @@ mod tests {
                 false,
                 0,
                 crate::ir::PrimitiveTopology::TriangleList,
-                2,
-                u32::MAX
+                0,
             ),
             Err(HandleError::InvalidParameter)
         );
