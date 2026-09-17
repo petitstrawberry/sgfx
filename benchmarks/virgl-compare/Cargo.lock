@@ -60,7 +60,7 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 [[package]]
 name = "gpu-raw"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4b5257897e341a0d0d3136b37d47b0157b9985cd#4b5257897e341a0d0d3136b37d47b0157b9985cd"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=8340078937951f6096e6f3273b547665368f70f4#8340078937951f6096e6f3273b547665368f70f4"
 dependencies = [
  "scarlet-os",
 ]
@@ -165,12 +165,12 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4b5257897e341a0d0d3136b37d47b0157b9985cd#4b5257897e341a0d0d3136b37d47b0157b9985cd"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=8340078937951f6096e6f3273b547665368f70f4#8340078937951f6096e6f3273b547665368f70f4"
 
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4b5257897e341a0d0d3136b37d47b0157b9985cd#4b5257897e341a0d0d3136b37d47b0157b9985cd"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=8340078937951f6096e6f3273b547665368f70f4#8340078937951f6096e6f3273b547665368f70f4"
 dependencies = [
  "scarlet-abi",
  "scarlet-sys",
@@ -179,7 +179,7 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4b5257897e341a0d0d3136b37d47b0157b9985cd#4b5257897e341a0d0d3136b37d47b0157b9985cd"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=8340078937951f6096e6f3273b547665368f70f4#8340078937951f6096e6f3273b547665368f70f4"
 dependencies = [
  "scarlet-abi",
 ]
