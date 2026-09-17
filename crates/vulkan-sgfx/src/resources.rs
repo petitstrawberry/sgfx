@@ -2,7 +2,7 @@
 use ash::vk::{self, Handle};
 use sgfx::ir;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::{CStr, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice,
@@ -25,7 +25,7 @@ pub(crate) struct AlignedBytes {
     len: usize,
 }
 impl AlignedBytes {
-    fn zeroed(len: usize) -> Result<Self, vk::Result> {
+    pub(crate) fn zeroed(len: usize) -> Result<Self, vk::Result> {
         let word_count = len
             .checked_add(7)
             .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?
@@ -151,6 +151,8 @@ pub(crate) unsafe fn specialization(
 pub(crate) struct Resources {
     pub buffers: HashMap<vk::Buffer, Buffer>,
     pub memories: HashMap<vk::DeviceMemory, Memory>,
+    /// Buffers whose unmapped host allocation has already been staged to SGFX.
+    pub uploaded_unmapped_buffers: HashSet<vk::Buffer>,
     pub shaders: HashMap<vk::ShaderModule, Shader>,
     pub set_layouts: HashMap<vk::DescriptorSetLayout, ir::BindGroupLayoutDesc>,
     pub set_layout_types: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::DescriptorType>>,
@@ -177,6 +179,15 @@ pub(crate) struct Resources {
 impl Resources {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn forget_uploads_for_memory(&mut self, memory: vk::DeviceMemory) {
+        let buffers = &self.buffers;
+        self.uploaded_unmapped_buffers.retain(|handle| {
+            buffers
+                .get(handle)
+                .is_some_and(|buffer| buffer.bound.is_some_and(|(bound, _)| bound != memory))
+        });
     }
     /// Cache shader variants for the component maps of statically used views.
     /// Identity bindings use the original pipeline without allocating a key.
@@ -328,6 +339,7 @@ impl Resources {
 
     /// Forget every cached identity before swapping to a fresh IR table.
     pub(crate) fn clear_ir_cache(&mut self) {
+        self.uploaded_unmapped_buffers.clear();
         self.bind_group_cache.clear();
         self.graphics_swizzles.clear();
         self.compute_swizzles.clear();
@@ -780,6 +792,7 @@ unsafe extern "system" fn destroy_buffer(
 ) {
     let _ = crate::api::with_device(device, move |r| {
         r.resources.buffers.remove(&buffer);
+        r.resources.uploaded_unmapped_buffers.remove(&buffer);
         Ok(())
     });
 }
@@ -865,6 +878,7 @@ unsafe extern "system" fn free_memory(
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
     let _ = crate::api::with_device(device, move |r| {
+        r.resources.forget_uploads_for_memory(memory);
         r.resources.memories.remove(&memory);
         for buffer in r.resources.buffers.values_mut() {
             if buffer.bound.is_some_and(|(m, _)| m == memory) {
@@ -955,7 +969,9 @@ unsafe extern "system" fn map_memory(
                 return Err(vk::Result::ERROR_MEMORY_MAP_FAILED);
             }
             mem.mapped = true;
-            Ok(mem.bytes.as_mut_ptr().add(offset as usize) as usize)
+            let address = mem.bytes.as_mut_ptr().add(offset as usize) as usize;
+            r.resources.forget_uploads_for_memory(memory);
+            Ok(address)
         })?;
         out.write(address as *mut c_void);
         Ok(())

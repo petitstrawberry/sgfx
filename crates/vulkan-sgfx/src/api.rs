@@ -3049,6 +3049,8 @@ unsafe extern "system" fn queue_submit(
                     for submission in &submissions {
                         let _ = wait_submission(rt, submission);
                     }
+                    // A partially accepted recording may have changed buffers.
+                    rt.resources.uploaded_unmapped_buffers.clear();
                     if error == vk::Result::ERROR_DEVICE_LOST {
                         rt.lost = true;
                     }
@@ -3273,6 +3275,46 @@ fn take_positioned<'a, T>(
     current
 }
 
+fn snapshot_buffer_uploads(
+    resources: &crate::resources::Resources,
+    used: &[vk::Buffer],
+) -> VkResult<(Vec<ir::OwnedCommand>, Vec<(vk::Buffer, vk::DeviceMemory)>)> {
+    let mut ops = Vec::new();
+    let mut fresh_uploads = Vec::new();
+    // Every upload is copied into SGFX-owned command storage before submission
+    // returns, so application mappings need not remain borrowed by the backend.
+    for handle in used {
+        let buffer = resources
+            .buffers
+            .get(handle)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        if let Some((memory, offset)) = buffer.bound {
+            let allocation = resources
+                .memories
+                .get(&memory)
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            if !allocation.mapped && resources.uploaded_unmapped_buffers.contains(handle) {
+                continue;
+            }
+            let mut bytes = allocation
+                .bytes
+                .get(offset as usize..(offset + buffer.size) as usize)
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                .to_vec();
+            bytes.resize(bytes.len().next_multiple_of(4), 0);
+            ops.push(ir::OwnedCommand::WriteBuffer {
+                buffer: buffer.id,
+                offset: 0,
+                data: bytes,
+            });
+            if !allocation.mapped {
+                fresh_uploads.push((*handle, memory));
+            }
+        }
+    }
+    Ok((ops, fresh_uploads))
+}
+
 fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
     let mut used = rec.used_buffers.clone();
     for insertion in &rec.descriptors {
@@ -3292,34 +3334,7 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
     }
     used.sort_unstable_by_key(|b| b.as_raw());
     used.dedup();
-    let mut ops = Vec::new();
-    // Every upload is copied into SGFX-owned command storage before submission
-    // returns, so application mappings need not remain borrowed by the backend.
-    for handle in &used {
-        let buffer = rt
-            .resources
-            .buffers
-            .get(handle)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if let Some((memory, offset)) = buffer.bound {
-            let memory = rt
-                .resources
-                .memories
-                .get(&memory)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            let mut bytes = memory
-                .bytes
-                .get(offset as usize..(offset + buffer.size) as usize)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
-                .to_vec();
-            bytes.resize(bytes.len().next_multiple_of(4), 0);
-            ops.push(ir::OwnedCommand::WriteBuffer {
-                buffer: buffer.id,
-                offset: 0,
-                data: bytes,
-            });
-        }
-    }
+    let (mut ops, fresh_uploads) = snapshot_buffer_uploads(&rt.resources, &used)?;
     let mut descriptors = rec.descriptors.as_slice();
     let mut barriers = rec.barriers.as_slice();
     let mut copies = rec.copies.as_slice();
@@ -3409,23 +3424,34 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
         submissions.clear();
     }
     // Stage only GPU-written bytes back into allocations returned by MapMemory.
+    let mut dirty_memories = Vec::new();
     for handle in &readback {
         let buffer = rt
             .resources
             .buffers
             .get(handle)
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if let Some((memory, offset)) = buffer.bound {
+        if let Some((memory_handle, offset)) = buffer.bound {
             let bytes = rt
                 .cache
                 .read_buffer(buffer.id, 0, buffer.size)
                 .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-            let memory = rt
+            let allocation = rt
                 .resources
                 .memories
-                .get_mut(&memory)
+                .get_mut(&memory_handle)
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            memory.bytes[offset as usize..(offset + buffer.size) as usize].copy_from_slice(&bytes);
+            allocation.bytes[offset as usize..(offset + buffer.size) as usize]
+                .copy_from_slice(&bytes);
+            dirty_memories.push(memory_handle);
+        }
+    }
+    for memory in &dirty_memories {
+        rt.resources.forget_uploads_for_memory(*memory);
+    }
+    for (handle, memory) in fresh_uploads {
+        if !dirty_memories.contains(&memory) {
+            rt.resources.uploaded_unmapped_buffers.insert(handle);
         }
     }
     Ok(submissions)
@@ -3593,6 +3619,64 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmapped_buffer_uploads_are_reused_until_host_mapping_changes_them() {
+        use crate::resources::{AlignedBytes, Buffer, Memory, Resources};
+
+        let table = ir::ResourceTable::new();
+        let id = table
+            .define_buffer(ir::BufferDesc::new(8, ir::BufferUsage::COPY_DST).unwrap())
+            .unwrap()
+            .id();
+        let handle = vk::Buffer::from_raw(1);
+        let memory = vk::DeviceMemory::from_raw(2);
+        let mut resources = Resources::new();
+        let mut bytes = AlignedBytes::zeroed(16).unwrap();
+        bytes[4..9].copy_from_slice(&[1, 2, 3, 4, 5]);
+        resources.memories.insert(
+            memory,
+            Memory {
+                bytes,
+                mapped: false,
+            },
+        );
+        resources.buffers.insert(
+            handle,
+            Buffer {
+                id,
+                size: 5,
+                usage: vk::BufferUsageFlags::TRANSFER_DST,
+                bound: Some((memory, 4)),
+            },
+        );
+
+        let (initial, fresh) = snapshot_buffer_uploads(&resources, &[handle]).unwrap();
+        assert!(matches!(initial.as_slice(),
+            [ir::OwnedCommand::WriteBuffer { data, .. }] if data == &[1, 2, 3, 4, 5, 0, 0, 0]));
+        assert_eq!(fresh, vec![(handle, memory)]);
+
+        resources.uploaded_unmapped_buffers.insert(handle);
+        assert!(
+            snapshot_buffer_uploads(&resources, &[handle])
+                .unwrap()
+                .0
+                .is_empty()
+        );
+
+        resources.forget_uploads_for_memory(memory);
+        resources.memories.get_mut(&memory).unwrap().bytes[4] = 9;
+        let (updated, fresh) = snapshot_buffer_uploads(&resources, &[handle]).unwrap();
+        assert!(matches!(updated.as_slice(),
+            [ir::OwnedCommand::WriteBuffer { data, .. }] if data == &[9, 2, 3, 4, 5, 0, 0, 0]));
+        assert_eq!(fresh, vec![(handle, memory)]);
+
+        resources.memories.get_mut(&memory).unwrap().mapped = true;
+        resources.uploaded_unmapped_buffers.insert(handle);
+        let (mapped, fresh) = snapshot_buffer_uploads(&resources, &[handle]).unwrap();
+        assert_eq!(mapped.len(), 1);
+        assert!(fresh.is_empty());
+    }
 
     #[test]
     fn submission_snapshots_share_commands_and_survive_re_recording() {
