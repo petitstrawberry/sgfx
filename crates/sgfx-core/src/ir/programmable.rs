@@ -467,14 +467,14 @@ impl ComputePipelineDesc {
         &self.layout
     }
 }
-/// Programmable graphics with one color target and an optional interleaved vertex buffer.
+/// Programmable graphics with one color target and up to eight vertex buffers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgrammableRenderPipelineDesc {
     vertex: ShaderEntryPoint,
     fragment: ShaderEntryPoint,
     layout: PipelineLayoutDesc,
     target_format: TextureFormat,
-    vertex_buffer: Option<VertexBufferLayout>,
+    vertex_buffers: Vec<VertexBufferLayout>,
     topology: PrimitiveTopology,
     blend: BlendState,
     raster: RasterState,
@@ -504,13 +504,31 @@ impl ProgrammableRenderPipelineDesc {
             fragment,
             layout,
             target_format,
-            vertex_buffer,
+            vertex_buffers: vertex_buffer.into_iter().collect(),
             topology,
             blend,
             raster,
             depth: None,
         })
     }
+    /// Replace vertex input with consecutive buffer slots. Attribute locations
+    /// must be unique across slots and respect the total attribute limit.
+    pub fn with_vertex_buffers(mut self, buffers: Vec<VertexBufferLayout>) -> Result<Self> {
+        if buffers.len() > MAX_VERTEX_BUFFERS { return Err(Error::ResourceLimitExceeded); }
+        let mut locations = Vec::new();
+        for buffer in &buffers {
+            for attribute in buffer.attributes() {
+                if attribute.location() >= MAX_VERTEX_ATTRIBUTES as u32 || locations.contains(&attribute.location()) {
+                    return Err(Error::InvalidDescriptor);
+                }
+                locations.push(attribute.location());
+            }
+        }
+        self.vertex_buffers = buffers;
+        Ok(self)
+    }
+    /// Return the layouts indexed by vertex buffer slot.
+    pub fn vertex_buffers(&self) -> &[VertexBufferLayout] { &self.vertex_buffers }
     /// Add depth testing and optional depth writes.
     pub fn with_depth_state(mut self, depth: DepthState) -> Result<Self> {
         if depth.format() != TextureFormat::Depth32Float {
@@ -536,8 +554,8 @@ impl ProgrammableRenderPipelineDesc {
         self.target_format
     }
     /// Return the optional vertex buffer layout.
-    pub const fn vertex_buffer(&self) -> Option<&VertexBufferLayout> {
-        self.vertex_buffer.as_ref()
+    pub fn vertex_buffer(&self) -> Option<&VertexBufferLayout> {
+        self.vertex_buffers.first()
     }
     /// Return triangle topology.
     pub const fn topology(&self) -> PrimitiveTopology {

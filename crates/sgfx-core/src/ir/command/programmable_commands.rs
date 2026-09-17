@@ -235,7 +235,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         layout: &PipelineLayoutDesc,
         groups: &[Option<BindGroupRef<'r>>; MAX_BIND_GROUPS],
         attachments: &[TextureRef<'r>],
-        vertex: Option<BufferRef<'r>>,
+        vertices: &[Option<(BufferRef<'r>, u64)>],
         index: Option<BufferRef<'r>>,
     ) -> Result<GroupAccesses> {
         let mut uses = Vec::new();
@@ -263,7 +263,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                             _ => BufferAccess::StorageReadWrite,
                         };
                         self.check_buffer_access(reference, access)?;
-                        if writes && (vertex == Some(reference) || index == Some(reference)) {
+                        if writes && (vertices.iter().flatten().any(|(buffer, _)| *buffer == reference) || index == Some(reference)) {
                             return Err(Error::ResourceAccessConflict);
                         }
                     }
@@ -297,7 +297,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         pending
             .try_reserve(uses.len())
             .map_err(|_| Error::OutOfMemory)?;
-        used.try_reserve(uses.len() + 2)
+        used.try_reserve(uses.len() + vertices.len() + 1)
             .map_err(|_| Error::OutOfMemory)?;
         for (resource, writes) in uses {
             let key = match resource {
@@ -310,7 +310,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                 pending.push(key);
             }
         }
-        if let Some(vertex) = vertex {
+        for (vertex, _) in vertices.iter().flatten() {
             used.push(PendingWrite::Buffer(vertex.id()));
         }
         if let Some(index) = index {
@@ -394,7 +394,7 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
             .compute_pipeline(self.pipeline.ok_or(Error::PipelineNotSet)?)?;
         let writes =
             self.encoder
-                .validate_groups(pipeline.layout(), &self.bind_groups, &[], None, None)?;
+                .validate_groups(pipeline.layout(), &self.bind_groups, &[], &[], None)?;
         self.encoder
             .record_with_writes(Command::Dispatch { x, y, z }, &writes)
     }
@@ -481,8 +481,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             desc.layout(),
             &self.bind_groups,
             &attachments[..attachment_count],
-            desc.vertex_buffer()
-                .and(self.vertex_buffer.map(|(buffer, _)| buffer)),
+            &self.vertex_buffers[..desc.vertex_buffers().len()],
             if indexed {
                 self.index_buffer.map(|(buffer, _, _)| buffer)
             } else {
@@ -518,8 +517,8 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     pub(super) fn draw_programmable(&mut self, count: u32, first: u32) -> Result<()> {
         let desc = self.validate_programmable_count(count)?;
         first.checked_add(count).ok_or(Error::Overflow)?;
-        if let Some(layout) = desc.vertex_buffer() {
-            let (buffer, offset) = self.vertex_buffer.ok_or(Error::VertexBufferNotSet)?;
+        for (slot, layout) in desc.vertex_buffers().iter().enumerate() {
+            let (buffer, offset) = self.vertex_buffers[slot].ok_or(Error::VertexBufferNotSet)?;
             let buffer_desc = self.encoder.resources.buffer(buffer)?;
             self.encoder
                 .check_buffer_access(buffer, BufferAccess::Vertex)?;
@@ -551,8 +550,8 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     ) -> Result<()> {
         let desc = self.validate_programmable_count(count)?;
         first.checked_add(count).ok_or(Error::Overflow)?;
-        if let Some(layout) = desc.vertex_buffer() {
-            let (buffer, offset) = self.vertex_buffer.ok_or(Error::VertexBufferNotSet)?;
+        for (slot, layout) in desc.vertex_buffers().iter().enumerate() {
+            let (buffer, offset) = self.vertex_buffers[slot].ok_or(Error::VertexBufferNotSet)?;
             let buffer_desc = self.encoder.resources.buffer(buffer)?;
             self.encoder
                 .check_buffer_access(buffer, BufferAccess::Vertex)?;

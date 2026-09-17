@@ -6,6 +6,8 @@ use super::{Color, Error, Result, TextureFormat, Transform};
 
 /// Maximum attributes accepted by one portable vertex-buffer layout.
 pub const MAX_VERTEX_ATTRIBUTES: usize = 16;
+/// Maximum vertex buffer slots in a programmable pipeline.
+pub const MAX_VERTEX_BUFFERS: usize = 8;
 
 /// Comparison applied between an incoming fragment depth and stored depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,18 @@ impl DepthState {
 /// Format of one vertex attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexFormat {
+    /// One 32-bit signed integer.
+    Sint32,
+    /// One 32-bit unsigned integer.
+    Uint32,
+    /// Two 16-bit floating-point components, widened during vertex fetch.
+    Float16x2,
+    /// Four 16-bit floating-point components, widened during vertex fetch.
+    Float16x4,
+    /// Four 16-bit signed integer components, widened during vertex fetch.
+    Sint16x4,
+    /// Signed normalized R, G, B, A in low-to-high 10, 10, 10, 2 bits.
+    Snorm10_10_10_2,
     /// Two 32-bit floating-point components.
     Float32x2,
     /// Three 32-bit floating-point components.
@@ -104,7 +118,8 @@ impl VertexFormat {
             Self::Float32x2 => 8,
             Self::Float32x3 => 12,
             Self::Float32x4 => 16,
-            Self::Unorm8x4 => 4,
+            Self::Unorm8x4 | Self::Sint32 | Self::Uint32 | Self::Float16x2 | Self::Snorm10_10_10_2 => 4,
+            Self::Float16x4 | Self::Sint16x4 => 8,
         }
     }
 }

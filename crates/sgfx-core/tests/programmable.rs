@@ -858,3 +858,52 @@ fn solid_draw_does_not_access_or_consume_a_stale_texture_binding() {
         .unwrap();
     encoder.finish().unwrap();
 }
+
+#[test]
+fn multiple_vertex_slots_validate_layouts_binding_bounds_and_write_aliases() {
+    let table = ResourceTable::new();
+    let input = |location, format: VertexFormat| VertexBufferLayout::new(format.byte_size(),
+        vec![VertexAttribute::new(location, format, 0)]).unwrap();
+    let desc = ProgrammableRenderPipelineDesc::new(shader(&table, ShaderStage::Vertex),
+        shader(&table, ShaderStage::Fragment), PipelineLayoutDesc::new(vec![]).unwrap(),
+        TextureFormat::Rgba8Unorm, None, PrimitiveTopology::TriangleList, BlendState::REPLACE,
+        RasterState::new(CullMode::None, FrontFace::CounterClockwise)).unwrap();
+    assert!(desc.clone().with_vertex_buffers(vec![input(0, VertexFormat::Float32x2), input(0, VertexFormat::Sint32)]).is_err());
+    assert!(desc.clone().with_vertex_buffers((0..9).map(|i| input(i, VertexFormat::Sint32)).collect()).is_err());
+    let desc = desc.with_vertex_buffers(vec![input(0, VertexFormat::Float32x2), input(1, VertexFormat::Sint32)]).unwrap();
+    let pipeline = table.define_programmable_render_pipeline(desc.clone()).unwrap();
+    let target = table.define_texture(TextureDesc::new(TextureFormat::Rgba8Unorm,
+        Extent2D::new(4,4).unwrap(), TextureUsage::RENDER_ATTACHMENT).unwrap()).unwrap();
+    let vertices = buffer(&table, BufferUsage::VERTEX);
+    let values = table.define_buffer(BufferDesc::new(16, BufferUsage::VERTEX | BufferUsage::STORAGE).unwrap()).unwrap();
+    let pass_desc = RenderPassDesc::new(&table, target, PixelRect::new(0,0,4,4).unwrap(), LoadOp::DontCare, StoreOp::Store).unwrap();
+    let mut encoder = CommandEncoder::new(&table);
+    let mut pass = encoder.begin_render_pass(pass_desc).unwrap();
+    pass.set_programmable_pipeline(pipeline).unwrap();
+    pass.set_vertex_buffer(vertices, 0).unwrap();
+    assert_eq!(pass.draw(3,0), Err(Error::VertexBufferNotSet));
+    assert_eq!(pass.set_vertex_buffer_slot(8, values, 0), Err(Error::OutOfBounds));
+    pass.set_vertex_buffer_slot(1, values, 8).unwrap();
+    assert_eq!(pass.draw(3,0), Err(Error::OutOfBounds));
+    pass.set_vertex_buffer_slot(1, values, 0).unwrap();
+    pass.draw(3,0).unwrap();
+    pass.end().unwrap();
+    encoder.finish().unwrap();
+    let storage_layout = BindGroupLayoutDesc::new(vec![BindGroupLayoutEntry::new(0, ShaderStages::FRAGMENT,
+        BindingType::StorageBuffer { read_only: false })]).unwrap();
+    let pipeline = table.define_programmable_render_pipeline(ProgrammableRenderPipelineDesc::new(
+        shader(&table, ShaderStage::Vertex), shader(&table, ShaderStage::Fragment),
+        PipelineLayoutDesc::new(vec![storage_layout.clone()]).unwrap(), TextureFormat::Rgba8Unorm,
+        None, PrimitiveTopology::TriangleList, BlendState::REPLACE,
+        RasterState::new(CullMode::None, FrontFace::CounterClockwise)).unwrap()
+        .with_vertex_buffers(desc.vertex_buffers().to_vec()).unwrap()).unwrap();
+    let group = table.define_bind_group(BindGroupDesc::new(&table, storage_layout, vec![BindGroupEntry::new(0,
+        BindingResource::Buffer { buffer: values.id(), offset: 0, size: 16 })]).unwrap()).unwrap();
+    let mut encoder = CommandEncoder::new(&table);
+    let mut pass = encoder.begin_render_pass(pass_desc).unwrap();
+    pass.set_programmable_pipeline(pipeline).unwrap();
+    pass.set_vertex_buffer(vertices,0).unwrap();
+    pass.set_vertex_buffer_slot(1, values,0).unwrap();
+    pass.set_bind_group(0,group).unwrap();
+    assert_eq!(pass.draw(3,0), Err(Error::ResourceAccessConflict));
+}

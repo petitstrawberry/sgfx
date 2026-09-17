@@ -245,6 +245,15 @@ pub enum OwnedCommand {
         /// Byte offset of the first vertex.
         offset: u64,
     },
+    /// Bind a numbered programmable vertex buffer slot.
+    SetVertexBufferSlot {
+        /// Zero-based slot.
+        slot: u32,
+        /// Vertex buffer identity.
+        buffer: BufferId,
+        /// Byte offset of vertex zero.
+        offset: u64,
+    },
     /// Bind an index buffer for the active render pass.
     SetIndexBuffer {
         /// Index buffer identity.
@@ -456,6 +465,9 @@ impl OwnedCommandBuffer {
                             }
                             OwnedCommand::SetVertexBuffer { buffer, offset } => {
                                 pass.set_vertex_buffer(resources.buffer_ref(*buffer)?, *offset)?;
+                            }
+                            OwnedCommand::SetVertexBufferSlot { slot, buffer, offset } => {
+                                pass.set_vertex_buffer_slot(*slot, resources.buffer_ref(*buffer)?, *offset)?;
                             }
                             OwnedCommand::SetIndexBuffer {
                                 buffer,

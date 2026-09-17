@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 mod programmable_commands;
 use super::{
-    BindGroupRef, ComputePipelineRef, MAX_BIND_GROUPS, ProgrammableRenderPipelineRef,
+    BindGroupRef, ComputePipelineRef, MAX_BIND_GROUPS, MAX_VERTEX_BUFFERS, ProgrammableRenderPipelineRef,
     ResourceBarrier, ShaderStages,
 };
 use super::{BufferAccess, TextureAccess};
@@ -315,6 +315,15 @@ pub enum Command<'r, 'data> {
         /// Byte offset of vertex zero.
         offset: u64,
     },
+    /// Bind a numbered programmable vertex buffer slot.
+    SetVertexBufferSlot {
+        /// Zero-based slot.
+        slot: u32,
+        /// Vertex buffer reference.
+        buffer: BufferRef<'r>,
+        /// Byte offset of vertex zero.
+        offset: u64,
+    },
     /// Bind an index buffer for subsequent indexed draws.
     SetIndexBuffer {
         /// Index buffer reference.
@@ -607,7 +616,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             bind_groups: [None; MAX_BIND_GROUPS],
             depth_target: desc.depth_attachment().map(|depth| depth.target()),
             used_resources: Vec::new(),
-            vertex_buffer: None,
+            vertex_buffers: [None; MAX_VERTEX_BUFFERS],
             index_buffer: None,
             texture: None,
             sampler: None,
@@ -737,7 +746,7 @@ pub struct RenderPassEncoder<'encoder, 'r, 'data> {
     bind_groups: [Option<BindGroupRef<'r>>; MAX_BIND_GROUPS],
     depth_target: Option<TextureRef<'r>>,
     used_resources: Vec<PendingWrite>,
-    vertex_buffer: Option<(BufferRef<'r>, u64)>,
+    vertex_buffers: [Option<(BufferRef<'r>, u64)>; MAX_VERTEX_BUFFERS],
     index_buffer: Option<(BufferRef<'r>, u64, IndexFormat)>,
     texture: Option<TextureRef<'r>>,
     sampler: Option<SamplerRef<'r>>,
@@ -793,7 +802,20 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         }
         self.encoder
             .push(Command::SetVertexBuffer { buffer, offset })?;
-        self.vertex_buffer = Some((buffer, offset));
+        self.vertex_buffers[0] = Some((buffer, offset));
+        Ok(())
+    }
+
+    /// Bind a numbered programmable vertex buffer. Slot zero is shared with
+    /// the fixed pipeline's vertex binding.
+    pub fn set_vertex_buffer_slot(&mut self, slot: u32, buffer: BufferRef<'r>, offset: u64) -> Result<()> {
+        if slot as usize >= MAX_VERTEX_BUFFERS { return Err(Error::OutOfBounds); }
+        if slot == 0 { return self.set_vertex_buffer(buffer, offset); }
+        let desc = self.encoder.resources.buffer(buffer)?;
+        CommandEncoder::require_buffer_usage(desc.usage(), BufferUsage::VERTEX)?;
+        if offset > desc.size() { return Err(Error::OutOfBounds); }
+        self.encoder.push(Command::SetVertexBufferSlot { slot, buffer, offset })?;
+        self.vertex_buffers[slot as usize] = Some((buffer, offset));
         Ok(())
     }
 
@@ -933,7 +955,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .encoder
             .resources
             .with_pipeline(pipeline, |descriptor| descriptor.vertex_buffer().stride())?;
-        let (buffer, offset) = self.vertex_buffer.ok_or(Error::VertexBufferNotSet)?;
+        let (buffer, offset) = self.vertex_buffers[0].ok_or(Error::VertexBufferNotSet)?;
         let desc = self.encoder.resources.buffer(buffer)?;
         self.encoder
             .check_buffer_access(buffer, BufferAccess::Vertex)?;
@@ -992,7 +1014,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .encoder
             .resources
             .with_pipeline(pipeline, |descriptor| descriptor.vertex_buffer().stride())?;
-        let (vertex_buffer, vertex_offset) = self.vertex_buffer.ok_or(Error::VertexBufferNotSet)?;
+        let (vertex_buffer, vertex_offset) = self.vertex_buffers[0].ok_or(Error::VertexBufferNotSet)?;
         let vertex_desc = self.encoder.resources.buffer(vertex_buffer)?;
         self.encoder
             .check_buffer_access(vertex_buffer, BufferAccess::Vertex)?;
