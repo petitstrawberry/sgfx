@@ -25,6 +25,9 @@ remain incomplete.
 - SPIR-V shader modules, compute pipelines, and vertex/fragment pipelines.
   Pipeline creation resolves specialization constants and uses Naga to validate
   and normalize Vulkan coordinate conventions before backend compilation.
+  Scalar 32-bit specialization expressions are frozen before Naga parsing;
+  unsupported expression operations return an error. Combined image samplers
+  can pass through shader helper functions, including comparison sampling.
 - Stage-specific push constants up to 128 bytes on capable Metal and native
   programmable VirGL adapters, with incremental updates and a value snapshot
   per draw/dispatch. VirGL stores its stage snapshot after UBO constants.
@@ -40,7 +43,8 @@ remain incomplete.
   the original texture/buffer allocations. Write-only RGBA8 storage images can
   select one 2D layer and mip; image barriers order writes before later sampling.
 - Descriptor sets for uniform/storage buffers (including dynamic offsets),
-  separate images/samplers, combined image samplers and write-only storage images;
+  separate images/samplers, combined image samplers, single-sample input
+  attachments and write-only storage images;
   four sets with 16 logical bindings each, one descriptor per binding. Updates
   can span consecutive compatible bindings. Descriptor arrays are unsupported.
 - Host-visible coherent memory with stable, aligned mappings; buffer memory
@@ -48,13 +52,23 @@ remain incomplete.
   four-byte sizes; binding offsets use the reported alignment. Uniform ranges
   are limited to 16 KiB and storage ranges to 128 MiB.
 - Primary command buffers and pools, pipeline/set binding, compute dispatch,
-  single-color render passes, non-indexed and indexed drawing, vertex buffers,
+  render passes, non-indexed and indexed drawing, vertex buffers,
   buffer copies, checked buffer-to-image uploads, whole-image RGBA8/BGRA8
   mip readback, whole-resource/per-mip barriers, dynamic viewport/scissor,
   D32 depth testing, front-face/back-face culling, fences, and binary semaphores.
+- Metal supports multiple color attachments with per-target write masks and
+  blend state, read-only depth testing while sampling depth, and up to eight
+  ordered subpasses with `vkCmdNextSubpass`. A render pass has at most eight
+  attachments; its simultaneous color limit follows the selected backend.
+  Each subpass becomes an SGFX GPU pass. Intermediate outputs are stored until
+  their last use, and input attachments become same-pixel GPU texture loads.
+  This path has no CPU image readback. Inputs currently require nonarray,
+  single-sample float data and zero offsets. Feedback loops, self-dependencies,
+  depth-only subpasses and resolves are unsupported. Native VirGL rejects MRT,
+  input attachments and read-only depth until its backend implements them.
 - Offscreen graphics: RGBA8_UNORM or BGRA8_UNORM color, optional D32_SFLOAT
-  depth, optimal 2D images, one layer/sample, at most 2048×2048, one color
-  attachment, triangle lists and nonindexed triangle strips on Metal, signed
+  depth, optimal 2D images, one layer/sample, at most 2048×2048,
+  triangle lists and nonindexed triangle strips on Metal, signed
   base vertices for indexed lists, up to eight vertex bindings, integer/half-float
   and packed signed-normal inputs on Metal, and instanced draws with a first
   instance index. Vertex attributes currently advance per vertex. Common alpha/additive blending and sampled 2D textures
@@ -254,13 +268,12 @@ and verify the chosen Mesa driver. The Linux check also used
 
 ## Limits and remaining work
 
-- **Not Vulkan conformant.** The ICD exposes 104 procedure names on macOS,
-  including 17 `vkCmd*` operations, but this is only a bounded executable
-  subset. WSI currently covers macOS Metal, FIFO mode, opaque composition, and
+- **Not Vulkan conformant.** The ICD implements a bounded executable subset.
+  WSI currently covers macOS Metal, FIFO mode, opaque composition, and
   fixed-size swapchains. Other platform surfaces, window-resize handling in the
   example, timeline semaphores, secondary command buffers, descriptor indexing,
   pipeline caches, queries, events, sparse resources, external memory, multisampling,
-  multiple subpasses, indirect operations, partial/flipped/converting blits, or arbitrary
+  indirect operations, partial/flipped/converting blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent
   append-only IDs. When no live Vulkan objects retain an epoch's IDs, the ICD

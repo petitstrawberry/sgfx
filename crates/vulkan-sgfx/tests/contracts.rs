@@ -11,6 +11,8 @@ use std::path::PathBuf;
 
 #[path = "contracts/errors.rs"]
 mod errors;
+#[path = "contracts/subpasses.rs"]
+mod subpasses;
 #[path = "contracts/textures.rs"]
 mod textures;
 

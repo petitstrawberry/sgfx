@@ -353,6 +353,27 @@ impl Resources {
                 attributes,
             })
             .collect::<Vec<_>>();
+        let targets = desc
+            .color_targets()
+            .enumerate()
+            .map(|(slot, target)| {
+                Ok(Some(raw::ColorTargetState {
+                    format: if slot == 0 {
+                        format
+                    } else {
+                        raw_format(target.format())
+                            .ok_or(Error::Unsupported(UnsupportedFeature::TextureFormat))?
+                    },
+                    blend: Some(raw::BlendState {
+                        color: blend_component(target.blend().color()),
+                        alpha: blend_component(target.blend().alpha()),
+                    }),
+                    write_mask: raw::ColorWrites::from_bits_truncate(u32::from(
+                        target.write_mask().bits(),
+                    )),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let pipeline = validated(self.context.raw_device(), || {
             Ok(self
                 .context
@@ -370,14 +391,7 @@ impl Resources {
                         module: &fragment,
                         entry_point: Some(desc.fragment().entry_point()),
                         compilation_options: Default::default(),
-                        targets: &[Some(raw::ColorTargetState {
-                            format,
-                            blend: Some(raw::BlendState {
-                                color: blend_component(desc.blend().color()),
-                                alpha: blend_component(desc.blend().alpha()),
-                            }),
-                            write_mask: raw::ColorWrites::ALL,
-                        })],
+                        targets: &targets,
                     }),
                     primitive: raw::PrimitiveState {
                         topology: match desc.topology() {

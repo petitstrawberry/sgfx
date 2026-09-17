@@ -122,6 +122,8 @@ pub enum UnsupportedFeature {
     /// WGPU cannot express a depth clear restricted to a rectangular render
     /// area without an explicit clear draw.
     PartialDepthClear,
+    /// Partial color clears with multiple render targets need a separate clear pass.
+    PartialMultiTargetClear,
     /// The physical surface format cannot be represented by SGFX.
     SurfaceFormat,
     /// Blocking waits are unavailable in a browser; use nonblocking observation.
@@ -1384,11 +1386,29 @@ impl Queue {
         commands: &[Command<'r, 'data>],
     ) -> Result<()> {
         let target = resources.texture(desc.target())?;
+        let colors = desc
+            .color_attachments()
+            .map(|attachment| {
+                resources
+                    .texture(attachment.target())
+                    .map(|texture| (attachment, texture))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let depth = desc
             .depth_attachment()
             .map(|attachment| resources.texture(attachment.target()))
             .transpose()?;
         let full_area = render_area_is_full(desc.area(), target.width, target.height);
+        if !full_area
+            && colors.len() > 1
+            && colors
+                .iter()
+                .any(|(attachment, _)| matches!(attachment.load(), LoadOp::Clear(_)))
+        {
+            return Err(Error::Unsupported(
+                UnsupportedFeature::PartialMultiTargetClear,
+            ));
+        }
         let partial_clear_color = if full_area {
             None
         } else {
@@ -1397,41 +1417,53 @@ impl Queue {
                 LoadOp::Load | LoadOp::DontCare => None,
             }
         };
-        let color_load = if full_area {
-            color_load_op(desc.load())
-        } else {
-            raw::LoadOp::Load
-        };
-        let color_attachment = raw::RenderPassColorAttachment {
-            view: &target.view,
-            resolve_target: None,
-            ops: raw::Operations {
-                load: color_load,
-                store: store_op(desc.store()),
-            },
-        };
-        let color_attachments = [Some(color_attachment)];
+        let color_attachments = colors
+            .iter()
+            .map(|(attachment, texture)| {
+                Some(raw::RenderPassColorAttachment {
+                    view: &texture.view,
+                    resolve_target: None,
+                    ops: raw::Operations {
+                        load: if full_area {
+                            color_load_op(attachment.load())
+                        } else {
+                            raw::LoadOp::Load
+                        },
+                        store: store_op(attachment.store()),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
         let depth_load = desc.depth_attachment().map(|attachment| attachment.load());
         let depth_store = desc.depth_attachment().map(|attachment| attachment.store());
-        let depth_ops = match (depth_load, depth_store) {
-            (Some(load), Some(store)) => {
-                let load = if full_area {
-                    depth_load_op(load)
-                } else {
-                    match load {
-                        DepthLoadOp::Clear(_) => {
-                            return Err(Error::Unsupported(UnsupportedFeature::PartialDepthClear));
+        let depth_ops = if desc
+            .depth_attachment()
+            .is_some_and(|attachment| attachment.read_only())
+        {
+            None
+        } else {
+            match (depth_load, depth_store) {
+                (Some(load), Some(store)) => {
+                    let load = if full_area {
+                        depth_load_op(load)
+                    } else {
+                        match load {
+                            DepthLoadOp::Clear(_) => {
+                                return Err(Error::Unsupported(
+                                    UnsupportedFeature::PartialDepthClear,
+                                ));
+                            }
+                            DepthLoadOp::Load | DepthLoadOp::DontCare => raw::LoadOp::Load,
                         }
-                        DepthLoadOp::Load | DepthLoadOp::DontCare => raw::LoadOp::Load,
-                    }
-                };
-                Some(raw::Operations {
-                    load,
-                    store: store_op(store),
-                })
+                    };
+                    Some(raw::Operations {
+                        load,
+                        store: store_op(store),
+                    })
+                }
+                (None, None) => None,
+                _ => return Err(Error::InvalidState),
             }
-            (None, None) => None,
-            _ => return Err(Error::InvalidState),
         };
         let clear_pipeline =
             partial_clear_color.map(|_| resources.clear_pipeline(target.format, depth.is_some()));

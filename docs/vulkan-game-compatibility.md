@@ -390,3 +390,24 @@ Scarlet shell using:
 abi-run linux-aarch64 /bin/sh /usr/games/vkquake2 \
   +set timedemo 0 +set viewsize 100 +map demo1
 ```
+
+## SuperTuxKart 1.5 on macOS Metal
+
+The release build at upstream commit
+`1fb491f507216c5d181ccd85f29ff08eca003827` was checked on an Apple M3 Pro using
+the [loader portability patch](../crates/vulkan-sgfx/compat/supertuxkart-1.5-vulkan-loader.patch).
+SDL loads the installed Khronos Vulkan loader, and its standard
+`VK_DRIVER_FILES` manifest selects the release SGFX ICD. Game shaders are
+unchanged. The execution path is Vulkan → SGFX IR → WGPU → Metal.
+
+Both forward rendering and the advanced lighting path render a race. The
+lighting check used `--enable-dynamic-lights --race-now --track=lighthouse
+--numkarts=1 --laps=3`, with screen-space reflections disabled and the render
+target scale set to 1.0. The kart headlights illuminate the road and fence.
+MRT outputs, sampled read-only depth and input attachments remain on the GPU.
+An independent Vulkan contract checks every pixel after three subpasses,
+including intermediate attachments with `DONT_CARE` final store operations.
+
+This check does not establish all shadow/reflection settings, resize stability
+or a performance baseline. Advanced lighting is not yet implemented by the
+native Scarlet/VirGL backend.

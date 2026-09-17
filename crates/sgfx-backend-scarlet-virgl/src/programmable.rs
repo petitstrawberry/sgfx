@@ -141,6 +141,15 @@ fn compile_pipeline(
 ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
     let reference = resources.programmable_render_pipeline_ref(id)?;
     let pipeline = resources.programmable_render_pipeline_shared(reference)?;
+    if pipeline.color_targets().count() != 1
+        || pipeline
+            .color_targets()
+            .any(|target| target.write_mask() != ir::ColorWriteMask::ALL)
+    {
+        return Err(IrSubmitError::Unsupported(
+            UnsupportedIrFeature::PipelineTargetFormat,
+        ));
+    }
     if !matches!(
         pipeline.target_format(),
         TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm

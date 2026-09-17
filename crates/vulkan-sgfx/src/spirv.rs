@@ -13,6 +13,91 @@ const SAMPLED_IMAGE: u32 = 86;
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sampler_function(depth: bool) -> Vec<u32> {
+        let mut words = vec![0x07230203, 0x00010000, 0, 26, 0];
+        for (opcode, operands) in [
+            (17, vec![1]),
+            (14, vec![0, 1]),
+            (15, vec![4, 14, u32::from_le_bytes(*b"main"), 0, 11]),
+            (16, vec![14, 7]),
+            (71, vec![9, 33, 2]),
+            (71, vec![9, 34, 1]),
+            (71, vec![11, 30, 0]),
+            (19, vec![1]),
+            (33, vec![2, 1]),
+            (22, vec![3, 32]),
+            (23, vec![4, 3, 2]),
+            (23, vec![5, 3, 4]),
+            (25, vec![6, 3, 1, u32::from(depth), 0, 0, 1, 0]),
+            (27, vec![7, 6]),
+            (32, vec![8, 0, 7]),
+            (32, vec![10, 3, 5]),
+            (33, vec![19, 5, 8]),
+            (43, vec![3, 12, 0.25f32.to_bits()]),
+            (44, vec![4, 13, 12, 12]),
+            (59, vec![8, 9, 0]),
+            (59, vec![10, 11, 3]),
+            (54, vec![1, 14, 0, 2]),
+            (248, vec![15]),
+            (57, vec![5, 17, 20, 9]),
+            (62, vec![11, 17]),
+            (253, vec![]),
+            (56, vec![]),
+            (54, vec![5, 20, 0, 19]),
+            (55, vec![8, 21]),
+            (248, vec![22]),
+            (61, vec![7, 23, 21]),
+        ] {
+            emit(&mut words, opcode, &operands);
+        }
+        if depth {
+            emit(&mut words, 89, &[3, 25, 23, 13, 12]);
+            emit(&mut words, 80, &[5, 24, 25, 25, 25, 25]);
+        } else {
+            emit(&mut words, 87, &[5, 24, 23, 13]);
+        }
+        emit(&mut words, 254, &[24]);
+        emit(&mut words, 56, &[]);
+        words
+    }
+    #[test]
+    fn combined_sampler_helpers_preserve_color_and_comparison_sampling() {
+        for depth in [false, true] {
+            let normalized = crate::resources::normalize_spirv(sampler_function(depth)).unwrap();
+            let sgfx::ir::ShaderSource::SpirV(words) = normalized.source() else {
+                panic!("SPIR-V expected")
+            };
+            let module =
+                naga::front::spv::Frontend::new(words.iter().copied(), &Default::default())
+                    .parse()
+                    .unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap();
+            assert!(
+                module
+                    .functions
+                    .iter()
+                    .all(|(_, f)| f.arguments.iter().all(|a| !matches!(
+                        module.types[a.ty].inner,
+                        naga::TypeInner::Image { .. } | naga::TypeInner::Sampler { .. }
+                    )))
+            );
+            let samplers = module
+                .global_variables
+                .iter()
+                .filter_map(|(_, global)| match module.types[global.ty].inner {
+                    naga::TypeInner::Sampler { comparison } => Some(comparison),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(samplers, [depth]);
+            assert!(module.functions.iter().any(|(_,function)|function.expressions.iter().any(|(_,expr)|matches!(expr,naga::Expression::ImageSample {depth_ref,..} if depth_ref.is_some()==depth))));
+        }
+    }
     #[test]
     fn combined_sampler_becomes_a_valid_separate_texture_sampler_pair() {
         let mut words = vec![0x07230203, 0x00010000, 0, 18, 0];
@@ -94,7 +179,7 @@ mod tests {
     }
 }
 
-fn instructions(words: &[u32]) -> Result<Vec<&[u32]>, vk::Result> {
+pub(crate) fn instructions(words: &[u32]) -> Result<Vec<&[u32]>, vk::Result> {
     if words.len() < 5 {
         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
     }
@@ -114,13 +199,13 @@ fn instructions(words: &[u32]) -> Result<Vec<&[u32]>, vk::Result> {
     }
     Ok(result)
 }
-fn emit(output: &mut Vec<u32>, opcode: u32, operands: &[u32]) {
+pub(crate) fn emit(output: &mut Vec<u32>, opcode: u32, operands: &[u32]) {
     output.push(((operands.len() as u32 + 1) << 16) | opcode);
     output.extend_from_slice(operands);
 }
 
-/// Split directly bound OpTypeSampledImage globals while retaining their Vulkan bindings.
-/// Arrays and pointer aliases are left unsupported by the frontend. No shader identity,
+/// Split OpTypeSampledImage globals and UniformConstant function parameters.
+/// Arrays and other pointer aliases are left unsupported by the frontend. No shader identity,
 /// application name or replacement shader participates in this transform.
 pub(crate) fn separate_combined_samplers(words: Vec<u32>) -> Result<Vec<u32>, vk::Result> {
     let ops = instructions(&words)?;
@@ -159,11 +244,27 @@ pub(crate) fn separate_combined_samplers(words: Vec<u32>) -> Result<Vec<u32>, vk
             }
             variables.insert(op[2], (*image, id()?));
         }
+        if op[0] & 0xffff == 55
+            && op.len() == 3
+            && let Some(image) = pointers.get(&op[1]).and_then(|ty| combined.get(ty))
+        {
+            variables.insert(op[2], (*image, id()?));
+        }
     }
     if variables.is_empty() {
         return Ok(words);
     }
     let mut output = words[..5].to_vec();
+    let signatures: HashMap<_, _> = ops
+        .iter()
+        .filter(|op| op[0] & 0xffff == 33 && op.len() >= 3)
+        .map(|op| (op[1], op[3..].to_vec()))
+        .collect();
+    let functions: HashMap<_, _> = ops
+        .iter()
+        .filter(|op| op[0] & 0xffff == 54 && op.len() == 5)
+        .map(|op| (op[2], op[4]))
+        .collect();
     let mut declared = false;
     for op in ops {
         let opcode = op[0] & 0xffff;
@@ -177,6 +278,48 @@ pub(crate) fn separate_combined_samplers(words: Vec<u32>) -> Result<Vec<u32>, vk
             declared = true;
         }
         match opcode {
+            33 if op.len() >= 3 => {
+                let mut types = op[1..3].to_vec();
+                for ty in &op[3..] {
+                    types.push(*ty);
+                    if pointers
+                        .get(ty)
+                        .is_some_and(|base| combined.contains_key(base))
+                    {
+                        types.push(sampler_pointer);
+                    }
+                }
+                emit(&mut output, opcode, &types);
+            }
+            55 if op.len() == 3 && variables.contains_key(&op[2]) => {
+                output.extend_from_slice(op);
+                emit(&mut output, opcode, &[sampler_pointer, variables[&op[2]].1]);
+            }
+            57 if op.len() >= 4 => {
+                let parameters = functions
+                    .get(&op[3])
+                    .and_then(|ty| signatures.get(ty))
+                    .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+                if parameters.len() != op.len() - 4 {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                let mut call = op[1..4].to_vec();
+                for (ty, argument) in parameters.iter().zip(&op[4..]) {
+                    call.push(*argument);
+                    if pointers
+                        .get(ty)
+                        .is_some_and(|base| combined.contains_key(base))
+                    {
+                        call.push(
+                            variables
+                                .get(argument)
+                                .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?
+                                .1,
+                        );
+                    }
+                }
+                emit(&mut output, opcode, &call);
+            }
             TYPE_POINTER if op.len() == 4 && op[2] == 0 && combined.contains_key(&op[3]) => {
                 emit(&mut output, TYPE_POINTER, &[op[1], 0, combined[&op[3]]]);
             }

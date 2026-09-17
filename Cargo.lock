@@ -1703,7 +1703,7 @@ dependencies = [
  "sgfx-backend-scarlet-maxwell",
  "sgfx-backend-scarlet-virgl",
  "sgfx-backend-wgpu",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=bff3dc8ec3a1cf9d0c47a6b64ea541eca5028b47)",
+ "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=53f15752f2ac2ee39e4da062133443ee708c1b8b)",
  "wgpu",
 ]
 
@@ -1742,7 +1742,7 @@ dependencies = [
  "scarlet-os",
  "scarlet-std",
  "sgfx-codegen-virgl",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=bff3dc8ec3a1cf9d0c47a6b64ea541eca5028b47)",
+ "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=53f15752f2ac2ee39e4da062133443ee708c1b8b)",
 ]
 
 [[package]]
@@ -1753,7 +1753,7 @@ dependencies = [
  "naga",
  "pollster",
  "raw-window-handle",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=bff3dc8ec3a1cf9d0c47a6b64ea541eca5028b47)",
+ "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=53f15752f2ac2ee39e4da062133443ee708c1b8b)",
  "wgpu",
 ]
 
@@ -1783,7 +1783,7 @@ name = "sgfx-codegen-virgl"
 version = "1.0.0"
 dependencies = [
  "naga",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=bff3dc8ec3a1cf9d0c47a6b64ea541eca5028b47)",
+ "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=53f15752f2ac2ee39e4da062133443ee708c1b8b)",
 ]
 
 [[package]]
@@ -1793,12 +1793,12 @@ version = "1.0.0"
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx?rev=a18b5a585616f05cf5df0fa5be1977752ceca1ea#a18b5a585616f05cf5df0fa5be1977752ceca1ea"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=53f15752f2ac2ee39e4da062133443ee708c1b8b#53f15752f2ac2ee39e4da062133443ee708c1b8b"
 
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx?rev=bff3dc8ec3a1cf9d0c47a6b64ea541eca5028b47#bff3dc8ec3a1cf9d0c47a6b64ea541eca5028b47"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=a18b5a585616f05cf5df0fa5be1977752ceca1ea#a18b5a585616f05cf5df0fa5be1977752ceca1ea"
 
 [[package]]
 name = "shlex"

@@ -89,7 +89,7 @@ pub(crate) struct DescriptorSet {
 pub(crate) type Specialization = Vec<(u32, Vec<u8>)>;
 pub(crate) struct Shader {
     words: Vec<u32>,
-    variants: Vec<(Specialization, ir::ShaderModuleId)>,
+    variants: Vec<(Specialization, Vec<Option<bool>>, ir::ShaderModuleId)>,
 }
 impl Shader {
     pub(crate) fn variant(
@@ -97,12 +97,29 @@ impl Shader {
         table: &ir::ResourceTable,
         values: &Specialization,
     ) -> Result<ir::ShaderModuleId, vk::Result> {
-        if let Some((_, id)) = self.variants.iter().find(|(key, _)| key == values) {
+        self.variant_for_subpass(table, values, &[])
+    }
+    pub(crate) fn input_bindings(
+        &self,
+    ) -> Result<Vec<crate::input_attachments::InputBinding>, vk::Result> {
+        crate::input_attachments::bindings(&self.words)
+    }
+    pub(crate) fn variant_for_subpass(
+        &mut self,
+        table: &ir::ResourceTable,
+        values: &Specialization,
+        inputs: &[Option<bool>],
+    ) -> Result<ir::ShaderModuleId, vk::Result> {
+        if let Some((_, _, id)) = self
+            .variants
+            .iter()
+            .find(|(key, input_key, _)| key == values && input_key == inputs)
+        {
             return Ok(*id);
         }
-        let desc = normalize_spirv_specialized(self.words.clone(), values)?;
+        let desc = normalize_spirv_specialized(self.words.clone(), values, inputs)?;
         let id = table.define_shader_module(desc).map_err(failure)?.id();
-        self.variants.push((values.clone(), id));
+        self.variants.push((values.clone(), inputs.to_vec(), id));
         Ok(id)
     }
 }
@@ -148,6 +165,8 @@ pub(crate) struct Resources {
     compute_swizzles: HashMap<(vk::Pipeline, crate::spirv::TextureSwizzles), ir::ComputePipelineId>,
     pub graphics_extents: HashMap<vk::Pipeline, vk::Extent2D>,
     pub graphics_state: HashMap<vk::Pipeline, crate::images::GraphicsDynamicState>,
+    pub graphics_inputs: HashMap<vk::Pipeline, Vec<crate::input_attachments::InputBinding>>,
+    pub graphics_subpasses: HashMap<vk::Pipeline, (crate::render_pass::RenderPass, usize)>,
     pub images: HashMap<vk::Image, crate::images::Image>,
     pub views: HashMap<vk::ImageView, crate::images::ImageView>,
     pub render_passes: HashMap<vk::RenderPass, crate::images::RenderPass>,
@@ -202,6 +221,8 @@ impl Resources {
         )
         .map_err(failure)?
         .with_vertex_buffers(desc.vertex_buffers().to_vec())
+        .map_err(failure)?
+        .with_color_targets(desc.color_targets().collect())
         .map_err(failure)?;
         if let Some(depth) = desc.depth_state() {
             variant = variant.with_depth_state(depth).map_err(failure)?;
@@ -313,6 +334,24 @@ impl Resources {
         for set in self.descriptor_sets.values_mut() {
             set.cached_group = None;
         }
+    }
+
+    pub(crate) fn empty_bind_group(
+        &mut self,
+        table: &ir::ResourceTable,
+    ) -> Result<ir::BindGroupId, vk::Result> {
+        if let Some((_, id)) = self
+            .bind_group_cache
+            .iter()
+            .find(|(desc, _)| desc.layout().entries().is_empty())
+        {
+            return Ok(*id);
+        }
+        let layout = ir::BindGroupLayoutDesc::new(Vec::new()).map_err(failure)?;
+        let desc = ir::BindGroupDesc::new(table, layout, Vec::new()).map_err(failure)?;
+        let id = table.define_bind_group(desc.clone()).map_err(failure)?.id();
+        self.bind_group_cache.push((desc, id));
+        Ok(id)
     }
 
     #[cfg(test)]
@@ -428,6 +467,10 @@ impl Resources {
                         if !image.usable()
                             || !image.usage.contains(if storage {
                                 vk::ImageUsageFlags::STORAGE
+                            } else if set.types.get(&binding)
+                                == Some(&vk::DescriptorType::INPUT_ATTACHMENT)
+                            {
+                                vk::ImageUsageFlags::INPUT_ATTACHMENT
                             } else {
                                 vk::ImageUsageFlags::SAMPLED
                             })
@@ -603,6 +646,7 @@ fn supported_descriptor_type(ty: vk::DescriptorType) -> bool {
         vk::DescriptorType::UNIFORM_BUFFER
             | vk::DescriptorType::STORAGE_BUFFER
             | vk::DescriptorType::SAMPLED_IMAGE
+            | vk::DescriptorType::INPUT_ATTACHMENT
             | vk::DescriptorType::STORAGE_IMAGE
             | vk::DescriptorType::SAMPLER
             | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
@@ -971,13 +1015,16 @@ unsafe extern "system" fn memory_commitment(
 /// Normalize Vulkan clip-space Y to SGFX's shader convention once, retaining entry-point names.
 #[cfg(test)]
 pub(crate) fn normalize_spirv(words: Vec<u32>) -> Result<ir::ShaderModuleDesc, vk::Result> {
-    normalize_spirv_specialized(words, &Vec::new())
+    normalize_spirv_specialized(words, &Vec::new(), &[])
 }
 fn normalize_spirv_specialized(
     words: Vec<u32>,
     values: &Specialization,
+    inputs: &[Option<bool>],
 ) -> Result<ir::ShaderModuleDesc, vk::Result> {
     ir::ShaderModuleDesc::spirv(words.clone()).map_err(failure)?;
+    let words = crate::specialization::freeze(words, values)?;
+    let words = crate::input_attachments::lower(words, inputs)?;
     let words = crate::spirv::separate_combined_samplers(words)?;
     let options = naga::front::spv::Options {
         adjust_coordinate_space: true,
@@ -987,6 +1034,9 @@ fn normalize_spirv_specialized(
     let mut module = naga::front::spv::Frontend::new(words.into_iter(), &options)
         .parse()
         .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    crate::shader_functions::specialize(&mut module)?;
+    crate::shader_functions::resolve_sampler_types(&mut module)?;
+    crate::shader_functions::widen_fragment_outputs(&mut module)?;
     // SPIR-V combined image samplers become two Naga globals with the same
     // Vulkan binding. SGFX has separate texture/sampler resources. Reserve an
     // adjacent pair per logical binding, including ordinary buffer bindings.
@@ -1017,41 +1067,6 @@ fn normalize_spirv_specialized(
     )
     .validate(&module)
     .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
-    let mut constants = naga::back::PipelineConstants::new();
-    for (_, value) in module.overrides.iter() {
-        let Some(id) = value.id else { continue };
-        let Some((_, data)) = values.iter().find(|(key, _)| *key == u32::from(id)) else {
-            continue;
-        };
-        let word = u32::from_ne_bytes(
-            data.as_slice()
-                .try_into()
-                .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?,
-        );
-        let number = match module.types[value.ty].inner {
-            naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Bool,
-                ..
-            }) => f64::from(u8::from(word != 0)),
-            naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Float,
-                width: 4,
-            }) => f64::from(f32::from_bits(word)),
-            naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Sint,
-                width: 4,
-            }) => f64::from(word as i32),
-            naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Uint,
-                width: 4,
-            }) => f64::from(word),
-            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-        };
-        constants.insert(id.to_string(), number);
-    }
-    let (module, info) =
-        naga::back::pipeline_constants::process_overrides(&module, &info, &constants)
-            .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
     let mut output = naga::back::spv::Options {
         lang_version: (1, 0),
         ..Default::default()
@@ -1175,9 +1190,9 @@ unsafe extern "system" fn create_descriptor_set_layout(
                 vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
                     ir::BindingType::StorageBuffer { read_only: false }
                 }
-                vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
-                    ir::BindingType::SampledTexture
-                }
+                vk::DescriptorType::SAMPLED_IMAGE
+                | vk::DescriptorType::INPUT_ATTACHMENT
+                | vk::DescriptorType::COMBINED_IMAGE_SAMPLER => ir::BindingType::SampledTexture,
                 vk::DescriptorType::SAMPLER => ir::BindingType::Sampler,
                 vk::DescriptorType::STORAGE_IMAGE => ir::BindingType::StorageTexture {
                     format: ir::TextureFormat::Rgba8Unorm,
@@ -1624,6 +1639,7 @@ unsafe extern "system" fn update_descriptor_sets(
                             })
                         }
                         vk::DescriptorType::SAMPLED_IMAGE
+                        | vk::DescriptorType::INPUT_ATTACHMENT
                         | vk::DescriptorType::STORAGE_IMAGE
                         | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
                             if !write.p_image_info.is_null() =>
@@ -1735,6 +1751,8 @@ unsafe extern "system" fn update_descriptor_sets(
                                 image.usage.contains(
                                     if write.ty == vk::DescriptorType::STORAGE_IMAGE {
                                         vk::ImageUsageFlags::STORAGE
+                                    } else if write.ty == vk::DescriptorType::INPUT_ATTACHMENT {
+                                        vk::ImageUsageFlags::INPUT_ATTACHMENT
                                     } else {
                                         vk::ImageUsageFlags::SAMPLED
                                     },
@@ -1911,6 +1929,9 @@ unsafe extern "system" fn destroy_pipeline(
             .compute_swizzles
             .retain(|(pipeline, _), _| *pipeline != handle);
         r.resources.graphics_extents.remove(&handle);
+        r.resources.graphics_state.remove(&handle);
+        r.resources.graphics_subpasses.remove(&handle);
+        r.resources.graphics_inputs.remove(&handle);
         Ok(())
     });
 }

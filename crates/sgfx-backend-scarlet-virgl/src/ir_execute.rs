@@ -1268,6 +1268,15 @@ impl ExecutionPlan {
                     ));
                 }
                 Command::BeginRenderPass(desc) if active.is_none() => {
+                    if desc.color_attachments().count() != 1
+                        || desc
+                            .depth_attachment()
+                            .is_some_and(|depth| depth.read_only())
+                    {
+                        return Err(IrSubmitError::Unsupported(
+                            UnsupportedIrFeature::ResourceBindings,
+                        ));
+                    }
                     let descriptor = resources.resources().texture(desc.target())?;
                     if !matches!(
                         descriptor.format(),

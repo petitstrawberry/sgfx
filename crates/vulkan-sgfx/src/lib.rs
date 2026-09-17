@@ -9,12 +9,16 @@ mod api;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod display;
 mod images;
+mod input_attachments;
 mod instance;
 mod push_constants;
+mod render_pass;
 mod resources;
 mod runtime;
 #[cfg(target_os = "scarlet")]
 pub mod scarlet_image;
+mod shader_functions;
+mod specialization;
 mod spirv;
 mod transfer;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]

@@ -632,6 +632,18 @@ unsafe extern "system" fn get_physical_device_properties(
             max_memory_allocation_count: 1024,
             buffer_image_granularity: 256,
             max_bound_descriptor_sets: limits.max_bound_descriptor_sets,
+            max_per_stage_descriptor_input_attachments: if capabilities
+                .supports_typed_texture_views()
+            {
+                8
+            } else {
+                0
+            },
+            max_descriptor_set_input_attachments: if capabilities.supports_typed_texture_views() {
+                8
+            } else {
+                0
+            },
             max_per_stage_descriptor_samplers: if graphics { 16 } else { 0 },
             max_per_stage_descriptor_sampled_images: if graphics { 16 } else { 0 },
             max_descriptor_set_samplers: if graphics { 16 } else { 0 },
@@ -722,7 +734,9 @@ unsafe extern "system" fn get_physical_device_properties(
             max_framebuffer_layers: 1,
             framebuffer_color_sample_counts: vk::SampleCountFlags::TYPE_1,
             framebuffer_depth_sample_counts: vk::SampleCountFlags::TYPE_1,
-            max_color_attachments: limits.max_color_attachments.min(1),
+            max_color_attachments: limits
+                .max_color_attachments
+                .min(sgfx::ir::MAX_COLOR_ATTACHMENTS as u32),
             max_sample_mask_words: 1,
             discrete_queue_priorities: 1,
             point_size_range: [1.0, 1.0],

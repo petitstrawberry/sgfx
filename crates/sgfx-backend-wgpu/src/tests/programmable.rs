@@ -7,6 +7,210 @@ use ir::*;
 use sgfx_core::backend::{Completion, CompletionStatus};
 
 #[test]
+fn multiple_outputs_and_read_only_depth_feed_a_lighting_pass_on_gpu() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().unwrap();
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let table = Rc::new(ResourceTable::new());
+    let extent = Extent2D::new(8, 8).unwrap();
+    let make_texture = |format| {
+        table
+            .define_texture(
+                TextureDesc::new(
+                    format,
+                    extent,
+                    TextureUsage::RENDER_ATTACHMENT
+                        | TextureUsage::SAMPLED
+                        | TextureUsage::COPY_SRC,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    };
+    let color = make_texture(TextureFormat::Rgba8Unorm);
+    let normal = make_texture(TextureFormat::Bgra8Unorm);
+    let output = make_texture(TextureFormat::Rgba8Unorm);
+    let depth = table
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::Depth32Float,
+                extent,
+                TextureUsage::RENDER_ATTACHMENT | TextureUsage::SAMPLED,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let module = shader(
+        &table,
+        r#"
+        @vertex fn vertex(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> {
+            var p = array<vec2<f32>,3>(vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));
+            return vec4(p[i],0.25,1.0);
+        }
+        struct GBuffer { @location(0) color:vec4<f32>, @location(1) normal:vec4<f32> }
+        @fragment fn geometry() -> GBuffer { return GBuffer(vec4(0.25,0.0,0.0,1.0),vec4(0.0,0.5,0.9,0.2)); }
+        @group(0) @binding(0) var color:texture_2d<f32>;
+        @group(0) @binding(1) var normal:texture_2d<f32>;
+        @group(0) @binding(2) var depth:texture_depth_2d;
+        @fragment fn lighting(@builtin(position) p:vec4<f32>) -> @location(0) vec4<f32> {
+            let xy = vec2<i32>(p.xy);
+            return vec4(textureLoad(color,xy,0).r,textureLoad(normal,xy,0).g,textureLoad(depth,xy,0),1.0);
+        }
+    "#,
+    );
+    let pipeline = |fragment, layout| {
+        ProgrammableRenderPipelineDesc::new(
+            entry(module, ShaderStage::Vertex, "vertex"),
+            entry(module, ShaderStage::Fragment, fragment),
+            layout,
+            TextureFormat::Rgba8Unorm,
+            None,
+            PrimitiveTopology::TriangleList,
+            BlendState::REPLACE,
+            RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        )
+        .unwrap()
+    };
+    let geometry = table
+        .define_programmable_render_pipeline(
+            pipeline("geometry", PipelineLayoutDesc::new(vec![]).unwrap())
+                .with_color_targets(vec![
+                    ColorTargetState::new(
+                        TextureFormat::Rgba8Unorm,
+                        BlendState::REPLACE,
+                        ColorWriteMask::ALL,
+                    )
+                    .unwrap(),
+                    ColorTargetState::new(
+                        TextureFormat::Bgra8Unorm,
+                        BlendState::REPLACE,
+                        ColorWriteMask::from_bits(3).unwrap(),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap()
+                .with_depth_state(DepthState::new(
+                    TextureFormat::Depth32Float,
+                    CompareFunction::Always,
+                    true,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+    let layout = BindGroupLayoutDesc::new(
+        (0..3)
+            .map(|binding| {
+                BindGroupLayoutEntry::new(
+                    binding,
+                    ShaderStages::FRAGMENT,
+                    BindingType::SampledTextureView {
+                        dimension: TextureViewDimension::D2,
+                        depth: binding == 2,
+                    },
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let lighting = table
+        .define_programmable_render_pipeline(
+            pipeline(
+                "lighting",
+                PipelineLayoutDesc::new(vec![layout.clone()]).unwrap(),
+            )
+            .with_depth_state(DepthState::new(
+                TextureFormat::Depth32Float,
+                CompareFunction::LessEqual,
+                false,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let group = table
+        .define_bind_group(
+            BindGroupDesc::new(
+                &table,
+                layout,
+                [color, normal, depth]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, t)| {
+                        let desc = table.texture(t).unwrap();
+                        BindGroupEntry::new(
+                            slot as u32,
+                            BindingResource::TextureView {
+                                texture: t.id(),
+                                view: TextureViewDesc::new(
+                                    desc,
+                                    desc.format(),
+                                    TextureViewDimension::D2,
+                                    0,
+                                    1,
+                                    0,
+                                    1,
+                                )
+                                .unwrap(),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let area = PixelRect::new(0, 0, 8, 8).unwrap();
+    let mut encoder = CommandEncoder::new(&table);
+    let mut pass = encoder
+        .begin_render_pass(
+            RenderPassDesc::new(&table, color, area, LoadOp::DontCare, StoreOp::Store)
+                .unwrap()
+                .with_color_attachment(
+                    &table,
+                    normal,
+                    LoadOp::Clear(Color::rgba(0.0, 0.0, 0.2, 1.0).unwrap()),
+                    StoreOp::Store,
+                )
+                .unwrap()
+                .with_depth_attachment(&table, depth, DepthLoadOp::Clear(1.0), StoreOp::Store)
+                .unwrap(),
+        )
+        .unwrap();
+    pass.set_programmable_pipeline(geometry).unwrap();
+    pass.draw(3, 0).unwrap();
+    pass.end().unwrap();
+    let mut pass = encoder
+        .begin_render_pass(
+            RenderPassDesc::new(&table, output, area, LoadOp::DontCare, StoreOp::Store)
+                .unwrap()
+                .with_depth_attachment(&table, depth, DepthLoadOp::Load, StoreOp::Store)
+                .unwrap()
+                .with_read_only_depth()
+                .unwrap(),
+        )
+        .unwrap();
+    pass.set_programmable_pipeline(lighting).unwrap();
+    pass.set_bind_group(0, group).unwrap();
+    pass.draw(3, 0).unwrap();
+    pass.end().unwrap();
+    let mut cache = context.create_resources(Rc::clone(&table));
+    context
+        .create_queue()
+        .submit(&mut cache, &encoder.finish().unwrap())
+        .unwrap();
+    assert_eq!(
+        cache.read_texture(output.id()).unwrap(),
+        [64, 128, 64, 255].repeat(64)
+    );
+    // Readback retains the image's native BGRA byte order.
+    assert_eq!(
+        cache.read_texture(normal.id()).unwrap(),
+        [51, 128, 0, 255].repeat(64)
+    );
+}
+
+#[test]
 fn instanced_and_indexed_draws_preserve_first_instance_on_gpu() {
     let _guard = HEADLESS_WGPU_TEST_LOCK.lock().unwrap();
     let Some(device) = headless_device() else {

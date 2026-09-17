@@ -1,3 +1,4 @@
+mod render_passes;
 use crate::runtime::Runtime;
 use ash::vk::{self, Handle};
 use sgfx::{
@@ -651,6 +652,7 @@ enum RecordedCommand {
         area: vk::Rect2D,
         clears: Vec<vk::ClearValue>,
     },
+    NextSubpass,
     EndRenderPass,
     SetViewport(vk::Viewport),
     SetScissor(vk::Rect2D),
@@ -724,6 +726,7 @@ struct ResolvedRecording {
     compute_offsets: BTreeMap<u32, Vec<u32>>,
     graphics_offsets: BTreeMap<u32, Vec<u32>>,
     render: Option<(u32, u32)>,
+    active_render_pass: Option<render_passes::ActiveRenderPass>,
     viewport: Option<vk::Viewport>,
     scissor: Option<vk::Rect2D>,
     used_buffers: Vec<vk::Buffer>,
@@ -788,7 +791,9 @@ impl Recording {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
             RecordedCommand::BeginRenderPass { .. } => self.render_active = true,
-            RecordedCommand::EndRenderPass if !self.render_active => {
+            RecordedCommand::EndRenderPass | RecordedCommand::NextSubpass
+                if !self.render_active =>
+            {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
@@ -842,6 +847,7 @@ impl ResolvedRecording {
             compute_offsets: BTreeMap::new(),
             graphics_offsets: BTreeMap::new(),
             render: None,
+            active_render_pass: None,
             viewport: None,
             scissor: None,
             used_buffers: Vec::new(),
@@ -1022,121 +1028,10 @@ impl RecordedCommand {
                 if *extended || *contents != vk::SubpassContents::INLINE || rec.render.is_some() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
-                let pass = rt
-                    .resources
-                    .render_passes
-                    .get(render_pass)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                let framebuffer_data = rt
-                    .resources
-                    .framebuffers
-                    .get(framebuffer)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                if framebuffer_data.render_pass != *render_pass
-                    || area.offset.x != 0
-                    || area.offset.y != 0
-                    || area.extent.width != framebuffer_data.width
-                    || area.extent.height != framebuffer_data.height
-                {
-                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-                }
-                let image = rt
-                    .resources
-                    .images
-                    .get(&framebuffer_data.image)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                if !image.usable() {
-                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                }
-                let load = match pass.load_op {
-                    vk::AttachmentLoadOp::LOAD => ir::LoadOp::Load,
-                    vk::AttachmentLoadOp::DONT_CARE => ir::LoadOp::DontCare,
-                    vk::AttachmentLoadOp::CLEAR => {
-                        let clear = clears
-                            .get(pass.color_index as usize)
-                            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                        let color = unsafe { clear.color.float32 };
-                        ir::LoadOp::Clear(
-                            ir::Color::rgba(color[0], color[1], color[2], color[3])
-                                .map_err(crate::resources::failure)?,
-                        )
-                    }
-                    _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-                };
-                let depth = if let Some(load_op) = pass.depth_load_op {
-                    let (_, handle) = framebuffer_data
-                        .depth
-                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    let depth_image = rt
-                        .resources
-                        .images
-                        .get(&handle)
-                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    if !depth_image.usable() {
-                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                    }
-                    let load = match load_op {
-                        vk::AttachmentLoadOp::LOAD => ir::DepthLoadOp::Load,
-                        vk::AttachmentLoadOp::DONT_CARE => ir::DepthLoadOp::DontCare,
-                        vk::AttachmentLoadOp::CLEAR => {
-                            let value = unsafe {
-                                clears
-                                    .get(
-                                        pass.depth_index
-                                            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
-                                            as usize,
-                                    )
-                                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
-                                    .depth_stencil
-                                    .depth
-                            };
-                            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                            }
-                            ir::DepthLoadOp::Clear(value)
-                        }
-                        _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-                    };
-                    rec.used_images.push(handle);
-                    Some(ir::OwnedDepthAttachment {
-                        target: depth_image.id,
-                        load,
-                        store: if pass.depth_store_op == vk::AttachmentStoreOp::STORE {
-                            ir::StoreOp::Store
-                        } else {
-                            ir::StoreOp::DontCare
-                        },
-                    })
-                } else {
-                    None
-                };
-                let render_area =
-                    ir::PixelRect::new(0, 0, framebuffer_data.width, framebuffer_data.height)
-                        .map_err(crate::resources::failure)?;
-                rec.ops
-                    .push(ir::OwnedCommand::BeginRenderPass(ir::OwnedRenderPassDesc {
-                        target: image.id,
-                        area: render_area,
-                        load,
-                        store: if pass.store_op == vk::AttachmentStoreOp::STORE {
-                            ir::StoreOp::Store
-                        } else {
-                            ir::StoreOp::DontCare
-                        },
-                        depth,
-                    }));
-                rec.render = Some((framebuffer_data.width, framebuffer_data.height));
-                rec.emitted_graphics = Default::default();
-                rec.used_images.push(framebuffer_data.image);
-                rec.used_framebuffers.push(*framebuffer);
-                rec.used_render_passes.push(*render_pass);
+                render_passes::begin(rt, rec, *render_pass, *framebuffer, *area, clears)?;
             }
-            Self::EndRenderPass => {
-                if rec.render.take().is_none() {
-                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                }
-                rec.ops.push(ir::OwnedCommand::EndRenderPass);
-            }
+            Self::NextSubpass => render_passes::next(rec)?,
+            Self::EndRenderPass => render_passes::end(rec)?,
             Self::SetViewport(viewport) => rec.viewport = Some(*viewport),
             Self::SetScissor(scissor) => rec.scissor = Some(*scissor),
             Self::BindVertexBuffer {
@@ -2086,6 +1981,16 @@ unsafe extern "system" fn cmd_begin_render_pass(
         },
     )
 }
+unsafe extern "system" fn cmd_next_subpass(
+    command: vk::CommandBuffer,
+    contents: vk::SubpassContents,
+) {
+    if contents != vk::SubpassContents::INLINE {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        return;
+    }
+    record(command, RecordedCommand::NextSubpass)
+}
 unsafe extern "system" fn cmd_end_render_pass(command: vk::CommandBuffer) {
     record(command, RecordedCommand::EndRenderPass)
 }
@@ -2236,6 +2141,7 @@ fn graphics_bindings(
                 .map_err(crate::resources::failure)?,
         )
         .map_err(crate::resources::failure)?;
+    render_passes::validate_bindings(resources, rec, pipeline, desc.layout())?;
     emit_changed(
         &mut rec.emitted_graphics.viewport,
         viewport,
@@ -2268,12 +2174,26 @@ fn graphics_bindings(
             rec.emitted_graphics.descriptors.clear();
         }
     }
+    let pipeline_changed = rec.emitted_graphics.pipeline != Some(id);
     emit_changed(
         &mut rec.emitted_graphics.pipeline,
         id,
         &mut rec.ops,
         ir::OwnedCommand::SetProgrammablePipeline,
     );
+    if pipeline_changed {
+        // Vulkan preserves descriptor bindings that the next shader no longer
+        // uses. SGFX's reflected layout has explicit empty slots; replace stale
+        // bindings there once per pipeline change, retaining active Vulkan sets.
+        for (index, group) in desc.layout().bind_groups().iter().enumerate() {
+            if group.entries().is_empty() {
+                rec.ops.push(ir::OwnedCommand::SetBindGroup {
+                    index: index as u32,
+                    bind_group: resources.empty_bind_group(table)?,
+                });
+            }
+        }
+    }
     let push_key = (id, rec.push_constants_revision);
     if rec.emitted_graphics.push_constants != Some(push_key) {
         rec.ops.extend(rec.push_constants.snapshot(desc.layout())?);
@@ -3227,9 +3147,7 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
                         .get(&view.image)
                         .is_some_and(|image| image.usable())
                 })
-            }) || fb
-                .depth
-                .is_some_and(|(view, _)| !rt.resources.views.contains_key(&view))
+            })
         })
     }) || rec
         .used_render_passes
@@ -3533,6 +3451,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdBindVertexBuffers" => entry!(cmd_bind_vertex_buffers),
         b"vkCmdBindIndexBuffer" => entry!(cmd_bind_index_buffer),
         b"vkCmdBeginRenderPass" => entry!(cmd_begin_render_pass),
+        b"vkCmdNextSubpass" => entry!(cmd_next_subpass),
         b"vkCmdEndRenderPass" => entry!(cmd_end_render_pass),
         b"vkCmdCopyImageToBuffer" => entry!(cmd_copy_image_to_buffer),
         b"vkCmdCopyBuffer" => entry!(cmd_copy_buffer),
@@ -3827,6 +3746,107 @@ mod tests {
         assert_eq!(
             graphics_bindings(&table, &mut resources, &mut rec),
             Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+    }
+
+    #[test]
+    fn pipeline_changes_clear_unused_ir_groups_but_preserve_vulkan_sets() {
+        let (table, mut resources, mut rec, layout) = graphics_fixture();
+        let crate::resources::Pipeline::Graphics(original) =
+            resources.pipelines[&vk::Pipeline::from_raw(1)]
+        else {
+            panic!("graphics pipeline expected")
+        };
+        let original = table
+            .programmable_render_pipeline_shared(
+                table.programmable_render_pipeline_ref(original).unwrap(),
+            )
+            .unwrap();
+        for (handle, second_group) in [
+            (10, layout.bind_groups()[0].clone()),
+            (11, ir::BindGroupLayoutDesc::new(Vec::new()).unwrap()),
+        ] {
+            let pipeline_layout =
+                ir::PipelineLayoutDesc::new(vec![layout.bind_groups()[0].clone(), second_group])
+                    .unwrap()
+                    .with_push_constant_ranges(layout.push_constant_ranges().to_vec())
+                    .unwrap();
+            let desc = ir::ProgrammableRenderPipelineDesc::new(
+                original.vertex().clone(),
+                original.fragment().clone(),
+                pipeline_layout,
+                original.target_format(),
+                None,
+                original.topology(),
+                original.blend(),
+                original.raster(),
+            )
+            .unwrap()
+            .with_vertex_buffers(original.vertex_buffers().to_vec())
+            .unwrap();
+            let pipeline = vk::Pipeline::from_raw(handle);
+            let id = table
+                .define_programmable_render_pipeline(desc)
+                .unwrap()
+                .id();
+            resources
+                .pipelines
+                .insert(pipeline, crate::resources::Pipeline::Graphics(id));
+            resources.graphics_state.insert(
+                pipeline,
+                crate::images::GraphicsDynamicState {
+                    viewport: None,
+                    scissor: None,
+                },
+            );
+        }
+        rec.graphics_sets.insert(1, vk::DescriptorSet::from_raw(6));
+        rec.graphics_offsets.insert(1, vec![0]);
+        rec.graphics = Some(vk::Pipeline::from_raw(10));
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
+        assert!(
+            rec.descriptors
+                .iter()
+                .any(|binding| binding.set == vk::DescriptorSet::from_raw(6))
+        );
+        let old_sets = rec.graphics_sets.clone();
+        let previous = rec.ops.len();
+        rec.graphics = Some(vk::Pipeline::from_raw(11));
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
+        assert_eq!(rec.graphics_sets, old_sets);
+        let empty_group = rec.ops[previous..]
+            .iter()
+            .find_map(|command| match command {
+                ir::OwnedCommand::SetBindGroup {
+                    index: 1,
+                    bind_group,
+                } => Some(*bind_group),
+                _ => None,
+            })
+            .expect("the stale SGFX slot must be replaced on pipeline change");
+        assert!(
+            table
+                .bind_group_shared(table.bind_group_ref(empty_group).unwrap())
+                .unwrap()
+                .layout()
+                .entries()
+                .is_empty()
+        );
+        assert_eq!(resources.empty_bind_group(&table).unwrap(), empty_group);
+        let previous = rec.ops.len();
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
+        assert_eq!(
+            rec.ops.len(),
+            previous,
+            "repeated draws must not rebind the empty slot"
+        );
+        let previous = rec.descriptors.len();
+        rec.graphics = Some(vk::Pipeline::from_raw(10));
+        graphics_bindings(&table, &mut resources, &mut rec).unwrap();
+        assert!(
+            rec.descriptors[previous..]
+                .iter()
+                .any(|binding| binding.set == vk::DescriptorSet::from_raw(6))
         );
     }
 

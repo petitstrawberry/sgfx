@@ -54,22 +54,11 @@ pub(crate) struct ImageView {
     pub components: [u8; 4],
 }
 
-pub(crate) struct RenderPass {
-    pub color_index: u32,
-    pub depth_index: Option<u32>,
-    pub attachment_formats: Vec<vk::Format>,
-    pub store_op: vk::AttachmentStoreOp,
-    pub format: vk::Format,
-    pub load_op: vk::AttachmentLoadOp,
-    pub depth_load_op: Option<vk::AttachmentLoadOp>,
-    pub depth_store_op: vk::AttachmentStoreOp,
-}
+pub(crate) use crate::render_pass::RenderPass;
 
 pub(crate) struct Framebuffer {
     pub attachments: Vec<vk::ImageView>,
-    pub render_pass: vk::RenderPass,
-    pub image: vk::Image,
-    pub depth: Option<(vk::ImageView, vk::Image)>,
+    pub render_pass: RenderPass,
     pub width: u32,
     pub height: u32,
 }
@@ -193,7 +182,10 @@ unsafe extern "system" fn create_image(
     if info.usage.contains(vk::ImageUsageFlags::STORAGE) {
         usage |= ir::TextureUsage::STORAGE;
     }
-    if info.usage.contains(vk::ImageUsageFlags::SAMPLED) {
+    if info
+        .usage
+        .intersects(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::INPUT_ATTACHMENT)
+    {
         usage |= ir::TextureUsage::SAMPLED;
     }
     if info.usage.intersects(
@@ -490,179 +482,28 @@ unsafe extern "system" fn create_render_pass(
         return INVALID;
     }
     *output = vk::RenderPass::null();
-    let info = &*info;
-    if !allocator.is_null()
-        || !info.p_next.is_null()
-        || !info.flags.is_empty()
-        || info.s_type != vk::StructureType::RENDER_PASS_CREATE_INFO
-        || !(1..=8).contains(&info.attachment_count)
-        || info.p_attachments.is_null()
-        || info.subpass_count != 1
-        || info.p_subpasses.is_null()
-    {
+    if !allocator.is_null() {
         return UNSUPPORTED;
     }
-    let subpass = &*info.p_subpasses;
-    if subpass.color_attachment_count != 1 || subpass.p_color_attachments.is_null() {
-        return UNSUPPORTED;
-    }
-    let color = &*subpass.p_color_attachments;
-    if color.attachment >= info.attachment_count
-        || color.layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-    {
-        return UNSUPPORTED;
-    }
-    let attachment = &*info.p_attachments.add(color.attachment as usize);
-    let attachment_formats =
-        std::slice::from_raw_parts(info.p_attachments, info.attachment_count as usize)
-            .iter()
-            .map(|attachment| attachment.format)
-            .collect::<Vec<_>>();
-    let color_index = color.attachment;
-    if !attachment.flags.is_empty()
-        || !matches!(
-            attachment.format,
-            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
-        )
-        || attachment.samples != vk::SampleCountFlags::TYPE_1
-        || !matches!(
-            attachment.load_op,
-            vk::AttachmentLoadOp::CLEAR
-                | vk::AttachmentLoadOp::LOAD
-                | vk::AttachmentLoadOp::DONT_CARE
-        )
-        || !matches!(
-            attachment.store_op,
-            vk::AttachmentStoreOp::STORE | vk::AttachmentStoreOp::DONT_CARE
-        )
-        || attachment.stencil_load_op != vk::AttachmentLoadOp::DONT_CARE
-        || attachment.stencil_store_op != vk::AttachmentStoreOp::DONT_CARE
-        || !matches!(
-            attachment.initial_layout,
-            vk::ImageLayout::UNDEFINED
-                | vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-                | vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                | vk::ImageLayout::GENERAL
-        )
-        || (attachment.load_op == vk::AttachmentLoadOp::LOAD
-            && attachment.initial_layout == vk::ImageLayout::UNDEFINED)
-        || !matches!(
-            attachment.final_layout,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-                | vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                | vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-                | vk::ImageLayout::PRESENT_SRC_KHR
-                | vk::ImageLayout::GENERAL
-        )
-        || !subpass.flags.is_empty()
-        || subpass.pipeline_bind_point != vk::PipelineBindPoint::GRAPHICS
-        || subpass.input_attachment_count != 0
-        || subpass.color_attachment_count != 1
-        || subpass.p_color_attachments.is_null()
-        || !subpass.p_resolve_attachments.is_null()
-        || subpass.preserve_attachment_count != 0
-    {
-        return UNSUPPORTED;
-    }
-    let mut depth_load_op = None;
-    let mut depth_store_op = vk::AttachmentStoreOp::DONT_CARE;
-    let mut depth_index = None;
-    if let Some(reference) = subpass
-        .p_depth_stencil_attachment
-        .as_ref()
-        .filter(|r| r.attachment != vk::ATTACHMENT_UNUSED)
-    {
-        if reference.attachment >= info.attachment_count || reference.attachment == color_index {
-            return UNSUPPORTED;
-        }
-        let depth = &*info.p_attachments.add(reference.attachment as usize);
-        if reference.attachment == color_index
-            || reference.layout != vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-            || !depth.flags.is_empty()
-            || depth.format != vk::Format::D32_SFLOAT
-            || depth.samples != vk::SampleCountFlags::TYPE_1
-            || !matches!(
-                depth.load_op,
-                vk::AttachmentLoadOp::CLEAR
-                    | vk::AttachmentLoadOp::LOAD
-                    | vk::AttachmentLoadOp::DONT_CARE
-            )
-            || !matches!(
-                depth.store_op,
-                vk::AttachmentStoreOp::STORE | vk::AttachmentStoreOp::DONT_CARE
-            )
-            || depth.stencil_load_op != vk::AttachmentLoadOp::DONT_CARE
-            || depth.stencil_store_op != vk::AttachmentStoreOp::DONT_CARE
-            || !matches!(
-                depth.initial_layout,
-                vk::ImageLayout::UNDEFINED
-                    | vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                    | vk::ImageLayout::GENERAL
-            )
-            || (depth.load_op == vk::AttachmentLoadOp::LOAD
-                && depth.initial_layout == vk::ImageLayout::UNDEFINED)
-            || !matches!(
-                depth.final_layout,
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL | vk::ImageLayout::GENERAL
-            )
-        {
-            return UNSUPPORTED;
-        }
-        depth_index = Some(reference.attachment);
-        depth_load_op = Some(depth.load_op);
-        depth_store_op = depth.store_op;
-    }
-    if info.dependency_count > 2 || (info.dependency_count != 0 && info.p_dependencies.is_null()) {
-        return UNSUPPORTED;
-    }
-    for index in 0..info.dependency_count as usize {
-        let dependency = &*info.p_dependencies.add(index);
-        let stages = vk::PipelineStageFlags::TOP_OF_PIPE
-            | vk::PipelineStageFlags::BOTTOM_OF_PIPE
-            | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-            | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-            | vk::PipelineStageFlags::TRANSFER
-            | vk::PipelineStageFlags::VERTEX_SHADER
-            | vk::PipelineStageFlags::FRAGMENT_SHADER;
-        let accesses = vk::AccessFlags::COLOR_ATTACHMENT_READ
-            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
-            | vk::AccessFlags::TRANSFER_READ
-            | vk::AccessFlags::TRANSFER_WRITE
-            | vk::AccessFlags::SHADER_READ;
-        let external_edge = (dependency.src_subpass == vk::SUBPASS_EXTERNAL
-            && dependency.dst_subpass == 0)
-            || (dependency.src_subpass == 0 && dependency.dst_subpass == vk::SUBPASS_EXTERNAL);
-        if !external_edge
-            || !stages.contains(dependency.src_stage_mask)
-            || !stages.contains(dependency.dst_stage_mask)
-            || !accesses.contains(dependency.src_access_mask)
-            || !accesses.contains(dependency.dst_access_mask)
-            || !vk::DependencyFlags::BY_REGION.contains(dependency.dependency_flags)
-        {
-            return UNSUPPORTED;
-        }
-    }
-    let format = attachment.format;
-    let load_op = attachment.load_op;
-    let store_op = attachment.store_op;
+    let pass = match crate::render_pass::parse(&*info) {
+        Ok(pass) => pass,
+        Err(error) => return error,
+    };
     match with_device(device, move |runtime| {
+        if pass
+            .subpasses
+            .iter()
+            .any(|s| s.colors.len() > runtime.capabilities.limits().max_color_attachments as usize)
+            || (pass
+                .subpasses
+                .iter()
+                .any(|s| !s.inputs.is_empty() || s.read_only_depth)
+                && !runtime.capabilities.supports_typed_texture_views())
+        {
+            return Err(UNSUPPORTED);
+        }
         let handle = vk::RenderPass::from_raw(next_id());
-        runtime.resources.render_passes.insert(
-            handle,
-            RenderPass {
-                color_index,
-                depth_index,
-                attachment_formats,
-                store_op,
-                format,
-                load_op,
-                depth_load_op,
-                depth_store_op,
-            },
-        );
+        runtime.resources.render_passes.insert(handle, pass);
         Ok(handle)
     }) {
         Ok(handle) => {
@@ -719,13 +560,13 @@ unsafe extern "system" fn create_framebuffer(
             .render_passes
             .get(&render_pass)
             .ok_or(INVALID)?;
-        if views.len() != pass.attachment_formats.len() {
+        if views.len() != pass.attachments.len() {
             return Err(INVALID);
         }
         for (index, view) in views.iter().enumerate() {
             let view = runtime.resources.views.get(view).ok_or(INVALID)?;
             let image = runtime.resources.images.get(&view.image).ok_or(INVALID)?;
-            if image.format != pass.attachment_formats[index] || !image.usable() {
+            if image.format != pass.attachments[index].format || !image.usable() {
                 return Err(INVALID);
             }
             if view.components != [0, 1, 2, 3]
@@ -740,47 +581,39 @@ unsafe extern "system" fn create_framebuffer(
                 return Err(UNSUPPORTED);
             }
         }
-        let view = views[pass.color_index as usize];
-        let depth_view = pass.depth_index.map(|index| views[index as usize]);
-        let image = runtime.resources.views.get(&view).ok_or(INVALID)?.image;
-        if depth_view.is_some() != pass.depth_load_op.is_some() {
-            return Err(UNSUPPORTED);
+        for (index, view) in views.iter().enumerate() {
+            let view = runtime.resources.views.get(view).ok_or(INVALID)?;
+            let image = runtime.resources.images.get(&view.image).ok_or(INVALID)?;
+            let color = pass.subpasses.iter().any(|s| s.colors.contains(&index));
+            let depth = pass.subpasses.iter().any(|s| s.depth == Some(index));
+            let input = pass
+                .subpasses
+                .iter()
+                .any(|s| s.inputs.contains(&Some(index)));
+            let mut required = vk::ImageUsageFlags::empty();
+            if color {
+                required |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            }
+            if depth {
+                required |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+            }
+            if input {
+                required |= vk::ImageUsageFlags::INPUT_ATTACHMENT;
+            }
+            if image.extent.width != width
+                || image.extent.height != height
+                || !image.usage.contains(required)
+            {
+                return Err(UNSUPPORTED);
+            }
         }
-        let depth = depth_view
-            .map(|view| {
-                let image = runtime.resources.views.get(&view).ok_or(INVALID)?.image;
-                let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
-                if !data.usable()
-                    || data.format != vk::Format::D32_SFLOAT
-                    || data.extent.width != width
-                    || data.extent.height != height
-                {
-                    return Err(UNSUPPORTED);
-                }
-                Ok((view, image))
-            })
-            .transpose()?;
-        let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
-        let desc = runtime
-            .table
-            .texture(runtime.table.texture_ref(data.id).map_err(|_| INVALID)?)
-            .map_err(|_| INVALID)?;
-        if !data.usable()
-            || data.format != pass.format
-            || data.extent.width != width
-            || data.extent.height != height
-            || !desc.usage().contains(ir::TextureUsage::RENDER_ATTACHMENT)
-        {
-            return Err(UNSUPPORTED);
-        }
+        let render_pass = pass.clone();
         let handle = vk::Framebuffer::from_raw(next_id());
         runtime.resources.framebuffers.insert(
             handle,
             Framebuffer {
                 attachments: views,
                 render_pass,
-                image,
-                depth,
                 width,
                 height,
             },
@@ -859,7 +692,7 @@ pub(crate) struct GraphicsDynamicState {
 
 struct GraphicsState {
     dynamic: GraphicsDynamicState,
-    blend: ir::BlendState,
+    colors: Vec<(ir::BlendState, ir::ColorWriteMask)>,
     extent: vk::Extent2D,
     vertex: Vec<ir::VertexBufferLayout>,
     depth: Option<ir::DepthState>,
@@ -965,7 +798,6 @@ unsafe fn graphics_state(
     if !info.p_next.is_null()
         || !info.flags.is_empty()
         || info.s_type != vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO
-        || info.subpass != 0
         || !info.p_tessellation_state.is_null()
         || info.p_vertex_input_state.is_null()
         || info.p_input_assembly_state.is_null()
@@ -1047,17 +879,9 @@ unsafe fn graphics_state(
         || !blend.p_next.is_null()
         || !blend.flags.is_empty()
         || blend.logic_op_enable != vk::FALSE
-        || blend.attachment_count != 1
+        || !(1..=ir::MAX_COLOR_ATTACHMENTS as u32).contains(&blend.attachment_count)
         || blend.p_attachments.is_null()
     {
-        return Err(UNSUPPORTED);
-    }
-    let color = &*blend.p_attachments;
-    let rgba = vk::ColorComponentFlags::R
-        | vk::ColorComponentFlags::G
-        | vk::ColorComponentFlags::B
-        | vk::ColorComponentFlags::A;
-    if !matches!(color.blend_enable, vk::FALSE | vk::TRUE) || color.color_write_mask != rgba {
         return Err(UNSUPPORTED);
     }
     if let Some(depth) = info.p_depth_stencil_state.as_ref()
@@ -1135,22 +959,35 @@ unsafe fn graphics_state(
             _ => return Err(UNSUPPORTED),
         })
     };
-    let blending = if color.blend_enable == vk::FALSE {
-        ir::BlendState::REPLACE
-    } else {
-        ir::BlendState::new(
-            ir::BlendComponent::new(
-                factor(color.src_color_blend_factor)?,
-                factor(color.dst_color_blend_factor)?,
-                op(color.color_blend_op)?,
-            ),
-            ir::BlendComponent::new(
-                factor(color.src_alpha_blend_factor)?,
-                factor(color.dst_alpha_blend_factor)?,
-                op(color.alpha_blend_op)?,
-            ),
-        )
-    };
+    let mut colors = Vec::new();
+    for color in std::slice::from_raw_parts(blend.p_attachments, blend.attachment_count as usize) {
+        if !matches!(color.blend_enable, vk::FALSE | vk::TRUE)
+            || !vk::ColorComponentFlags::RGBA.contains(color.color_write_mask)
+        {
+            return Err(UNSUPPORTED);
+        }
+        let blending = if color.blend_enable == vk::FALSE {
+            ir::BlendState::REPLACE
+        } else {
+            ir::BlendState::new(
+                ir::BlendComponent::new(
+                    factor(color.src_color_blend_factor)?,
+                    factor(color.dst_color_blend_factor)?,
+                    op(color.color_blend_op)?,
+                ),
+                ir::BlendComponent::new(
+                    factor(color.src_alpha_blend_factor)?,
+                    factor(color.dst_alpha_blend_factor)?,
+                    op(color.alpha_blend_op)?,
+                ),
+            )
+        };
+        colors.push((
+            blending,
+            ir::ColorWriteMask::from_bits(color.color_write_mask.as_raw() as u8)
+                .map_err(|_| UNSUPPORTED)?,
+        ));
+    }
     let front = if raster.front_face == vk::FrontFace::CLOCKWISE {
         ir::FrontFace::Clockwise
     } else {
@@ -1167,7 +1004,7 @@ unsafe fn graphics_state(
             viewport: view,
             scissor,
         },
-        blend: blending,
+        colors,
         vertex: vertex_layout(vertex)?,
         depth,
         raster: ir::RasterState::new(cull, front),
@@ -1218,6 +1055,7 @@ unsafe extern "system" fn create_graphics_pipelines(
         };
         let layout = info.layout;
         let render_pass = info.render_pass;
+        let subpass_index = info.subpass as usize;
         // Shader-module normalization already compensates for Vulkan's positive
         // viewport height. Framebuffer winding therefore maps without reversal.
         match with_device(device, move |runtime| {
@@ -1226,7 +1064,26 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .render_passes
                 .get(&render_pass)
                 .ok_or(INVALID)?;
-            let target_format = texture_format(pass.format).ok_or(UNSUPPORTED)?;
+            let pass = pass.clone();
+            let subpass = pass.subpasses.get(subpass_index).ok_or(INVALID)?;
+            if subpass.colors.len() != state.colors.len() {
+                return Err(INVALID);
+            }
+            let targets = subpass
+                .colors
+                .iter()
+                .zip(&state.colors)
+                .map(|(&i, &(blend, mask))| {
+                    ir::ColorTargetState::new(
+                        texture_format(pass.attachments[i].format).ok_or(UNSUPPORTED)?,
+                        blend,
+                        mask,
+                    )
+                    .map_err(|_| INVALID)
+                })
+                .collect::<Result<Vec<_>, vk::Result>>()?;
+            let target_format = targets[0].format();
+            let input_depths = pass.input_depths(subpass_index);
             let layout = runtime
                 .resources
                 .pipeline_layouts
@@ -1239,12 +1096,18 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .get_mut(&vertex_module)
                 .ok_or(INVALID)?
                 .variant(&runtime.table, &vertex_values)?;
+            let input_bindings = runtime
+                .resources
+                .shaders
+                .get(&fragment_module)
+                .ok_or(INVALID)?
+                .input_bindings()?;
             let fragment_id = runtime
                 .resources
                 .shaders
                 .get_mut(&fragment_module)
                 .ok_or(INVALID)?
-                .variant(&runtime.table, &fragment_values)?;
+                .variant_for_subpass(&runtime.table, &fragment_values, &input_depths)?;
             let vertex = ir::ShaderEntryPoint::new(
                 runtime
                     .table
@@ -1270,13 +1133,18 @@ unsafe extern "system" fn create_graphics_pipelines(
                 target_format,
                 None,
                 state.topology,
-                state.blend,
+                targets[0].blend(),
                 state.raster,
             )
             .map_err(|_| INVALID)?
             .with_vertex_buffers(state.vertex)
+            .map_err(|_| INVALID)?
+            .with_color_targets(targets)
             .map_err(|_| INVALID)?;
-            if pass.depth_load_op.is_some() {
+            if subpass.read_only_depth && state.depth.is_some_and(|d| d.write_enabled()) {
+                return Err(INVALID);
+            }
+            if subpass.depth.is_some() {
                 desc = desc
                     .with_depth_state(state.depth.ok_or(UNSUPPORTED)?)
                     .map_err(|_| INVALID)?;
@@ -1299,6 +1167,14 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .resources
                 .pipelines
                 .insert(handle, crate::resources::Pipeline::Graphics(id));
+            runtime
+                .resources
+                .graphics_subpasses
+                .insert(handle, (pass, subpass_index));
+            runtime
+                .resources
+                .graphics_inputs
+                .insert(handle, input_bindings);
             runtime
                 .resources
                 .graphics_extents
