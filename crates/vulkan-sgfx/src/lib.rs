@@ -20,6 +20,15 @@ mod transfer;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
 mod wsi;
 
+// Keep the Linux-ABI ICD's short-lived command and draw allocations in a
+// reusable heap. Passing these buffers through musl on every submit dominated
+// CPU time on Scarlet, including cleanup after native queue submission.
+// This allocator belongs to the Rust driver; the Vulkan application's libc
+// allocation entry points and the standard loader are unchanged.
+#[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+#[global_allocator]
+static ICD_ALLOCATOR: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
 /// Construct a Vulkan entry table for the ICD linked into this executable.
 ///
 /// This supports native Scarlet applications before a dynamic Vulkan loader is

@@ -29,7 +29,8 @@ use crate::driver::{
     IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrBufferUpdate,
     IrCompareFunction, IrConstantBuffer, IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram,
     IrFrontFace, IrPipelineState, IrProgrammablePipeline, IrSamplerState, IrSubmission,
-    IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload, IrVertex, MAX_IR_VERTICES,
+    IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload, IrUniforms, IrVertex,
+    MAX_IR_VERTICES,
 };
 use crate::packets::UPLOAD_ARENA_COUNT;
 use crate::{
@@ -1895,6 +1896,7 @@ impl Queue {
         let mut bound_vertex_buffer = Some((resources.vertex_resource_id, 0));
         let mut bound_programmable = false;
         let mut programmable_bindings = ProgrammableBindings::default();
+        let mut fixed_uniform_bindings = FixedUniformBindings::default();
         let mut bound_viewport = None;
         let mut bound_scissor = Some((
             pass_scissor.x(),
@@ -1935,6 +1937,7 @@ impl Queue {
                 bound_fragment_shader = None;
                 bound_vertex_buffer = None;
                 bound_scissor = None;
+                fixed_uniform_bindings = FixedUniformBindings::default();
                 continue;
             }
             if bound_programmable {
@@ -1987,9 +1990,9 @@ impl Queue {
             if bound_fragment_shader != Some(fragment_shader) {
                 push_fragment_shader(&mut commands, fragment_shader);
                 bound_fragment_shader = Some(fragment_shader);
+                fixed_uniform_bindings = FixedUniformBindings::default();
             }
-            push_constant_buffer(&mut commands, PIPE_SHADER_VERTEX, &draw.uniforms.transform)?;
-            push_constant_buffer(&mut commands, PIPE_SHADER_FRAGMENT, &draw.uniforms.color)?;
+            fixed_uniform_bindings.bind(&mut commands, draw.uniforms)?;
             let scissor = ir_rect_to_pixel_rect(draw.scissor)?;
             let scissor_key = (scissor.x(), scissor.y(), scissor.width(), scissor.height());
             if bound_scissor != Some(scissor_key) {
@@ -3235,6 +3238,28 @@ fn push_sampler_state_binding(commands: &mut Vec<u8>, handle: u32) {
     push_dword(commands, PIPE_SHADER_FRAGMENT);
     push_dword(commands, 0);
     push_dword(commands, handle);
+}
+
+#[derive(Default)]
+struct FixedUniformBindings {
+    vertex: Option<[u32; 16]>,
+    fragment: Option<[u32; 4]>,
+}
+
+impl FixedUniformBindings {
+    fn bind(&mut self, commands: &mut Vec<u8>, uniforms: IrUniforms) -> HandleResult<()> {
+        let vertex = uniforms.transform.map(f32::to_bits);
+        if self.vertex != Some(vertex) {
+            push_constant_buffer(commands, PIPE_SHADER_VERTEX, &uniforms.transform)?;
+            self.vertex = Some(vertex);
+        }
+        let fragment = uniforms.color.map(f32::to_bits);
+        if self.fragment != Some(fragment) {
+            push_constant_buffer(commands, PIPE_SHADER_FRAGMENT, &uniforms.color)?;
+            self.fragment = Some(fragment);
+        }
+        Ok(())
+    }
 }
 
 fn push_constant_buffer(
@@ -4520,6 +4545,32 @@ mod tests {
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte command word")))
             .collect()
+    }
+
+    #[test]
+    fn fixed_uniforms_only_emit_changed_stage_values() {
+        let mut commands = Vec::new();
+        let mut bindings = FixedUniformBindings::default();
+        let mut uniforms = IrUniforms {
+            transform: [0.0; 16],
+            color: [1.0; 4],
+        };
+        bindings.bind(&mut commands, uniforms).unwrap();
+        assert_eq!(commands.len(), (19 + 7) * 4);
+        bindings.bind(&mut commands, uniforms).unwrap();
+        assert_eq!(commands.len(), (19 + 7) * 4);
+
+        uniforms.color[0] = 0.5;
+        bindings.bind(&mut commands, uniforms).unwrap();
+        assert_eq!(commands.len(), (19 + 7 + 7) * 4);
+        assert_eq!(dwords(&commands).last(), Some(&1.0f32.to_bits()));
+
+        uniforms.transform[0] = -0.0;
+        bindings.bind(&mut commands, uniforms).unwrap();
+        assert_eq!(commands.len(), (19 + 7 + 7 + 19) * 4);
+        bindings = FixedUniformBindings::default();
+        bindings.bind(&mut commands, uniforms).unwrap();
+        assert_eq!(commands.len(), (19 + 7 + 7 + 19 + 19 + 7) * 4);
     }
 
     #[test]

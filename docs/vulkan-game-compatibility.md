@@ -339,3 +339,54 @@ modest improvement, not sustained or playable performance. The copied demo
 prefix is a private test asset and is not included in the repository or normal
 image. The ordinary full bundled demo can be timed with
 `+set timedemo 1 +demomap q2demo1.dm2`.
+
+### Reusable heap for the Linux ABI ICD
+
+On Linux with `scarlet-wsi`, the Rust ICD now uses
+`dlmalloc::GlobalDlmalloc` for its command, draw and resource allocations.
+Temporary allocation clocks identified substantial time inside the musl
+allocation/free calls, including destruction of draw storage after submission.
+Reusing a driver heap removes this repeated cost without changing the GPU
+command stream, Vulkan procedures, canonical IR or native GPU/SWS SDK.
+The ordinary Vulkan loader and the application's libc allocator are unchanged;
+the ICD does not export replacement `malloc`/`free` entry points. Other build
+configurations retain their existing allocator.
+
+The same 57-frame demo prefix was checked on 2026-09-17 with release builds,
+1280x800 output, four AArch64 HVF CPUs, 8 GiB RAM and the same game settings,
+kernel and Cocoa VirGL display path:
+
+| Release ICD | Engine elapsed time | Engine FPS |
+| --- | --- | --- |
+| Before the allocator change (`4cf4fc9`), first check | 15.2 s | 3.7 |
+| Before the allocator change (`4cf4fc9`), repeated check | 13.5 s | 4.2 |
+| Reusable driver heap | 1.1 s | 50.4 |
+
+This is approximately a 12x improvement over the faster baseline in this short
+test, not a sustained FPS measurement. The game reports rounded elapsed time
+and FPS separately. Normal `demo1` gameplay was also checked after a fresh boot
+with timedemo disabled: the world, weapon and HUD render, and player/menu input
+updates the display. The final ICD contains no allocation profiling hooks.
+
+All 31 ICD library tests pass on AArch64 Linux/musl, including threaded command
+recording and host-allocation alignment/size checks. The locked release build
+also succeeds. With the native SWS library in `/path/to/native-libs`, run on
+Linux/musl:
+
+```sh
+LD_LIBRARY_PATH=/path/to/native-libs LIBRARY_PATH=/path/to/native-libs \
+  cargo test --locked -p vulkan-sgfx --no-default-features \
+  --features scarlet-wsi --lib
+LIBRARY_PATH=/path/to/native-libs \
+  cargo build --locked --release -p vulkan-sgfx --no-default-features \
+  --features scarlet-wsi
+```
+
+Install `target/release/libvulkan_sgfx.so` as the ICD in the Scarlet Linux ABI
+image. With the existing vkQuake2 launcher, start normal gameplay from the
+Scarlet shell using:
+
+```sh
+abi-run linux-aarch64 /bin/sh /usr/games/vkquake2 \
+  +set timedemo 0 +set viewsize 100 +map demo1
+```
