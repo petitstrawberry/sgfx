@@ -198,7 +198,7 @@ impl TextureDesc {
 
     /// Declare a complete or partial 2D mip chain. Render attachments and
     /// storage bindings continue to use level zero; sampled bindings use the
-    /// complete declared chain. Depth, storage and presentation images retain
+    /// complete declared chain. Depth and presentation images retain
     /// one level in this portable subset.
     pub fn with_mip_level_count(mut self, count: u32) -> Result<Self> {
         let maximum = self.extent.width().max(self.extent.height()).ilog2() + 1;
@@ -206,7 +206,6 @@ impl TextureDesc {
             || count > maximum
             || (count > 1
                 && (self.format == TextureFormat::Depth32Float
-                    || self.usage.contains(TextureUsage::STORAGE)
                     || self.usage.contains(TextureUsage::PRESENT)))
         {
             return Err(Error::InvalidDescriptor);

@@ -907,3 +907,26 @@ fn multiple_vertex_slots_validate_layouts_binding_bounds_and_write_aliases() {
     pass.set_bind_group(0,group).unwrap();
     assert_eq!(pass.draw(3,0), Err(Error::ResourceAccessConflict));
 }
+#[test]
+fn storage_texture_views_select_one_mip_and_layer() {
+    let table = ResourceTable::new();
+    let desc = TextureDesc::new(TextureFormat::Rgba8Unorm, Extent2D::new(8, 8).unwrap(),
+        TextureUsage::STORAGE | TextureUsage::SAMPLED).unwrap()
+        .with_mip_level_count(4).unwrap().with_array_layer_count(6).unwrap();
+    let texture = table.define_texture(desc).unwrap();
+    let bindings = layout(BindingType::StorageTexture {
+        format: TextureFormat::Rgba8Unorm, access: StorageTextureAccess::WriteOnly,
+    });
+    let bind = |resource| BindGroupDesc::new(&table, bindings.clone(),
+        vec![BindGroupEntry::new(0, resource)]);
+    assert!(bind(BindingResource::Texture(texture.id())).is_err());
+    let view = |dimension, levels, layers| TextureViewDesc::new(desc, desc.format(),
+        dimension, 1, levels, 0, layers).unwrap();
+    assert!(bind(BindingResource::TextureView { texture: texture.id(),
+        view: view(TextureViewDimension::D2, 1, 1) }).is_ok());
+    for invalid in [view(TextureViewDimension::D2, 2, 1),
+        view(TextureViewDimension::Cube, 1, 6),
+        view(TextureViewDimension::D2Array, 1, 6)] {
+        assert!(bind(BindingResource::TextureView { texture: texture.id(), view: invalid }).is_err());
+    }
+}

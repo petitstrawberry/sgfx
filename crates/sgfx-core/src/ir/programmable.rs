@@ -392,7 +392,18 @@ impl BindGroupDesc {
                     if !desc.usage().contains(TextureUsage::STORAGE) {
                         return Err(Error::InvalidUsage);
                     }
-                    if desc.format() != format {
+                    if desc.format() != format || desc.array_layer_count() != 1 || desc.mip_level_count() != 1 {
+                        return Err(Error::BindingLayoutMismatch);
+                    }
+                }
+                (BindingResource::TextureView { texture, view }, BindingType::StorageTexture { format, .. }) => {
+                    let desc = resources.texture(resources.texture_ref(texture)?)?;
+                    view.validate(desc)?;
+                    if !desc.usage().contains(TextureUsage::STORAGE) {
+                        return Err(Error::InvalidUsage);
+                    }
+                    if view.format() != format || view.dimension() != super::TextureViewDimension::D2
+                        || view.mip_level_count() != 1 || view.array_layer_count() != 1 {
                         return Err(Error::BindingLayoutMismatch);
                     }
                 }
