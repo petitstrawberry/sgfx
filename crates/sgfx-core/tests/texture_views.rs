@@ -16,6 +16,11 @@ fn cube_allocation() -> TextureDesc {
 #[test]
 fn cube_view_preserves_allocation_and_subresource_bounds() {
     let texture = cube_allocation();
+    let cube = texture.with_cube_compatible(true).unwrap();
+    assert!(cube.cube_compatible());
+    assert_eq!(cube.byte_size(), texture.byte_size());
+    assert!(cube.with_array_layer_count(5).is_err());
+    assert!(!cube.with_cube_compatible(false).unwrap().cube_compatible());
     assert_eq!(texture.byte_size().unwrap(), (64 + 16 + 4 + 1) * 4 * 6);
     let view = TextureViewDesc::new(
         texture,
@@ -71,6 +76,7 @@ fn cube_view_preserves_allocation_and_subresource_bounds() {
     .with_array_layer_count(6)
     .unwrap();
     assert!(view.validate(nonsquare).is_err());
+    assert!(nonsquare.with_cube_compatible(true).is_err());
 }
 
 #[test]

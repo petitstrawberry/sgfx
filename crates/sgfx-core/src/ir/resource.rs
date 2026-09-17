@@ -50,19 +50,28 @@ impl TextureFormat {
     /// The portable byte size for this format.
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
-            Self::Bgra8Unorm | Self::Rgba8Unorm | Self::Bgra8UnormSrgb
-            | Self::Rgba8UnormSrgb | Self::Depth32Float => 4,
+            Self::Bgra8Unorm
+            | Self::Rgba8Unorm
+            | Self::Bgra8UnormSrgb
+            | Self::Rgba8UnormSrgb
+            | Self::Depth32Float => 4,
             Self::R8Unorm => 1,
         }
     }
 
     /// Whether one texture allocation can be viewed in the other format.
     pub const fn view_compatible(self, other: Self) -> bool {
-        matches!((self, other),
-            (Self::Bgra8Unorm | Self::Bgra8UnormSrgb, Self::Bgra8Unorm | Self::Bgra8UnormSrgb)
-            | (Self::Rgba8Unorm | Self::Rgba8UnormSrgb, Self::Rgba8Unorm | Self::Rgba8UnormSrgb)
-            | (Self::R8Unorm, Self::R8Unorm)
-            | (Self::Depth32Float, Self::Depth32Float))
+        matches!(
+            (self, other),
+            (
+                Self::Bgra8Unorm | Self::Bgra8UnormSrgb,
+                Self::Bgra8Unorm | Self::Bgra8UnormSrgb
+            ) | (
+                Self::Rgba8Unorm | Self::Rgba8UnormSrgb,
+                Self::Rgba8Unorm | Self::Rgba8UnormSrgb
+            ) | (Self::R8Unorm, Self::R8Unorm)
+                | (Self::Depth32Float, Self::Depth32Float)
+        )
     }
 }
 
@@ -140,6 +149,7 @@ pub struct TextureDesc {
     usage: TextureUsage,
     mip_level_count: u32,
     array_layer_count: u32,
+    cube_compatible: bool,
 }
 
 impl TextureDesc {
@@ -170,6 +180,7 @@ impl TextureDesc {
                 usage,
                 mip_level_count: 1,
                 array_layer_count: 1,
+                cube_compatible: false,
             })
         }
     }
@@ -221,8 +232,10 @@ impl TextureDesc {
 
     /// Set the number of independent 2D layers in this allocation.
     pub fn with_array_layer_count(mut self, count: u32) -> Result<Self> {
-        if count == 0 || count > 2048
+        if count == 0
+            || count > 2048
             || (count != 1 && self.usage.contains(TextureUsage::PRESENT))
+            || (self.cube_compatible && count < 6)
         {
             return Err(Error::InvalidDescriptor);
         }
@@ -233,6 +246,23 @@ impl TextureDesc {
     /// Return the number of 2D layers.
     pub const fn array_layer_count(self) -> u32 {
         self.array_layer_count
+    }
+
+    /// Preserve cube-compatible allocation intent for backends whose physical
+    /// cube and array texture targets differ. The first six square layers form
+    /// a cube; this does not change layer ordering or texel storage.
+    pub fn with_cube_compatible(mut self, compatible: bool) -> Result<Self> {
+        if compatible && (self.array_layer_count < 6 || self.extent.width() != self.extent.height())
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.cube_compatible = compatible;
+        Ok(self)
+    }
+
+    /// Return whether the allocation must permit cube sampling.
+    pub const fn cube_compatible(self) -> bool {
+        self.cube_compatible
     }
 
     /// Return the checked dimensions of a mip level, including odd-sized
@@ -258,7 +288,8 @@ impl TextureDesc {
                 .ok_or(Error::Overflow)?;
             size = size.checked_add(bytes).ok_or(Error::Overflow)?;
         }
-        size.checked_mul(u64::from(self.array_layer_count)).ok_or(Error::Overflow)
+        size.checked_mul(u64::from(self.array_layer_count))
+            .ok_or(Error::Overflow)
     }
 }
 
