@@ -74,6 +74,47 @@ pub(super) fn readback_pixels(device: &Device, image: &Image) -> Vec<[u8; 4]> {
 }
 
 #[test]
+fn blits_r8_mips_on_the_gpu() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let table = Rc::new(ResourceTable::new());
+    let texture = table
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::R8Unorm,
+                Extent2D::new(4, 4).unwrap(),
+                TextureUsage::SAMPLED | TextureUsage::COPY_SRC | TextureUsage::COPY_DST,
+            )
+            .unwrap()
+            .with_mip_level_count(2)
+            .unwrap(),
+        )
+        .unwrap();
+    let pixels = [173_u8; 16];
+    let mut encoder = CommandEncoder::new(table.as_ref());
+    encoder
+        .write_texture(
+            texture,
+            TextureWrite::new(PixelRect::new(0, 0, 4, 4).unwrap(), 4, &pixels).unwrap(),
+        )
+        .unwrap();
+    encoder
+        .blit_texture(texture, 0, texture, 1, FilterMode::Nearest)
+        .unwrap();
+    let commands = encoder.finish().unwrap();
+    let mut cache = context.create_resources(Rc::clone(&table));
+    context
+        .create_queue()
+        .executor(&mut cache)
+        .execute(&commands)
+        .unwrap();
+    assert_eq!(cache.read_texture_mip(texture.id(), 1).unwrap(), [173; 4]);
+}
+
+#[test]
 fn uploads_outlive_caller_storage_and_keep_submission_order() {
     let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
     let Some(device) = headless_device() else {

@@ -2115,7 +2115,7 @@ fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
         usage |= raw::TextureUsages::COPY_SRC;
         if matches!(
             descriptor.format(),
-            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
+            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
         ) {
             usage |= raw::TextureUsages::TEXTURE_BINDING;
         }
@@ -2124,7 +2124,7 @@ fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
         usage |= raw::TextureUsages::COPY_DST;
         if matches!(
             descriptor.format(),
-            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
+            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
         ) {
             usage |= raw::TextureUsages::RENDER_ATTACHMENT;
         }
