@@ -289,6 +289,30 @@ pub enum OwnedCommand {
         /// First vertex relative to the bound buffer.
         first_vertex: u32,
     },
+    /// Issue an instanced programmable draw.
+    DrawInstanced {
+        /// Number of vertices per instance.
+        vertex_count: u32,
+        /// First vertex.
+        first_vertex: u32,
+        /// Number of instances.
+        instance_count: u32,
+        /// First shader instance index.
+        first_instance: u32,
+    },
+    /// Issue an indexed instanced programmable draw.
+    DrawIndexedInstanced {
+        /// Number of indices per instance.
+        index_count: u32,
+        /// First index.
+        first_index: u32,
+        /// Signed vertex offset.
+        base_vertex: i32,
+        /// Number of instances.
+        instance_count: u32,
+        /// First shader instance index.
+        first_instance: u32,
+    },
     /// Issue an indexed draw.
     DrawIndexed {
         /// Number of indices.
@@ -501,6 +525,10 @@ impl OwnedCommandBuffer {
                                 first_index,
                                 base_vertex,
                             } => pass.draw_indexed(*index_count, *first_index, *base_vertex)?,
+                            OwnedCommand::DrawInstanced { vertex_count, first_vertex, instance_count, first_instance } =>
+                                pass.draw_instanced(*vertex_count, *first_vertex, *instance_count, *first_instance)?,
+                            OwnedCommand::DrawIndexedInstanced { index_count, first_index, base_vertex, instance_count, first_instance } =>
+                                pass.draw_indexed_instanced(*index_count, *first_index, *base_vertex, *instance_count, *first_instance)?,
                             _ => return Err(Error::InvalidDescriptor),
                         }
                     }
@@ -916,11 +944,10 @@ mod tests {
     }
 
     #[test]
-    fn mip_descriptors_reject_overflow_and_nonportable_storage_or_lod_values() {
+    fn mip_descriptors_reject_overflow_and_nonportable_depth_present_or_lod_values() {
         let extent = Extent2D::new(8, 8).unwrap();
         for (format, usage) in [
             (TextureFormat::Depth32Float, TextureUsage::RENDER_ATTACHMENT),
-            (TextureFormat::Rgba8Unorm, TextureUsage::STORAGE),
             (TextureFormat::Bgra8Unorm, TextureUsage::PRESENT),
         ] {
             assert!(

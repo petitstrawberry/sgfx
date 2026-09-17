@@ -1,6 +1,35 @@
 use sgfx_core::ir::*;
 
 #[test]
+fn instanced_draw_ranges_survive_owned_replay() {
+    let table = ResourceTable::new();
+    let format = TextureFormat::Rgba8Unorm;
+    let target = table.define_texture(TextureDesc::new(format, Extent2D::new(8,8).unwrap(),
+        TextureUsage::RENDER_ATTACHMENT).unwrap()).unwrap();
+    let pipeline = table.define_programmable_render_pipeline(ProgrammableRenderPipelineDesc::new(
+        shader(&table, ShaderStage::Vertex), shader(&table, ShaderStage::Fragment), PipelineLayoutDesc::new(vec![]).unwrap(),
+        format, None, PrimitiveTopology::TriangleList,
+        BlendState::REPLACE, RasterState::new(CullMode::None, FrontFace::CounterClockwise)).unwrap()).unwrap();
+    let indices = buffer(&table, BufferUsage::INDEX);
+    let recording = OwnedCommandBuffer::new(vec![
+        OwnedCommand::BeginRenderPass(OwnedRenderPassDesc { target:target.id(), depth:None, area:PixelRect::new(0,0,8,8).unwrap(), load:LoadOp::Load, store:StoreOp::Store }),
+        OwnedCommand::SetProgrammablePipeline(pipeline.id()),
+        OwnedCommand::SetIndexBuffer { buffer:indices.id(), offset:0, format:IndexFormat::Uint16 },
+        OwnedCommand::DrawInstanced { vertex_count:3, first_vertex:0, instance_count:4, first_instance:7 },
+        OwnedCommand::DrawIndexedInstanced { index_count:3, first_index:0, base_vertex:2, instance_count:5, first_instance:9 },
+        OwnedCommand::EndRenderPass,
+    ]);
+    let commands = recording.record(&table).unwrap();
+    assert!(matches!(commands.commands()[3], Command::DrawInstanced { instance_count:4, first_instance:7, .. }));
+    assert!(matches!(commands.commands()[4], Command::DrawIndexedInstanced { instance_count:5, first_instance:9, base_vertex:2, .. }));
+    for (count, first, error) in [(0, 0, Error::InvalidValue), (2, u32::MAX, Error::Overflow)] {
+        let mut invalid = recording.commands().to_vec();
+        invalid[3] = OwnedCommand::DrawInstanced { vertex_count:3, first_vertex:0, instance_count:count, first_instance:first };
+        assert_eq!(OwnedCommandBuffer::new(invalid).validate(&table), Err(error));
+    }
+}
+
+#[test]
 fn comparison_samplers_require_a_matching_binding_type() {
     let table = ResourceTable::new();
     let ordinary = SamplerDesc::new(
@@ -929,4 +958,34 @@ fn storage_texture_views_select_one_mip_and_layer() {
         view(TextureViewDimension::D2Array, 1, 6)] {
         assert!(bind(BindingResource::TextureView { texture: texture.id(), view: invalid }).is_err());
     }
+}
+
+#[test]
+fn storage_view_writes_require_a_barrier_on_the_written_mip() {
+    let table = ResourceTable::new();
+    let desc = TextureDesc::new(TextureFormat::Rgba8Unorm, Extent2D::new(8, 8).unwrap(),
+        TextureUsage::STORAGE | TextureUsage::SAMPLED).unwrap().with_mip_level_count(4).unwrap();
+    let texture = table.define_texture(desc).unwrap();
+    let ty = BindingType::StorageTexture { format: desc.format(), access: StorageTextureAccess::WriteOnly };
+    let pipeline = compute(&table, ty);
+    let view = TextureViewDesc::new(desc, desc.format(), TextureViewDimension::D2, 1, 1, 0, 1).unwrap();
+    let bindings = table.define_bind_group(BindGroupDesc::new(&table, layout(ty),
+        vec![BindGroupEntry::new(0, BindingResource::TextureView { texture: texture.id(), view })]).unwrap()).unwrap();
+    let mut encoder = CommandEncoder::new(&table);
+    fn dispatch_checked<'r>(encoder: &mut CommandEncoder<'r, '_>, pipeline: ComputePipelineRef<'r>, bindings: BindGroupRef<'r>) -> Result<()> {
+        let mut pass = encoder.begin_compute_pass()?;
+        pass.set_pipeline(pipeline)?; pass.set_bind_group(0, bindings)?;
+        let result = pass.dispatch(1,1,1); pass.end()?; result
+    }
+    dispatch_checked(&mut encoder, pipeline, bindings).unwrap();
+    assert_eq!(dispatch_checked(&mut encoder, pipeline, bindings), Err(Error::MissingBarrier));
+    encoder.resource_barrier(ResourceBarrier::TextureMip { texture, mip_level:0,
+        before:TextureAccess::StorageWrite, after:TextureAccess::Sampled }).unwrap();
+    assert_eq!(dispatch_checked(&mut encoder, pipeline, bindings), Err(Error::MissingBarrier));
+    assert_eq!(encoder.resource_barrier(ResourceBarrier::TextureMip { texture, mip_level:1,
+        before:TextureAccess::Sampled, after:TextureAccess::StorageWrite }), Err(Error::InvalidResourceAccess));
+    encoder.resource_barrier(ResourceBarrier::TextureMip { texture, mip_level:1,
+        before:TextureAccess::StorageWrite, after:TextureAccess::StorageWrite }).unwrap();
+    dispatch_checked(&mut encoder, pipeline, bindings).unwrap();
+    encoder.finish().unwrap();
 }

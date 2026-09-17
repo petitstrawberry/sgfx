@@ -359,6 +359,30 @@ pub enum Command<'r, 'data> {
         /// First vertex relative to the bound vertex buffer.
         first_vertex: u32,
     },
+    /// Issue an instanced programmable draw.
+    DrawInstanced {
+        /// Number of vertices per instance.
+        vertex_count: u32,
+        /// First vertex.
+        first_vertex: u32,
+        /// Number of instances.
+        instance_count: u32,
+        /// First shader instance index.
+        first_instance: u32,
+    },
+    /// Issue an indexed instanced programmable draw.
+    DrawIndexedInstanced {
+        /// Number of indices per instance.
+        index_count: u32,
+        /// First index.
+        first_index: u32,
+        /// Signed vertex offset.
+        base_vertex: i32,
+        /// Number of instances.
+        instance_count: u32,
+        /// First shader instance index.
+        first_instance: u32,
+    },
     /// Issue an indexed draw.
     DrawIndexed {
         /// Number of indices to draw.
@@ -946,7 +970,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     /// Success, or an error for missing state, vertex range, texture bindings, or capacity.
     pub fn draw(&mut self, vertex_count: u32, first_vertex: u32) -> Result<()> {
         if self.programmable_pipeline.is_some() {
-            return self.draw_programmable(vertex_count, first_vertex);
+            return self.draw_programmable(vertex_count, first_vertex, 1, 0);
         }
         self.validate_draw(vertex_count)?;
         let sampled_texture = self.active_sampled_texture()?;
@@ -1005,7 +1029,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         base_vertex: i32,
     ) -> Result<()> {
         if self.programmable_pipeline.is_some() {
-            return self.draw_indexed_programmable(index_count, first_index, base_vertex);
+            return self.draw_indexed_programmable(index_count, first_index, base_vertex, 1, 0);
         }
         self.validate_draw(index_count)?;
         let sampled_texture = self.active_sampled_texture()?;
