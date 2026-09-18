@@ -18,7 +18,11 @@ use wgpu as raw;
 
 use sgfx_core::backend::{CommandSubmitter, SubmitError};
 
+mod blit;
 mod completion;
+mod programmable;
+mod readback;
+mod vertex_input;
 pub use completion::Submission;
 
 use sgfx_core::ir::{
@@ -59,6 +63,8 @@ pub enum Error {
     DeviceLost,
     /// Submission retirement could not be established by the private marker.
     CompletionObservation,
+    /// WGPU rejected a programmable shader, pipeline, or binding.
+    Validation(String),
 }
 
 impl From<ir::Error> for Error {
@@ -83,6 +89,7 @@ impl fmt::Display for Error {
             Self::DeviceRequest => formatter.write_str("WGPU device creation failed"),
             Self::SurfaceAcquire => formatter.write_str("WGPU surface acquisition failed"),
             Self::DeviceLost => formatter.write_str("WGPU device was lost or destroyed"),
+            Self::Validation(message) => write!(formatter, "WGPU validation failed: {message}"),
             Self::CompletionObservation => {
                 formatter.write_str("WGPU completion observation failed")
             }
@@ -93,7 +100,9 @@ impl fmt::Display for Error {
 /// Logical SGFX features that are not yet represented by this backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedFeature {
-    /// A write command appeared after a copy or render pass had been encoded.
+    /// Shareable presentation images are unavailable on this WGPU platform.
+    PresentationPlatform,
+    /// Reserved for compatibility; ordered uploads are now supported.
     LateUpload,
     /// A buffer upload offset or byte length is not a multiple of WGPU's
     /// four-byte copy alignment. The portable IR permits byte-granular writes.
@@ -104,16 +113,27 @@ pub enum UnsupportedFeature {
     /// A render pipeline uses a format or vertex convention outside WGPU's
     /// current portable lowering.
     Pipeline,
+    /// Indexed strips need explicit restart semantics or a faithful index
+    /// conversion. WGPU's implicit restart must not reinterpret ordinary indices.
+    IndexedTriangleStrip,
     /// A sampled texture format is incompatible with the selected fragment
     /// program.
     TextureFormat,
     /// WGPU cannot express a depth clear restricted to a rectangular render
     /// area without an explicit clear draw.
     PartialDepthClear,
+    /// Partial color clears with multiple render targets need a separate clear pass.
+    PartialMultiTargetClear,
     /// The physical surface format cannot be represented by SGFX.
     SurfaceFormat,
     /// Blocking waits are unavailable in a browser; use nonblocking observation.
     BlockingWait,
+    /// Programmable execution needs native synchronous validation scopes.
+    ProgrammableOnWeb,
+    /// A buffer binding violates this WGPU device's offset alignment or size limits.
+    BindingLimits,
+    /// Dispatch dimensions exceed the device workgroup-count limit.
+    DispatchLimits,
 }
 
 /// WGPU device and queue pair used by the SGFX backend.
@@ -123,6 +143,7 @@ pub struct Device {
     queue: Arc<raw::Queue>,
     identity: Arc<()>,
     tracker: Arc<completion::Tracker>,
+    validation: Arc<std::sync::Mutex<()>>,
 }
 
 impl Device {
@@ -140,6 +161,8 @@ impl Device {
     /// This installs SGFX's device-lost callback for completion observation.
     /// Do not replace it or wrap another alias of this raw device while using
     /// SGFX completion receipts. Other raw WGPU error handlers are unchanged.
+    /// Do not concurrently interleave raw WGPU error scopes with SGFX calls:
+    /// WGPU validation scopes belong to the device, not the calling thread.
     pub fn new(device: raw::Device, queue: raw::Queue) -> Self {
         let tracker = Arc::new(completion::Tracker::default());
         let loss_tracker = Arc::clone(&tracker);
@@ -153,6 +176,7 @@ impl Device {
             queue: Arc::new(queue),
             identity: Arc::new(()),
             tracker,
+            validation: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -244,6 +268,8 @@ impl Context {
             width,
             height,
             format,
+            1,
+            1,
             raw::TextureUsages::TEXTURE_BINDING
                 | raw::TextureUsages::RENDER_ATTACHMENT
                 | raw::TextureUsages::COPY_SRC
@@ -274,6 +300,8 @@ impl Context {
             pipelines: Vec::new(),
             clear_pipelines: Vec::new(),
             mapped_images: Vec::new(),
+            programmable: programmable::Cache::default(),
+            blit: blit::Cache::default(),
         }
     }
 
@@ -476,7 +504,69 @@ impl WindowContext {
         device.on_uncaptured_error(Box::new(|error| {
             eprintln!("[SGFX/WGPU] uncaptured error: {error}");
         }));
-        let capabilities = surface.get_capabilities(&adapter);
+        let device = Device::new(device, queue);
+        let context = device.create_context();
+        Self::from_parts(
+            instance,
+            &adapter,
+            context,
+            surface,
+            width,
+            height,
+            transparent,
+        )
+    }
+
+    /// Create presentation state for an existing WGPU device and CAMetalLayer.
+    ///
+    /// This is used by API frontends whose device was selected before the
+    /// native surface was created, including Vulkan's instance/device split.
+    /// The supplied instance and adapter must be the ones used to create the
+    /// context's device.
+    ///
+    /// # Safety
+    ///
+    /// `layer` must point to a live CAMetalLayer until this context is dropped.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn from_core_animation_layer(
+        instance: raw::Instance,
+        adapter: &raw::Adapter,
+        context: Context,
+        layer: *mut core::ffi::c_void,
+        width: u32,
+        height: u32,
+        transparent: bool,
+    ) -> Result<Self> {
+        if layer.is_null() {
+            return Err(Error::SurfaceCreation);
+        }
+        // SAFETY: the caller keeps the CAMetalLayer alive for the returned
+        // context's lifetime.
+        let surface = unsafe {
+            instance.create_surface_unsafe(raw::SurfaceTargetUnsafe::CoreAnimationLayer(layer))
+        }
+        .map_err(|_| Error::SurfaceCreation)?;
+        Self::from_parts(
+            instance,
+            adapter,
+            context,
+            surface,
+            width,
+            height,
+            transparent,
+        )
+    }
+
+    fn from_parts(
+        instance: raw::Instance,
+        adapter: &raw::Adapter,
+        context: Context,
+        surface: raw::Surface<'static>,
+        width: u32,
+        height: u32,
+        transparent: bool,
+    ) -> Result<Self> {
+        let capabilities = surface.get_capabilities(adapter);
         let format = select_surface_format(&capabilities.formats).ok_or(Error::SurfaceCreation)?;
         let alpha_mode = select_surface_alpha_mode(&capabilities.alpha_modes, transparent)
             .ok_or(Error::SurfaceCreation)?;
@@ -490,8 +580,6 @@ impl WindowContext {
             alpha_mode,
             view_formats: Vec::new(),
         };
-        let device = Device::new(device, queue);
-        let context = device.create_context();
         surface.configure(context.raw_device(), &config);
         let sampler = context
             .raw_device()
@@ -564,6 +652,17 @@ impl WindowContext {
     /// Success after the surface frame is submitted and presented.
     pub fn present(&mut self, session: &MappedTargetSession, target: TextureId) -> Result<()> {
         let image = session.image(target)?;
+        self.present_image(image)
+    }
+
+    /// Present a physical SGFX image created by this context.
+    pub fn present_image(&mut self, image: &Image) -> Result<()> {
+        if !Arc::ptr_eq(&self.context.device.identity, &image.device_identity)
+            || image.width() != self.config.width
+            || image.height() != self.config.height
+        {
+            return Err(Error::InvalidState);
+        }
         let frame = self
             .surface
             .get_current_texture()
@@ -691,6 +790,8 @@ pub struct Resources {
     )>,
     clear_pipelines: Vec<(raw::TextureFormat, bool, Arc<GpuClearPipeline>)>,
     mapped_images: Vec<(TextureId, Arc<GpuTexture>)>,
+    programmable: programmable::Cache,
+    blit: blit::Cache,
 }
 
 impl Resources {
@@ -701,6 +802,14 @@ impl Resources {
     /// The resource table used to brand submitted references.
     pub fn resource_table(&self) -> &ResourceTable {
         self.resources.as_ref()
+    }
+
+    /// Remove the cached allocation for a retired logical buffer.
+    pub fn release_buffer(&mut self, id: BufferId) -> Result<()> {
+        self.resources.buffer_ref(id)?;
+        self.buffers.retain(|(candidate, _)| *candidate != id);
+        self.programmable.groups.clear();
+        Ok(())
     }
 
     /// Map a logical presentation texture to a physical WGPU image.
@@ -741,11 +850,22 @@ impl Resources {
             .iter_mut()
             .find(|(candidate, _)| *candidate == texture)
         {
+            if Arc::ptr_eq(mapped, &image.gpu) {
+                return Ok(());
+            }
             *mapped = Arc::clone(&image.gpu);
         } else {
             self.mapped_images.push((texture, Arc::clone(&image.gpu)));
         }
+        self.programmable.groups.clear();
         Ok(())
+    }
+
+    /// Remove a physical presentation mapping for a logical texture.
+    pub fn unmap_image(&mut self, texture: TextureId) {
+        self.mapped_images
+            .retain(|(candidate, _)| *candidate != texture);
+        self.programmable.groups.clear();
     }
 
     fn texture(&mut self, reference: TextureRef<'_>) -> Result<Arc<GpuTexture>> {
@@ -770,6 +890,8 @@ impl Resources {
             descriptor.extent().width(),
             descriptor.extent().height(),
             descriptor.format(),
+            descriptor.mip_level_count(),
+            descriptor.array_layer_count(),
             usage,
         )?;
         self.textures.push((id, Arc::clone(&texture)));
@@ -788,6 +910,12 @@ impl Resources {
         let mut usage = raw::BufferUsages::empty();
         if descriptor.usage().contains(BufferUsage::VERTEX) {
             usage |= raw::BufferUsages::VERTEX;
+        }
+        if descriptor.usage().contains(BufferUsage::UNIFORM) {
+            usage |= raw::BufferUsages::UNIFORM;
+        }
+        if descriptor.usage().contains(BufferUsage::STORAGE) {
+            usage |= raw::BufferUsages::STORAGE;
         }
         if descriptor.usage().contains(BufferUsage::INDEX) {
             usage |= raw::BufferUsages::INDEX;
@@ -828,7 +956,12 @@ impl Resources {
                 address_mode_w: raw::AddressMode::ClampToEdge,
                 mag_filter: filter_mode(descriptor.mag_filter()),
                 min_filter: filter_mode(descriptor.min_filter()),
-                mipmap_filter: raw::FilterMode::Nearest,
+                mipmap_filter: filter_mode(descriptor.mip_filter()),
+                // Logical textures have at most 32 levels. Larger Vulkan LOD
+                // maxima are equivalent to this physical clamp.
+                lod_min_clamp: descriptor.min_lod().min(32.0),
+                lod_max_clamp: descriptor.max_lod().min(32.0),
+                compare: descriptor.compare().map(compare_function),
                 ..raw::SamplerDescriptor::default()
             },
         ));
@@ -906,6 +1039,32 @@ pub struct Queue {
     context: Context,
 }
 
+fn validate_indexed_topologies(commands: &CommandBuffer<'_, '_>) -> Result<()> {
+    let mut pipeline = None;
+    for command in commands.commands() {
+        match command {
+            Command::BeginRenderPass(_) | Command::EndRenderPass | Command::SetPipeline(_) => {
+                pipeline = None
+            }
+            Command::SetProgrammablePipeline(reference) => {
+                pipeline = Some(
+                    commands
+                        .resources()
+                        .programmable_render_pipeline(*reference)?
+                        .topology(),
+                );
+            }
+            Command::DrawIndexed { .. } | Command::DrawIndexedInstanced { .. }
+                if pipeline == Some(ir::PrimitiveTopology::TriangleStrip) =>
+            {
+                return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl Queue {
     /// Bind this queue to a persistent resource cache for command execution.
     ///
@@ -926,8 +1085,8 @@ impl Queue {
 
     /// Submit one validated SGFX command buffer.
     ///
-    /// Upload commands are expected before the first texture copy or render
-    /// pass. The command buffer is translated into one WGPU submission, and
+    /// Upload bytes are copied to backend-owned staging buffers and encoded
+    /// in command order. The stream becomes one WGPU submission, and
     /// this method returns after it has been queued; WGPU GPU completion
     /// remains asynchronous.
     ///
@@ -947,6 +1106,7 @@ impl Queue {
         resources: &mut Resources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<()> {
+        validate_indexed_topologies(commands)?;
         self.submit_inner(resources, commands, None).map(|_| ())
     }
 
@@ -975,6 +1135,7 @@ impl Queue {
         if !core::ptr::eq(resources.resources.as_ref(), commands.resources()) {
             return Err(SubmitError::Rejected(Error::ResourceTableMismatch));
         }
+        validate_indexed_topologies(commands).map_err(SubmitError::Rejected)?;
         let _ = device.raw_device().poll(raw::Maintain::Poll);
         if device
             .tracker
@@ -984,12 +1145,21 @@ impl Queue {
             return Err(SubmitError::Rejected(Error::DeviceLost));
         }
         let slot = device.tracker.reserve().ok_or(SubmitError::Busy)?;
-        let marker = device.raw_device().create_buffer(&raw::BufferDescriptor {
-            label: Some("sgfx submission completion marker"),
-            size: 4,
-            usage: raw::BufferUsages::COPY_DST | raw::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let marker = {
+            let _guard = device
+                .validation
+                .lock()
+                .map_err(|_| SubmitError::Rejected(Error::InvalidState))?;
+            programmable::validated(device.raw_device(), || {
+                Ok(device.raw_device().create_buffer(&raw::BufferDescriptor {
+                    label: Some("sgfx submission completion marker"),
+                    size: 4,
+                    usage: raw::BufferUsages::COPY_DST | raw::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }))
+            })
+            .map_err(SubmitError::Rejected)?
+        };
         match self.submit_inner(resources, commands, Some(&marker)) {
             Ok(index) => Ok(Submission::new(device.clone(), index, marker, slot)),
             Err(error) => {
@@ -1027,14 +1197,41 @@ impl Queue {
         if !core::ptr::eq(resources.resources.as_ref(), commands.resources()) {
             return Err(Error::ResourceTableMismatch);
         }
+        let _ = self.context.raw_device().poll(raw::Maintain::Poll);
+        if self
+            .context
+            .device
+            .tracker
+            .lost
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::DeviceLost);
+        }
+        let _scope_guard = self
+            .context
+            .device
+            .validation
+            .lock()
+            .map_err(|_| Error::InvalidState)?;
+        let encoded = programmable::validated(self.context.raw_device(), || {
+            self.encode_commands(resources, commands, marker)
+        })?;
+        programmable::validated(self.context.raw_device(), || {
+            Ok(self.context.raw_queue().submit([encoded]))
+        })
+    }
+
+    fn encode_commands<'r, 'data>(
+        &self,
+        resources: &mut Resources,
+        commands: &CommandBuffer<'r, 'data>,
+        marker: Option<&raw::Buffer>,
+    ) -> Result<raw::CommandBuffer> {
         let mut encoder = self.context.device.raw_device().create_command_encoder(
             &raw::CommandEncoderDescriptor {
                 label: Some("sgfx wgpu command encoder"),
             },
         );
-        let mut buffer_writes = Vec::new();
-        let mut texture_writes = Vec::new();
-        let mut upload_phase = true;
         let mut index = 0;
         while index < commands.commands().len() {
             match commands.commands().get(index).ok_or(Error::InvalidState)? {
@@ -1043,9 +1240,6 @@ impl Queue {
                     offset,
                     data,
                 } => {
-                    if !upload_phase {
-                        return Err(Error::Unsupported(UnsupportedFeature::LateUpload));
-                    }
                     if !offset.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
                         || !data
                             .len()
@@ -1054,19 +1248,66 @@ impl Queue {
                         return Err(Error::Unsupported(UnsupportedFeature::BufferWriteAlignment));
                     }
                     let buffer = resources.buffer(*buffer)?;
-                    buffer_writes.push((buffer, *offset, *data));
+                    if !data.is_empty() {
+                        let staging = create_staging_buffer(self.context.raw_device(), data)?;
+                        encoder.copy_buffer_to_buffer(
+                            &staging,
+                            0,
+                            &buffer.buffer,
+                            *offset,
+                            data.len() as u64,
+                        );
+                    }
+                }
+                Command::BlitTexture {
+                    source,
+                    source_mip,
+                    destination,
+                    destination_mip,
+                    filter,
+                } => {
+                    let source = resources.texture(*source)?;
+                    let destination = resources.texture(*destination)?;
+                    resources.encode_mip_blit(
+                        &mut encoder,
+                        &source,
+                        *source_mip,
+                        &destination,
+                        *destination_mip,
+                        *filter,
+                    )?;
                 }
                 Command::WriteTexture { texture, write } => {
-                    if !upload_phase {
-                        return Err(Error::Unsupported(UnsupportedFeature::LateUpload));
-                    }
                     let texture_resource = resources.texture(*texture)?;
-                    texture_writes.push((
-                        texture_resource,
-                        write.destination(),
-                        write.bytes_per_row(),
-                        write.data(),
-                    ));
+                    encode_texture_upload(
+                        self.context.raw_device(),
+                        &mut encoder,
+                        &texture_resource,
+                        *write,
+                    )?;
+                }
+                Command::CopyBufferToBuffer {
+                    source,
+                    source_offset,
+                    destination,
+                    destination_offset,
+                    size,
+                } => {
+                    if !source_offset.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
+                        || !destination_offset.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
+                        || !size.is_multiple_of(raw::COPY_BUFFER_ALIGNMENT)
+                    {
+                        return Err(Error::Unsupported(UnsupportedFeature::BufferWriteAlignment));
+                    }
+                    let source = resources.buffer(*source)?;
+                    let destination = resources.buffer(*destination)?;
+                    encoder.copy_buffer_to_buffer(
+                        &source.buffer,
+                        *source_offset,
+                        &destination.buffer,
+                        *destination_offset,
+                        *size,
+                    );
                 }
                 Command::CopyTextureToTexture {
                     source,
@@ -1074,7 +1315,6 @@ impl Queue {
                     destination,
                     destination_rect,
                 } => {
-                    upload_phase = false;
                     let source = resources.texture(*source)?;
                     let destination = resources.texture(*destination)?;
                     encoder.copy_texture_to_texture(
@@ -1106,7 +1346,6 @@ impl Queue {
                     );
                 }
                 Command::BeginRenderPass(desc) => {
-                    upload_phase = false;
                     let end = commands.commands()[index + 1..]
                         .iter()
                         .position(|command| matches!(command, Command::EndRenderPass))
@@ -1120,51 +1359,31 @@ impl Queue {
                     )?;
                     index = end;
                 }
+                Command::BeginComputePass => {
+                    let end = commands.commands()[index + 1..]
+                        .iter()
+                        .position(|command| matches!(command, Command::EndComputePass))
+                        .map(|relative| index + 1 + relative)
+                        .ok_or(Error::InvalidState)?;
+                    self.encode_compute_pass(
+                        resources,
+                        &mut encoder,
+                        &commands.commands()[index + 1..end],
+                    )?;
+                    index = end;
+                }
+                // IR validates this single-queue barrier's usage and pass scope.
+                // WGPU inserts resource transitions between ordered encoder operations.
+                Command::ResourceBarrier(_) => {}
                 Command::EndRenderPass => return Err(Error::InvalidState),
                 _ => return Err(Error::InvalidState),
             }
             index += 1;
         }
-        for (buffer, offset, data) in buffer_writes {
-            self.context
-                .device
-                .raw_queue()
-                .write_buffer(&buffer.buffer, offset, data);
-        }
-        for (texture, destination, bytes_per_row, data) in texture_writes {
-            self.context.device.raw_queue().write_texture(
-                raw::TexelCopyTextureInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: raw::Origin3d {
-                        x: destination.x(),
-                        y: destination.y(),
-                        z: 0,
-                    },
-                    aspect: raw::TextureAspect::All,
-                },
-                data,
-                raw::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(destination.height()),
-                },
-                raw::Extent3d {
-                    width: destination.width(),
-                    height: destination.height(),
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
         if let Some(marker) = marker {
             encoder.clear_buffer(marker, 0, None);
         }
-        let index = self
-            .context
-            .device
-            .raw_queue()
-            .submit(core::iter::once(encoder.finish()));
-        Ok(index)
+        Ok(encoder.finish())
     }
 
     fn encode_render_pass<'r, 'data>(
@@ -1175,11 +1394,29 @@ impl Queue {
         commands: &[Command<'r, 'data>],
     ) -> Result<()> {
         let target = resources.texture(desc.target())?;
+        let colors = desc
+            .color_attachments()
+            .map(|attachment| {
+                resources
+                    .texture(attachment.target())
+                    .map(|texture| (attachment, texture))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let depth = desc
             .depth_attachment()
             .map(|attachment| resources.texture(attachment.target()))
             .transpose()?;
         let full_area = render_area_is_full(desc.area(), target.width, target.height);
+        if !full_area
+            && colors.len() > 1
+            && colors
+                .iter()
+                .any(|(attachment, _)| matches!(attachment.load(), LoadOp::Clear(_)))
+        {
+            return Err(Error::Unsupported(
+                UnsupportedFeature::PartialMultiTargetClear,
+            ));
+        }
         let partial_clear_color = if full_area {
             None
         } else {
@@ -1188,41 +1425,53 @@ impl Queue {
                 LoadOp::Load | LoadOp::DontCare => None,
             }
         };
-        let color_load = if full_area {
-            color_load_op(desc.load())
-        } else {
-            raw::LoadOp::Load
-        };
-        let color_attachment = raw::RenderPassColorAttachment {
-            view: &target.view,
-            resolve_target: None,
-            ops: raw::Operations {
-                load: color_load,
-                store: store_op(desc.store()),
-            },
-        };
-        let color_attachments = [Some(color_attachment)];
+        let color_attachments = colors
+            .iter()
+            .map(|(attachment, texture)| {
+                Some(raw::RenderPassColorAttachment {
+                    view: &texture.view,
+                    resolve_target: None,
+                    ops: raw::Operations {
+                        load: if full_area {
+                            color_load_op(attachment.load())
+                        } else {
+                            raw::LoadOp::Load
+                        },
+                        store: store_op(attachment.store()),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
         let depth_load = desc.depth_attachment().map(|attachment| attachment.load());
         let depth_store = desc.depth_attachment().map(|attachment| attachment.store());
-        let depth_ops = match (depth_load, depth_store) {
-            (Some(load), Some(store)) => {
-                let load = if full_area {
-                    depth_load_op(load)
-                } else {
-                    match load {
-                        DepthLoadOp::Clear(_) => {
-                            return Err(Error::Unsupported(UnsupportedFeature::PartialDepthClear));
+        let depth_ops = if desc
+            .depth_attachment()
+            .is_some_and(|attachment| attachment.read_only())
+        {
+            None
+        } else {
+            match (depth_load, depth_store) {
+                (Some(load), Some(store)) => {
+                    let load = if full_area {
+                        depth_load_op(load)
+                    } else {
+                        match load {
+                            DepthLoadOp::Clear(_) => {
+                                return Err(Error::Unsupported(
+                                    UnsupportedFeature::PartialDepthClear,
+                                ));
+                            }
+                            DepthLoadOp::Load | DepthLoadOp::DontCare => raw::LoadOp::Load,
                         }
-                        DepthLoadOp::Load | DepthLoadOp::DontCare => raw::LoadOp::Load,
-                    }
-                };
-                Some(raw::Operations {
-                    load,
-                    store: store_op(store),
-                })
+                    };
+                    Some(raw::Operations {
+                        load,
+                        store: store_op(store),
+                    })
+                }
+                (None, None) => None,
+                _ => return Err(Error::InvalidState),
             }
-            (None, None) => None,
-            _ => return Err(Error::InvalidState),
         };
         let clear_pipeline =
             partial_clear_color.map(|_| resources.clear_pipeline(target.format, depth.is_some()));
@@ -1252,16 +1501,19 @@ impl Queue {
         let mut state = PassState {
             pipeline: None,
             pipeline_id: None,
-            vertex_buffer: None,
+            vertex_buffers: std::array::from_fn(|_| None),
             index_buffer: None,
             texture: None,
             sampler: None,
             uniforms: None,
             has_depth_attachment: depth.is_some(),
+            programmable: None,
+            bind_groups: Vec::new(),
         };
         for command in commands {
             match command {
                 Command::SetPipeline(pipeline) => {
+                    state.programmable = None;
                     let sample_format =
                         state.texture.as_ref().map(|texture| texture.logical_format);
                     state.pipeline_id = Some(pipeline.id());
@@ -1273,8 +1525,40 @@ impl Queue {
                     }
                     render_pass.set_pipeline(&pipeline.pipeline);
                 }
+                Command::SetProgrammablePipeline(pipeline) => {
+                    let pipeline = resources.programmable_pipeline(
+                        pipeline.id(),
+                        target.format,
+                        state.has_depth_attachment,
+                    )?;
+                    if pipeline.has_depth != state.has_depth_attachment {
+                        return Err(Error::InvalidState);
+                    }
+                    render_pass.set_pipeline(&pipeline.pipeline);
+                    state.programmable = Some(pipeline);
+                    state.pipeline = None;
+                    state.pipeline_id = None;
+                }
+                Command::SetBindGroup { index, bind_group } => {
+                    let group = resources.programmable_bind_group(*bind_group)?;
+                    if let Some((_, current)) =
+                        state.bind_groups.iter_mut().find(|(slot, _)| slot == index)
+                    {
+                        *current = group;
+                    } else {
+                        state.bind_groups.push((*index, group));
+                    }
+                }
                 Command::SetVertexBuffer { buffer, offset } => {
-                    state.vertex_buffer = Some((resources.buffer(*buffer)?, *offset));
+                    state.vertex_buffers[0] = Some((resources.buffer(*buffer)?, *offset));
+                }
+                Command::SetVertexBufferSlot {
+                    slot,
+                    buffer,
+                    offset,
+                } => {
+                    state.vertex_buffers[*slot as usize] =
+                        Some((resources.buffer(*buffer)?, *offset));
                 }
                 Command::SetIndexBuffer {
                     buffer,
@@ -1318,11 +1602,26 @@ impl Queue {
                         rectangle.height(),
                     );
                 }
+                Command::SetViewport(viewport) => {
+                    let [x, y, width, height, min_depth, max_depth] = viewport.components();
+                    render_pass.set_viewport(x, y, width, height, min_depth, max_depth);
+                }
+                Command::SetPushConstants {
+                    stages,
+                    offset,
+                    data,
+                } => {
+                    let stages = programmable::shader_stages(*stages)
+                        & (raw::ShaderStages::VERTEX | raw::ShaderStages::FRAGMENT);
+                    if !stages.is_empty() {
+                        render_pass.set_push_constants(stages, *offset, data);
+                    }
+                }
                 Command::Draw {
                     vertex_count,
                     first_vertex,
                 } => {
-                    self.encode_draw(&mut render_pass, &state, *vertex_count, *first_vertex)?;
+                    self.encode_draw(&mut render_pass, &state, *vertex_count, *first_vertex, 0..1)?;
                 }
                 Command::DrawIndexed {
                     index_count,
@@ -1335,13 +1634,40 @@ impl Queue {
                         *index_count,
                         *first_index,
                         *base_vertex,
+                        0..1,
                     )?;
                 }
-                Command::BeginRenderPass(_)
-                | Command::EndRenderPass
-                | Command::WriteBuffer { .. }
-                | Command::WriteTexture { .. }
-                | Command::CopyTextureToTexture { .. } => return Err(Error::InvalidState),
+                Command::DrawInstanced {
+                    vertex_count,
+                    first_vertex,
+                    instance_count,
+                    first_instance,
+                } => {
+                    self.encode_draw(
+                        &mut render_pass,
+                        &state,
+                        *vertex_count,
+                        *first_vertex,
+                        *first_instance..*first_instance + *instance_count,
+                    )?;
+                }
+                Command::DrawIndexedInstanced {
+                    index_count,
+                    first_index,
+                    base_vertex,
+                    instance_count,
+                    first_instance,
+                } => {
+                    self.encode_indexed_draw(
+                        &mut render_pass,
+                        &state,
+                        *index_count,
+                        *first_index,
+                        *base_vertex,
+                        *first_instance..*first_instance + *instance_count,
+                    )?;
+                }
+                _ => return Err(Error::InvalidState),
             }
         }
         Ok(())
@@ -1398,9 +1724,17 @@ impl Queue {
         state: &PassState,
         vertex_count: u32,
         first_vertex: u32,
+        instances: core::ops::Range<u32>,
     ) -> Result<()> {
+        if let Some(pipeline) = &state.programmable {
+            self.prepare_programmable_draw(render_pass, state, pipeline)?;
+            render_pass.draw(first_vertex..first_vertex + vertex_count, instances);
+            return Ok(());
+        }
         let pipeline = state.pipeline.as_ref().ok_or(Error::InvalidState)?;
-        let (vertex_buffer, offset) = state.vertex_buffer.as_ref().ok_or(Error::InvalidState)?;
+        let (vertex_buffer, offset) = state.vertex_buffers[0]
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
         let uniforms = state.uniforms.ok_or(Error::InvalidState)?;
         let bind_group = self.create_bind_group(pipeline, uniforms, state)?;
         render_pass.set_bind_group(0, &bind_group, &[]);
@@ -1416,10 +1750,27 @@ impl Queue {
         index_count: u32,
         first_index: u32,
         base_vertex: i32,
+        instances: core::ops::Range<u32>,
     ) -> Result<()> {
+        if let Some(pipeline) = &state.programmable {
+            if pipeline.topology == ir::PrimitiveTopology::TriangleStrip {
+                return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
+            }
+            self.prepare_programmable_draw(render_pass, state, pipeline)?;
+            let (buffer, offset, format) =
+                state.index_buffer.as_ref().ok_or(Error::InvalidState)?;
+            render_pass.set_index_buffer(buffer.buffer.slice(*offset..), index_format(*format));
+            render_pass.draw_indexed(
+                first_index..first_index + index_count,
+                base_vertex,
+                instances,
+            );
+            return Ok(());
+        }
         let pipeline = state.pipeline.as_ref().ok_or(Error::InvalidState)?;
-        let (vertex_buffer, vertex_offset) =
-            state.vertex_buffer.as_ref().ok_or(Error::InvalidState)?;
+        let (vertex_buffer, vertex_offset) = state.vertex_buffers[0]
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
         let (index_buffer, index_offset, index_kind) =
             state.index_buffer.as_ref().ok_or(Error::InvalidState)?;
         let uniforms = state.uniforms.ok_or(Error::InvalidState)?;
@@ -1431,6 +1782,31 @@ impl Queue {
             index_format(*index_kind),
         );
         render_pass.draw_indexed(first_index..first_index + index_count, base_vertex, 0..1);
+        Ok(())
+    }
+
+    fn prepare_programmable_draw(
+        &self,
+        pass: &mut raw::RenderPass<'_>,
+        state: &PassState,
+        pipeline: &programmable::RenderPipeline,
+    ) -> Result<()> {
+        for slot in 0..pipeline.vertex_buffer_count {
+            let (buffer, offset) = state.vertex_buffers[slot]
+                .as_ref()
+                .ok_or(Error::InvalidState)?;
+            pass.set_vertex_buffer(slot as u32, buffer.buffer.slice(*offset..));
+        }
+        for (index, empty) in pipeline.empty_groups.iter().enumerate() {
+            let group = state
+                .bind_groups
+                .iter()
+                .find(|(slot, _)| *slot == index as u32)
+                .map(|(_, group)| group)
+                .or(empty.as_ref())
+                .ok_or(Error::InvalidState)?;
+            pass.set_bind_group(index as u32, group.as_ref(), &[]);
+        }
         Ok(())
     }
 
@@ -1480,7 +1856,7 @@ impl Queue {
         if let Some((texture, sampler)) = sampled {
             entries.push(raw::BindGroupEntry {
                 binding: 1,
-                resource: raw::BindingResource::TextureView(&texture.view),
+                resource: raw::BindingResource::TextureView(&texture.sampled_view),
             });
             entries.push(raw::BindGroupEntry {
                 binding: 2,
@@ -1527,12 +1903,14 @@ impl CommandSubmitter for Executor<'_> {
 struct PassState {
     pipeline: Option<Arc<GpuPipeline>>,
     pipeline_id: Option<RenderPipelineId>,
-    vertex_buffer: Option<(Arc<GpuBuffer>, u64)>,
+    vertex_buffers: [Option<(Arc<GpuBuffer>, u64)>; ir::MAX_VERTEX_BUFFERS],
     index_buffer: Option<(Arc<GpuBuffer>, u64, IndexFormat)>,
     texture: Option<Arc<GpuTexture>>,
     sampler: Option<Arc<raw::Sampler>>,
     uniforms: Option<DrawUniforms>,
     has_depth_attachment: bool,
+    programmable: Option<Arc<programmable::RenderPipeline>>,
+    bind_groups: Vec<(u32, Arc<raw::BindGroup>)>,
 }
 
 #[repr(C)]
@@ -1566,6 +1944,7 @@ impl From<DrawUniforms> for Uniforms {
 struct GpuTexture {
     texture: raw::Texture,
     view: raw::TextureView,
+    sampled_view: raw::TextureView,
     format: raw::TextureFormat,
     logical_format: TextureFormat,
     width: u32,
@@ -1589,15 +1968,100 @@ struct GpuClearPipeline {
     bind_group_layout: raw::BindGroupLayout,
 }
 
+// Mapped-at-creation staging owns borrowed upload data immediately. WGPU's
+// encoder retains the staging resource until the submitted copy retires.
+fn create_staging_buffer(device: &raw::Device, data: &[u8]) -> Result<raw::Buffer> {
+    let buffer = programmable::validated(device, || {
+        Ok(device.create_buffer(&raw::BufferDescriptor {
+            label: Some("sgfx ordered upload staging"),
+            size: (data.len() as u64).next_multiple_of(raw::COPY_BUFFER_ALIGNMENT),
+            usage: raw::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        }))
+    })?;
+    buffer.slice(..).get_mapped_range_mut()[..data.len()].copy_from_slice(data);
+    buffer.unmap();
+    Ok(buffer)
+}
+
+fn encode_texture_upload(
+    device: &raw::Device,
+    encoder: &mut raw::CommandEncoder,
+    texture: &GpuTexture,
+    write: ir::TextureWrite<'_>,
+) -> Result<()> {
+    let area = write.destination();
+    let row_size = area
+        .width()
+        .checked_mul(texture.logical_format.bytes_per_pixel())
+        .ok_or(Error::Unsupported(UnsupportedFeature::ResourceSize))?;
+    let stride = row_size
+        .checked_next_multiple_of(raw::COPY_BYTES_PER_ROW_ALIGNMENT)
+        .ok_or(Error::Unsupported(UnsupportedFeature::ResourceSize))?;
+    let size = u64::from(stride) * u64::from(area.height());
+    if size > device.limits().max_buffer_size {
+        return Err(Error::Unsupported(UnsupportedFeature::ResourceSize));
+    }
+    let staging = programmable::validated(device, || {
+        Ok(device.create_buffer(&raw::BufferDescriptor {
+            label: Some("sgfx ordered texture upload staging"),
+            size,
+            usage: raw::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        }))
+    })?;
+    {
+        let mut destination = staging.slice(..).get_mapped_range_mut();
+        for row in 0..area.height() as usize {
+            let source_start = row * write.bytes_per_row() as usize;
+            let target_start = row * stride as usize;
+            destination[target_start..target_start + row_size as usize]
+                .copy_from_slice(&write.data()[source_start..source_start + row_size as usize]);
+        }
+    }
+    staging.unmap();
+    encoder.copy_buffer_to_texture(
+        raw::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: raw::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(area.height()),
+            },
+        },
+        raw::TexelCopyTextureInfo {
+            texture: &texture.texture,
+            mip_level: write.mip_level(),
+            origin: raw::Origin3d {
+                x: area.x(),
+                y: area.y(),
+                z: write.array_layer(),
+            },
+            aspect: raw::TextureAspect::All,
+        },
+        raw::Extent3d {
+            width: area.width(),
+            height: area.height(),
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
+}
+
 fn create_gpu_texture(
     device: &raw::Device,
     width: u32,
     height: u32,
     format: TextureFormat,
+    mip_level_count: u32,
+    array_layer_count: u32,
     usage: raw::TextureUsages,
 ) -> Result<Arc<GpuTexture>> {
     let max_dimension = device.limits().max_texture_dimension_2d;
-    if width > max_dimension || height > max_dimension {
+    if width > max_dimension
+        || height > max_dimension
+        || array_layer_count > device.limits().max_texture_array_layers
+    {
         return Err(Error::Unsupported(UnsupportedFeature::ResourceSize));
     }
     let raw_format =
@@ -1607,19 +2071,36 @@ fn create_gpu_texture(
         size: raw::Extent3d {
             width,
             height,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: array_layer_count,
         },
-        mip_level_count: 1,
+        mip_level_count,
         sample_count: 1,
         dimension: raw::TextureDimension::D2,
         format: raw_format,
         usage,
-        view_formats: &[],
+        view_formats: match format {
+            TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => &[
+                raw::TextureFormat::Rgba8Unorm,
+                raw::TextureFormat::Rgba8UnormSrgb,
+            ],
+            TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => &[
+                raw::TextureFormat::Bgra8Unorm,
+                raw::TextureFormat::Bgra8UnormSrgb,
+            ],
+            _ => &[],
+        },
     });
-    let view = texture.create_view(&raw::TextureViewDescriptor::default());
+    let view = texture.create_view(&raw::TextureViewDescriptor {
+        mip_level_count: Some(1),
+        dimension: Some(raw::TextureViewDimension::D2),
+        array_layer_count: Some(1),
+        ..Default::default()
+    });
+    let sampled_view = texture.create_view(&raw::TextureViewDescriptor::default());
     Ok(Arc::new(GpuTexture {
         texture,
         view,
+        sampled_view,
         format: raw_format,
         logical_format: format,
         width,
@@ -1629,6 +2110,9 @@ fn create_gpu_texture(
 
 fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
     let mut usage = raw::TextureUsages::empty();
+    if descriptor.usage().contains(TextureUsage::STORAGE) {
+        usage |= raw::TextureUsages::STORAGE_BINDING;
+    }
     if descriptor.usage().contains(TextureUsage::SAMPLED) {
         usage |= raw::TextureUsages::TEXTURE_BINDING;
     }
@@ -1637,9 +2121,21 @@ fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
     }
     if descriptor.usage().contains(TextureUsage::COPY_SRC) {
         usage |= raw::TextureUsages::COPY_SRC;
+        if matches!(
+            descriptor.format(),
+            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
+        ) {
+            usage |= raw::TextureUsages::TEXTURE_BINDING;
+        }
     }
     if descriptor.usage().contains(TextureUsage::COPY_DST) {
         usage |= raw::TextureUsages::COPY_DST;
+        if matches!(
+            descriptor.format(),
+            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
+        ) {
+            usage |= raw::TextureUsages::RENDER_ATTACHMENT;
+        }
     }
     if usage.is_empty() {
         Err(Error::InvalidState)
@@ -1651,7 +2147,9 @@ fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
 fn raw_format(format: TextureFormat) -> Option<raw::TextureFormat> {
     match format {
         TextureFormat::Bgra8Unorm => Some(raw::TextureFormat::Bgra8Unorm),
+        TextureFormat::Bgra8UnormSrgb => Some(raw::TextureFormat::Bgra8UnormSrgb),
         TextureFormat::Rgba8Unorm => Some(raw::TextureFormat::Rgba8Unorm),
+        TextureFormat::Rgba8UnormSrgb => Some(raw::TextureFormat::Rgba8UnormSrgb),
         TextureFormat::R8Unorm => Some(raw::TextureFormat::R8Unorm),
         TextureFormat::Depth32Float => Some(raw::TextureFormat::Depth32Float),
     }
@@ -2107,6 +2605,11 @@ fn raw_vertex_attribute(attribute: &VertexAttribute) -> raw::VertexAttribute {
             VertexFormat::Float32x3 => raw::VertexFormat::Float32x3,
             VertexFormat::Float32x4 => raw::VertexFormat::Float32x4,
             VertexFormat::Unorm8x4 => raw::VertexFormat::Unorm8x4,
+            VertexFormat::Sint32 => raw::VertexFormat::Sint32,
+            VertexFormat::Uint32 | VertexFormat::Snorm10_10_10_2 => raw::VertexFormat::Uint32,
+            VertexFormat::Float16x2 => raw::VertexFormat::Float16x2,
+            VertexFormat::Float16x4 => raw::VertexFormat::Float16x4,
+            VertexFormat::Sint16x4 => raw::VertexFormat::Sint16x4,
         },
         offset: u64::from(attribute.offset()),
         shader_location: attribute.location(),
@@ -2264,9 +2767,12 @@ fn find_attribute(attributes: &[VertexAttribute], location: u32) -> Option<Verte
 
 fn wgsl_vertex_type(format: VertexFormat) -> &'static str {
     match format {
-        VertexFormat::Float32x2 => "vec2<f32>",
+        VertexFormat::Sint32 => "i32",
+        VertexFormat::Uint32 | VertexFormat::Snorm10_10_10_2 => "u32",
+        VertexFormat::Sint16x4 => "vec4<i32>",
+        VertexFormat::Float16x2 | VertexFormat::Float32x2 => "vec2<f32>",
         VertexFormat::Float32x3 => "vec3<f32>",
-        VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => "vec4<f32>",
+        VertexFormat::Float16x4 | VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => "vec4<f32>",
     }
 }
 
@@ -2279,6 +2785,7 @@ fn position_expression(attribute: VertexAttribute) -> String {
         VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => {
             format!("input.attr{}", attribute.location())
         }
+        _ => unreachable!("fixed pipeline validates float vertex inputs"),
     }
 }
 
@@ -2291,6 +2798,7 @@ fn color_expression(attribute: VertexAttribute) -> String {
         VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => {
             format!("input.attr{}", attribute.location())
         }
+        _ => unreachable!("fixed pipeline validates float vertex inputs"),
     }
 }
 
@@ -2351,6 +2859,7 @@ fn sampled_alpha(sample: &str, sample_format: Option<TextureFormat>) -> String {
 mod tests {
     mod completion;
     mod execution;
+    mod programmable;
 
     use alloc::rc::Rc;
     use alloc::vec;
@@ -2362,7 +2871,7 @@ mod tests {
         StoreOp, TextureWrite, Transform, VertexBufferLayout,
     };
 
-    static HEADLESS_WGPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static HEADLESS_WGPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn request_headless_adapter(instance: &raw::Instance) -> Option<raw::Adapter> {
         pollster::block_on(instance.request_adapter(&raw::RequestAdapterOptions {

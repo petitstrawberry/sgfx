@@ -6,7 +6,15 @@ license = "MIT"
 repository = "https://github.com/petitstrawberry/sgfx"
 
 [dependencies]
-sgfx-core = { path = "../sgfx-core", default-features = false }
+naga = { version = "24", optional = true, features = ["wgsl-in", "spv-in"] }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "0213c76bdc9777ddb2a3a25e30b54ac8c5e01912", default-features = false }
+
+[features]
+default = []
+programmable = ["dep:naga"]
+
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }
 
 [lib]
 name = "sgfx_codegen_virgl"

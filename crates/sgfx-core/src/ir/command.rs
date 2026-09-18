@@ -2,14 +2,24 @@
 
 use alloc::vec::Vec;
 
+mod programmable_commands;
 use super::{
-    BufferRef, BufferUsage, Color, DrawUniforms, Error, FragmentProgram, IndexFormat, PixelRect,
-    RenderPipelineRef, ResourceTable, Result, SamplerRef, TextureFormat, TextureRef, TextureUsage,
-    TextureWrite,
+    BindGroupRef, ComputePipelineRef, MAX_BIND_GROUPS, MAX_VERTEX_BUFFERS,
+    ProgrammableRenderPipelineRef, ResourceBarrier, ShaderStages,
+};
+use super::{BufferAccess, TextureAccess};
+use super::{ColorAttachment, MAX_COLOR_ATTACHMENTS};
+pub use programmable_commands::ComputePassEncoder;
+use programmable_commands::{AnnouncedAccess, PendingWrite};
+
+use super::{
+    BufferRef, BufferUsage, Color, DrawUniforms, Error, FilterMode, FragmentProgram, IndexFormat,
+    PixelRect, RenderPipelineRef, ResourceTable, Result, SamplerRef, TextureFormat, TextureRef,
+    TextureUsage, TextureWrite, Viewport,
 };
 
 /// Maximum commands retained by one logical command buffer.
-pub const MAX_COMMANDS: usize = 4_096;
+pub const MAX_COMMANDS: usize = 65_536;
 
 /// Color attachment initialization operation for a render pass.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,9 +58,14 @@ pub struct DepthAttachment<'r> {
     pub(crate) target: TextureRef<'r>,
     pub(crate) load: DepthLoadOp,
     pub(crate) store: StoreOp,
+    pub(crate) read_only: bool,
 }
 
 impl<'r> DepthAttachment<'r> {
+    /// Whether depth may be sampled while the pass uses it for read-only tests.
+    pub const fn read_only(self) -> bool {
+        self.read_only
+    }
     /// Return the depth attachment reference.
     ///
     /// # Returns
@@ -84,6 +99,7 @@ pub struct RenderPassDesc<'r> {
     pub(crate) load: LoadOp,
     pub(crate) store: StoreOp,
     pub(crate) depth: Option<DepthAttachment<'r>>,
+    extra_colors: [Option<ColorAttachment<'r>>; MAX_COLOR_ATTACHMENTS - 1],
 }
 
 impl<'r> RenderPassDesc<'r> {
@@ -107,7 +123,7 @@ impl<'r> RenderPassDesc<'r> {
         store: StoreOp,
     ) -> Result<Self> {
         let texture = resources.texture(target)?;
-        if texture.format() == TextureFormat::Depth32Float {
+        if texture.format() == TextureFormat::Depth32Float || texture.array_layer_count() != 1 {
             return Err(Error::InvalidDescriptor);
         }
         if !texture.usage().contains(TextureUsage::RENDER_ATTACHMENT) {
@@ -122,6 +138,7 @@ impl<'r> RenderPassDesc<'r> {
             load,
             store,
             depth: None,
+            extra_colors: [None; MAX_COLOR_ATTACHMENTS - 1],
         })
     }
 
@@ -146,7 +163,7 @@ impl<'r> RenderPassDesc<'r> {
     ) -> Result<Self> {
         let texture = resources.texture(target)?;
         let color_texture = resources.texture(self.target)?;
-        if texture.format() != TextureFormat::Depth32Float {
+        if texture.format() != TextureFormat::Depth32Float || texture.array_layer_count() != 1 {
             return Err(Error::InvalidDescriptor);
         }
         if !texture.usage().contains(TextureUsage::RENDER_ATTACHMENT) {
@@ -163,8 +180,60 @@ impl<'r> RenderPassDesc<'r> {
             target,
             load,
             store,
+            read_only: false,
         });
         Ok(self)
+    }
+
+    /// Append a color output with matching extent and a distinct allocation.
+    pub fn with_color_attachment(
+        mut self,
+        resources: &'r ResourceTable,
+        target: TextureRef<'r>,
+        load: LoadOp,
+        store: StoreOp,
+    ) -> Result<Self> {
+        Self::new(resources, target, self.area, load, store)?;
+        if resources.texture(target)?.extent() != resources.texture(self.target)?.extent() {
+            return Err(Error::OutOfBounds);
+        }
+        if self
+            .color_attachments()
+            .any(|attachment| attachment.target() == target)
+        {
+            return Err(Error::AttachmentFeedback);
+        }
+        let slot = self
+            .extra_colors
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(Error::ResourceLimitExceeded)?;
+        *slot = Some(ColorAttachment {
+            target,
+            load,
+            store,
+        });
+        Ok(self)
+    }
+
+    /// Preserve depth contents and allow simultaneous read-only depth sampling.
+    pub fn with_read_only_depth(mut self) -> Result<Self> {
+        let depth = self.depth.as_mut().ok_or(Error::InvalidDescriptor)?;
+        if matches!(depth.load, DepthLoadOp::Clear(_)) {
+            return Err(Error::InvalidDescriptor);
+        }
+        depth.read_only = true;
+        Ok(self)
+    }
+
+    /// Iterate color outputs in fragment output-location order.
+    pub fn color_attachments(self) -> impl Iterator<Item = ColorAttachment<'r>> {
+        core::iter::once(ColorAttachment {
+            target: self.target,
+            load: self.load,
+            store: self.store,
+        })
+        .chain(self.extra_colors.into_iter().flatten())
     }
 
     /// Return the color attachment reference.
@@ -212,7 +281,62 @@ impl<'r> RenderPassDesc<'r> {
 ///
 /// Commands are exposed only through [`CommandBuffer::commands`]. Resource
 /// references remain lifetime-branded and cannot be constructed from raw IDs.
+// Render-pass descriptors stay inline to avoid allocating while recording commands.
+#[allow(clippy::large_enum_variant)]
 pub enum Command<'r, 'data> {
+    /// Scale a complete color mip level into a complete destination mip level.
+    /// The operation is a GPU transfer; filtering uses texel-center coordinates.
+    BlitTexture {
+        /// Source texture with COPY_SRC usage.
+        source: TextureRef<'r>,
+        /// Source mip level.
+        source_mip: u32,
+        /// Destination texture with COPY_DST usage.
+        destination: TextureRef<'r>,
+        /// Destination mip level.
+        destination_mip: u32,
+        /// Nearest or linear sampling.
+        filter: FilterMode,
+    },
+    /// Copy non-overlapping byte ranges between logical buffers.
+    CopyBufferToBuffer {
+        /// Source buffer.
+        source: BufferRef<'r>,
+        /// Source byte offset.
+        source_offset: u64,
+        /// Destination buffer.
+        destination: BufferRef<'r>,
+        /// Destination byte offset.
+        destination_offset: u64,
+        /// Non-zero byte count.
+        size: u64,
+    },
+    /// Bind a programmable graphics pipeline.
+    SetProgrammablePipeline(ProgrammableRenderPipelineRef<'r>),
+    /// Bind immutable resources at a descriptor set number.
+    SetBindGroup {
+        /// Descriptor set number.
+        index: u32,
+        /// Resources.
+        bind_group: BindGroupRef<'r>,
+    },
+    /// Begin a compute pass.
+    BeginComputePass,
+    /// End a compute pass.
+    EndComputePass,
+    /// Bind a compute pipeline.
+    SetComputePipeline(ComputePipelineRef<'r>),
+    /// Dispatch a non-zero grid of workgroups.
+    Dispatch {
+        /// X workgroup count.
+        x: u32,
+        /// Y workgroup count.
+        y: u32,
+        /// Z workgroup count.
+        z: u32,
+    },
+    /// Declare an execution and memory dependency outside passes.
+    ResourceBarrier(ResourceBarrier<'r>),
     /// Upload borrowed bytes into a logical buffer.
     WriteBuffer {
         /// Destination buffer reference.
@@ -253,6 +377,15 @@ pub enum Command<'r, 'data> {
         /// Byte offset of vertex zero.
         offset: u64,
     },
+    /// Bind a numbered programmable vertex buffer slot.
+    SetVertexBufferSlot {
+        /// Zero-based slot.
+        slot: u32,
+        /// Vertex buffer reference.
+        buffer: BufferRef<'r>,
+        /// Byte offset of vertex zero.
+        offset: u64,
+    },
     /// Bind an index buffer for subsequent indexed draws.
     SetIndexBuffer {
         /// Index buffer reference.
@@ -270,12 +403,47 @@ pub enum Command<'r, 'data> {
     SetUniforms(DrawUniforms),
     /// Set or reset the scissor for subsequent draws.
     SetScissor(Option<PixelRect>),
+    /// Set the viewport for subsequent draws.
+    SetViewport(Viewport),
+    /// Update aligned bytes for declared programmable shader stages.
+    SetPushConstants {
+        /// Updated shader stages.
+        stages: ShaderStages,
+        /// First byte in the stage's push-constant block.
+        offset: u32,
+        /// Bytes retained by this command recording.
+        data: &'data [u8],
+    },
     /// Issue a non-indexed draw.
     Draw {
         /// Number of vertices to draw.
         vertex_count: u32,
         /// First vertex relative to the bound vertex buffer.
         first_vertex: u32,
+    },
+    /// Issue an instanced programmable draw.
+    DrawInstanced {
+        /// Number of vertices per instance.
+        vertex_count: u32,
+        /// First vertex.
+        first_vertex: u32,
+        /// Number of instances.
+        instance_count: u32,
+        /// First shader instance index.
+        first_instance: u32,
+    },
+    /// Issue an indexed instanced programmable draw.
+    DrawIndexedInstanced {
+        /// Number of indices per instance.
+        index_count: u32,
+        /// First index.
+        first_index: u32,
+        /// Signed vertex offset.
+        base_vertex: i32,
+        /// Number of instances.
+        instance_count: u32,
+        /// First shader instance index.
+        first_instance: u32,
     },
     /// Issue an indexed draw.
     DrawIndexed {
@@ -293,6 +461,8 @@ pub struct CommandEncoder<'r, 'data> {
     resources: &'r ResourceTable,
     commands: Vec<Command<'r, 'data>>,
     pass_open: bool,
+    pending_writes: Vec<PendingWrite>,
+    announced_accesses: Vec<AnnouncedAccess>,
 }
 
 impl<'r, 'data> CommandEncoder<'r, 'data> {
@@ -309,6 +479,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             resources,
             commands: Vec::new(),
             pass_open: false,
+            pending_writes: Vec::new(),
+            announced_accesses: Vec::new(),
         }
     }
 
@@ -339,6 +511,7 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             u64::try_from(data.len()).map_err(|_| Error::Overflow)?,
             desc.size(),
         )?;
+        self.check_buffer_access(buffer, BufferAccess::CopyDestination)?;
         self.push(Command::WriteBuffer {
             buffer,
             offset,
@@ -363,7 +536,13 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         self.ensure_outside_pass()?;
         let desc = self.resources.texture(texture)?;
         Self::require_texture_usage(desc.usage(), TextureUsage::COPY_DST)?;
-        if !write.destination().is_within(desc.extent()) {
+        if write.array_layer() >= desc.array_layer_count() {
+            return Err(Error::OutOfBounds);
+        }
+        if !write
+            .destination()
+            .is_within(desc.mip_extent(write.mip_level())?)
+        {
             return Err(Error::OutOfBounds);
         }
         let tight = write
@@ -382,7 +561,53 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         if u64::try_from(write.data().len()).map_err(|_| Error::Overflow)? < required {
             return Err(Error::OutOfBounds);
         }
+        self.check_texture_mip_access(texture, write.mip_level(), TextureAccess::CopyDestination)?;
         self.push(Command::WriteTexture { texture, write })
+    }
+
+    /// Record a GPU blit between complete color mip levels. Different levels
+    /// of one texture are allowed; the same texture/level pair is rejected.
+    pub fn blit_texture(
+        &mut self,
+        source: TextureRef<'r>,
+        source_mip: u32,
+        destination: TextureRef<'r>,
+        destination_mip: u32,
+        filter: FilterMode,
+    ) -> Result<()> {
+        self.ensure_outside_pass()?;
+        let src = self.resources.texture(source)?;
+        let dst = self.resources.texture(destination)?;
+        Self::require_texture_usage(src.usage(), TextureUsage::COPY_SRC)?;
+        Self::require_texture_usage(dst.usage(), TextureUsage::COPY_DST)?;
+        src.mip_extent(source_mip)?;
+        dst.mip_extent(destination_mip)?;
+        if src.format() != dst.format()
+            || src.array_layer_count() != 1
+            || dst.array_layer_count() != 1
+            || !matches!(
+                src.format(),
+                TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
+            )
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        if self.resources.same_texture(source, destination)? && source_mip == destination_mip {
+            return Err(Error::ResourceAccessConflict);
+        }
+        self.check_texture_mip_access(source, source_mip, TextureAccess::CopySource)?;
+        self.check_texture_mip_access(
+            destination,
+            destination_mip,
+            TextureAccess::CopyDestination,
+        )?;
+        self.push(Command::BlitTexture {
+            source,
+            source_mip,
+            destination,
+            destination_mip,
+            filter,
+        })
     }
 
     /// Record a format-preserving texture-to-texture copy outside a render pass.
@@ -409,6 +634,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         Self::require_texture_usage(source_desc.usage(), TextureUsage::COPY_SRC)?;
         Self::require_texture_usage(destination_desc.usage(), TextureUsage::COPY_DST)?;
         if source_desc.format() != destination_desc.format()
+            || source_desc.array_layer_count() != 1
+            || destination_desc.array_layer_count() != 1
             || !source_rect.same_extent(destination_rect)
         {
             return Err(Error::InvalidDescriptor);
@@ -423,6 +650,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         {
             return Err(Error::InvalidValue);
         }
+        self.check_texture_mip_access(source, 0, TextureAccess::CopySource)?;
+        self.check_texture_mip_access(destination, 0, TextureAccess::CopyDestination)?;
         self.push(Command::CopyTextureToTexture {
             source,
             source_rect,
@@ -457,6 +686,24 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                     .map(|desc| desc.format())
             })
             .transpose()?;
+        let mut color_targets = [None; MAX_COLOR_ATTACHMENTS];
+        let mut color_formats = [None; MAX_COLOR_ATTACHMENTS];
+        for (slot, attachment) in desc.color_attachments().enumerate() {
+            self.check_texture_mip_access(attachment.target(), 0, TextureAccess::RenderAttachment)?;
+            color_targets[slot] = Some(attachment.target());
+            color_formats[slot] = Some(self.resources.texture(attachment.target())?.format());
+        }
+        if let Some(depth) = desc.depth_attachment() {
+            self.check_texture_mip_access(
+                depth.target(),
+                0,
+                if depth.read_only() {
+                    TextureAccess::Sampled
+                } else {
+                    TextureAccess::RenderAttachment
+                },
+            )?;
+        }
         self.reserve_pass_begin()?;
         self.push(Command::BeginRenderPass(desc))?;
         self.pass_open = true;
@@ -464,10 +711,19 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             encoder: self,
             target: desc.target,
             target_format: target_desc.format(),
+            color_targets,
+            color_formats,
+            depth_read_only: desc
+                .depth_attachment()
+                .is_some_and(|depth| depth.read_only()),
             depth_format,
             area: desc.area,
             pipeline: None,
-            vertex_buffer: None,
+            programmable_pipeline: None,
+            bind_groups: [None; MAX_BIND_GROUPS],
+            depth_target: desc.depth_attachment().map(|depth| depth.target()),
+            used_resources: Vec::new(),
+            vertex_buffers: [None; MAX_VERTEX_BUFFERS],
             index_buffer: None,
             texture: None,
             sampler: None,
@@ -505,6 +761,39 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         self.commands
             .try_reserve(1)
             .map_err(|_| Error::OutOfMemory)?;
+        match &command {
+            Command::WriteBuffer { buffer, .. } => {
+                self.consume_access(PendingWrite::Buffer(buffer.id()))
+            }
+            Command::WriteTexture { texture, .. } => {
+                self.consume_access(PendingWrite::Texture(texture.id()))
+            }
+            Command::CopyBufferToBuffer {
+                source,
+                destination,
+                ..
+            } => {
+                self.consume_access(PendingWrite::Buffer(source.id()));
+                self.consume_access(PendingWrite::Buffer(destination.id()));
+            }
+            Command::CopyTextureToTexture {
+                source,
+                destination,
+                ..
+            } => {
+                self.consume_access(PendingWrite::Texture(source.id()));
+                self.consume_access(PendingWrite::Texture(destination.id()));
+            }
+            Command::BeginRenderPass(desc) => {
+                for attachment in desc.color_attachments() {
+                    self.consume_access(PendingWrite::Texture(attachment.target().id()));
+                }
+                if let Some(depth) = desc.depth_attachment() {
+                    self.consume_access(PendingWrite::Texture(depth.target().id()));
+                }
+            }
+            _ => {}
+        }
         self.commands.push(command);
         Ok(())
     }
@@ -559,10 +848,17 @@ pub struct RenderPassEncoder<'encoder, 'r, 'data> {
     encoder: &'encoder mut CommandEncoder<'r, 'data>,
     target: TextureRef<'r>,
     target_format: super::TextureFormat,
+    color_targets: [Option<TextureRef<'r>>; MAX_COLOR_ATTACHMENTS],
+    color_formats: [Option<TextureFormat>; MAX_COLOR_ATTACHMENTS],
+    depth_read_only: bool,
     depth_format: Option<TextureFormat>,
     area: PixelRect,
     pipeline: Option<RenderPipelineRef<'r>>,
-    vertex_buffer: Option<(BufferRef<'r>, u64)>,
+    programmable_pipeline: Option<ProgrammableRenderPipelineRef<'r>>,
+    bind_groups: [Option<BindGroupRef<'r>>; MAX_BIND_GROUPS],
+    depth_target: Option<TextureRef<'r>>,
+    used_resources: Vec<PendingWrite>,
+    vertex_buffers: [Option<(BufferRef<'r>, u64)>; MAX_VERTEX_BUFFERS],
     index_buffer: Option<(BufferRef<'r>, u64, IndexFormat)>,
     texture: Option<TextureRef<'r>>,
     sampler: Option<SamplerRef<'r>>,
@@ -581,22 +877,28 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     /// attachment format does not match, or command capacity is exhausted.
     /// A pipeline without depth state does not require a depth attachment.
     pub fn set_pipeline(&mut self, pipeline: RenderPipelineRef<'r>) -> Result<()> {
-        let (target_format, depth_format) =
+        let (target_format, depth_format, depth_write) =
             self.encoder
                 .resources
                 .with_pipeline(pipeline, |descriptor| {
                     (
                         descriptor.target_format(),
                         descriptor.depth_state().map(|depth| depth.format()),
+                        descriptor
+                            .depth_state()
+                            .is_some_and(|depth| depth.write_enabled()),
                     )
                 })?;
-        if target_format != self.target_format
+        if self.color_targets[1].is_some()
+            || (self.depth_read_only && depth_write)
+            || target_format != self.target_format
             || depth_format.is_some_and(|format| Some(format) != self.depth_format)
         {
             return Err(Error::PipelineTargetMismatch);
         }
         self.encoder.push(Command::SetPipeline(pipeline))?;
         self.pipeline = Some(pipeline);
+        self.programmable_pipeline = None;
         Ok(())
     }
 
@@ -617,7 +919,35 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         }
         self.encoder
             .push(Command::SetVertexBuffer { buffer, offset })?;
-        self.vertex_buffer = Some((buffer, offset));
+        self.vertex_buffers[0] = Some((buffer, offset));
+        Ok(())
+    }
+
+    /// Bind a numbered programmable vertex buffer. Slot zero is shared with
+    /// the fixed pipeline's vertex binding.
+    pub fn set_vertex_buffer_slot(
+        &mut self,
+        slot: u32,
+        buffer: BufferRef<'r>,
+        offset: u64,
+    ) -> Result<()> {
+        if slot as usize >= MAX_VERTEX_BUFFERS {
+            return Err(Error::OutOfBounds);
+        }
+        if slot == 0 {
+            return self.set_vertex_buffer(buffer, offset);
+        }
+        let desc = self.encoder.resources.buffer(buffer)?;
+        CommandEncoder::require_buffer_usage(desc.usage(), BufferUsage::VERTEX)?;
+        if offset > desc.size() {
+            return Err(Error::OutOfBounds);
+        }
+        self.encoder.push(Command::SetVertexBufferSlot {
+            slot,
+            buffer,
+            offset,
+        })?;
+        self.vertex_buffers[slot as usize] = Some((buffer, offset));
         Ok(())
     }
 
@@ -665,6 +995,9 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     pub fn set_texture(&mut self, texture: TextureRef<'r>) -> Result<()> {
         let desc = self.encoder.resources.texture(texture)?;
         CommandEncoder::require_texture_usage(desc.usage(), TextureUsage::SAMPLED)?;
+        if desc.array_layer_count() != 1 || desc.format() == TextureFormat::Depth32Float {
+            return Err(Error::BindingLayoutMismatch);
+        }
         if self.encoder.resources.same_texture(texture, self.target)? {
             return Err(Error::AttachmentFeedback);
         }
@@ -682,7 +1015,9 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     /// # Returns
     /// Success, or an error for table mismatch or capacity.
     pub fn set_sampler(&mut self, sampler: SamplerRef<'r>) -> Result<()> {
-        self.encoder.resources.sampler(sampler)?;
+        if self.encoder.resources.sampler(sampler)?.compare().is_some() {
+            return Err(Error::BindingLayoutMismatch);
+        }
         self.encoder.push(Command::SetSampler(sampler))?;
         self.sampler = Some(sampler);
         Ok(())
@@ -722,24 +1057,40 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         self.encoder.push(Command::SetScissor(scissor))
     }
 
-    /// Record a non-indexed triangle-list draw.
+    /// Set a viewport wholly within the color attachment.
+    pub fn set_viewport(&mut self, viewport: Viewport) -> Result<()> {
+        let [x, y, width, height, _, _] = viewport.components();
+        let target = self.encoder.resources.texture(self.target)?.extent();
+        if x + width > target.width() as f32 || y + height > target.height() as f32 {
+            return Err(Error::OutOfBounds);
+        }
+        self.encoder.push(Command::SetViewport(viewport))
+    }
+
+    /// Record a non-indexed draw using the selected pipeline's topology.
     ///
     /// # Arguments
     ///
-    /// * `vertex_count` - Positive multiple of three vertices.
+    /// * `vertex_count` - Positive multiple of three for lists, at least three for strips.
     /// * `first_vertex` - First vertex relative to the bound vertex buffer.
     ///
     /// # Returns
     /// Success, or an error for missing state, vertex range, texture bindings, or capacity.
     pub fn draw(&mut self, vertex_count: u32, first_vertex: u32) -> Result<()> {
+        if self.programmable_pipeline.is_some() {
+            return self.draw_programmable(vertex_count, first_vertex, 1, 0);
+        }
         self.validate_draw(vertex_count)?;
+        let sampled_texture = self.active_sampled_texture()?;
         let pipeline = self.pipeline.ok_or(Error::PipelineNotSet)?;
         let stride = self
             .encoder
             .resources
             .with_pipeline(pipeline, |descriptor| descriptor.vertex_buffer().stride())?;
-        let (buffer, offset) = self.vertex_buffer.ok_or(Error::VertexBufferNotSet)?;
+        let (buffer, offset) = self.vertex_buffers[0].ok_or(Error::VertexBufferNotSet)?;
         let desc = self.encoder.resources.buffer(buffer)?;
+        self.encoder
+            .check_buffer_access(buffer, BufferAccess::Vertex)?;
         if offset % u64::from(stride) != 0 {
             return Err(Error::InvalidValue);
         }
@@ -750,17 +1101,30 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .checked_mul(u64::from(stride))
             .ok_or(Error::Overflow)?;
         CommandEncoder::validate_byte_range(offset, bytes, desc.size())?;
+        self.used_resources
+            .try_reserve(2)
+            .map_err(|_| Error::OutOfMemory)?;
         self.encoder.push(Command::Draw {
             vertex_count,
             first_vertex,
-        })
+        })?;
+        self.encoder
+            .consume_access(PendingWrite::Buffer(buffer.id()));
+        self.used_resources.push(PendingWrite::Buffer(buffer.id()));
+        if let Some(texture) = sampled_texture {
+            self.encoder
+                .consume_access(PendingWrite::Texture(texture.id()));
+            self.used_resources
+                .push(PendingWrite::Texture(texture.id()));
+        }
+        Ok(())
     }
 
-    /// Record an indexed triangle-list draw.
+    /// Record an indexed draw using the selected pipeline's topology.
     ///
     /// # Arguments
     ///
-    /// * `index_count` - Positive multiple of three indices.
+    /// * `index_count` - Positive multiple of three for lists, at least three for strips.
     /// * `first_index` - First index relative to the bound index buffer.
     /// * `base_vertex` - Signed base vertex added by a future backend.
     ///
@@ -772,20 +1136,29 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         first_index: u32,
         base_vertex: i32,
     ) -> Result<()> {
+        if self.programmable_pipeline.is_some() {
+            return self.draw_indexed_programmable(index_count, first_index, base_vertex, 1, 0);
+        }
         self.validate_draw(index_count)?;
+        let sampled_texture = self.active_sampled_texture()?;
         let pipeline = self.pipeline.ok_or(Error::PipelineNotSet)?;
         let stride = self
             .encoder
             .resources
             .with_pipeline(pipeline, |descriptor| descriptor.vertex_buffer().stride())?;
-        let (vertex_buffer, vertex_offset) = self.vertex_buffer.ok_or(Error::VertexBufferNotSet)?;
+        let (vertex_buffer, vertex_offset) =
+            self.vertex_buffers[0].ok_or(Error::VertexBufferNotSet)?;
         let vertex_desc = self.encoder.resources.buffer(vertex_buffer)?;
+        self.encoder
+            .check_buffer_access(vertex_buffer, BufferAccess::Vertex)?;
         if vertex_offset % u64::from(stride) != 0 {
             return Err(Error::InvalidValue);
         }
         CommandEncoder::validate_byte_range(vertex_offset, u64::from(stride), vertex_desc.size())?;
         let (buffer, offset, format) = self.index_buffer.ok_or(Error::IndexBufferNotSet)?;
         let desc = self.encoder.resources.buffer(buffer)?;
+        self.encoder
+            .check_buffer_access(buffer, BufferAccess::Index)?;
         let indices = u64::from(first_index)
             .checked_add(u64::from(index_count))
             .ok_or(Error::Overflow)?;
@@ -793,11 +1166,29 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .checked_mul(format.byte_size())
             .ok_or(Error::Overflow)?;
         CommandEncoder::validate_byte_range(offset, bytes, desc.size())?;
+        self.used_resources
+            .try_reserve(3)
+            .map_err(|_| Error::OutOfMemory)?;
         self.encoder.push(Command::DrawIndexed {
             index_count,
             first_index,
             base_vertex,
-        })
+        })?;
+        self.encoder
+            .consume_access(PendingWrite::Buffer(buffer.id()));
+        self.encoder
+            .consume_access(PendingWrite::Buffer(vertex_buffer.id()));
+        self.used_resources.extend([
+            PendingWrite::Buffer(buffer.id()),
+            PendingWrite::Buffer(vertex_buffer.id()),
+        ]);
+        if let Some(texture) = sampled_texture {
+            self.encoder
+                .consume_access(PendingWrite::Texture(texture.id()));
+            self.used_resources
+                .push(PendingWrite::Texture(texture.id()));
+        }
+        Ok(())
     }
 
     /// End this render pass.
@@ -810,16 +1201,37 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         Ok(())
     }
 
+    fn active_sampled_texture(&self) -> Result<Option<TextureRef<'r>>> {
+        let pipeline = self.pipeline.ok_or(Error::PipelineNotSet)?;
+        let samples = self.encoder.resources.with_pipeline(pipeline, |desc| {
+            matches!(
+                desc.fragment(),
+                FragmentProgram::Texture(_) | FragmentProgram::TextureVertexColor(_)
+            )
+        })?;
+        Ok(if samples { self.texture } else { None })
+    }
+
     fn validate_draw(&self, count: u32) -> Result<()> {
-        if count == 0 || !count.is_multiple_of(3) {
+        let pipeline = self.pipeline.ok_or(Error::PipelineNotSet)?;
+        let valid_count = self
+            .encoder
+            .resources
+            .with_pipeline(pipeline, |descriptor| {
+                descriptor.topology().accepts_count(count)
+            })?;
+        if !valid_count {
             return Err(Error::InvalidValue);
         }
-        let pipeline = self.pipeline.ok_or(Error::PipelineNotSet)?;
         let fragment = self
             .encoder
             .resources
             .with_pipeline(pipeline, |descriptor| descriptor.fragment())?;
         self.uniforms.ok_or(Error::UniformsNotSet)?;
+        if let Some(texture) = self.active_sampled_texture()? {
+            self.encoder
+                .check_texture_access(texture, TextureAccess::Sampled)?;
+        }
         if matches!(
             fragment,
             FragmentProgram::Texture(_) | FragmentProgram::TextureVertexColor(_)

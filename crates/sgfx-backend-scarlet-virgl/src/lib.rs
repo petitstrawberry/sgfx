@@ -13,7 +13,11 @@ extern crate alloc;
 extern crate scarlet_std as std;
 
 use alloc::{rc::Rc, vec::Vec};
-use gpu_raw::{Gpu, GpuQueryInfo};
+use gpu_raw::{
+    GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_DEPTH, GPU_EXECUTION_SUPPORT_IMAGE_READBACK,
+    GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD, GPU_EXECUTION_SUPPORT_PRESENTATION,
+    GPU_EXECUTION_SUPPORT_QUEUE, GPU_RESULT_SUCCESS, Gpu, GpuQueryInfo,
+};
 #[cfg(feature = "std")]
 pub use scarlet_os::handle::{Handle, HandleError, HandleResult};
 #[cfg(feature = "std")]
@@ -54,7 +58,7 @@ mod scheduler;
 mod virgl;
 
 pub use completion::Submission;
-pub use ir_execute::{IrResources, IrSubmitError, UnsupportedIrFeature};
+pub use ir_execute::{IrResources, IrSubmitError, ShaderCompileError, UnsupportedIrFeature};
 
 /// Device capabilities expressed in application rendering terms.
 #[derive(Debug, Clone, Copy)]
@@ -64,9 +68,40 @@ pub struct Capabilities {
     image_upload: bool,
     image_readback: bool,
     depth: bool,
+    image_mips: bool,
+    texture_arrays: bool,
+    depth_sampling: bool,
 }
 
 impl Capabilities {
+    /// Derive the public execution capabilities from one GPU query response.
+    ///
+    /// An invalid or incompatible response yields an all-disabled capability
+    /// set. Device adoption performs the same compatibility check before any
+    /// context is created.
+    pub fn from_query_info(info: &GpuQueryInfo) -> Self {
+        let rendering = info.result == GPU_RESULT_SUCCESS
+            && info.device_state == GPU_DEVICE_STATE_READY
+            && matches_backend_id(info.backend_id_bytes())
+            && info.execution_support & GPU_EXECUTION_SUPPORT_QUEUE != 0;
+        Self {
+            rendering,
+            presentation: rendering
+                && info.execution_support & GPU_EXECUTION_SUPPORT_PRESENTATION != 0,
+            image_upload: rendering
+                && info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_UPLOAD != 0,
+            image_readback: rendering
+                && info.execution_support & GPU_EXECUTION_SUPPORT_IMAGE_READBACK != 0,
+            depth: rendering && info.execution_support & GPU_EXECUTION_SUPPORT_DEPTH != 0,
+            texture_arrays: rendering
+                && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_TEXTURE_ARRAYS != 0,
+            depth_sampling: rendering
+                && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_DEPTH_SAMPLING != 0,
+            image_mips: rendering
+                && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_IMAGE_MIPS != 0,
+        }
+    }
+
     /// Return whether the device can execute the built-in rendering pipeline.
     ///
     /// # Returns
@@ -74,6 +109,12 @@ impl Capabilities {
     /// `true` when rendering commands are available.
     pub const fn supports_rendering(&self) -> bool {
         self.rendering
+    }
+
+    /// Return whether the compiled VirGL backend can lower programmable
+    /// vertex and fragment stages for this device.
+    pub const fn supports_programmable_graphics(&self) -> bool {
+        self.rendering && cfg!(feature = "programmable")
     }
 
     /// Return whether render-target images can be presented to a display.
@@ -110,6 +151,22 @@ impl Capabilities {
     /// `true` when `Depth32Float` render attachments can be used.
     pub const fn supports_depth(&self) -> bool {
         self.depth
+    }
+
+    /// Return whether the kernel allocates array and cube texture storage.
+    pub const fn supports_texture_arrays(&self) -> bool {
+        self.texture_arrays
+    }
+
+    /// Return whether depth attachments can also be sampled.
+    pub const fn supports_depth_sampling(&self) -> bool {
+        self.depth_sampling
+    }
+
+    /// Return whether the kernel allocates real image mip storage for VirGL
+    /// uploads, sampling and color blits.
+    pub const fn supports_image_mips(&self) -> bool {
+        self.image_mips
     }
 }
 

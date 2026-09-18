@@ -1,0 +1,53 @@
+[package]
+name = "vulkan-sgfx"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Experimental non-conformant Vulkan frontend and ICD for SGFX"
+
+[lib]
+name = "vulkan_sgfx"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["backend-wgpu"]
+backend-wgpu = ["sgfx/backend-wgpu"]
+scarlet-wsi = ["sgfx/scarlet-native-api", "dep:dlmalloc"]
+cube-demo = ["dep:png", "dep:framebuffer", "naga/wgsl-in"]
+
+[[bin]]
+name = "vulkan-cube"
+path = "src/bin/vulkan_cube.rs"
+required-features = ["cube-demo"]
+
+[dependencies]
+naga = { version = "24", features = ["spv-in", "spv-out"] }
+ash = { version = "0.38", default-features = false, features = ["debug", "std"] }
+sgfx = { path = "../sgfx", default-features = false, features = ["std"] }
+png = { version = "0.18", optional = true }
+
+[target.'cfg(not(target_os = "scarlet"))'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dlmalloc = { version = "0.2.14", features = ["global"], optional = true }
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "54bfdf3048a100fc4bfba5198e59bdb184702871", default-features = false, features = ["std"], optional = true }
+sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-scarlet-virgl"] }
+
+[dev-dependencies]
+png = "0.18"
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }
+
+[target.'cfg(not(target_os = "scarlet"))'.dev-dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+libloading = "0.8"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+ash-window = "0.13"
+raw-window-handle = "0.6"
+winit = { version = "0.30", features = ["rwh_06"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

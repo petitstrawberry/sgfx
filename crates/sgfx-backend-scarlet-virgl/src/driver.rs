@@ -105,6 +105,18 @@ impl Context {
         }
     }
 
+    pub(crate) fn readback_ir_texture(
+        &self,
+        resources: &mut IrResources,
+        texture: IrTextureSpec,
+    ) -> HandleResult<Vec<u8>> {
+        match (self, resources) {
+            (Self::Virgl(context), IrResources::Virgl(resources)) => {
+                context.readback_ir_texture(resources, texture)
+            }
+        }
+    }
+
     pub(crate) fn create_image(&self, width: u32, height: u32) -> HandleResult<Image> {
         match self {
             Self::Virgl(context) => Ok(Image::Virgl(context.create_image(width, height)?)),
@@ -339,11 +351,12 @@ impl Queue {
         resources: &mut IrResources,
         buffer: IrBufferSpec,
         bytes: &[u8],
+        update: Option<&IrBufferUpdate>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
-                queue.prepare_ir_buffer(context, resources, buffer, bytes, mode)
+                queue.prepare_ir_buffer(context, resources, buffer, bytes, update, mode)
             }
         }
     }
@@ -473,6 +486,12 @@ pub(crate) struct IrBufferSpec {
     pub(crate) revision: u64,
 }
 
+/// Byte changes relative to the last accepted CPU shadow revision.
+pub(crate) struct IrBufferUpdate {
+    pub(crate) previous_revision: u64,
+    pub(crate) range: core::ops::Range<usize>,
+}
+
 /// One draw's binding into a persistent canonical vertex buffer.
 #[derive(Clone, Copy)]
 pub(crate) struct IrVertexBufferBinding {
@@ -577,6 +596,8 @@ pub(crate) struct IrPipelineState {
     pub(crate) slot: usize,
     pub(crate) fragment: IrFragmentProgram,
     pub(crate) blend: IrBlendState,
+    pub(crate) color_write_mask: u8,
+    pub(crate) additional_color_blends: [Option<(IrBlendState, u8)>; 7],
     pub(crate) cull_mode: IrCullMode,
     pub(crate) front_face: IrFrontFace,
     pub(crate) depth: Option<IrDepthState>,
@@ -605,6 +626,10 @@ pub(crate) struct IrSamplerState {
     pub(crate) mag_filter: IrFilterMode,
     pub(crate) address_u: IrAddressMode,
     pub(crate) address_v: IrAddressMode,
+    pub(crate) mip_filter: IrFilterMode,
+    pub(crate) min_lod: f32,
+    pub(crate) max_lod: f32,
+    pub(crate) compare: Option<crate::ir::CompareFunction>,
 }
 
 /// Draw-uniform constants sent to the GPU without CPU vertex transformation.
@@ -617,7 +642,11 @@ pub(crate) struct IrUniforms {
 /// One private non-indexed draw in an ordered IR submission.
 #[derive(Clone)]
 pub(crate) struct IrDraw {
+    pub(crate) programmable: Option<Rc<IrProgrammableDraw>>,
     pub(crate) start_vertex: usize,
+    pub(crate) instance_count: u32,
+    pub(crate) first_instance: u32,
+    pub(crate) vertex_buffers: [Option<IrVertexBufferBinding>; 8],
     pub(crate) vertex_count: usize,
     pub(crate) vertex_buffer: Option<IrVertexBufferBinding>,
     pub(crate) pipeline: IrPipelineState,
@@ -625,6 +654,116 @@ pub(crate) struct IrDraw {
     pub(crate) sampler: Option<IrSamplerState>,
     pub(crate) uniforms: IrUniforms,
     pub(crate) scissor: IrRect,
+    pub(crate) viewport: Option<[f32; 6]>,
+}
+
+pub(crate) fn draw_count_valid(draw: &IrDraw) -> bool {
+    match draw
+        .programmable
+        .as_ref()
+        .map(|draw| draw.pipeline.topology)
+    {
+        Some(crate::ir::PrimitiveTopology::TriangleStrip) => draw.vertex_count >= 3,
+        _ => draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(3),
+    }
+}
+
+/// Immutable compiled stages and vertex-fetch layout for one programmable pipeline.
+pub(crate) struct IrProgrammablePipeline {
+    pub(crate) slot: usize,
+    #[cfg(feature = "programmable")]
+    pub(crate) vertex: sgfx_codegen_virgl::programmable::CompiledShader,
+    #[cfg(feature = "programmable")]
+    pub(crate) fragment: sgfx_codegen_virgl::programmable::CompiledShader,
+    pub(crate) vertex_buffers: Vec<crate::ir::VertexBufferLayout>,
+    pub(crate) topology: crate::ir::PrimitiveTopology,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IrIndexBufferBinding {
+    pub(crate) buffer: IrBufferSpec,
+    pub(crate) offset: u32,
+    pub(crate) format: crate::ir::IndexFormat,
+    pub(crate) base_vertex: i32,
+}
+
+/// Small constant banks are copied with a draw snapshot without a separate
+/// allocation. Larger uniform blocks keep immutable shared storage.
+#[derive(Clone, Debug)]
+pub(crate) enum IrConstantWords {
+    Inline { words: [u32; 32], len: usize },
+    Shared(Rc<[u32]>),
+}
+
+impl IrConstantWords {
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline { words, len } => &words[..*len],
+            Self::Shared(words) => words,
+        }
+    }
+}
+
+impl core::ops::Deref for IrConstantWords {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for IrConstantWords {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for IrConstantWords {}
+
+#[cfg(test)]
+impl From<Vec<u32>> for IrConstantWords {
+    fn from(values: Vec<u32>) -> Self {
+        if values.len() <= 32 {
+            let mut words = [0; 32];
+            words[..values.len()].copy_from_slice(&values);
+            Self::Inline {
+                words,
+                len: values.len(),
+            }
+        } else {
+            Self::Shared(values.into())
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct IrConstantBuffer {
+    pub(crate) stage: crate::ir::ShaderStage,
+    pub(crate) first_register: u32,
+    pub(crate) words: IrConstantWords,
+}
+
+pub(crate) struct IrProgrammableDraw {
+    pub(crate) pipeline: Rc<IrProgrammablePipeline>,
+    pub(crate) index_buffer: Option<IrIndexBufferBinding>,
+    pub(crate) constants: Rc<[IrConstantBuffer]>,
+    pub(crate) textures: Rc<[IrTextureBinding]>,
+    pub(crate) storage_buffers: Rc<[IrStorageBufferBinding]>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IrStorageBufferBinding {
+    pub(crate) stage: crate::ir::ShaderStage,
+    pub(crate) slot: u32,
+    pub(crate) buffer: IrBufferSpec,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IrTextureBinding {
+    pub(crate) stage: crate::ir::ShaderStage,
+    pub(crate) slot: u32,
+    pub(crate) texture: IrTextureSpec,
+    pub(crate) sampler: Option<IrSamplerState>,
 }
 
 /// Converted BGRA texture upload retained until all stream validation succeeds.
@@ -633,6 +772,8 @@ pub(crate) struct IrTextureUpload {
     pub(crate) texture: IrTextureSpec,
     pub(crate) destination: IrRect,
     pub(crate) pixels: Vec<u8>,
+    pub(crate) mip_level: u32,
+    pub(crate) array_layer: u32,
 }
 
 /// Logical texture materialization requirements without backend identifiers.
@@ -641,6 +782,9 @@ pub(crate) struct IrTextureSpec {
     pub(crate) slot: usize,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) mip_levels: u32,
+    pub(crate) array_layers: u32,
+    pub(crate) cube: bool,
     pub(crate) sampled: bool,
     pub(crate) render_attachment: bool,
     pub(crate) copy_destination: bool,
@@ -663,17 +807,30 @@ pub(crate) struct IrTextureCopy {
     pub(crate) source_rect: IrRect,
     pub(crate) destination: IrTextureSpec,
     pub(crate) destination_rect: IrRect,
+    pub(crate) source_mip: u32,
+    pub(crate) destination_mip: u32,
+    /// None requests an exact copy; Some requests a filtered GPU blit.
+    pub(crate) filter: Option<IrFilterMode>,
 }
 
 /// Complete backend-neutral render submission for one mapped presentation target.
 pub(crate) struct IrSubmission {
     pub(crate) clear_color: Option<[f32; 4]>,
+    pub(crate) additional_colors: Vec<IrColorAttachment>,
     pub(crate) depth_attachment: Option<IrTextureSpec>,
+    pub(crate) depth_read_only: bool,
     pub(crate) clear_depth: Option<f32>,
     pub(crate) render_area: IrRect,
     pub(crate) vertices: Vec<IrVertex>,
     pub(crate) draws: Vec<IrDraw>,
     pub(crate) texture_uploads: Vec<IrTextureUpload>,
+}
+
+/// One additional color output in a render pass.
+#[derive(Clone, Copy)]
+pub(crate) struct IrColorAttachment {
+    pub(crate) texture: IrTextureSpec,
+    pub(crate) clear: Option<[f32; 4]>,
 }
 
 /// Private persistent materialization cache owned by the creating context.
@@ -682,6 +839,24 @@ pub(crate) enum IrResources {
 }
 
 impl IrResources {
+    pub(crate) fn release_buffer(&mut self, slot: usize) {
+        match self {
+            Self::Virgl(resources) => resources.release_buffer(slot),
+        }
+    }
+
+    pub(crate) fn unmap_ir_image(
+        &mut self,
+        texture: IrTextureSpec,
+        image: &Image,
+    ) -> HandleResult<()> {
+        match (self, image) {
+            (Self::Virgl(resources), Image::Virgl(image)) => {
+                resources.unmap_ir_image(texture, image)
+            }
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> HandleResult<virgl::IrStateSnapshot> {
         match self {
             Self::Virgl(resources) => resources.snapshot(),

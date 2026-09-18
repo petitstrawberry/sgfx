@@ -1,13 +1,16 @@
 //! Logical resource descriptors, validated resource tables, and branded references.
 
-use alloc::vec::Vec;
-use core::cell::RefCell;
+use alloc::{rc::Rc, vec::Vec};
+use core::cell::{Cell, RefCell};
 use core::fmt;
 use core::ops::{BitOr, BitOrAssign};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::pipeline::RenderPipelineDesc;
-use super::{Error, Extent2D, PixelRect, Result};
+use super::{
+    BindGroupDesc, ComputePipelineDesc, Error, Extent2D, PixelRect, ProgrammableRenderPipelineDesc,
+    Result, ShaderModuleDesc,
+};
 
 /// Maximum textures held by one [`ResourceTable`].
 pub const MAX_TEXTURES: usize = 1_024;
@@ -17,6 +20,8 @@ pub const MAX_BUFFERS: usize = 1_024;
 pub const MAX_SAMPLERS: usize = 256;
 /// Maximum render pipelines held by one [`ResourceTable`].
 pub const MAX_RENDER_PIPELINES: usize = 256;
+/// Maximum immutable bind-group definitions held by one resource table.
+pub const MAX_BIND_GROUP_DEFINITIONS: usize = 4_096;
 
 static NEXT_RESOURCE_TABLE_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -25,8 +30,12 @@ static NEXT_RESOURCE_TABLE_ID: AtomicUsize = AtomicUsize::new(1);
 pub enum TextureFormat {
     /// Eight-bit blue, green, red, and alpha channels.
     Bgra8Unorm,
+    /// Eight-bit BGRA channels with sRGB transfer for color channels.
+    Bgra8UnormSrgb,
     /// Eight-bit red, green, blue, and alpha channels.
     Rgba8Unorm,
+    /// Eight-bit RGBA channels with sRGB transfer for color channels.
+    Rgba8UnormSrgb,
     /// One eight-bit normalized red channel.
     R8Unorm,
     /// One 32-bit floating-point depth component.
@@ -41,9 +50,28 @@ impl TextureFormat {
     /// The portable byte size for this format.
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
-            Self::Bgra8Unorm | Self::Rgba8Unorm | Self::Depth32Float => 4,
+            Self::Bgra8Unorm
+            | Self::Rgba8Unorm
+            | Self::Bgra8UnormSrgb
+            | Self::Rgba8UnormSrgb
+            | Self::Depth32Float => 4,
             Self::R8Unorm => 1,
         }
+    }
+
+    /// Whether one texture allocation can be viewed in the other format.
+    pub const fn view_compatible(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                Self::Bgra8Unorm | Self::Bgra8UnormSrgb,
+                Self::Bgra8Unorm | Self::Bgra8UnormSrgb
+            ) | (
+                Self::Rgba8Unorm | Self::Rgba8UnormSrgb,
+                Self::Rgba8Unorm | Self::Rgba8UnormSrgb
+            ) | (Self::R8Unorm, Self::R8Unorm)
+                | (Self::Depth32Float, Self::Depth32Float)
+        )
     }
 }
 
@@ -62,6 +90,8 @@ impl TextureUsage {
     pub const COPY_DST: Self = Self(1 << 3);
     /// Allow eventual presentation by a backend.
     pub const PRESENT: Self = Self(1 << 4);
+    /// Allow write-only shader storage access to RGBA8 texels.
+    pub const STORAGE: Self = Self(1 << 5);
 
     /// Return no usage flags.
     ///
@@ -117,6 +147,9 @@ pub struct TextureDesc {
     format: TextureFormat,
     extent: Extent2D,
     usage: TextureUsage,
+    mip_level_count: u32,
+    array_layer_count: u32,
+    cube_compatible: bool,
 }
 
 impl TextureDesc {
@@ -131,11 +164,13 @@ impl TextureDesc {
     /// # Returns
     ///
     /// A descriptor, or [`Error::InvalidDescriptor`] for empty usage or a
-    /// depth format carrying anything except `RENDER_ATTACHMENT` usage.
+    /// depth format carrying usage other than `RENDER_ATTACHMENT` or `SAMPLED`.
     pub const fn new(format: TextureFormat, extent: Extent2D, usage: TextureUsage) -> Result<Self> {
         if usage.0 == 0
+            || (usage.contains(TextureUsage::STORAGE)
+                && !matches!(format, TextureFormat::Rgba8Unorm))
             || (matches!(format, TextureFormat::Depth32Float)
-                && usage.0 != TextureUsage::RENDER_ATTACHMENT.0)
+                && usage.0 & !(TextureUsage::RENDER_ATTACHMENT.0 | TextureUsage::SAMPLED.0) != 0)
         {
             Err(Error::InvalidDescriptor)
         } else {
@@ -143,6 +178,9 @@ impl TextureDesc {
                 format,
                 extent,
                 usage,
+                mip_level_count: 1,
+                array_layer_count: 1,
+                cube_compatible: false,
             })
         }
     }
@@ -168,6 +206,91 @@ impl TextureDesc {
     pub const fn usage(self) -> TextureUsage {
         self.usage
     }
+
+    /// Declare a complete or partial 2D mip chain. Render attachments and
+    /// storage bindings continue to use level zero; sampled bindings use the
+    /// complete declared chain. Depth and presentation images retain
+    /// one level in this portable subset.
+    pub fn with_mip_level_count(mut self, count: u32) -> Result<Self> {
+        let maximum = self.extent.width().max(self.extent.height()).ilog2() + 1;
+        if count == 0
+            || count > maximum
+            || (count > 1
+                && (self.format == TextureFormat::Depth32Float
+                    || self.usage.contains(TextureUsage::PRESENT)))
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.mip_level_count = count;
+        Ok(self)
+    }
+
+    /// Return the number of declared mip levels.
+    pub const fn mip_level_count(self) -> u32 {
+        self.mip_level_count
+    }
+
+    /// Set the number of independent 2D layers in this allocation.
+    pub fn with_array_layer_count(mut self, count: u32) -> Result<Self> {
+        if count == 0
+            || count > 2048
+            || (count != 1 && self.usage.contains(TextureUsage::PRESENT))
+            || (self.cube_compatible && count < 6)
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.array_layer_count = count;
+        Ok(self)
+    }
+
+    /// Return the number of 2D layers.
+    pub const fn array_layer_count(self) -> u32 {
+        self.array_layer_count
+    }
+
+    /// Preserve cube-compatible allocation intent for backends whose physical
+    /// cube and array texture targets differ. The first six square layers form
+    /// a cube; this does not change layer ordering or texel storage.
+    pub fn with_cube_compatible(mut self, compatible: bool) -> Result<Self> {
+        if compatible && (self.array_layer_count < 6 || self.extent.width() != self.extent.height())
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.cube_compatible = compatible;
+        Ok(self)
+    }
+
+    /// Return whether the allocation must permit cube sampling.
+    pub const fn cube_compatible(self) -> bool {
+        self.cube_compatible
+    }
+
+    /// Return the checked dimensions of a mip level, including odd-sized
+    /// chains and dimensions clamped to one texel.
+    pub fn mip_extent(self, level: u32) -> Result<Extent2D> {
+        if level >= self.mip_level_count {
+            return Err(Error::OutOfBounds);
+        }
+        Extent2D::new(
+            (self.extent.width() >> level).max(1),
+            (self.extent.height() >> level).max(1),
+        )
+    }
+
+    /// Return the tightly packed byte size of every declared mip level.
+    pub fn byte_size(self) -> Result<u64> {
+        let mut size = 0u64;
+        for level in 0..self.mip_level_count {
+            let extent = self.mip_extent(level)?;
+            let bytes = u64::from(extent.width())
+                .checked_mul(u64::from(extent.height()))
+                .and_then(|v| v.checked_mul(u64::from(self.format.bytes_per_pixel())))
+                .ok_or(Error::Overflow)?;
+            size = size.checked_add(bytes).ok_or(Error::Overflow)?;
+        }
+        size.checked_mul(u64::from(self.array_layer_count))
+            .ok_or(Error::Overflow)
+    }
 }
 
 /// Bitflag-like allowed operations for a buffer.
@@ -183,6 +306,10 @@ impl BufferUsage {
     pub const COPY_SRC: Self = Self(1 << 2);
     /// Allow writes through upload commands.
     pub const COPY_DST: Self = Self(1 << 3);
+    /// Allow shader uniform reads.
+    pub const UNIFORM: Self = Self(1 << 4);
+    /// Allow shader storage reads and writes.
+    pub const STORAGE: Self = Self(1 << 5);
     /// Return no usage flags.
     ///
     /// # Returns
@@ -293,6 +420,10 @@ pub struct SamplerDesc {
     mag_filter: FilterMode,
     address_u: AddressMode,
     address_v: AddressMode,
+    mip_filter: FilterMode,
+    min_lod_bits: u32,
+    max_lod_bits: u32,
+    compare: Option<super::CompareFunction>,
 }
 
 impl SamplerDesc {
@@ -318,6 +449,10 @@ impl SamplerDesc {
             mag_filter,
             address_u,
             address_v,
+            mip_filter: FilterMode::Nearest,
+            min_lod_bits: 0,
+            max_lod_bits: 0,
+            compare: None,
         }
     }
     /// Return the minification filter.
@@ -348,6 +483,46 @@ impl SamplerDesc {
     pub const fn address_v(self) -> AddressMode {
         self.address_v
     }
+
+    /// Set mip filtering and a finite, nonnegative LOD interval. Keeping
+    /// floating values as validated bits preserves descriptor equality.
+    pub fn with_mip_filter(
+        mut self,
+        filter: FilterMode,
+        min_lod: f32,
+        max_lod: f32,
+    ) -> Result<Self> {
+        if !min_lod.is_finite() || !max_lod.is_finite() || min_lod < 0.0 || max_lod < min_lod {
+            return Err(Error::InvalidValue);
+        }
+        self.mip_filter = filter;
+        self.min_lod_bits = if min_lod == 0.0 { 0 } else { min_lod.to_bits() };
+        self.max_lod_bits = if max_lod == 0.0 { 0 } else { max_lod.to_bits() };
+        Ok(self)
+    }
+    /// Return mip-level filtering.
+    pub const fn mip_filter(self) -> FilterMode {
+        self.mip_filter
+    }
+    /// Return the minimum LOD.
+    pub const fn min_lod(self) -> f32 {
+        f32::from_bits(self.min_lod_bits)
+    }
+    /// Return the maximum LOD.
+    pub const fn max_lod(self) -> f32 {
+        f32::from_bits(self.max_lod_bits)
+    }
+
+    /// Enable depth-reference comparison, or disable it with `None`.
+    pub const fn with_compare(mut self, compare: Option<super::CompareFunction>) -> Self {
+        self.compare = compare;
+        self
+    }
+
+    /// Return the depth-reference comparison performed during sampling.
+    pub const fn compare(self) -> Option<super::CompareFunction> {
+        self.compare
+    }
 }
 
 /// Borrowed pixel data and layout for one texture upload.
@@ -356,6 +531,8 @@ pub struct TextureWrite<'data> {
     destination: PixelRect,
     bytes_per_row: u32,
     data: &'data [u8],
+    mip_level: u32,
+    array_layer: u32,
 }
 
 impl<'data> TextureWrite<'data> {
@@ -381,6 +558,8 @@ impl<'data> TextureWrite<'data> {
                 destination,
                 bytes_per_row,
                 data,
+                mip_level: 0,
+                array_layer: 0,
             })
         }
     }
@@ -405,15 +584,46 @@ impl<'data> TextureWrite<'data> {
     pub const fn data(self) -> &'data [u8] {
         self.data
     }
+    /// Select a destination mip level; recording validates it against the texture.
+    pub const fn with_mip_level(mut self, level: u32) -> Self {
+        self.mip_level = level;
+        self
+    }
+    /// Return the destination mip level.
+    pub const fn mip_level(self) -> u32 {
+        self.mip_level
+    }
+
+    /// Select one destination layer; recording validates its bounds.
+    pub const fn with_array_layer(mut self, layer: u32) -> Self {
+        self.array_layer = layer;
+        self
+    }
+
+    /// Return the destination layer.
+    pub const fn array_layer(self) -> u32 {
+        self.array_layer
+    }
 }
 
 /// Table that owns validated logical resource descriptors.
 pub struct ResourceTable {
     id: usize,
     textures: RefCell<Vec<TextureDesc>>,
-    buffers: RefCell<Vec<BufferDesc>>,
+    buffers: RefCell<Vec<BufferSlot>>,
+    free_buffer: Cell<Option<usize>>,
     samplers: RefCell<Vec<SamplerDesc>>,
     pipelines: RefCell<Vec<RenderPipelineDesc>>,
+    shader_modules: RefCell<Vec<ShaderModuleDesc>>,
+    bind_groups: RefCell<Vec<Rc<BindGroupDesc>>>,
+    compute_pipelines: RefCell<Vec<ComputePipelineDesc>>,
+    programmable_pipelines: RefCell<Vec<Rc<ProgrammableRenderPipelineDesc>>>,
+}
+
+struct BufferSlot {
+    descriptor: Option<BufferDesc>,
+    generation: u64,
+    next_free: Option<usize>,
 }
 
 impl ResourceTable {
@@ -426,8 +636,13 @@ impl ResourceTable {
             id: NEXT_RESOURCE_TABLE_ID.fetch_add(1, Ordering::Relaxed),
             textures: RefCell::new(Vec::new()),
             buffers: RefCell::new(Vec::new()),
+            free_buffer: Cell::new(None),
             samplers: RefCell::new(Vec::new()),
             pipelines: RefCell::new(Vec::new()),
+            shader_modules: RefCell::new(Vec::new()),
+            bind_groups: RefCell::new(Vec::new()),
+            compute_pipelines: RefCell::new(Vec::new()),
+            programmable_pipelines: RefCell::new(Vec::new()),
         }
     }
 
@@ -452,8 +667,49 @@ impl ResourceTable {
     /// # Returns
     /// A buffer reference, or a bounded-allocation error.
     pub fn define_buffer(&self, desc: BufferDesc) -> Result<BufferRef<'_>> {
-        let index = Self::push(&self.buffers, desc, MAX_BUFFERS)?;
-        Ok(BufferRef { owner: self, index })
+        let mut buffers = self.buffers.borrow_mut();
+        if let Some(index) = self.free_buffer.get() {
+            let slot = &mut buffers[index];
+            self.free_buffer.set(slot.next_free.take());
+            slot.descriptor = Some(desc);
+            return Ok(BufferRef {
+                owner: self,
+                index,
+                generation: slot.generation,
+            });
+        }
+        if buffers.len() >= MAX_BUFFERS {
+            return Err(Error::ResourceLimitExceeded);
+        }
+        buffers.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        let index = buffers.len();
+        buffers.push(BufferSlot {
+            descriptor: Some(desc),
+            generation: 0,
+            next_free: None,
+        });
+        Ok(BufferRef {
+            owner: self,
+            index,
+            generation: 0,
+        })
+    }
+
+    /// Retire a buffer identity so its bounded slot can be reused safely.
+    /// References from an earlier generation no longer resolve.
+    pub fn release_buffer(&self, id: BufferId) -> Result<()> {
+        self.buffer_ref(id)?;
+        let mut buffers = self.buffers.borrow_mut();
+        let slot = &mut buffers[id.index];
+        let next_generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or(Error::ResourceLimitExceeded)?;
+        slot.descriptor = None;
+        slot.generation = next_generation;
+        slot.next_free = self.free_buffer.get();
+        self.free_buffer.set(Some(id.index));
+        Ok(())
     }
     /// Define a sampler descriptor and return its table-branded reference.
     ///
@@ -512,10 +768,20 @@ impl ResourceTable {
     /// A reference branded with this borrow of the owning table, or
     /// [`Error::ResourceTableMismatch`] when `id` belongs to another table.
     pub fn buffer_ref(&self, id: BufferId) -> Result<BufferRef<'_>> {
-        self.validate_id(id.owner, id.index, &self.buffers)?;
+        if id.owner != self.id {
+            return Err(Error::ResourceTableMismatch);
+        }
+        let buffers = self.buffers.borrow();
+        if buffers
+            .get(id.index)
+            .is_none_or(|slot| slot.generation != id.generation || slot.descriptor.is_none())
+        {
+            return Err(Error::InvalidDescriptor);
+        }
         Ok(BufferRef {
             owner: self,
             index: id.index,
+            generation: id.generation,
         })
     }
 
@@ -553,6 +819,139 @@ impl ResourceTable {
             owner: self,
             index: id.index,
         })
+    }
+
+    /// Define an immutable shader module and return its branded reference.
+    pub fn define_shader_module(&self, desc: ShaderModuleDesc) -> Result<ShaderModuleRef<'_>> {
+        let index = Self::push(&self.shader_modules, desc, 256)?;
+        Ok(ShaderModuleRef { owner: self, index })
+    }
+    /// Resolve a persistent shader module identity in its owning table.
+    pub fn shader_module_ref(&self, id: ShaderModuleId) -> Result<ShaderModuleRef<'_>> {
+        self.validate_id(id.owner, id.index, &self.shader_modules)?;
+        Ok(ShaderModuleRef {
+            owner: self,
+            index: id.index,
+        })
+    }
+    /// Return an owned copy of a validated shader module descriptor.
+    pub fn shader_module(&self, reference: ShaderModuleRef<'_>) -> Result<ShaderModuleDesc> {
+        if !core::ptr::eq(reference.owner, self) {
+            return Err(Error::ResourceTableMismatch);
+        }
+        self.shader_modules
+            .borrow()
+            .get(reference.index)
+            .cloned()
+            .ok_or(Error::InvalidDescriptor)
+    }
+    /// Define an immutable bind group and return its branded reference.
+    pub fn define_bind_group(&self, desc: BindGroupDesc) -> Result<BindGroupRef<'_>> {
+        desc.validate(self)?;
+        let index = Self::push(&self.bind_groups, Rc::new(desc), MAX_BIND_GROUP_DEFINITIONS)?;
+        Ok(BindGroupRef { owner: self, index })
+    }
+    /// Resolve a persistent bind group identity in its owning table.
+    pub fn bind_group_ref(&self, id: BindGroupId) -> Result<BindGroupRef<'_>> {
+        self.validate_id(id.owner, id.index, &self.bind_groups)?;
+        Ok(BindGroupRef {
+            owner: self,
+            index: id.index,
+        })
+    }
+    /// Return an owned copy of a validated bind group descriptor.
+    pub fn bind_group(&self, reference: BindGroupRef<'_>) -> Result<BindGroupDesc> {
+        self.bind_group_shared(reference)
+            .map(|desc| (*desc).clone())
+    }
+    /// Return shared immutable binding metadata without copying its entries.
+    /// The table qualification is checked on every call. The returned value
+    /// remains valid while further definitions grow the table.
+    pub fn bind_group_shared(&self, reference: BindGroupRef<'_>) -> Result<Rc<BindGroupDesc>> {
+        if !core::ptr::eq(reference.owner, self) {
+            return Err(Error::ResourceTableMismatch);
+        }
+        self.bind_groups
+            .borrow()
+            .get(reference.index)
+            .cloned()
+            .ok_or(Error::InvalidDescriptor)
+    }
+    /// Define an immutable compute pipeline and return its branded reference.
+    pub fn define_compute_pipeline(
+        &self,
+        desc: ComputePipelineDesc,
+    ) -> Result<ComputePipelineRef<'_>> {
+        self.shader_module_ref(desc.shader().module())?;
+        let index = Self::push(&self.compute_pipelines, desc, 256)?;
+        Ok(ComputePipelineRef { owner: self, index })
+    }
+    /// Resolve a persistent compute pipeline identity in its owning table.
+    pub fn compute_pipeline_ref(&self, id: ComputePipelineId) -> Result<ComputePipelineRef<'_>> {
+        self.validate_id(id.owner, id.index, &self.compute_pipelines)?;
+        Ok(ComputePipelineRef {
+            owner: self,
+            index: id.index,
+        })
+    }
+    /// Return an owned copy of a validated compute pipeline descriptor.
+    pub fn compute_pipeline(
+        &self,
+        reference: ComputePipelineRef<'_>,
+    ) -> Result<ComputePipelineDesc> {
+        if !core::ptr::eq(reference.owner, self) {
+            return Err(Error::ResourceTableMismatch);
+        }
+        self.compute_pipelines
+            .borrow()
+            .get(reference.index)
+            .cloned()
+            .ok_or(Error::InvalidDescriptor)
+    }
+    /// Define an immutable programmable render pipeline and return its branded reference.
+    pub fn define_programmable_render_pipeline(
+        &self,
+        desc: ProgrammableRenderPipelineDesc,
+    ) -> Result<ProgrammableRenderPipelineRef<'_>> {
+        self.shader_module_ref(desc.vertex().module())?;
+        self.shader_module_ref(desc.fragment().module())?;
+        let index = Self::push(&self.programmable_pipelines, Rc::new(desc), 256)?;
+        Ok(ProgrammableRenderPipelineRef { owner: self, index })
+    }
+    /// Resolve a persistent programmable render pipeline identity in its owning table.
+    pub fn programmable_render_pipeline_ref(
+        &self,
+        id: ProgrammableRenderPipelineId,
+    ) -> Result<ProgrammableRenderPipelineRef<'_>> {
+        self.validate_id(id.owner, id.index, &self.programmable_pipelines)?;
+        Ok(ProgrammableRenderPipelineRef {
+            owner: self,
+            index: id.index,
+        })
+    }
+    /// Return an owned copy of a validated programmable render pipeline descriptor.
+    pub fn programmable_render_pipeline(
+        &self,
+        reference: ProgrammableRenderPipelineRef<'_>,
+    ) -> Result<ProgrammableRenderPipelineDesc> {
+        self.programmable_render_pipeline_shared(reference)
+            .map(|desc| (*desc).clone())
+    }
+    /// Return shared immutable pipeline metadata without copying its layout
+    /// or vertex attributes. Ownership validation is identical to the copying
+    /// getter and no table borrow is retained while the descriptor is used.
+    pub fn programmable_render_pipeline_shared(
+        &self,
+        reference: ProgrammableRenderPipelineRef<'_>,
+    ) -> Result<Rc<ProgrammableRenderPipelineDesc>> {
+        if !core::ptr::eq(reference.owner, self) {
+            return Err(Error::ResourceTableMismatch);
+        }
+        self.programmable_pipelines
+            .borrow()
+            .get(reference.index)
+            .cloned()
+            .ok_or(Error::InvalidDescriptor)
     }
 
     fn push<T>(items: &RefCell<Vec<T>>, value: T, maximum: usize) -> Result<usize> {
@@ -612,7 +1011,8 @@ impl ResourceTable {
         self.buffers
             .borrow()
             .get(reference.index)
-            .copied()
+            .filter(|slot| slot.generation == reference.generation)
+            .and_then(|slot| slot.descriptor)
             .ok_or(Error::InvalidDescriptor)
     }
     /// Return the validated descriptor for a sampler reference.
@@ -688,6 +1088,7 @@ pub struct TextureRef<'r> {
 pub struct BufferRef<'r> {
     pub(crate) owner: &'r ResourceTable,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 /// Reference to a sampler retained by one [`ResourceTable`].
 #[derive(Clone, Copy)]
@@ -714,6 +1115,7 @@ pub struct TextureId {
 pub struct BufferId {
     owner: usize,
     index: usize,
+    generation: u64,
 }
 
 /// Persistent table-qualified identity of a logical sampler.
@@ -787,6 +1189,7 @@ impl BufferRef<'_> {
         BufferId {
             owner: self.owner.id,
             index: self.index,
+            generation: self.generation,
         }
     }
 }
@@ -862,3 +1265,233 @@ impl_resource_ref_traits!(TextureRef);
 impl_resource_ref_traits!(BufferRef);
 impl_resource_ref_traits!(SamplerRef);
 impl_resource_ref_traits!(RenderPipelineRef);
+
+/// Borrowed reference to an immutable shader module.
+#[derive(Clone, Copy)]
+pub struct ShaderModuleRef<'r> {
+    pub(crate) owner: &'r ResourceTable,
+    pub(crate) index: usize,
+}
+/// Persistent table-qualified shader module identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShaderModuleId {
+    owner: usize,
+    index: usize,
+}
+impl ShaderModuleRef<'_> {
+    /// Return the stable table-local backend slot.
+    pub const fn slot(self) -> usize {
+        self.index
+    }
+    /// Return a persistent identity for later resolution by the owning table.
+    pub const fn id(self) -> ShaderModuleId {
+        ShaderModuleId {
+            owner: self.owner.id,
+            index: self.index,
+        }
+    }
+}
+impl_resource_ref_traits!(ShaderModuleRef);
+
+/// Borrowed reference to an immutable bind group.
+#[derive(Clone, Copy)]
+pub struct BindGroupRef<'r> {
+    pub(crate) owner: &'r ResourceTable,
+    pub(crate) index: usize,
+}
+/// Persistent table-qualified bind group identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindGroupId {
+    owner: usize,
+    index: usize,
+}
+impl BindGroupRef<'_> {
+    /// Return the stable table-local backend slot.
+    pub const fn slot(self) -> usize {
+        self.index
+    }
+    /// Return a persistent identity for later resolution by the owning table.
+    pub const fn id(self) -> BindGroupId {
+        BindGroupId {
+            owner: self.owner.id,
+            index: self.index,
+        }
+    }
+}
+impl_resource_ref_traits!(BindGroupRef);
+
+/// Borrowed reference to an immutable compute pipeline.
+#[derive(Clone, Copy)]
+pub struct ComputePipelineRef<'r> {
+    pub(crate) owner: &'r ResourceTable,
+    pub(crate) index: usize,
+}
+/// Persistent table-qualified compute pipeline identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ComputePipelineId {
+    owner: usize,
+    index: usize,
+}
+impl ComputePipelineRef<'_> {
+    /// Return the stable table-local backend slot.
+    pub const fn slot(self) -> usize {
+        self.index
+    }
+    /// Return a persistent identity for later resolution by the owning table.
+    pub const fn id(self) -> ComputePipelineId {
+        ComputePipelineId {
+            owner: self.owner.id,
+            index: self.index,
+        }
+    }
+}
+impl_resource_ref_traits!(ComputePipelineRef);
+
+/// Borrowed reference to an immutable programmable render pipeline.
+#[derive(Clone, Copy)]
+pub struct ProgrammableRenderPipelineRef<'r> {
+    pub(crate) owner: &'r ResourceTable,
+    pub(crate) index: usize,
+}
+/// Persistent table-qualified programmable render pipeline identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProgrammableRenderPipelineId {
+    owner: usize,
+    index: usize,
+}
+impl ProgrammableRenderPipelineRef<'_> {
+    /// Return the stable table-local backend slot.
+    pub const fn slot(self) -> usize {
+        self.index
+    }
+    /// Return a persistent identity for later resolution by the owning table.
+    pub const fn id(self) -> ProgrammableRenderPipelineId {
+        ProgrammableRenderPipelineId {
+            owner: self.owner.id,
+            index: self.index,
+        }
+    }
+}
+impl_resource_ref_traits!(ProgrammableRenderPipelineRef);
+
+#[cfg(test)]
+mod shared_metadata_tests {
+    use super::*;
+    use crate::ir::*;
+    use alloc::vec;
+
+    #[test]
+    fn shared_bindings_retain_identity_across_table_growth_and_validate_owners() {
+        let table = ResourceTable::new();
+        let foreign = ResourceTable::new();
+        let buffer = table
+            .define_buffer(BufferDesc::new(16, BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = BindGroupLayoutDesc::new(vec![BindGroupLayoutEntry::new(
+            0,
+            ShaderStages::VERTEX,
+            BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let desc = BindGroupDesc::new(
+            &table,
+            layout,
+            vec![BindGroupEntry::new(
+                0,
+                BindingResource::Buffer {
+                    buffer,
+                    offset: 0,
+                    size: 16,
+                },
+            )],
+        )
+        .unwrap();
+        let reference = table.define_bind_group(desc.clone()).unwrap();
+        let shared = table.bind_group_shared(reference).unwrap();
+        for _ in 0..32 {
+            table.define_bind_group(desc.clone()).unwrap();
+            assert!(Rc::ptr_eq(
+                &shared,
+                &table.bind_group_shared(reference).unwrap()
+            ));
+        }
+        let copied = table.bind_group(reference).unwrap();
+        assert_eq!(*shared, copied);
+        assert_ne!(shared.entries().as_ptr(), copied.entries().as_ptr());
+        assert_eq!(
+            foreign.bind_group_shared(reference).unwrap_err(),
+            Error::ResourceTableMismatch
+        );
+        assert_eq!(
+            foreign.bind_group(reference).unwrap_err(),
+            Error::ResourceTableMismatch
+        );
+    }
+
+    #[test]
+    fn shared_pipelines_preserve_copying_getter_and_survive_new_definitions() {
+        let table = ResourceTable::new();
+        let foreign = ResourceTable::new();
+        let shader = table
+            .define_shader_module(
+                ShaderModuleDesc::wgsl(
+                    "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }
+                     @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"
+                        .into(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let desc = ProgrammableRenderPipelineDesc::new(
+            ShaderEntryPoint::new(shader, ShaderStage::Vertex, "vs".into()).unwrap(),
+            ShaderEntryPoint::new(shader, ShaderStage::Fragment, "fs".into()).unwrap(),
+            PipelineLayoutDesc::new(vec![]).unwrap(),
+            TextureFormat::Rgba8Unorm,
+            Some(
+                VertexBufferLayout::new(
+                    8,
+                    vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+                )
+                .unwrap(),
+            ),
+            PrimitiveTopology::TriangleList,
+            BlendState::REPLACE,
+            RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        )
+        .unwrap();
+        let reference = table
+            .define_programmable_render_pipeline(desc.clone())
+            .unwrap();
+        let shared = table
+            .programmable_render_pipeline_shared(reference)
+            .unwrap();
+        for _ in 0..32 {
+            table
+                .define_programmable_render_pipeline(desc.clone())
+                .unwrap();
+            assert!(Rc::ptr_eq(
+                &shared,
+                &table
+                    .programmable_render_pipeline_shared(reference)
+                    .unwrap()
+            ));
+        }
+        let copied = table.programmable_render_pipeline(reference).unwrap();
+        assert_eq!(*shared, copied);
+        assert_ne!(
+            shared.vertex_buffer().unwrap().attributes().as_ptr(),
+            copied.vertex_buffer().unwrap().attributes().as_ptr()
+        );
+        assert_eq!(
+            foreign
+                .programmable_render_pipeline_shared(reference)
+                .unwrap_err(),
+            Error::ResourceTableMismatch
+        );
+        assert_eq!(
+            foreign.programmable_render_pipeline(reference).unwrap_err(),
+            Error::ResourceTableMismatch
+        );
+    }
+}

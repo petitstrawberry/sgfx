@@ -60,6 +60,9 @@ jobs:
           cargo test --locked -p sgfx-codegen-virgl
           cargo test --locked -p sgfx-backend-wgpu
           cargo test --locked -p sgfx
+          cargo test --locked -p vulkan-sgfx
+      - name: Build the experimental Vulkan ICD and examples
+        run: cargo build --locked -p vulkan-sgfx --examples
       - name: Test native dispatch policy without GPU syscalls
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
@@ -68,7 +71,9 @@ jobs:
           rustc --edition=2024 --test crates/sgfx-backend-scarlet-virgl/src/packets.rs -o "$CARGO_TARGET_DIR/native-packet-tests"
           "$CARGO_TARGET_DIR/native-packet-tests"
       - name: Lint portable crates
-        run: cargo-clippy clippy --locked -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx --all-targets --no-deps -- -D warnings
+        run: |
+          cargo-clippy clippy --locked --manifest-path crates/sgfx-core/Cargo.toml --all-targets --no-deps -- -D warnings
+          cargo-clippy clippy --locked -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx -p vulkan-sgfx --all-targets --no-deps -- -D warnings
       - name: Test and lint facade feature boundaries
         run: |
           cargo test --locked -p sgfx --no-default-features
@@ -79,7 +84,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --locked --no-deps -p sgfx-core -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx
+          cargo doc --locked --no-deps --manifest-path crates/sgfx-core/Cargo.toml
+          cargo doc --locked --no-deps -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx -p vulkan-sgfx
           cargo doc --locked --no-deps -p sgfx --no-default-features
 
   scarlet:
@@ -99,17 +105,21 @@ jobs:
             accept-flake-config = true
             extra-substituters = https://scarlet-rust-toolchain.cachix.org
             extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
+      - name: Install the pinned Scarlet Rust toolchain
+        run: |
+          scarlet_toolchain_path="$(nix build "${SCARLET_TOOLCHAIN}^out" --no-link --print-out-paths)"
+          echo "$scarlet_toolchain_path/bin" >> "$GITHUB_PATH"
       - name: Check SGFX core source identity
-        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo tree --locked -p sgfx --target '${{ matrix.target }}' --invert sgfx-core
+        run: cargo tree --locked -p sgfx --target '${{ matrix.target }}' --invert sgfx-core
       - name: Check std-enabled Scarlet target
-        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo check --locked -p sgfx --target '${{ matrix.target }}'
+        run: cargo check --locked -p sgfx --target '${{ matrix.target }}'
       - name: Lint std-enabled Scarlet target
-        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-deps -- -D warnings
+        run: cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-deps -- -D warnings
       - name: Check backend-neutral facade without a runtime
         run: |
-          nix shell "$SCARLET_TOOLCHAIN" --command cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features
-          nix shell "$SCARLET_TOOLCHAIN" --command cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --no-deps -- -D warnings
+          cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features
+          cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --no-deps -- -D warnings
       - name: Check native public API documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: nix shell "$SCARLET_TOOLCHAIN" --command cargo doc --locked --no-deps -p sgfx -p sgfx-backend-scarlet-virgl --target '${{ matrix.target }}'
+        run: cargo doc --locked --no-deps -p sgfx -p sgfx-backend-scarlet-virgl --target '${{ matrix.target }}'

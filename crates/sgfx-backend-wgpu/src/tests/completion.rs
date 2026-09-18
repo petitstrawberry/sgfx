@@ -122,25 +122,31 @@ fn tracked_rejection_preserves_a_receipt_for_possible_staged_work() {
     .expect("descriptor");
     let source = table.define_texture(desc).expect("source");
     let target = table.define_texture(desc).expect("target");
+    let unaligned = table
+        .define_buffer(
+            sgfx_core::ir::BufferDesc::new(8, sgfx_core::ir::BufferUsage::COPY_DST)
+                .expect("buffer descriptor"),
+        )
+        .expect("buffer for rejected upload");
     let area = PixelRect::new(0, 0, 1, 1).expect("area");
     let mut encoder = CommandEncoder::new(&table);
     encoder
         .copy_texture_to_texture(source, area, target, area)
         .expect("copy");
     encoder
-        .write_texture(
-            source,
-            TextureWrite::new(area, 4, &[0, 0, 255, 255]).expect("write"),
-        )
-        .expect("ordered late upload is valid IR");
+        .write_buffer(unaligned, 1, &[1, 2, 3, 4])
+        .expect("byte-granular buffer upload is valid IR");
     let failed = queue
         .executor(&mut cache)
         .submit(&encoder.finish().expect("finish"))
-        .expect_err("unsupported late upload");
+        .expect_err("unsupported unaligned buffer upload");
     let SubmitError::Failed { error, completion } = failed else {
         panic!("failure lost its conservative queue checkpoint");
     };
-    assert_eq!(error, Error::Unsupported(UnsupportedFeature::LateUpload));
+    assert_eq!(
+        error,
+        Error::Unsupported(UnsupportedFeature::BufferWriteAlignment)
+    );
     assert_eq!(
         completion.wait(Some(Duration::from_secs(10))),
         Ok(CompletionStatus::Complete)
@@ -231,4 +237,50 @@ fn device_loss_is_not_reported_as_successful_completion() {
         queue.executor(&mut cache).submit(&commands),
         Err(SubmitError::Rejected(Error::DeviceLost))
     ));
+}
+
+#[test]
+fn destroyed_device_rejects_untracked_buffer_and_texture_uploads() {
+    use sgfx_core::ir::{BufferDesc, BufferUsage};
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let table = Rc::new(ResourceTable::new());
+    let buffer = table
+        .define_buffer(BufferDesc::new(4, BufferUsage::COPY_DST).unwrap())
+        .unwrap();
+    let texture = table
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::Rgba8Unorm,
+                Extent2D::new(1, 1).unwrap(),
+                TextureUsage::COPY_DST,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut cache = context.create_resources(Rc::clone(&table));
+    device.raw_device().destroy();
+    for buffer_upload in [true, false] {
+        let mut encoder = CommandEncoder::new(&table);
+        if buffer_upload {
+            encoder.write_buffer(buffer, 0, &[1, 2, 3, 4]).unwrap();
+        } else {
+            encoder
+                .write_texture(
+                    texture,
+                    TextureWrite::new(PixelRect::new(0, 0, 1, 1).unwrap(), 4, &[1, 2, 3, 4])
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            context
+                .create_queue()
+                .submit(&mut cache, &encoder.finish().unwrap()),
+            Err(Error::DeviceLost)
+        );
+    }
 }

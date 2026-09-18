@@ -74,6 +74,47 @@ pub(super) fn readback_pixels(device: &Device, image: &Image) -> Vec<[u8; 4]> {
 }
 
 #[test]
+fn blits_r8_mips_on_the_gpu() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let table = Rc::new(ResourceTable::new());
+    let texture = table
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::R8Unorm,
+                Extent2D::new(4, 4).unwrap(),
+                TextureUsage::SAMPLED | TextureUsage::COPY_SRC | TextureUsage::COPY_DST,
+            )
+            .unwrap()
+            .with_mip_level_count(2)
+            .unwrap(),
+        )
+        .unwrap();
+    let pixels = [173_u8; 16];
+    let mut encoder = CommandEncoder::new(table.as_ref());
+    encoder
+        .write_texture(
+            texture,
+            TextureWrite::new(PixelRect::new(0, 0, 4, 4).unwrap(), 4, &pixels).unwrap(),
+        )
+        .unwrap();
+    encoder
+        .blit_texture(texture, 0, texture, 1, FilterMode::Nearest)
+        .unwrap();
+    let commands = encoder.finish().unwrap();
+    let mut cache = context.create_resources(Rc::clone(&table));
+    context
+        .create_queue()
+        .executor(&mut cache)
+        .execute(&commands)
+        .unwrap();
+    assert_eq!(cache.read_texture_mip(texture.id(), 1).unwrap(), [173; 4]);
+}
+
+#[test]
 fn uploads_outlive_caller_storage_and_keep_submission_order() {
     let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
     let Some(device) = headless_device() else {
@@ -176,7 +217,7 @@ fn executor_rejects_a_different_resource_table_even_when_empty() {
 }
 
 #[test]
-fn executor_rejects_late_upload_instead_of_silently_reordering_it() {
+fn executor_keeps_interleaved_uploads_and_copies_in_command_order() {
     let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
     let Some(device) = headless_device() else {
         return;
@@ -190,27 +231,43 @@ fn executor_rejects_late_upload_instead_of_silently_reordering_it() {
     )
     .expect("descriptor");
     let source = table.define_texture(descriptor).expect("source");
-    let target = table.define_texture(descriptor).expect("target");
+    let first_target = table.define_texture(descriptor).expect("first target");
+    let second_target = table.define_texture(descriptor).expect("second target");
     let area = PixelRect::new(0, 0, 1, 1).expect("area");
+    let first_color = [19, 43, 131, 255];
+    let second_color = [207, 71, 23, 255];
     let mut encoder = CommandEncoder::new(table.as_ref());
-    encoder
-        .copy_texture_to_texture(source, area, target, area)
-        .expect("copy");
     encoder
         .write_texture(
             source,
-            TextureWrite::new(area, 4, &[0, 0, 255, 255]).expect("upload"),
+            TextureWrite::new(area, 4, &first_color).expect("first upload"),
         )
-        .expect("core accepts an ordered late upload");
+        .expect("record first upload");
+    encoder
+        .copy_texture_to_texture(source, area, first_target, area)
+        .expect("copy first color");
+    encoder
+        .write_texture(
+            source,
+            TextureWrite::new(area, 4, &second_color).expect("second upload"),
+        )
+        .expect("record upload after copy");
+    encoder
+        .copy_texture_to_texture(source, area, second_target, area)
+        .expect("copy second color");
     let commands = encoder.finish().expect("finish stream");
     let mut cache = context.create_resources(Rc::clone(&table));
-    assert!(matches!(
-        context
-            .create_queue()
-            .executor(&mut cache)
-            .execute(&commands),
-        Err(Error::Unsupported(UnsupportedFeature::LateUpload))
-    ));
+    context
+        .create_queue()
+        .executor(&mut cache)
+        .execute(&commands)
+        .expect("execute interleaved uploads and copies");
+    assert_eq!(cache.read_texture(first_target.id()).unwrap(), first_color);
+    assert_eq!(
+        cache.read_texture(second_target.id()).unwrap(),
+        second_color
+    );
+    assert_eq!(cache.read_texture(source.id()).unwrap(), second_color);
 }
 
 #[test]

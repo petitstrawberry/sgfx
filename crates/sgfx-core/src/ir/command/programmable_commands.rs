@@ -1,0 +1,718 @@
+//! Programmable pass validation and shader-write dependencies.
+use super::*;
+use crate::ir::{
+    programmable::{binding_writes, resource_alias},
+    *,
+};
+use alloc::rc::Rc;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingWrite {
+    Buffer(BufferId),
+    Texture(TextureId),
+    TextureMip(TextureId, u32),
+}
+impl PendingWrite {
+    fn aliases(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Buffer(a), Self::Buffer(b)) => a == b,
+            (
+                Self::Texture(a) | Self::TextureMip(a, _),
+                Self::Texture(b) | Self::TextureMip(b, _),
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub(super) enum AnnouncedAccess {
+    Buffer(BufferId, BufferAccess),
+    Texture(TextureId, u32, TextureAccess),
+}
+impl AnnouncedAccess {
+    fn resource(self) -> PendingWrite {
+        match self {
+            Self::Buffer(id, _) => PendingWrite::Buffer(id),
+            Self::Texture(id, _, _) => PendingWrite::Texture(id),
+        }
+    }
+}
+struct GroupAccesses {
+    writes: Vec<PendingWrite>,
+    used: Vec<PendingWrite>,
+}
+impl<'r, 'data> CommandEncoder<'r, 'data> {
+    /// Copy a non-zero, four-byte-aligned range outside passes.
+    pub fn copy_buffer_to_buffer(
+        &mut self,
+        source: BufferRef<'r>,
+        source_offset: u64,
+        destination: BufferRef<'r>,
+        destination_offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        self.ensure_outside_pass()?;
+        let src = self.resources.buffer(source)?;
+        let dst = self.resources.buffer(destination)?;
+        Self::require_buffer_usage(src.usage(), BufferUsage::COPY_SRC)?;
+        Self::require_buffer_usage(dst.usage(), BufferUsage::COPY_DST)?;
+        if size == 0
+            || !source_offset.is_multiple_of(4)
+            || !destination_offset.is_multiple_of(4)
+            || !size.is_multiple_of(4)
+        {
+            return Err(Error::InvalidValue);
+        }
+        Self::validate_byte_range(source_offset, size, src.size())?;
+        Self::validate_byte_range(destination_offset, size, dst.size())?;
+        // Whole-resource copy aliasing is not portable across WebGPU implementations.
+        if source == destination {
+            return Err(Error::ResourceAccessConflict);
+        }
+        self.check_buffer_access(source, BufferAccess::CopySource)?;
+        self.check_buffer_access(destination, BufferAccess::CopyDestination)?;
+        self.push(Command::CopyBufferToBuffer {
+            source,
+            source_offset,
+            destination,
+            destination_offset,
+            size,
+        })
+    }
+    /// Record a whole-resource execution and memory dependency outside passes.
+    ///
+    /// Storage writes must be followed by this command before another access.
+    /// Access flags are checked against resource usage. Backends validate and
+    /// implement the dependency; WGPU's ordered passes implement it implicitly.
+    pub fn resource_barrier(&mut self, barrier: ResourceBarrier<'r>) -> Result<()> {
+        self.ensure_outside_pass()?;
+        let mut announced = Vec::new();
+        match barrier {
+            ResourceBarrier::Buffer {
+                buffer,
+                before,
+                after,
+            } => {
+                let desc = self.resources.buffer(buffer)?;
+                Self::require_buffer_usage(desc.usage(), before.usage())?;
+                Self::require_buffer_usage(desc.usage(), after.usage())?;
+                let key = PendingWrite::Buffer(buffer.id());
+                if self.pending_writes.contains(&key) && before != BufferAccess::StorageReadWrite {
+                    return Err(Error::InvalidResourceAccess);
+                }
+                if self.announced_accesses.iter().any(|entry| matches!(entry, AnnouncedAccess::Buffer(id, access) if *id == buffer.id() && *access != before)) {
+                    return Err(Error::InvalidResourceAccess);
+                }
+                announced.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                announced.push(AnnouncedAccess::Buffer(buffer.id(), after));
+            }
+            ResourceBarrier::Texture {
+                texture,
+                before,
+                after,
+            } => {
+                let count = self.resources.texture(texture)?.mip_level_count();
+                announced
+                    .try_reserve(count as usize)
+                    .map_err(|_| Error::OutOfMemory)?;
+                for mip in 0..count {
+                    self.validate_texture_transition(texture, mip, before, after)?;
+                    announced.push(AnnouncedAccess::Texture(texture.id(), mip, after));
+                }
+            }
+            ResourceBarrier::TextureMip {
+                texture,
+                mip_level,
+                before,
+                after,
+            } => {
+                self.validate_texture_transition(texture, mip_level, before, after)?;
+                announced.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                announced.push(AnnouncedAccess::Texture(texture.id(), mip_level, after));
+            }
+        }
+        self.announced_accesses
+            .try_reserve(announced.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        self.push(Command::ResourceBarrier(barrier))?;
+        for access in announced {
+            match access {
+                AnnouncedAccess::Buffer(id, _) => {
+                    let key = PendingWrite::Buffer(id);
+                    self.pending_writes.retain(|pending| *pending != key);
+                    self.consume_access(key);
+                }
+                AnnouncedAccess::Texture(id, mip, _) => {
+                    if mip == 0 {
+                        self.pending_writes
+                            .retain(|pending| *pending != PendingWrite::Texture(id));
+                    }
+                    self.pending_writes
+                        .retain(|pending| *pending != PendingWrite::TextureMip(id, mip));
+                    self.announced_accesses.retain(|entry| !matches!(entry,
+                        AnnouncedAccess::Texture(other, other_mip, _) if *other == id && *other_mip == mip));
+                }
+            }
+            self.announced_accesses.push(access);
+        }
+        Ok(())
+    }
+    fn validate_texture_transition(
+        &self,
+        texture: TextureRef<'_>,
+        mip: u32,
+        before: TextureAccess,
+        after: TextureAccess,
+    ) -> Result<()> {
+        let desc = self.resources.texture(texture)?;
+        desc.mip_extent(mip)?;
+        Self::require_texture_usage(desc.usage(), before.usage())?;
+        Self::require_texture_usage(desc.usage(), after.usage())?;
+        if (self
+            .pending_writes
+            .contains(&PendingWrite::TextureMip(texture.id(), mip))
+            || (mip == 0
+                && self
+                    .pending_writes
+                    .contains(&PendingWrite::Texture(texture.id()))))
+            && before != TextureAccess::StorageWrite
+        {
+            return Err(Error::InvalidResourceAccess);
+        }
+        if self.announced_accesses.iter().any(|entry| matches!(entry,
+            AnnouncedAccess::Texture(id, level, access) if *id == texture.id() && *level == mip && *access != before)) {
+            return Err(Error::InvalidResourceAccess);
+        }
+        Ok(())
+    }
+    /// Begin a compute pass. A dropped pass remains open and prevents finish.
+    pub fn begin_compute_pass<'encoder>(
+        &'encoder mut self,
+    ) -> Result<ComputePassEncoder<'encoder, 'r, 'data>> {
+        self.ensure_outside_pass()?;
+        self.reserve_pass_begin()?;
+        self.push(Command::BeginComputePass)?;
+        self.pass_open = true;
+        Ok(ComputePassEncoder {
+            encoder: self,
+            pipeline: None,
+            bind_groups: [None; MAX_BIND_GROUPS],
+        })
+    }
+    pub(super) fn check_buffer_access(
+        &self,
+        buffer: BufferRef<'_>,
+        access: BufferAccess,
+    ) -> Result<()> {
+        if self
+            .pending_writes
+            .contains(&PendingWrite::Buffer(buffer.id()))
+        {
+            return Err(Error::MissingBarrier);
+        }
+        if self.announced_accesses.iter().any(|entry| matches!(entry, AnnouncedAccess::Buffer(id, expected) if *id == buffer.id() && *expected != access)) { return Err(Error::InvalidResourceAccess); }
+        Ok(())
+    }
+    pub(super) fn check_texture_access(
+        &self,
+        texture: TextureRef<'_>,
+        access: TextureAccess,
+    ) -> Result<()> {
+        for mip in 0..self.resources.texture(texture)?.mip_level_count() {
+            self.check_texture_mip_access(texture, mip, access)?;
+        }
+        Ok(())
+    }
+    pub(super) fn check_texture_mip_access(
+        &self,
+        texture: TextureRef<'_>,
+        mip: u32,
+        access: TextureAccess,
+    ) -> Result<()> {
+        self.resources.texture(texture)?.mip_extent(mip)?;
+        if self
+            .pending_writes
+            .contains(&PendingWrite::TextureMip(texture.id(), mip))
+            || (mip == 0
+                && self
+                    .pending_writes
+                    .contains(&PendingWrite::Texture(texture.id())))
+        {
+            return Err(Error::MissingBarrier);
+        }
+        if self.announced_accesses.iter().any(|entry| matches!(entry,
+            AnnouncedAccess::Texture(id, level, expected) if *id == texture.id() && *level == mip && *expected != access)) {
+            return Err(Error::InvalidResourceAccess);
+        }
+        Ok(())
+    }
+    pub(super) fn consume_access(&mut self, resource: PendingWrite) {
+        self.announced_accesses
+            .retain(|entry| match resource {
+                PendingWrite::TextureMip(id, mip) => !matches!(entry, AnnouncedAccess::Texture(other, level, _) if *other == id && *level == mip),
+                _ => entry.resource() != resource,
+            });
+    }
+    fn validate_groups(
+        &self,
+        layout: &PipelineLayoutDesc,
+        groups: &[Option<BindGroupRef<'r>>; MAX_BIND_GROUPS],
+        attachments: &[TextureRef<'r>],
+        vertices: &[Option<(BufferRef<'r>, u64)>],
+        index: Option<BufferRef<'r>>,
+    ) -> Result<GroupAccesses> {
+        let mut uses = Vec::new();
+        for (slot, expected) in layout.bind_groups().iter().enumerate() {
+            if expected.entries().is_empty() && groups[slot].is_none() {
+                continue;
+            }
+            let group = self
+                .resources
+                .bind_group_shared(groups[slot].ok_or(Error::BindGroupNotSet)?)?;
+            if group.layout() != expected {
+                return Err(Error::BindingLayoutMismatch);
+            }
+            for (entry, entry_layout) in group.entries().iter().zip(expected.entries()) {
+                let resource = entry.resource();
+                let writes = binding_writes(entry_layout.ty());
+                match resource {
+                    BindingResource::Buffer { buffer, .. } => {
+                        let reference = self.resources.buffer_ref(buffer)?;
+                        let access = match entry_layout.ty() {
+                            BindingType::UniformBuffer => BufferAccess::Uniform,
+                            BindingType::StorageBuffer { read_only: true } => {
+                                BufferAccess::StorageRead
+                            }
+                            _ => BufferAccess::StorageReadWrite,
+                        };
+                        self.check_buffer_access(reference, access)?;
+                        if writes
+                            && (vertices
+                                .iter()
+                                .flatten()
+                                .any(|(buffer, _)| *buffer == reference)
+                                || index == Some(reference))
+                        {
+                            return Err(Error::ResourceAccessConflict);
+                        }
+                    }
+                    BindingResource::TextureView { texture, view } => {
+                        let reference = self.resources.texture_ref(texture)?;
+                        for mip in
+                            view.base_mip_level()..view.base_mip_level() + view.mip_level_count()
+                        {
+                            self.check_texture_mip_access(
+                                reference,
+                                mip,
+                                if writes {
+                                    TextureAccess::StorageWrite
+                                } else {
+                                    TextureAccess::Sampled
+                                },
+                            )?;
+                        }
+                        if attachments.contains(&reference) {
+                            return Err(Error::AttachmentFeedback);
+                        }
+                    }
+                    BindingResource::Texture(texture) => {
+                        let reference = self.resources.texture_ref(texture)?;
+                        self.check_texture_access(
+                            reference,
+                            if writes {
+                                TextureAccess::StorageWrite
+                            } else {
+                                TextureAccess::Sampled
+                            },
+                        )?;
+                        if attachments.contains(&reference) {
+                            return Err(Error::AttachmentFeedback);
+                        }
+                    }
+                    BindingResource::Sampler(_) => {}
+                }
+                if uses.iter().any(|(other, other_writes)| {
+                    resource_alias(resource, *other) && (writes || *other_writes)
+                }) {
+                    return Err(Error::ResourceAccessConflict);
+                }
+                uses.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                uses.push((resource, writes));
+            }
+        }
+        let mut pending = Vec::new();
+        let mut used = Vec::new();
+        pending
+            .try_reserve(uses.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        used.try_reserve(uses.len() + vertices.len() + 1)
+            .map_err(|_| Error::OutOfMemory)?;
+        for (resource, writes) in uses {
+            let key = match resource {
+                BindingResource::Buffer { buffer, .. } => PendingWrite::Buffer(buffer),
+                BindingResource::TextureView { texture, view } => {
+                    for mip in view.base_mip_level()..view.base_mip_level() + view.mip_level_count()
+                    {
+                        let key = PendingWrite::TextureMip(texture, mip);
+                        used.push(key);
+                        if writes {
+                            pending.push(key);
+                        }
+                    }
+                    continue;
+                }
+                BindingResource::Texture(texture) => PendingWrite::Texture(texture),
+                BindingResource::Sampler(_) => continue,
+            };
+            used.push(key);
+            if writes {
+                pending.push(key);
+            }
+        }
+        for (vertex, _) in vertices.iter().flatten() {
+            used.push(PendingWrite::Buffer(vertex.id()));
+        }
+        if let Some(index) = index {
+            used.push(PendingWrite::Buffer(index.id()));
+        }
+        Ok(GroupAccesses {
+            writes: pending,
+            used,
+        })
+    }
+    fn record_with_writes(
+        &mut self,
+        command: Command<'r, 'data>,
+        accesses: &GroupAccesses,
+    ) -> Result<()> {
+        self.pending_writes
+            .try_reserve(accesses.writes.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        self.push(command)?;
+        for resource in &accesses.used {
+            self.consume_access(*resource);
+        }
+        self.pending_writes.extend_from_slice(&accesses.writes);
+        Ok(())
+    }
+}
+
+/// Encoder for programmable dispatch commands in one active compute pass.
+pub struct ComputePassEncoder<'encoder, 'r, 'data> {
+    encoder: &'encoder mut CommandEncoder<'r, 'data>,
+    pipeline: Option<ComputePipelineRef<'r>>,
+    bind_groups: [Option<BindGroupRef<'r>>; MAX_BIND_GROUPS],
+}
+impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
+    /// Update push constants declared by the selected compute pipeline.
+    pub fn set_push_constants(
+        &mut self,
+        stages: ShaderStages,
+        offset: u32,
+        data: &'data [u8],
+    ) -> Result<()> {
+        let pipeline = self
+            .encoder
+            .resources
+            .compute_pipeline(self.pipeline.ok_or(Error::PipelineNotSet)?)?;
+        pipeline
+            .layout()
+            .validate_push_constants(stages, offset, data)?;
+        self.encoder.push(Command::SetPushConstants {
+            stages,
+            offset,
+            data,
+        })
+    }
+    /// Select a compute pipeline from this command buffer's resource table.
+    pub fn set_pipeline(&mut self, pipeline: ComputePipelineRef<'r>) -> Result<()> {
+        self.encoder.resources.compute_pipeline(pipeline)?;
+        self.encoder.push(Command::SetComputePipeline(pipeline))?;
+        self.pipeline = Some(pipeline);
+        Ok(())
+    }
+    /// Bind one descriptor set. Its pipeline compatibility is checked at dispatch.
+    pub fn set_bind_group(&mut self, index: u32, bind_group: BindGroupRef<'r>) -> Result<()> {
+        if index as usize >= MAX_BIND_GROUPS {
+            return Err(Error::OutOfBounds);
+        }
+        self.encoder.resources.bind_group_shared(bind_group)?;
+        self.encoder
+            .push(Command::SetBindGroup { index, bind_group })?;
+        self.bind_groups[index as usize] = Some(bind_group);
+        Ok(())
+    }
+    /// Dispatch a positive grid, with at most 65,535 workgroups per dimension.
+    pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<()> {
+        if [x, y, z].iter().any(|count| *count == 0 || *count > 65_535) {
+            return Err(Error::InvalidValue);
+        }
+        let pipeline = self
+            .encoder
+            .resources
+            .compute_pipeline(self.pipeline.ok_or(Error::PipelineNotSet)?)?;
+        let writes =
+            self.encoder
+                .validate_groups(pipeline.layout(), &self.bind_groups, &[], &[], None)?;
+        self.encoder
+            .record_with_writes(Command::Dispatch { x, y, z }, &writes)
+    }
+    /// End this compute pass, releasing the encoder for barriers or other passes.
+    pub fn end(self) -> Result<()> {
+        if self.encoder.commands.len() >= MAX_COMMANDS {
+            return Err(Error::CommandLimitExceeded);
+        }
+        self.encoder
+            .commands
+            .try_reserve(1)
+            .map_err(|_| Error::OutOfMemory)?;
+        self.encoder.commands.push(Command::EndComputePass);
+        self.encoder.pass_open = false;
+        Ok(())
+    }
+}
+impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
+    /// Update push constants declared by the selected programmable graphics pipeline.
+    pub fn set_push_constants(
+        &mut self,
+        stages: ShaderStages,
+        offset: u32,
+        data: &'data [u8],
+    ) -> Result<()> {
+        let pipeline = self.encoder.resources.programmable_render_pipeline_shared(
+            self.programmable_pipeline.ok_or(Error::PipelineNotSet)?,
+        )?;
+        pipeline
+            .layout()
+            .validate_push_constants(stages, offset, data)?;
+        self.encoder.push(Command::SetPushConstants {
+            stages,
+            offset,
+            data,
+        })
+    }
+    /// Select programmable graphics with compatible color and optional depth formats.
+    pub fn set_programmable_pipeline(
+        &mut self,
+        pipeline: ProgrammableRenderPipelineRef<'r>,
+    ) -> Result<()> {
+        let desc = self
+            .encoder
+            .resources
+            .programmable_render_pipeline_shared(pipeline)?;
+        if desc.color_targets().map(|target| target.format()).ne(self
+            .color_formats
+            .iter()
+            .flatten()
+            .copied())
+            || (self.depth_read_only
+                && desc
+                    .depth_state()
+                    .is_some_and(|depth| depth.write_enabled()))
+            || desc
+                .depth_state()
+                .is_some_and(|depth| Some(depth.format()) != self.depth_format)
+        {
+            return Err(Error::PipelineTargetMismatch);
+        }
+        self.encoder
+            .push(Command::SetProgrammablePipeline(pipeline))?;
+        self.programmable_pipeline = Some(pipeline);
+        self.pipeline = None;
+        Ok(())
+    }
+    /// Bind one programmable descriptor set; compatibility is checked at draw.
+    pub fn set_bind_group(&mut self, index: u32, bind_group: BindGroupRef<'r>) -> Result<()> {
+        if index as usize >= MAX_BIND_GROUPS {
+            return Err(Error::OutOfBounds);
+        }
+        self.encoder.resources.bind_group_shared(bind_group)?;
+        self.encoder
+            .push(Command::SetBindGroup { index, bind_group })?;
+        self.bind_groups[index as usize] = Some(bind_group);
+        Ok(())
+    }
+    fn programmable_writes(
+        &self,
+        desc: &ProgrammableRenderPipelineDesc,
+        indexed: bool,
+    ) -> Result<GroupAccesses> {
+        let mut attachments = [self.target; MAX_COLOR_ATTACHMENTS + 1];
+        let mut attachment_count = 0;
+        for target in self.color_targets.iter().flatten() {
+            attachments[attachment_count] = *target;
+            attachment_count += 1;
+        }
+        if let Some(depth) = self.depth_target.filter(|_| !self.depth_read_only) {
+            attachments[attachment_count] = depth;
+            attachment_count += 1;
+        }
+        self.encoder.validate_groups(
+            desc.layout(),
+            &self.bind_groups,
+            &attachments[..attachment_count],
+            &self.vertex_buffers[..desc.vertex_buffers().len()],
+            if indexed {
+                self.index_buffer.map(|(buffer, _, _)| buffer)
+            } else {
+                None
+            },
+        )
+    }
+    fn validate_cumulative_accesses(&mut self, accesses: &GroupAccesses) -> Result<()> {
+        if accesses.writes.iter().any(|resource| {
+            self.used_resources
+                .iter()
+                .any(|used| resource.aliases(*used))
+        }) {
+            return Err(Error::ResourceAccessConflict);
+        }
+        self.used_resources
+            .try_reserve(accesses.used.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        Ok(())
+    }
+    fn validate_programmable_count(
+        &self,
+        count: u32,
+    ) -> Result<Rc<ProgrammableRenderPipelineDesc>> {
+        let desc = self.encoder.resources.programmable_render_pipeline_shared(
+            self.programmable_pipeline.ok_or(Error::PipelineNotSet)?,
+        )?;
+        if !desc.topology().accepts_count(count) {
+            return Err(Error::InvalidValue);
+        }
+        Ok(desc)
+    }
+    /// Draw multiple instances with shader-generated instance data.
+    pub fn draw_instanced(
+        &mut self,
+        count: u32,
+        first: u32,
+        instances: u32,
+        first_instance: u32,
+    ) -> Result<()> {
+        self.draw_programmable(count, first, instances, first_instance)
+    }
+    /// Draw multiple indexed instances with shader-generated instance data.
+    pub fn draw_indexed_instanced(
+        &mut self,
+        count: u32,
+        first: u32,
+        base_vertex: i32,
+        instances: u32,
+        first_instance: u32,
+    ) -> Result<()> {
+        self.draw_indexed_programmable(count, first, base_vertex, instances, first_instance)
+    }
+    pub(super) fn draw_programmable(
+        &mut self,
+        count: u32,
+        first: u32,
+        instances: u32,
+        first_instance: u32,
+    ) -> Result<()> {
+        if instances == 0 {
+            return Err(Error::InvalidValue);
+        }
+        first_instance
+            .checked_add(instances)
+            .ok_or(Error::Overflow)?;
+        let desc = self.validate_programmable_count(count)?;
+        first.checked_add(count).ok_or(Error::Overflow)?;
+        for (slot, layout) in desc.vertex_buffers().iter().enumerate() {
+            let (buffer, offset) = self.vertex_buffers[slot].ok_or(Error::VertexBufferNotSet)?;
+            let buffer_desc = self.encoder.resources.buffer(buffer)?;
+            self.encoder
+                .check_buffer_access(buffer, BufferAccess::Vertex)?;
+            if !offset.is_multiple_of(4) {
+                return Err(Error::InvalidValue);
+            }
+            let bytes = (u64::from(first) + u64::from(count))
+                .checked_mul(u64::from(layout.stride()))
+                .ok_or(Error::Overflow)?;
+            CommandEncoder::validate_byte_range(offset, bytes, buffer_desc.size())?;
+        }
+        let writes = self.programmable_writes(&desc, false)?;
+        self.validate_cumulative_accesses(&writes)?;
+        self.encoder.record_with_writes(
+            if instances == 1 && first_instance == 0 {
+                Command::Draw {
+                    vertex_count: count,
+                    first_vertex: first,
+                }
+            } else {
+                Command::DrawInstanced {
+                    vertex_count: count,
+                    first_vertex: first,
+                    instance_count: instances,
+                    first_instance,
+                }
+            },
+            &writes,
+        )?;
+        self.used_resources.extend_from_slice(&writes.used);
+        Ok(())
+    }
+    pub(super) fn draw_indexed_programmable(
+        &mut self,
+        count: u32,
+        first: u32,
+        base_vertex: i32,
+        instances: u32,
+        first_instance: u32,
+    ) -> Result<()> {
+        if instances == 0 {
+            return Err(Error::InvalidValue);
+        }
+        first_instance
+            .checked_add(instances)
+            .ok_or(Error::Overflow)?;
+        let desc = self.validate_programmable_count(count)?;
+        first.checked_add(count).ok_or(Error::Overflow)?;
+        for (slot, layout) in desc.vertex_buffers().iter().enumerate() {
+            let (buffer, offset) = self.vertex_buffers[slot].ok_or(Error::VertexBufferNotSet)?;
+            let buffer_desc = self.encoder.resources.buffer(buffer)?;
+            self.encoder
+                .check_buffer_access(buffer, BufferAccess::Vertex)?;
+            if !offset.is_multiple_of(4) {
+                return Err(Error::InvalidValue);
+            }
+            CommandEncoder::validate_byte_range(
+                offset,
+                u64::from(layout.stride()),
+                buffer_desc.size(),
+            )?;
+        }
+        let (buffer, offset, format) = self.index_buffer.ok_or(Error::IndexBufferNotSet)?;
+        let buffer_desc = self.encoder.resources.buffer(buffer)?;
+        self.encoder
+            .check_buffer_access(buffer, BufferAccess::Index)?;
+        let bytes = (u64::from(first) + u64::from(count))
+            .checked_mul(format.byte_size())
+            .ok_or(Error::Overflow)?;
+        CommandEncoder::validate_byte_range(offset, bytes, buffer_desc.size())?;
+        let writes = self.programmable_writes(&desc, true)?;
+        self.validate_cumulative_accesses(&writes)?;
+        self.encoder.record_with_writes(
+            if instances == 1 && first_instance == 0 {
+                Command::DrawIndexed {
+                    index_count: count,
+                    first_index: first,
+                    base_vertex,
+                }
+            } else {
+                Command::DrawIndexedInstanced {
+                    index_count: count,
+                    first_index: first,
+                    base_vertex,
+                    instance_count: instances,
+                    first_instance,
+                }
+            },
+            &writes,
+        )?;
+        self.used_resources.extend_from_slice(&writes.used);
+        Ok(())
+    }
+}

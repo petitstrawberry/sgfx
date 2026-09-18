@@ -265,7 +265,8 @@ to prove which vertices they address; device-specific validation is backend work
 
 ## Recording rules and limits
 
-A stream is uploads/copies and non-nested render passes in recorded order.
+Fixed drawing streams contain uploads/copies and non-nested render passes in
+recorded order. The programmable extension below also adds compute passes.
 Each new pass starts without a pipeline, buffer or uniform binding; state does
 not carry from a previous pass. Before each draw, set the bindings required by
 its pipeline. Within a pass, accepted bindings persist until changed.
@@ -284,8 +285,9 @@ non-transactional [backend execution failures](reference.md#execution-and-comple
 | `MAX_BUFFERS` | 1,024 | Per resource table. |
 | `MAX_SAMPLERS` | 256 | Per resource table. |
 | `MAX_RENDER_PIPELINES` | 256 | Per resource table. |
+| `MAX_BIND_GROUP_DEFINITIONS` | 4,096 | Immutable bind-group definitions per resource table. |
 | `MAX_VERTEX_ATTRIBUTES` | 16 | Per vertex layout. |
-| `MAX_COMMANDS` | 4,096 | Per command buffer, including pass begin/end and bindings. |
+| `MAX_COMMANDS` | 65,536 | Per command buffer, including pass begin/end and bindings. |
 
 Beginning a pass reserves room for its end command. These are IR capacity
 bounds, not promises about GPU memory or device limits. Command buffers borrow
@@ -293,15 +295,17 @@ the table and upload slices; backend execution must consume/copy any upload
 data needed by pending work before returning.
 
 Backend support can be narrower than valid IR. For example, WGPU requires
-buffer upload offsets and lengths to be multiples of four and uploads to
-precede the first copy/pass. It also requires pass/pipeline depth-state presence
-to agree and rejects partial rectangular depth clears. Such restrictions must
-return errors, not silently change command meanings.
+buffer upload offsets and lengths to be multiples of four. Encoder-owned staging
+copies preserve upload order between copies and render/compute passes. Fixed
+render pipelines require pass/pipeline depth-state presence to agree, and WGPU
+rejects partial rectangular depth clears. Such restrictions must return errors,
+not silently change command meanings.
 
-The current IR has no arbitrary shader modules, compute dispatch, instancing,
-multiple color attachments, mip/array/3D textures, explicit barriers or
-cross-queue semaphore commands. Presentation and completion observation are
-outside the command enum.
+Shader modules, compute dispatch and explicit same-queue resource dependencies
+are part of the [programmable extension](#programmable-graphics-and-compute).
+Instancing, multiple color attachments, array/3D textures and cross-queue
+semaphore commands remain outside the implemented subset. Presentation and
+completion observation are outside the command enum.
 
 ## Example: upload and draw a triangle
 
@@ -378,3 +382,156 @@ keep the table, resource IDs and mapped session; create a new encoder without
 adding duplicate definitions. The [platform setup](reference.md#platform-setup)
 and [execution reference](reference.md#execution-and-completion) describe how
 to materialize the target, submit this stream and observe its completion.
+
+## Programmable graphics and compute
+
+The fixed `FragmentProgram` API remains available. Programmable pipelines use
+separate descriptor and reference types, so backends supporting only the fixed
+subset can reject programmable command streams before executing any command.
+The WGPU backend lowers the programmable subset. A native backend must advertise
+and implement a feature before accepting it; shader acceptance is not a promise
+that every SPIR-V capability or every device format is supported.
+
+`ShaderModuleDesc::spirv(Vec<u32>)` owns SPIR-V 1.0–1.6 words and validates the
+header, bounded instruction framing, and vertex/fragment/compute entry-point
+metadata. The cap is `MAX_SPIRV_WORDS` (1,048,576 words). This is structural
+validation: the execution backend must parse and semantically validate all shader
+instructions and capabilities before submission. `ShaderModuleDesc::wgsl(String)`
+owns nonempty, NUL-free WGSL up to `MAX_WGSL_BYTES` (4 MiB); full WGSL syntax,
+entry-point existence, and stage validation belong to the backend. Source getters
+return borrowed data, while resource-table descriptor lookups return owned clones.
+
+| Constructor or method | Meaning |
+| --- | --- |
+| `table.define_shader_module(desc)` | Define a module and obtain `ShaderModuleRef`. |
+| `ShaderEntryPoint::new(module, stage, entry_point: String)` | Select `ShaderStage::Vertex`, `Fragment`, or `Compute`. SPIR-V entry-point stage/name is checked here. |
+| `BindGroupLayoutEntry::new(binding, visibility, ty)` | Describe one binding; visibility is `ShaderStages::VERTEX`, `FRAGMENT`, `COMPUTE`, or their union. |
+| `BindGroupLayoutDesc::new(entries)` | Validate and sort unique binding numbers in `0..16`. Empty layouts are valid. |
+| `PipelineLayoutDesc::new(bind_groups)` | Define up to four descriptor sets, in set-number order. |
+| `BindGroupDesc::new(&table, layout, entries)` | Validate exact layout coverage, resource ownership, types, usage, alignment, and byte ranges. |
+| `table.define_bind_group(desc)` | Retain immutable bindings, rechecking ownership. |
+| `ComputePipelineDesc::new(shader, layout)` | Describe one compute entry point and its resource interface. |
+| `table.define_compute_pipeline(desc)` | Retain a compute pipeline with a table-owned shader module. |
+| `ProgrammableRenderPipelineDesc::new(vertex, fragment, layout, target_format, vertex_buffer, topology, blend, raster)` | Describe vertex/fragment shaders, one color target, and fixed raster state. `vertex_buffer: None` allows geometry generated from vertex index. |
+| `desc.with_depth_state(depth)` | Add the existing `Depth32Float` comparison/write state. |
+| `table.define_programmable_render_pipeline(desc)` | Retain a programmable render pipeline. |
+
+All new reference types expose `.id()` and `.slot()`. Persistent identities resolve
+with `table.shader_module_ref`, `bind_group_ref`, `compute_pipeline_ref`, or
+`programmable_render_pipeline_ref`. Descriptors retain table-qualified IDs;
+defining a pipeline or group in another table fails with `ResourceTableMismatch`.
+
+`BindGroupEntry::new(binding, resource)` binds one of:
+
+| `BindingType` | `BindingResource` | Required usage |
+| --- | --- | --- |
+| `UniformBuffer` | `Buffer { buffer: BufferId, offset, size }` | `BufferUsage::UNIFORM` |
+| `StorageBuffer { read_only }` | `Buffer { buffer: BufferId, offset, size }` | `BufferUsage::STORAGE` |
+| `SampledTexture` | `Texture(TextureId)` | `TextureUsage::SAMPLED`; filterable 2D color format |
+| `Sampler` | `Sampler(SamplerId)` | Existing portable filtering sampler |
+| `StorageTexture { format, access: WriteOnly }` | `Texture(TextureId)` | `TextureUsage::STORAGE`; `Rgba8Unorm` only |
+
+Uniform/storage offsets are multiples of 256 bytes. Sizes are nonzero multiples
+of four and must fit the buffer. Writable aliases of the same whole buffer or
+texture are rejected within or across descriptor sets used by one command, even
+if buffer byte ranges do not overlap. Sampling or storing an active color/depth
+attachment is rejected as attachment feedback. Read-only aliases are valid.
+Device-specific size limits and shader/layout compatibility are checked by the
+backend. Empty descriptor sets may remain unbound; a backend must synthesize them
+if its native API requires an actual empty binding object.
+
+New commands and recording methods:
+
+| Command payload | Recording method |
+| --- | --- |
+| `SetProgrammablePipeline(ProgrammableRenderPipelineRef)` | `render_pass.set_programmable_pipeline(pipeline)` |
+| `SetBindGroup { index, bind_group }` | `render_pass.set_bind_group(index, group)` or `compute_pass.set_bind_group(index, group)` |
+| `BeginComputePass` | `encoder.begin_compute_pass()` |
+| `SetComputePipeline(ComputePipelineRef)` | `compute_pass.set_pipeline(pipeline)` |
+| `Dispatch { x, y, z }` | `compute_pass.dispatch(x, y, z)`; each workgroup count is `1..=65535` |
+| `EndComputePass` | `compute_pass.end()` |
+| `CopyBufferToBuffer { source, source_offset, destination, destination_offset, size }` | `encoder.copy_buffer_to_buffer(source, source_offset, destination, destination_offset, size)` |
+| `ResourceBarrier(ResourceBarrier)` | `encoder.resource_barrier(barrier)` |
+
+Programmable draws use the existing `draw` and `draw_indexed` commands. They require
+matching descriptor sets but no fixed `DrawUniforms`, texture slot, or sampler
+slot. Vertexless nonindexed draws require no vertex/index buffer. Indexed draws
+always require an index buffer; a backend validates indirect vertex addresses
+against opaque index data, including signed base vertices. Triangle-list counts
+are positive multiples of three; triangle strips require at least three vertices
+or indices. Backend support is narrower: WGPU executes nonindexed programmable
+strips and rejects indexed strips before acceptance; native VirGL accepts both
+indexed and nonindexed programmable strips. Primitive restart has no IR representation.
+Copies require distinct buffers, copy usage, nonzero sizes, and four-byte-aligned
+offsets/sizes. All new passes retain the bounded command encoder's reserved end
+slot and explicit `end()` requirement.
+
+### Access and barrier contract
+
+The command stream is a single ordered queue. Existing upload/copy/render accesses
+retain their automatic ordered dependency semantics. Shader storage writes require
+an explicit whole-resource dependency before the next access to that resource in
+the same command buffer. A missing dependency returns `MissingBarrier`; a barrier
+with the wrong preceding shader-write access or a next command inconsistent with
+its destination access returns `InvalidResourceAccess`. Failed commands do not
+consume a dependency or alter the recorded stream.
+
+```rust
+encoder.resource_barrier(ResourceBarrier::Buffer {
+    buffer: output,
+    before: BufferAccess::StorageReadWrite,
+    after: BufferAccess::CopySource,
+})?;
+encoder.copy_buffer_to_buffer(output, 0, staging, 0, byte_count)?;
+```
+
+`BufferAccess` is `CopyDestination`, `CopySource`, `Vertex`, `Index`, `Uniform`,
+`StorageRead`, or `StorageReadWrite`. `TextureAccess` is `CopyDestination`,
+`CopySource`, `Sampled`, `RenderAttachment`, or `StorageWrite`. Both sides must be
+permitted by the resource's declared usage. A barrier's destination describes the
+first actual following access; intervening state binding does not consume it.
+Shader access scopes cover every shader stage. A sequence of barriers without an
+intervening access must connect matching destination/source scopes.
+
+Barriers are outside render/compute passes. End the pass before synchronizing and
+starting the consumer pass. Repeated accesses after a storage write inside one
+pass are rejected. Render passes also reject a writable storage alias of any
+resource read by an earlier draw in that pass, matching whole-pass GPU resource
+tracking. A merely bound index buffer does not count as an access in a nonindexed
+draw. Validation tracks the current command buffer; execution backends retain
+responsibility for ordering and memory visibility across submitted command
+buffers, including imported resources. The first-consumer check does not relieve a backend
+of automatic visibility transitions for later accesses: for example, a storage
+read followed by a copy read still requires the earlier producer to be visible
+to the copy operation. WGPU implements accepted dependencies with
+its ordered command stream and automatic resource transitions.
+
+### Owned recording and the implemented subset
+
+`OwnedCommandBuffer::new(Vec<OwnedCommand>)` retains persistent IDs and owns upload
+bytes without borrowing a resource table. Its source commands are inspectable and
+may be malformed until validated. `owned.record(&table)` resolves IDs and replays
+through `CommandEncoder`, returning a borrowed, fully validated `CommandBuffer`;
+`owned.validate(&table)` performs the same checks without retaining the result.
+Uploads borrow the owned source bytes during replay. Replaying does not introduce
+another lowering IR or extend lifetimes with unsafe code. Owned render-pass,
+depth-attachment, and barrier forms replace references with their persistent IDs.
+
+This extension serves offscreen vertex/fragment rendering, descriptor-backed
+uniforms and storage, compute-buffer workloads, RGBA8 storage images, and compute
+to copy/draw dependencies. It retains one color attachment, optional depth, one
+interleaved vertex buffer, single-sample 2D textures with one layer, direct
+draws/dispatches, and one queue. Sampled color textures can declare checked mip
+chains with `TextureDesc::with_mip_level_count`; attachment, depth, storage and
+present textures retain one mip. `TextureWrite::with_mip_level` selects an
+upload level, `blit_texture` scales complete matching-format color levels, and
+`ResourceBarrier::TextureMip` checks independent level dependencies. Sampler
+mip filtering and finite nonnegative LOD clamps are explicit descriptor state.
+`OwnedCommand` has 26 variants, including owned mip uploads and blits. Pipeline
+layouts and `SetPushConstants` carry up to 128 checked, stage-specific bytes.
+Actual backend support remains capability-dependent.
+
+MRT, texture arrays/3D images, multisampling, descriptor arrays/indexing, dynamic
+descriptor offsets, indirect commands, tessellation/geometry stages, presentation,
+and queue-family ownership transfer are deferred. No descriptor encodes those
+features, so they cannot be silently flattened into the supported subset.

@@ -133,13 +133,19 @@ impl<T: Transport> Scheduler<T> {
     pub(crate) fn advance(&mut self, transport: &T) -> bool {
         let mut progressed = false;
         for job in &mut self.jobs {
-            while let Some(receipt) = job.receipts.front() {
+            let mut index = 0;
+            while let Some(receipt) = job.receipts.get(index) {
                 match transport.poll(receipt) {
                     Ok(true) => {
-                        job.receipts.pop_front();
+                        // Completion readiness can arrive out of order. Remove
+                        // every retired handle from the worker's poll set so
+                        // a later signalled event cannot make it spin behind
+                        // an earlier pending chunk. Job retirement below still
+                        // requires the entire ordered prefix to complete.
+                        job.receipts.remove(index);
                         progressed = true;
                     }
-                    Ok(false) => break,
+                    Ok(false) => index += 1,
                     Err(error) => {
                         self.fail(transport, error);
                         return true;
@@ -393,5 +399,37 @@ mod tests {
                 Err(AdmissionError::Failed(7))
             );
         }
+    }
+
+    #[test]
+    fn completed_later_chunk_leaves_wait_set_without_certifying_prefix() {
+        let native = ready();
+        let mut queue = Scheduler::new();
+        let signal = add(&mut queue, alloc::vec![(1, 1), (2, 1)]);
+        queue.advance(&native);
+        native.fences.borrow()[1].set(Some(Ok(())));
+        assert!(queue.advance(&native));
+        assert_eq!(queue.receipts().count(), 1);
+        assert_eq!(signal.get(), None);
+        // A completed event must not remain in the worker's readiness set:
+        // it would wake immediately while the earlier chunk is still pending.
+        assert!(!queue.advance(&native));
+        native.fences.borrow()[0].set(Some(Ok(())));
+        queue.advance(&native);
+        assert_eq!(signal.get(), Some(Ok(())));
+    }
+
+    #[test]
+    fn later_chunk_failure_is_observed_while_first_chunk_is_pending() {
+        let native = ready();
+        let mut queue = Scheduler::new();
+        let signal = add(&mut queue, alloc::vec![(1, 1), (2, 1)]);
+        let successor = add(&mut queue, alloc::vec![(3, 1)]);
+        queue.advance(&native);
+        native.fences.borrow()[1].set(Some(Err(7)));
+        assert!(queue.advance(&native));
+        assert_eq!(signal.get(), Some(Err(7)));
+        assert_eq!(successor.get(), Some(Err(7)));
+        assert_eq!(queue.failure(), Some(7));
     }
 }

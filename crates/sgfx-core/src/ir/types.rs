@@ -3,11 +3,76 @@
 /// Result type returned by graphics IR operations.
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Finite positive viewport and normalized depth range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    min_depth: f32,
+    max_depth: f32,
+}
+
+impl Viewport {
+    /// Construct a viewport; pass encoders additionally check attachment bounds.
+    pub fn new(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        min_depth: f32,
+        max_depth: f32,
+    ) -> Result<Self> {
+        if ![x, y, width, height, min_depth, max_depth]
+            .iter()
+            .all(|v| v.is_finite())
+            || x < 0.0
+            || y < 0.0
+            || width <= 0.0
+            || height <= 0.0
+            || !(0.0..=1.0).contains(&min_depth)
+            || !(0.0..=1.0).contains(&max_depth)
+        {
+            return Err(Error::InvalidValue);
+        }
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            min_depth,
+            max_depth,
+        })
+    }
+    /// Return x, y, width, height, minimum depth and maximum depth.
+    pub const fn components(self) -> [f32; 6] {
+        [
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self.min_depth,
+            self.max_depth,
+        ]
+    }
+}
+
 /// Reason a graphics IR descriptor or command was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// A value was non-finite, zero where non-zero is required, or otherwise malformed.
     InvalidValue,
+    /// Shader resources do not match the bound pipeline layout.
+    BindingLayoutMismatch,
+    /// A required descriptor set has not been bound.
+    BindGroupNotSet,
+    /// Simultaneous accesses alias a writable resource.
+    ResourceAccessConflict,
+    /// A shader write requires an explicit dependency before the next access.
+    MissingBarrier,
+    /// A barrier does not match the preceding shader-write access.
+    InvalidResourceAccess,
     /// A descriptor does not describe a portable logical graphics object.
     InvalidDescriptor,
     /// A resource's required usage flag is absent.

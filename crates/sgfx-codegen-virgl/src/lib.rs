@@ -8,6 +8,9 @@
 
 extern crate alloc;
 
+#[cfg(feature = "programmable")]
+pub mod programmable;
+
 use alloc::vec::Vec;
 use sgfx_core::ir::{CullMode, FrontFace};
 
