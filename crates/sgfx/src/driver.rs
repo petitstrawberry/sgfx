@@ -109,6 +109,7 @@ pub struct Capabilities {
     storage_images: bool,
     typed_texture_views: bool,
     srgb_texture_views: bool,
+    srgb_color_attachments: bool,
     extended_vertex_formats: bool,
     rgba8_color_attachment: bool,
     bgra8_color_attachment: bool,
@@ -161,6 +162,10 @@ impl Capabilities {
     /// Whether native sRGB sampling and color conversion execute.
     pub const fn supports_srgb_texture_views(&self) -> bool {
         self.srgb_texture_views
+    }
+    /// Whether sRGB color attachments encode linear shader output on write.
+    pub const fn supports_srgb_color_attachments(&self) -> bool {
+        self.srgb_color_attachments
     }
     /// Whether integer, half-float and packed signed-normal vertex inputs execute.
     pub const fn supports_extended_vertex_formats(&self) -> bool {
@@ -1090,6 +1095,7 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                             .contains(wgpu::TextureUsages::STORAGE_BINDING),
                     typed_texture_views: true,
                     srgb_texture_views: true,
+                    srgb_color_attachments: true,
                     extended_vertex_formats: true,
                     rgba8_color_attachment: rgba
                         .allowed_usages
@@ -1243,7 +1249,10 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                 storage_images: false,
                 typed_texture_views: capabilities.supports_texture_arrays()
                     && capabilities.supports_depth_sampling(),
-                srgb_texture_views: false,
+                // VirGL on macOS cannot reinterpret GL texture storage, so
+                // the native backend decodes sRGB sampled views in TGSI.
+                srgb_texture_views: capabilities.supports_programmable_graphics(),
+                srgb_color_attachments: false,
                 extended_vertex_formats: true,
                 rgba8_color_attachment: true,
                 bgra8_color_attachment: true,

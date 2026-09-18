@@ -739,12 +739,47 @@ impl ProgrammableDrawCache<'_> {
         if self.key.pipeline != key.pipeline || self.key.push_constants != key.push_constants {
             return Ok(None);
         }
-        if self.key.bind_groups != key.bind_groups
-            && [&self.draw.pipeline.vertex, &self.draw.pipeline.fragment]
-                .iter()
-                .any(|shader| !shader.image_query_levels.is_empty())
-        {
-            return Ok(None);
+        if self.key.bind_groups != key.bind_groups {
+            for shader in [&self.draw.pipeline.vertex, &self.draw.pipeline.fragment] {
+                if !shader.image_query_levels.is_empty() {
+                    return Ok(None);
+                }
+                if shader.srgb_view_flags_register.is_none() {
+                    continue;
+                }
+                for texture in &shader.textures {
+                    let format = |groups: &[Option<ir::BindGroupRef<'_>>; ir::MAX_BIND_GROUPS]| {
+                        let group = groups
+                            .get(texture.image_group as usize)
+                            .copied()
+                            .flatten()
+                            .ok_or(ir::Error::BindingLayoutMismatch)?;
+                        let group = resources.bind_group_shared(group)?;
+                        let entry = group
+                            .entries()
+                            .iter()
+                            .find(|entry| entry.binding() == texture.image_binding)
+                            .ok_or(ir::Error::BindingLayoutMismatch)?;
+                        match entry.resource() {
+                            ir::BindingResource::Texture(image) => {
+                                Ok(resources.texture(resources.texture_ref(image)?)?.format())
+                            }
+                            ir::BindingResource::TextureView { view, .. } => Ok(view.format()),
+                            _ => Err(ir::Error::BindingLayoutMismatch),
+                        }
+                    };
+                    let is_srgb = |format| {
+                        matches!(
+                            format,
+                            ir::TextureFormat::Bgra8UnormSrgb | ir::TextureFormat::Rgba8UnormSrgb
+                        )
+                    };
+                    if is_srgb(format(&self.key.bind_groups)?) != is_srgb(format(&key.bind_groups)?)
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
         }
         for shader in [&self.draw.pipeline.vertex, &self.draw.pipeline.fragment] {
             for (group, binding) in shader
@@ -3004,15 +3039,10 @@ fn texture_spec(
         copy_destination: usage.contains(TextureUsage::COPY_DST),
         present: usage.contains(TextureUsage::PRESENT),
         format: match descriptor.format() {
-            TextureFormat::Bgra8Unorm => IrTextureFormat::Bgra8,
-            TextureFormat::Rgba8Unorm => IrTextureFormat::Rgba8,
+            TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => IrTextureFormat::Bgra8,
+            TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => IrTextureFormat::Rgba8,
             TextureFormat::R8Unorm => IrTextureFormat::R8,
             TextureFormat::Depth32Float => IrTextureFormat::Depth32Float,
-            TextureFormat::Bgra8UnormSrgb | TextureFormat::Rgba8UnormSrgb => {
-                return Err(IrSubmitError::Unsupported(
-                    UnsupportedIrFeature::TargetFormat,
-                ));
-            }
         },
     })
 }

@@ -841,12 +841,11 @@ unsafe extern "system" fn get_physical_device_format_properties(
         return;
     };
     let capabilities = adapter.capabilities();
-    if !capabilities.supports_srgb_texture_views()
-        && matches!(
-            format,
-            vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
-        )
-    {
+    let srgb = matches!(
+        format,
+        vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+    );
+    if srgb && !capabilities.supports_srgb_texture_views() {
         unsafe { *output = properties };
         return;
     }
@@ -863,10 +862,12 @@ unsafe extern "system" fn get_physical_device_format_properties(
     {
         // In Vulkan 1.0, transfer support follows image-format support; the
         // TRANSFER_SRC/DST format-feature bits belong to maintenance1 / 1.1.
-        properties.optimal_tiling_features = vk::FormatFeatureFlags::COLOR_ATTACHMENT
-            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+        properties.optimal_tiling_features = vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        if !srgb || capabilities.supports_srgb_color_attachments() {
+            properties.optimal_tiling_features |= vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+        }
     }
     if capabilities.supports_image_blits()
         && matches!(
@@ -944,6 +945,16 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         )
     {
         supported_usage = vk::ImageUsageFlags::empty();
+    }
+    if !capabilities.supports_srgb_color_attachments()
+        && matches!(
+            format,
+            vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+        )
+    {
+        supported_usage &= !(vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::INPUT_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT);
     }
     if !capabilities.supports_typed_texture_views() && format == vk::Format::D32_SFLOAT {
         supported_usage &= !vk::ImageUsageFlags::SAMPLED;

@@ -142,7 +142,12 @@ fn image_size_and_mip_level_queries_lower_for_stk_displacement() {
     );
     let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
     assert_eq!(compiled.tgsi.matches("TXQ").count(), 1);
-    assert!(compiled.tgsi.lines().any(|line| line.contains("TXQ ") && line.contains(".xy,")));
+    assert!(
+        compiled
+            .tgsi
+            .lines()
+            .any(|line| line.contains("TXQ ") && line.contains(".xy,"))
+    );
     assert_eq!(compiled.image_query_levels.len(), 1);
     assert!(compiled.tgsi.contains("CONST[0]"));
 }
@@ -343,6 +348,35 @@ fn separate_texture_and_sampler_pairs_lower_for_wgsl_and_spirv() {
         assert!(shader.tgsi.contains("DCL SVIEW[0], 2D, FLOAT"));
         assert!(shader.tgsi.contains("TEX "));
         assert!(shader.tgsi.contains("MUL"));
+    }
+}
+
+#[test]
+fn srgb_decode_flags_follow_sampler_slots_after_storage_buffers() {
+    let module = wgsl(
+        r#"
+        @group(0) @binding(0) var<storage, read> weights: array<u32>;
+        @group(0) @binding(1) var image: texture_2d<f32>;
+        @group(0) @binding(2) var filtering: sampler;
+        @fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+            return textureSample(image, filtering, uv) * f32(weights[0]);
+        }
+        "#,
+    );
+    let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert_eq!(shader.storage_buffers.len(), 1);
+    assert_eq!(shader.textures.len(), 1);
+    assert_eq!(shader.textures[0].slot, 1);
+    let register = shader.srgb_view_flags_register.unwrap();
+    assert!(shader.tgsi.contains(&format!("UIF CONST[{register}].yyyy")));
+    assert!(shader.tgsi.contains(&format!("DCL CONST[0..{register}]")));
+    assert_eq!(shader.tgsi.matches("POW ").count(), 3);
+    if let Ok(directory) = std::env::var("SGFX_TGSI_EXPORT_DIR") {
+        std::fs::write(
+            std::path::Path::new(&directory).join("srgb-storage.frag.tgsi"),
+            &shader.tgsi,
+        )
+        .unwrap();
     }
 }
 

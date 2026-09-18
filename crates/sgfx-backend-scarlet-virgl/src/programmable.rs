@@ -624,6 +624,7 @@ pub(super) fn decode_draw(
                 .ok_or_else(|| ir::Error::BindingLayoutMismatch.into())
         };
         for shader in [&compiled.vertex, &compiled.fragment] {
+            let mut srgb_view_flags = [0u32; 16];
             for binding in &shader.storage_buffers {
                 let ir::BindingResource::Buffer {
                     buffer,
@@ -689,29 +690,34 @@ pub(super) fn decode_draw(
                 }
             }
             for binding in &shader.textures {
-                let texture = match resource(binding.image_group, binding.image_binding)? {
-                    ir::BindingResource::Texture(texture) => texture,
-                    ir::BindingResource::TextureView { texture, view } => {
-                        let desc = resources
-                            .resources
-                            .texture(resources.resources.texture_ref(texture)?)?;
-                        if view.dimension() != binding.dimension
-                            || view.format() != desc.format()
-                            || view.base_mip_level() != 0
-                            || view.mip_level_count() != desc.mip_level_count()
-                            || view.base_array_layer() != 0
-                            || view.array_layer_count() != desc.array_layer_count()
-                        {
-                            return Err(IrSubmitError::Unsupported(
-                                UnsupportedIrFeature::ResourceBindings,
-                            ));
+                let (texture, view_format) =
+                    match resource(binding.image_group, binding.image_binding)? {
+                        ir::BindingResource::Texture(texture) => (texture, None),
+                        ir::BindingResource::TextureView { texture, view } => {
+                            let desc = resources
+                                .resources
+                                .texture(resources.resources.texture_ref(texture)?)?;
+                            if view.dimension() != binding.dimension
+                                || !desc.format().view_compatible(view.format())
+                                || view.base_mip_level() != 0
+                                || view.mip_level_count() != desc.mip_level_count()
+                                || view.base_array_layer() != 0
+                                || view.array_layer_count() != desc.array_layer_count()
+                            {
+                                return Err(IrSubmitError::Unsupported(
+                                    UnsupportedIrFeature::ResourceBindings,
+                                ));
+                            }
+                            (texture, Some(view.format()))
                         }
-                        texture
-                    }
-                    _ => return Err(ir::Error::BindingLayoutMismatch.into()),
-                };
+                        _ => return Err(ir::Error::BindingLayoutMismatch.into()),
+                    };
                 let texture = resources.resources.texture_ref(texture)?;
                 let descriptor = resources.resources.texture(texture)?;
+                srgb_view_flags[binding.slot as usize] = u32::from(matches!(
+                    view_format.unwrap_or(descriptor.format()),
+                    TextureFormat::Bgra8UnormSrgb | TextureFormat::Rgba8UnormSrgb
+                ));
                 if !descriptor.usage().contains(TextureUsage::SAMPLED)
                     || texture == pass.attachment
                     || pass.additional_attachments.contains(&texture)
@@ -751,6 +757,21 @@ pub(super) fn decode_draw(
                     slot: binding.slot,
                     texture: texture_spec(texture, descriptor)?,
                     sampler,
+                });
+            }
+            if let Some(first_register) = shader.srgb_view_flags_register
+                && cached_constants.is_none()
+            {
+                let mut words = [0; 32];
+                let slots = shader.storage_buffers.len() + shader.textures.len();
+                words[..slots].copy_from_slice(&srgb_view_flags[..slots]);
+                constants.push(driver::IrConstantBuffer {
+                    stage: shader.stage,
+                    first_register,
+                    words: driver::IrConstantWords::Inline {
+                        words,
+                        len: slots.div_ceil(4) * 4,
+                    },
                 });
             }
             if let Some(push) = shader

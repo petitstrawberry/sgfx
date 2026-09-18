@@ -219,6 +219,18 @@ unsafe extern "system" fn create_image(
             return Err(UNSUPPORTED);
         }
         let ir_format = texture_format(format).ok_or(UNSUPPORTED)?;
+        if matches!(
+            format,
+            vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+        ) && !runtime.capabilities.supports_srgb_color_attachments()
+            && image_usage.intersects(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::INPUT_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+            )
+        {
+            return Err(UNSUPPORTED);
+        }
         if (!runtime.capabilities.supports_srgb_texture_views()
             && matches!(
                 format,

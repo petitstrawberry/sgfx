@@ -128,6 +128,8 @@ pub struct CompiledShader {
     /// Push constants occupy a distinct span after every uniform buffer.
     pub push_constants: Option<PushConstantBinding>,
     pub image_query_levels: Vec<ImageQueryLevelsBinding>,
+    /// Packed per-sampler-view sRGB flags supplied by the backend at draw time.
+    pub srgb_view_flags_register: Option<u32>,
     /// Inline constant register added to the vertex instance ID on hosts
     /// without native base-instance draws.
     pub first_instance_register: Option<u32>,
@@ -369,6 +371,7 @@ struct Compiler<'a> {
     storage_buffers: Vec<StorageBufferBinding>,
     push_constants: Option<PushConstantBinding>,
     image_query_levels: Vec<ImageQueryLevelsBinding>,
+    srgb_view_flags_register: Option<u32>,
     first_instance_register: Option<u32>,
     textures: Vec<TextureSamplerBinding>,
     input_locations: Vec<u32>,
@@ -397,6 +400,7 @@ impl<'a> Compiler<'a> {
             storage_buffers: Vec::new(),
             push_constants: None,
             image_query_levels: Vec::new(),
+            srgb_view_flags_register: None,
             first_instance_register: None,
             textures: Vec::new(),
             input_locations: Vec::new(),
@@ -1005,12 +1009,10 @@ impl<'a> Compiler<'a> {
                 first_register,
             });
         }
-        if next_constant_register == 1 {
-            self.declarations.push("DCL CONST[0]".into());
-        } else if next_constant_register > 1 {
-            self.declarations
-                .push(format!("DCL CONST[0..{}]", next_constant_register - 1));
-        }
+        // Texture slots are assigned while lowering expressions. Reserve their
+        // packed format flags after the other constants, then declare the full
+        // bank once all slots are known.
+        self.srgb_view_flags_register = Some(next_constant_register);
         for (handle, global) in self.module.global_variables.iter() {
             if global.space != AddressSpace::Private || entry_info[handle].is_empty() {
                 continue;
@@ -1055,6 +1057,23 @@ impl<'a> Compiler<'a> {
             self.instruction("MUL", &temp.lanes[0], &[&z, &two.lanes[0]])?;
             self.instruction("SUB", &z, &[&temp.lanes[0], &w])?;
         }
+        let srgb_view_flags_register = if self.textures.is_empty() {
+            None
+        } else {
+            // Storage buffers occupy sampler slots before sampled textures.
+            let registers = ((self.storage_buffers.len() + self.textures.len()) as u32).div_ceil(4);
+            next_constant_register = next_constant_register
+                .checked_add(registers)
+                .filter(|&register| register <= 1024)
+                .ok_or_else(|| unsupported("more than 1024 inline constant registers"))?;
+            self.srgb_view_flags_register
+        };
+        if next_constant_register == 1 {
+            self.declarations.push("DCL CONST[0]".into());
+        } else if next_constant_register > 1 {
+            self.declarations
+                .push(format!("DCL CONST[0..{}]", next_constant_register - 1));
+        }
         let mut tgsi = String::from(if self.stage == ShaderStage::Vertex {
             "VERT\n"
         } else {
@@ -1085,6 +1104,7 @@ impl<'a> Compiler<'a> {
             storage_buffers: self.storage_buffers,
             push_constants: self.push_constants,
             image_query_levels: self.image_query_levels,
+            srgb_view_flags_register,
             first_instance_register: self.first_instance_register,
             textures: self.textures,
             input_locations: self.input_locations,
@@ -1649,7 +1669,7 @@ impl<'a> Compiler<'a> {
                     }
                     _ => return Err(unsupported("sampling level/gradients")),
                 };
-                self.texture_instruction(opcode, slot, target, &coords, shape)?
+                self.texture_instruction(opcode, slot, target, &coords, shape, !depth)?
             }
             E::ImageLoad {
                 image,
@@ -1702,7 +1722,7 @@ impl<'a> Compiler<'a> {
                     let lod = self.expression(frame, lod)?;
                     self.instruction("MOV", &coords.lanes[3], &[&lod.lanes[0]])?;
                 }
-                self.texture_instruction("TXF", slot, target, &coords, shape)?
+                self.texture_instruction("TXF", slot, target, &coords, shape, !depth)?
             }
             E::ImageQuery { image, query } => {
                 let image = self.expression(frame, image)?;
@@ -2005,6 +2025,7 @@ impl<'a> Compiler<'a> {
         target: &str,
         coords: &Value,
         shape: Shape,
+        color: bool,
     ) -> Result<Value> {
         self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
         let result = self.allocate(Shape::Vector(K::Float, 4), false)?;
@@ -2012,11 +2033,50 @@ impl<'a> Compiler<'a> {
             "{opcode} {}, {}, SAMP[{slot}], {target}",
             result.lanes[0].register, coords.lanes[0].register
         ));
+        if color {
+            self.decode_srgb_view(&result, slot)?;
+        }
         if matches!(shape, Shape::Scalar(K::Float)) {
             result.element(0)
         } else {
             Ok(result)
         }
+    }
+    fn decode_srgb_view(&mut self, sampled: &Value, slot: u32) -> Result<()> {
+        let base = self
+            .srgb_view_flags_register
+            .ok_or_else(|| unsupported("missing sRGB view flags"))?;
+        let flag = Lane {
+            register: format!("CONST[{}]", base + slot / 4),
+            component: (slot % 4) as usize,
+        };
+        self.instructions.push(format!("UIF {}", flag.src()));
+        let threshold = self.immediate(Literal::F32(0.04045))?;
+        let linear_scale = self.immediate(Literal::F32(1.0 / 12.92))?;
+        let offset = self.immediate(Literal::F32(0.055))?;
+        let srgb_scale = self.immediate(Literal::F32(1.0 / 1.055))?;
+        let exponent = self.immediate(Literal::F32(2.4))?;
+        for channel in sampled.lanes.iter().take(3) {
+            let low = self.allocate(Shape::Scalar(K::Float), false)?;
+            let high = self.allocate(Shape::Scalar(K::Float), false)?;
+            let test = self.allocate(Shape::Scalar(K::Float), false)?;
+            self.instruction("MUL", &low.lanes[0], &[channel, &linear_scale.lanes[0]])?;
+            self.instruction("ADD", &high.lanes[0], &[channel, &offset.lanes[0]])?;
+            self.instruction(
+                "MUL",
+                &high.lanes[0],
+                &[&high.lanes[0], &srgb_scale.lanes[0]],
+            )?;
+            self.instruction("POW", &high.lanes[0], &[&high.lanes[0], &exponent.lanes[0]])?;
+            self.instruction("SUB", &test.lanes[0], &[channel, &threshold.lanes[0]])?;
+            self.instruction(
+                "CMP",
+                channel,
+                &[&test.lanes[0], &low.lanes[0], &high.lanes[0]],
+            )?;
+        }
+        self.instructions.push("ENDIF".into());
+        Ok(())
     }
     fn unary_instruction(&mut self, opcode: &str, value: &Value, shape: Shape) -> Result<Value> {
         let result = self.allocate(shape, false)?;
