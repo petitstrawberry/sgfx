@@ -828,6 +828,12 @@ pub(crate) enum IrResources {
 }
 
 impl IrResources {
+    pub(crate) fn release_buffer(&mut self, slot: usize) {
+        match self {
+            Self::Virgl(resources) => resources.release_buffer(slot),
+        }
+    }
+
     pub(crate) fn unmap_ir_image(
         &mut self,
         texture: IrTextureSpec,

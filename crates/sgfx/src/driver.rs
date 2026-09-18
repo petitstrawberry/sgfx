@@ -651,6 +651,25 @@ enum ResourcesBackend {
 }
 
 impl Resources {
+    /// Release backend materialization for a retired logical buffer.
+    /// The caller must first wait for submissions using it to complete.
+    pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<()> {
+        match &mut self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            ResourcesBackend::Wgpu(resources) => resources.release_buffer(id).map_err(Error::Wgpu),
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                feature = "backend-scarlet-virgl"
+            ))]
+            ResourcesBackend::ScarletVirgl(resources) => {
+                resources.release_buffer(id).map_err(Error::ScarletVirglIr)
+            }
+        }
+    }
+
     /// Map a logical render target to a device-local shareable image.
     #[cfg(any(
         all(target_os = "macos", feature = "backend-wgpu"),

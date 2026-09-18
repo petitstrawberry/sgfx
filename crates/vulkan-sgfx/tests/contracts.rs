@@ -586,11 +586,32 @@ fn odd_sized_vulkan_buffers_remain_bindable() {
 
 #[test]
 #[ignore = "requires a built SGFX ICD and a native GPU adapter"]
-fn repeated_buffer_destruction_reclaims_idle_resource_capacity() {
+fn repeated_buffer_destruction_reuses_capacity_with_live_pipeline() {
     let context = Context::new();
-    // Context owns only an empty command pool/buffer. No pipeline, descriptor,
-    // or recorded IR object remains live while each unbound buffer is retired.
-    // More than 1024 creations expose the old monotonically growing IR table.
+    // Keep a pipeline and layout alive so idle-epoch reclamation cannot mask
+    // monotonically growing buffer definitions.
+    let compute = Compute::new(&context);
+    {
+        let first = Storage::new(&context);
+        compute.update(&first);
+        compute.record(false);
+        unsafe {
+            let fence = context
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            context.submit(fence).unwrap();
+            context
+                .device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .unwrap();
+            context.device.destroy_fence(fence, None);
+        }
+        assert_eq!(
+            first.read(),
+            (0..WORDS as u32).map(|i| i * 3 + 7).collect::<Vec<_>>()
+        );
+    }
     unsafe {
         for iteration in 0..1250 {
             let buffer = context
@@ -609,9 +630,8 @@ fn repeated_buffer_destruction_reclaims_idle_resource_capacity() {
         }
     }
 
-    // A real GPU workload must still work using objects created after reclaim.
+    // A real GPU workload must still work using objects created after reuse.
     let storage = Storage::new(&context);
-    let compute = Compute::new(&context);
     compute.update(&storage);
     compute.record(false);
     unsafe {

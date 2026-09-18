@@ -67,7 +67,7 @@ impl InFlight {
             == 0
     }
 
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         let mut count = self
             .count
             .lock()

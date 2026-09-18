@@ -217,6 +217,17 @@ impl IrResources {
         self.resources.as_ref()
     }
 
+    /// Forget a retired logical buffer and its physical VirGL allocation.
+    /// Callers must ensure previously submitted work has completed first.
+    pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<(), IrSubmitError> {
+        let slot = self.resources.buffer_ref(id)?.slot();
+        self.backend.release_buffer(slot);
+        self.buffer_shadows[slot] = None;
+        self.buffer_revisions[slot] = 0;
+        self.canonical_buffer_revisions[slot] = None;
+        Ok(())
+    }
+
     /// Map a logical render target to a physical image.
     ///
     /// # Arguments

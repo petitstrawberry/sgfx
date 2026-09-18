@@ -804,6 +804,14 @@ impl Resources {
         self.resources.as_ref()
     }
 
+    /// Remove the cached allocation for a retired logical buffer.
+    pub fn release_buffer(&mut self, id: BufferId) -> Result<()> {
+        self.resources.buffer_ref(id)?;
+        self.buffers.retain(|(candidate, _)| *candidate != id);
+        self.programmable.groups.clear();
+        Ok(())
+    }
+
     /// Map a logical presentation texture to a physical WGPU image.
     ///
     /// # Arguments

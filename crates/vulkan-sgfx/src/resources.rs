@@ -791,8 +791,17 @@ unsafe extern "system" fn destroy_buffer(
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
     let _ = crate::api::with_device(device, move |r| {
-        r.resources.buffers.remove(&buffer);
-        r.resources.uploaded_unmapped_buffers.remove(&buffer);
+        if let Some(id) = r.resources.buffers.get(&buffer).map(|buffer| buffer.id) {
+            // The backend cache owns the physical allocation for this slot.
+            // Complete submitted work before dropping it or recycling the ID.
+            r.in_flight.wait();
+            r.cache
+                .release_buffer(id)
+                .map_err(crate::runtime::backend_failure)?;
+            r.table.release_buffer(id).map_err(failure)?;
+            r.resources.buffers.remove(&buffer);
+            r.resources.uploaded_unmapped_buffers.remove(&buffer);
+        }
         Ok(())
     });
 }

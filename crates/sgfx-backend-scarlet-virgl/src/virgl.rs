@@ -1035,6 +1035,12 @@ pub(crate) struct IrStateSnapshot {
 }
 
 impl IrResources {
+    pub(crate) fn release_buffer(&mut self, slot: usize) {
+        if let Some(buffer) = self.buffers.get_mut(slot) {
+            buffer.take();
+        }
+    }
+
     pub(crate) fn unmap_ir_image(
         &mut self,
         texture: IrTextureSpec,
