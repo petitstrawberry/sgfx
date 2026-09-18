@@ -11,24 +11,20 @@ default = [
     "backend-wgpu",
     "backend-scarlet-virgl",
     "backend-scarlet-adreno",
-    "backend-scarlet-maxwell",
 ]
 std = [
     "sgfx-core/std",
     "gpu-raw?/std",
     "sgfx-backend-scarlet-adreno?/std",
-    "sgfx-backend-scarlet-maxwell?/std",
     "sgfx-backend-scarlet-virgl?/std",
 ]
 legacy-scarlet-std = [
     "backend-wgpu",
     "backend-scarlet-virgl",
     "backend-scarlet-adreno",
-    "backend-scarlet-maxwell",
     "dep:scarlet-std",
     "gpu-raw?/scarlet-std",
     "sgfx-backend-scarlet-adreno?/scarlet-std",
-    "sgfx-backend-scarlet-maxwell?/scarlet-std",
     "sgfx-backend-scarlet-virgl?/scarlet-std",
 ]
 # Compatibility alias for consumers that previously selected Scarlet's
@@ -42,7 +38,6 @@ backend-wgpu = [
 ]
 scarlet-native-api = ["std", "backend-scarlet-virgl"]
 backend-scarlet-virgl = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl"]
-backend-scarlet-maxwell = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-maxwell"]
 backend-scarlet-adreno = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
 
 [dependencies]
@@ -57,7 +52,6 @@ wgpu = { version = "24", features = ["spirv"], optional = true }
 [target.'cfg(target_os = "scarlet")'.dependencies]
 scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "54bfdf3048a100fc4bfba5198e59bdb184702871", optional = true }
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "54bfdf3048a100fc4bfba5198e59bdb184702871", default-features = false, optional = true }
-sgfx-backend-scarlet-maxwell = { git = "https://github.com/petitstrawberry/scarlet-project-switch", rev = "82862366584b5b46fc5474ce4d149a582bad2adb", default-features = false, optional = true }
 sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "45f244eee6230cb4521d5e90f9f322a8943aa072", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
 sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-features = false, optional = true }
 

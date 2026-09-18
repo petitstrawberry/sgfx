@@ -42,11 +42,7 @@ pub mod driver;
 mod host;
 #[cfg(all(
     target_os = "scarlet",
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-adreno",
-        feature = "backend-scarlet-maxwell"
-    )
+    any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
 ))]
 mod scarlet;
 
@@ -54,11 +50,7 @@ mod scarlet;
 pub use host::{Executor, MappedTargetSession, Submission, WindowContext};
 #[cfg(all(
     target_os = "scarlet",
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-adreno",
-        feature = "backend-scarlet-maxwell"
-    )
+    any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
 ))]
 pub use scarlet::{
     Capabilities, Context, Device, Executor, Handle, ImageRef, MappedTargetSession, Submission,
@@ -79,8 +71,6 @@ pub enum BackendKind {
     ScarletVirgl,
     /// SGFX native Qualcomm Adreno execution through the Scarlet GPU ABI.
     ScarletAdreno,
-    /// Native NVIDIA Maxwell SGFX through Scarlet GPU capabilities.
-    ScarletMaxwell,
 }
 
 impl BackendKind {
@@ -95,7 +85,6 @@ impl BackendKind {
             Self::Metal => "metal",
             Self::ScarletVirgl => "scarlet-virgl",
             Self::ScarletAdreno => "scarlet-adreno",
-            Self::ScarletMaxwell => "scarlet-maxwell",
         }
     }
 }
@@ -120,8 +109,6 @@ pub enum BackendPreference {
     ScarletVirgl,
     /// Require native Scarlet/Adreno execution.
     ScarletAdreno,
-    /// Native NVIDIA Maxwell SGFX through Scarlet GPU capabilities.
-    ScarletMaxwell,
 }
 
 impl BackendPreference {
@@ -143,7 +130,6 @@ impl BackendPreference {
             "metal" => Ok(Self::Metal),
             "scarlet-virgl" | "virgl" => Ok(Self::ScarletVirgl),
             "scarlet-adreno" | "adreno" => Ok(Self::ScarletAdreno),
-            "scarlet-maxwell" | "maxwell" => Ok(Self::ScarletMaxwell),
             _ => Err(Error::InvalidBackendPreference),
         }
     }
@@ -199,52 +185,33 @@ pub enum Error {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-adreno",
-            feature = "backend-scarlet-maxwell"
-        )
+        any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
     ))]
     ScarletGpu,
-
     /// The opened Scarlet GPU does not match an explicitly requested backend.
     #[cfg(all(
         any(
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-adreno",
-            feature = "backend-scarlet-maxwell"
-        )
+        any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
     ))]
     BackendDeviceMismatch(BackendKind),
-
     /// No compiled Scarlet backend supports the opened GPU.
     #[cfg(all(
         any(
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-adreno",
-            feature = "backend-scarlet-maxwell"
-        )
+        any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
     ))]
     ScarletBackendUnsupported,
-
     /// A Scarlet/Adreno device or context operation failed.
     #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
     ScarletAdrenoHandle(sgfx_backend_scarlet_adreno::HandleError),
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-maxwell"))]
-    ScarletMaxwellHandle(sgfx_backend_scarlet_maxwell::HandleError),
     /// A Scarlet/Adreno IR materialization or execution operation failed.
     #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
     ScarletAdrenoIr(sgfx_backend_scarlet_adreno::IrSubmitError),
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-maxwell"))]
-    ScarletMaxwellIr(sgfx_backend_scarlet_maxwell::IrSubmitError),
 }
 
 /// Backend-neutral failure category for API frontends.
@@ -330,31 +297,19 @@ impl Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    feature = "backend-scarlet-maxwell"
-                )
+                any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::ScarletGpu | Self::BackendDeviceMismatch(_) => ErrorKind::InitializationFailed,
-
             #[cfg(all(
                 any(
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    feature = "backend-scarlet-maxwell"
-                )
+                any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::ScarletBackendUnsupported => ErrorKind::Unsupported,
-
             #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
             Self::ScarletAdrenoHandle(error) => adreno_handle_error_kind(*error),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-maxwell"))]
-            Self::ScarletMaxwellHandle(error) => maxwell_handle_error_kind(*error),
             #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
             Self::ScarletAdrenoIr(error) => {
                 use sgfx_backend_scarlet_adreno::IrSubmitError as E;
@@ -372,26 +327,6 @@ impl Error {
                         ErrorKind::Unsupported
                     }
                     E::Backend(error) => adreno_handle_error_kind(*error),
-                    E::CompletionUnavailable | E::CompletionFailed(_) => ErrorKind::DeviceLost,
-                }
-            }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-maxwell"))]
-            Self::ScarletMaxwellIr(error) => {
-                use sgfx_backend_scarlet_maxwell::IrSubmitError as E;
-                match error {
-                    E::InvalidIr(error) => ir_error_kind(*error),
-                    E::ResourceTableMismatch
-                    | E::ContextMismatch
-                    | E::TargetExtentMismatch
-                    | E::ImageNotMapped
-                    | E::TextureAlreadyMapped
-                    | E::ImageAlreadyMapped => ErrorKind::InvalidInput,
-                    E::OutOfMemory => ErrorKind::OutOfHostMemory,
-                    E::SubmissionTooLarge => ErrorKind::OutOfDeviceMemory,
-                    E::Unsupported(_) | E::Codegen(_) | E::SubmitWire(_) | E::AsyncUnsupported => {
-                        ErrorKind::Unsupported
-                    }
-                    E::Backend(error) => maxwell_handle_error_kind(*error),
                     E::CompletionUnavailable | E::CompletionFailed(_) => ErrorKind::DeviceLost,
                 }
             }
@@ -474,29 +409,6 @@ impl Error {
                         )
                 )
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-maxwell"))]
-            Self::ScarletMaxwellIr(error) => {
-                use sgfx_backend_scarlet_maxwell::{HandleError, IrSubmitError as E};
-                matches!(
-                    error,
-                    E::InvalidIr(_)
-                        | E::ResourceTableMismatch
-                        | E::ContextMismatch
-                        | E::TargetExtentMismatch
-                        | E::ImageNotMapped
-                        | E::TextureAlreadyMapped
-                        | E::ImageAlreadyMapped
-                        | E::Unsupported(_)
-                        | E::OutOfMemory
-                        | E::SubmissionTooLarge
-                        | E::AsyncUnsupported
-                        | E::Backend(
-                            HandleError::InvalidParameter
-                                | HandleError::Unsupported
-                                | HandleError::OutOfResources
-                        )
-                )
-            }
             _ => false,
         }
     }
@@ -533,17 +445,6 @@ fn virgl_handle_error_kind(error: sgfx_backend_scarlet_virgl::HandleError) -> Er
 #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
 fn adreno_handle_error_kind(error: sgfx_backend_scarlet_adreno::HandleError) -> ErrorKind {
     use sgfx_backend_scarlet_adreno::HandleError as E;
-    match error {
-        E::InvalidParameter | E::InvalidHandle => ErrorKind::InvalidInput,
-        E::Unsupported => ErrorKind::Unsupported,
-        E::OutOfResources => ErrorKind::OutOfDeviceMemory,
-        E::NotFound => ErrorKind::InitializationFailed,
-        E::PermissionDenied | E::SystemError(_) => ErrorKind::DeviceLost,
-    }
-}
-#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-maxwell"))]
-fn maxwell_handle_error_kind(error: sgfx_backend_scarlet_maxwell::HandleError) -> ErrorKind {
-    use sgfx_backend_scarlet_maxwell::HandleError as E;
     match error {
         E::InvalidParameter | E::InvalidHandle => ErrorKind::InvalidInput,
         E::Unsupported => ErrorKind::Unsupported,
@@ -592,24 +493,15 @@ impl fmt::Display for Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    feature = "backend-scarlet-maxwell"
-                )
+                any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::ScarletGpu => formatter.write_str("SGFX Scarlet GPU control operation failed"),
-
             #[cfg(all(
                 any(
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    feature = "backend-scarlet-maxwell"
-                )
+                any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::BackendDeviceMismatch(backend) => {
                 write!(
@@ -617,40 +509,23 @@ impl fmt::Display for Error {
                     "opened Scarlet GPU does not support SGFX backend {backend}"
                 )
             }
-
             #[cfg(all(
                 any(
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    feature = "backend-scarlet-maxwell"
-                )
+                any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")
             ))]
             Self::ScarletBackendUnsupported => {
                 formatter.write_str("no compiled SGFX Scarlet backend supports the opened GPU")
             }
-
             #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
             Self::ScarletAdrenoHandle(error) => {
                 write!(formatter, "SGFX Scarlet/Adreno device failed: {error:?}")
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-maxwell"))]
-            Self::ScarletMaxwellHandle(error) => {
-                write!(formatter, "SGFX Scarlet/Maxwell device failed: {error:?}")
-            }
             #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
             Self::ScarletAdrenoIr(error) => {
                 write!(formatter, "SGFX Scarlet/Adreno execution failed: {error:?}")
-            }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-maxwell"))]
-            Self::ScarletMaxwellIr(error) => {
-                write!(
-                    formatter,
-                    "SGFX Scarlet/Maxwell execution failed: {error:?}"
-                )
             }
         }
     }
@@ -721,20 +596,10 @@ fn resolve_backend(preference: BackendPreference) -> Result<BackendKind> {
         BackendPreference::Metal => require_backend(BackendKind::Metal),
         BackendPreference::ScarletVirgl => require_backend(BackendKind::ScarletVirgl),
         BackendPreference::ScarletAdreno => require_backend(BackendKind::ScarletAdreno),
-        BackendPreference::ScarletMaxwell => require_backend(BackendKind::ScarletMaxwell),
     }
 }
 
 fn default_backend() -> Result<BackendKind> {
-    #[cfg(all(
-        target_os = "scarlet",
-        not(feature = "backend-scarlet-virgl"),
-        not(feature = "backend-scarlet-adreno"),
-        feature = "backend-scarlet-maxwell"
-    ))]
-    {
-        return Ok(BackendKind::ScarletMaxwell);
-    }
     #[cfg(all(
         any(
             target_os = "scarlet",
@@ -765,14 +630,6 @@ const fn default_backend_kind() -> BackendKind {
     if cfg!(all(
         target_os = "scarlet",
         not(feature = "backend-scarlet-virgl"),
-        not(feature = "backend-scarlet-adreno"),
-        feature = "backend-scarlet-maxwell"
-    )) {
-        return BackendKind::ScarletMaxwell;
-    }
-    if cfg!(all(
-        target_os = "scarlet",
-        not(feature = "backend-scarlet-virgl"),
         feature = "backend-scarlet-adreno"
     )) {
         BackendKind::ScarletAdreno
@@ -796,10 +653,6 @@ fn require_backend(backend: BackendKind) -> Result<BackendKind> {
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
             feature = "backend-scarlet-virgl"
-        )),
-        BackendKind::ScarletMaxwell => cfg!(all(
-            target_os = "scarlet",
-            feature = "backend-scarlet-maxwell"
         )),
         BackendKind::ScarletAdreno => cfg!(all(
             target_os = "scarlet",

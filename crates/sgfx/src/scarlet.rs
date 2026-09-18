@@ -17,13 +17,6 @@ pub use sgfx_backend_scarlet_adreno::Handle;
 #[cfg(feature = "backend-scarlet-virgl")]
 pub use sgfx_backend_scarlet_virgl::Handle;
 
-#[cfg(all(
-    not(feature = "backend-scarlet-virgl"),
-    not(feature = "backend-scarlet-adreno"),
-    feature = "backend-scarlet-maxwell"
-))]
-pub use sgfx_backend_scarlet_maxwell::Handle;
-
 /// Backend-neutral Scarlet rendering capabilities.
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities {
@@ -89,8 +82,6 @@ pub enum Device {
     /// Native Qualcomm Adreno execution through Scarlet's GPU ABI.
     #[cfg(feature = "backend-scarlet-adreno")]
     Adreno(sgfx_backend_scarlet_adreno::Device),
-    #[cfg(feature = "backend-scarlet-maxwell")]
-    Maxwell(sgfx_backend_scarlet_maxwell::Device),
 }
 
 impl Device {
@@ -118,8 +109,6 @@ impl Device {
             Self::Virgl(_) => BackendKind::ScarletVirgl,
             #[cfg(feature = "backend-scarlet-adreno")]
             Self::Adreno(_) => BackendKind::ScarletAdreno,
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(_) => BackendKind::ScarletMaxwell,
         }
     }
 
@@ -152,17 +141,6 @@ impl Device {
                     depth: capabilities.supports_depth(),
                 }
             }
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(device) => {
-                let capabilities = device.capabilities();
-                Capabilities {
-                    rendering: capabilities.supports_rendering(),
-                    presentation: capabilities.supports_presentation(),
-                    image_upload: capabilities.supports_image_upload(),
-                    image_readback: capabilities.supports_image_readback(),
-                    depth: capabilities.supports_depth(),
-                }
-            }
         }
     }
 
@@ -183,11 +161,6 @@ impl Device {
                 .create_context()
                 .map(Context::Adreno)
                 .map_err(Error::ScarletAdrenoHandle),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(device) => device
-                .create_context()
-                .map(Context::Maxwell)
-                .map_err(Error::ScarletMaxwellHandle),
         }
     }
 }
@@ -212,7 +185,6 @@ impl Instance {
             BackendPreference::Auto => open_auto(gpu, info),
             BackendPreference::ScarletVirgl => open_virgl(gpu, info),
             BackendPreference::ScarletAdreno => open_adreno(gpu, info),
-            BackendPreference::ScarletMaxwell => open_maxwell(gpu, info),
             BackendPreference::Wgpu => Err(Error::BackendUnavailable(BackendKind::Wgpu)),
             BackendPreference::Metal => Err(Error::BackendUnavailable(BackendKind::Metal)),
         }
@@ -223,7 +195,6 @@ fn open_auto(gpu: Gpu, info: gpu_raw::GpuQueryInfo) -> Result<Device> {
     match select_auto_backend(&info)? {
         BackendKind::ScarletVirgl => open_virgl(gpu, info),
         BackendKind::ScarletAdreno => open_adreno(gpu, info),
-        BackendKind::ScarletMaxwell => open_maxwell(gpu, info),
         BackendKind::Wgpu | BackendKind::Metal => Err(Error::ScarletBackendUnsupported),
     }
 }
@@ -236,10 +207,6 @@ fn select_auto_backend(info: &gpu_raw::GpuQueryInfo) -> Result<BackendKind> {
     #[cfg(feature = "backend-scarlet-adreno")]
     if sgfx_backend_scarlet_adreno::Device::supports(info) {
         return Ok(BackendKind::ScarletAdreno);
-    }
-    #[cfg(feature = "backend-scarlet-maxwell")]
-    if sgfx_backend_scarlet_maxwell::Device::supports(info) {
-        return Ok(BackendKind::ScarletMaxwell);
     }
     Err(Error::ScarletBackendUnsupported)
 }
@@ -286,8 +253,6 @@ pub enum Context {
     /// A native Adreno rendering context.
     #[cfg(feature = "backend-scarlet-adreno")]
     Adreno(sgfx_backend_scarlet_adreno::Context),
-    #[cfg(feature = "backend-scarlet-maxwell")]
-    Maxwell(sgfx_backend_scarlet_maxwell::Context),
 }
 
 impl Context {
@@ -317,11 +282,6 @@ impl Context {
                 .create_mapped_target_session(resources, targets)
                 .map(MappedTargetSession::Adreno)
                 .map_err(Error::ScarletAdrenoIr),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(context) => context
-                .create_mapped_target_session(resources, targets)
-                .map(MappedTargetSession::Maxwell)
-                .map_err(Error::ScarletMaxwellIr),
         }
     }
 }
@@ -335,8 +295,6 @@ pub enum MappedTargetSession {
     /// A native Adreno mapped-target session.
     #[cfg(feature = "backend-scarlet-adreno")]
     Adreno(sgfx_backend_scarlet_adreno::MappedTargetSession),
-    #[cfg(feature = "backend-scarlet-maxwell")]
-    Maxwell(sgfx_backend_scarlet_maxwell::MappedTargetSession),
 }
 
 impl MappedTargetSession {
@@ -355,10 +313,6 @@ impl MappedTargetSession {
             Self::Adreno(session) => session
                 .import_shared_bgra_texture(texture, handle)
                 .map_err(Error::ScarletAdrenoIr),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(session) => session
-                .import_shared_bgra_texture(texture, handle)
-                .map_err(Error::ScarletMaxwellIr),
         }
     }
 
@@ -373,10 +327,6 @@ impl MappedTargetSession {
             Self::Adreno(session) => session
                 .release_imported_texture(texture)
                 .map_err(Error::ScarletAdrenoIr),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(session) => session
-                .release_imported_texture(texture)
-                .map_err(Error::ScarletMaxwellIr),
         }
     }
 
@@ -405,13 +355,6 @@ impl MappedTargetSession {
                     backend: Image::Adreno(image),
                 })
                 .map_err(Error::ScarletAdrenoIr),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(session) => session
-                .image(target)
-                .map(|image| ImageRef {
-                    backend: Image::Maxwell(image),
-                })
-                .map_err(Error::ScarletMaxwellIr),
         }
     }
 
@@ -444,10 +387,6 @@ impl MappedTargetSession {
             Self::Adreno(session) => session
                 .readback_bgra(target, destination, destination_stride, rect)
                 .map_err(Error::ScarletAdrenoIr),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(session) => session
-                .readback_bgra(target, destination, destination_stride, rect)
-                .map_err(Error::ScarletMaxwellIr),
         }
     }
 
@@ -462,8 +401,6 @@ impl MappedTargetSession {
             Self::Virgl(session) => Executor::Virgl(session.executor()),
             #[cfg(feature = "backend-scarlet-adreno")]
             Self::Adreno(session) => Executor::Adreno(session.executor()),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(session) => Executor::Maxwell(session.executor()),
         }
     }
 }
@@ -473,8 +410,6 @@ enum Image<'a> {
     Virgl(&'a sgfx_backend_scarlet_virgl::Image),
     #[cfg(feature = "backend-scarlet-adreno")]
     Adreno(&'a sgfx_backend_scarlet_adreno::Image),
-    #[cfg(feature = "backend-scarlet-maxwell")]
-    Maxwell(&'a sgfx_backend_scarlet_maxwell::Image),
 }
 
 /// Borrowed Scarlet presentation image exposed by the SGFX frontend.
@@ -494,8 +429,6 @@ impl ImageRef<'_> {
             Image::Virgl(image) => image.width(),
             #[cfg(feature = "backend-scarlet-adreno")]
             Image::Adreno(image) => image.width(),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Image::Maxwell(image) => image.width(),
         }
     }
 
@@ -510,8 +443,6 @@ impl ImageRef<'_> {
             Image::Virgl(image) => image.height(),
             #[cfg(feature = "backend-scarlet-adreno")]
             Image::Adreno(image) => image.height(),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Image::Maxwell(image) => image.height(),
         }
     }
 
@@ -526,8 +457,6 @@ impl ImageRef<'_> {
             Image::Virgl(image) => image.shared_handle(),
             #[cfg(feature = "backend-scarlet-adreno")]
             Image::Adreno(image) => image.shared_handle(),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Image::Maxwell(image) => image.shared_handle(),
         }
     }
 }
@@ -540,8 +469,6 @@ pub enum Executor<'a> {
     /// A native Adreno command executor.
     #[cfg(feature = "backend-scarlet-adreno")]
     Adreno(sgfx_backend_scarlet_adreno::Executor<'a>),
-    #[cfg(feature = "backend-scarlet-maxwell")]
-    Maxwell(sgfx_backend_scarlet_maxwell::Executor<'a>),
 }
 
 impl CommandExecutor for Executor<'_> {
@@ -553,8 +480,6 @@ impl CommandExecutor for Executor<'_> {
             Self::Virgl(executor) => executor.execute(commands).map_err(Error::ScarletVirglIr),
             #[cfg(feature = "backend-scarlet-adreno")]
             Self::Adreno(executor) => executor.execute(commands).map_err(Error::ScarletAdrenoIr),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(executor) => executor.execute(commands).map_err(Error::ScarletMaxwellIr),
         }
     }
 }
@@ -572,8 +497,6 @@ pub enum Submission {
     /// Completion of every Adreno chunk and its ordered queue prefix.
     #[cfg(feature = "backend-scarlet-adreno")]
     Adreno(sgfx_backend_scarlet_adreno::Submission),
-    #[cfg(feature = "backend-scarlet-maxwell")]
-    Maxwell(sgfx_backend_scarlet_maxwell::Submission),
 }
 
 impl Completion for Submission {
@@ -590,8 +513,6 @@ impl Completion for Submission {
             Self::Virgl(ref receipt) => receipt.poll().map_err(Error::ScarletVirglIr),
             #[cfg(feature = "backend-scarlet-adreno")]
             Self::Adreno(ref receipt) => receipt.poll().map_err(Error::ScarletAdrenoIr),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(ref receipt) => receipt.poll().map_err(Error::ScarletMaxwellIr),
         }
     }
 
@@ -606,19 +527,13 @@ impl Completion for Submission {
     /// Complete, pending on timeout, or a backend error. Timeout never cancels
     /// work or grants permission to recycle an externally shared buffer.
     fn wait(&self, timeout: Option<Duration>) -> Result<CompletionStatus> {
-        #[cfg(not(any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-adreno",
-            feature = "backend-scarlet-maxwell"
-        )))]
+        #[cfg(not(any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")))]
         let _ = timeout;
         match *self {
             #[cfg(feature = "backend-scarlet-virgl")]
             Self::Virgl(ref receipt) => receipt.wait(timeout).map_err(Error::ScarletVirglIr),
             #[cfg(feature = "backend-scarlet-adreno")]
             Self::Adreno(ref receipt) => receipt.wait(timeout).map_err(Error::ScarletAdrenoIr),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(ref receipt) => receipt.wait(timeout).map_err(Error::ScarletMaxwellIr),
         }
     }
 }
@@ -643,11 +558,7 @@ impl CommandSubmitter for Executor<'_> {
         &mut self,
         commands: &ir::CommandBuffer<'r, 'data>,
     ) -> core::result::Result<Submission, SubmitError<Error, Submission>> {
-        #[cfg(not(any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-adreno",
-            feature = "backend-scarlet-maxwell"
-        )))]
+        #[cfg(not(any(feature = "backend-scarlet-virgl", feature = "backend-scarlet-adreno")))]
         let _ = commands;
         match self {
             #[cfg(feature = "backend-scarlet-virgl")]
@@ -660,11 +571,6 @@ impl CommandSubmitter for Executor<'_> {
                 .submit(commands)
                 .map(Submission::Adreno)
                 .map_err(|error| error.map(Error::ScarletAdrenoIr, Submission::Adreno)),
-            #[cfg(feature = "backend-scarlet-maxwell")]
-            Self::Maxwell(executor) => executor
-                .submit(commands)
-                .map(Submission::Maxwell)
-                .map_err(|error| error.map(Error::ScarletMaxwellIr, Submission::Maxwell)),
         }
     }
 }
@@ -708,22 +614,5 @@ mod tests {
             select_auto_backend(&info).unwrap(),
             BackendKind::ScarletAdreno
         );
-    }
-}
-
-fn open_maxwell(gpu: Gpu, info: gpu_raw::GpuQueryInfo) -> Result<Device> {
-    #[cfg(feature = "backend-scarlet-maxwell")]
-    {
-        if !sgfx_backend_scarlet_maxwell::Device::supports(&info) {
-            return Err(Error::BackendDeviceMismatch(BackendKind::ScarletMaxwell));
-        }
-        sgfx_backend_scarlet_maxwell::Device::from_gpu(gpu, info)
-            .map(Device::Maxwell)
-            .map_err(Error::ScarletMaxwellHandle)
-    }
-    #[cfg(not(feature = "backend-scarlet-maxwell"))]
-    {
-        let _ = (gpu, info);
-        Err(Error::BackendUnavailable(BackendKind::ScarletMaxwell))
     }
 }
