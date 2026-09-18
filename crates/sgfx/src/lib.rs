@@ -414,6 +414,17 @@ impl Error {
     }
 }
 
+#[cfg(any(
+    all(not(target_os = "scarlet"), feature = "backend-wgpu"),
+    all(
+        any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-native-api")
+        ),
+        feature = "backend-scarlet-virgl"
+    ),
+    all(target_os = "scarlet", feature = "backend-scarlet-adreno")
+))]
 fn ir_error_kind(error: ir::Error) -> ErrorKind {
     match error {
         ir::Error::OutOfMemory => ErrorKind::OutOfHostMemory,

@@ -64,5 +64,9 @@ sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-f
 name = "sgfx"
 path = "src/lib.rs"
 
+[[example]]
+name = "deferred_lighting"
+required-features = ["backend-wgpu"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
