@@ -4068,10 +4068,14 @@ fn push_programmable_draw(
         }
         bindings.vertex_buffers = Some(vertex_bindings);
     }
+    #[cfg(feature = "programmable")]
+    let first_instance_register = native.description.vertex.first_instance_register;
+    #[cfg(not(feature = "programmable"))]
+    let first_instance_register = None;
     push_programmable_constants(
         commands,
         &programmable.constants,
-        native.description.vertex.first_instance_register,
+        first_instance_register,
         draw.first_instance,
         bindings,
     )?;
