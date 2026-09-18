@@ -686,6 +686,7 @@ enum ExecutionTarget {
 
 struct ActivePass<'r> {
     attachment: TextureRef<'r>,
+    additional_attachments: Vec<TextureRef<'r>>,
     target: ExecutionTarget,
     depth_attachment: Option<TextureRef<'r>>,
     submission: IrSubmission,
@@ -736,6 +737,13 @@ impl ProgrammableDrawCache<'_> {
         layout: &ir::PipelineLayoutDesc,
     ) -> Result<Option<Rc<[driver::IrConstantBuffer]>>, IrSubmitError> {
         if self.key.pipeline != key.pipeline || self.key.push_constants != key.push_constants {
+            return Ok(None);
+        }
+        if self.key.bind_groups != key.bind_groups
+            && [&self.draw.pipeline.vertex, &self.draw.pipeline.fragment]
+                .iter()
+                .any(|shader| !shader.image_query_levels.is_empty())
+        {
             return Ok(None);
         }
         for shader in [&self.draw.pipeline.vertex, &self.draw.pipeline.fragment] {
@@ -1297,15 +1305,6 @@ impl ExecutionPlan {
                     ));
                 }
                 Command::BeginRenderPass(desc) if active.is_none() => {
-                    if desc.color_attachments().count() != 1
-                        || desc
-                            .depth_attachment()
-                            .is_some_and(|depth| depth.read_only())
-                    {
-                        return Err(IrSubmitError::Unsupported(
-                            UnsupportedIrFeature::ResourceBindings,
-                        ));
-                    }
                     let descriptor = resources.resources().texture(desc.target())?;
                     if !matches!(
                         descriptor.format(),
@@ -1334,6 +1333,33 @@ impl ExecutionPlan {
                     if !desc.area().is_within(descriptor.extent()) {
                         return Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds));
                     }
+                    let mut additional_attachments = Vec::new();
+                    let mut additional_colors = Vec::new();
+                    for attachment in desc.color_attachments().skip(1) {
+                        let descriptor = resources.resources().texture(attachment.target())?;
+                        if !matches!(
+                            descriptor.format(),
+                            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+                        ) {
+                            return Err(IrSubmitError::Unsupported(
+                                UnsupportedIrFeature::TargetFormat,
+                            ));
+                        }
+                        additional_attachments
+                            .try_reserve(1)
+                            .map_err(|_| IrSubmitError::OutOfMemory)?;
+                        additional_colors
+                            .try_reserve(1)
+                            .map_err(|_| IrSubmitError::OutOfMemory)?;
+                        additional_attachments.push(attachment.target());
+                        additional_colors.push(driver::IrColorAttachment {
+                            texture: texture_spec(attachment.target(), descriptor)?,
+                            clear: match attachment.load() {
+                                LoadOp::Clear(color) => Some(color.components()),
+                                LoadOp::Load | LoadOp::DontCare => None,
+                            },
+                        });
+                    }
                     let depth_attachment = desc.depth_attachment();
                     let depth_spec = if let Some(depth) = depth_attachment {
                         let depth_descriptor = resources.resources().texture(depth.target())?;
@@ -1343,6 +1369,7 @@ impl ExecutionPlan {
                     };
                     active = Some(ActivePass {
                         attachment: desc.target(),
+                        additional_attachments,
                         target,
                         depth_attachment: depth_attachment.map(|depth| depth.target()),
                         submission: IrSubmission {
@@ -1350,7 +1377,10 @@ impl ExecutionPlan {
                                 LoadOp::Clear(color) => Some(color.components()),
                                 LoadOp::Load | LoadOp::DontCare => None,
                             },
+                            additional_colors,
                             depth_attachment: depth_spec,
+                            depth_read_only: depth_attachment
+                                .is_some_and(|depth| depth.read_only()),
                             clear_depth: depth_attachment.and_then(|depth| match depth.load() {
                                 DepthLoadOp::Clear(value) => Some(value),
                                 DepthLoadOp::Load | DepthLoadOp::DontCare => None,
@@ -1633,7 +1663,12 @@ impl ExecutionPlan {
 
 /// Return whether a draw-free pass still changes an attachment.
 fn submission_has_clear(submission: &IrSubmission) -> bool {
-    submission.clear_color.is_some() || submission.clear_depth.is_some()
+    submission.clear_color.is_some()
+        || submission.clear_depth.is_some()
+        || submission
+            .additional_colors
+            .iter()
+            .any(|attachment| attachment.clear.is_some())
 }
 
 struct DecodedDraw {
@@ -2082,7 +2117,9 @@ fn programmable_chunk_bytes<'draw>(
 fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> {
     let IrSubmission {
         clear_color,
+        additional_colors,
         depth_attachment,
+        depth_read_only,
         clear_depth,
         render_area,
         vertices,
@@ -2108,7 +2145,9 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                 &mut chunks,
                 &pass.target,
                 clear_color,
+                &additional_colors,
                 depth_attachment,
+                depth_read_only,
                 clear_depth,
                 render_area,
                 core::mem::take(&mut chunk_vertices),
@@ -2150,7 +2189,9 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                         &mut chunks,
                         &pass.target,
                         clear_color,
+                        &additional_colors,
                         depth_attachment,
+                        depth_read_only,
                         clear_depth,
                         render_area,
                         core::mem::take(&mut chunk_vertices),
@@ -2183,7 +2224,9 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                         &mut chunks,
                         &pass.target,
                         clear_color,
+                        &additional_colors,
                         depth_attachment,
+                        depth_read_only,
                         clear_depth,
                         render_area,
                         core::mem::take(&mut chunk_vertices),
@@ -2206,7 +2249,9 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                     &mut chunks,
                     &pass.target,
                     clear_color,
+                    &additional_colors,
                     depth_attachment,
+                    depth_read_only,
                     clear_depth,
                     render_area,
                     core::mem::take(&mut chunk_vertices),
@@ -2233,7 +2278,9 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
         &mut chunks,
         &pass.target,
         clear_color,
+        &additional_colors,
         depth_attachment,
+        depth_read_only,
         clear_depth,
         render_area,
         chunk_vertices,
@@ -2253,7 +2300,9 @@ fn push_pass_chunk(
     chunks: &mut Vec<ExecutionPass>,
     target: &ExecutionTarget,
     clear_color: Option<[f32; 4]>,
+    additional_colors: &[driver::IrColorAttachment],
     depth_attachment: Option<driver::IrTextureSpec>,
+    depth_read_only: bool,
     clear_depth: Option<f32>,
     render_area: IrRect,
     vertices: Vec<IrVertex>,
@@ -2261,6 +2310,18 @@ fn push_pass_chunk(
     texture_uploads: Vec<IrTextureUpload>,
     first: bool,
 ) -> Result<(), IrSubmitError> {
+    let mut colors = Vec::new();
+    colors
+        .try_reserve_exact(additional_colors.len())
+        .map_err(|_| IrSubmitError::OutOfMemory)?;
+    colors.extend(
+        additional_colors
+            .iter()
+            .map(|color| driver::IrColorAttachment {
+                texture: color.texture,
+                clear: if first { color.clear } else { None },
+            }),
+    );
     chunks
         .try_reserve(1)
         .map_err(|_| IrSubmitError::OutOfMemory)?;
@@ -2268,7 +2329,9 @@ fn push_pass_chunk(
         target: target.clone(),
         submission: IrSubmission {
             clear_color: first.then_some(clear_color).flatten(),
+            additional_colors: colors,
             depth_attachment,
+            depth_read_only,
             clear_depth: first.then_some(clear_depth).flatten(),
             render_area,
             vertices,
@@ -2365,6 +2428,8 @@ fn pipeline_info(
             slot: reference.slot(),
             fragment: fragment_program(fragment),
             blend: blend_state(blend),
+            color_write_mask: 0xf,
+            additional_color_blends: [None; 7],
             cull_mode: match raster.cull_mode() {
                 ir::CullMode::None => IrCullMode::None,
                 ir::CullMode::Front => IrCullMode::Front,
@@ -3100,6 +3165,8 @@ mod tests {
                     color: blend_component,
                     alpha: blend_component,
                 },
+                color_write_mask: 0xf,
+                additional_color_blends: [None; 7],
                 cull_mode: IrCullMode::None,
                 front_face: IrFrontFace::CounterClockwise,
                 depth: None,
@@ -3125,7 +3192,9 @@ mod tests {
             target: ExecutionTarget::Internal(target()),
             submission: IrSubmission {
                 clear_color: Some([0.1, 0.2, 0.3, 1.0]),
+                additional_colors: Vec::new(),
                 depth_attachment: None,
+                depth_read_only: false,
                 clear_depth: None,
                 render_area: IrRect {
                     x: 0,

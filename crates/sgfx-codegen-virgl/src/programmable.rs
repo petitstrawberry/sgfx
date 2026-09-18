@@ -58,6 +58,16 @@ pub struct PushConstantBinding {
     pub size: u32,
 }
 
+/// The number of mip levels in a bound image, supplied by the resource
+/// descriptor instead of TGSI TXQ (which requires an unavailable GL extension
+/// on some VirGL hosts).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageQueryLevelsBinding {
+    pub group: u32,
+    pub binding: u32,
+    pub first_register: u32,
+}
+
 /// A shader sampling operation's separate SGFX texture and sampler bindings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextureSamplerBinding {
@@ -117,6 +127,7 @@ pub struct CompiledShader {
     pub storage_buffers: Vec<StorageBufferBinding>,
     /// Push constants occupy a distinct span after every uniform buffer.
     pub push_constants: Option<PushConstantBinding>,
+    pub image_query_levels: Vec<ImageQueryLevelsBinding>,
     /// Inline constant register added to the vertex instance ID on hosts
     /// without native base-instance draws.
     pub first_instance_register: Option<u32>,
@@ -280,6 +291,11 @@ struct Value {
     writable: bool,
     indirect: Option<Box<IndirectRead>>,
 }
+
+enum LoopControl {
+    Body { break_flag: Lane },
+    Continuing,
+}
 #[derive(Clone, Debug)]
 struct IndirectRead {
     elements: Vec<Value>,
@@ -321,6 +337,24 @@ struct Frame<'a> {
     locals: Vec<Value>,
     expressions: Vec<Option<Value>>,
     returned: Option<Value>,
+    return_flag: Option<Lane>,
+}
+
+fn statement_may_return(statement: &S) -> bool {
+    match statement {
+        S::Return { .. } => true,
+        S::Block(block) => block.iter().any(statement_may_return),
+        S::If { accept, reject, .. } => {
+            accept.iter().chain(reject.iter()).any(statement_may_return)
+        }
+        S::Loop {
+            body, continuing, ..
+        } => body
+            .iter()
+            .chain(continuing.iter())
+            .any(statement_may_return),
+        _ => false,
+    }
 }
 struct Compiler<'a> {
     module: &'a naga::Module,
@@ -334,6 +368,7 @@ struct Compiler<'a> {
     uniforms: Vec<UniformBufferBinding>,
     storage_buffers: Vec<StorageBufferBinding>,
     push_constants: Option<PushConstantBinding>,
+    image_query_levels: Vec<ImageQueryLevelsBinding>,
     first_instance_register: Option<u32>,
     textures: Vec<TextureSamplerBinding>,
     input_locations: Vec<u32>,
@@ -361,6 +396,7 @@ impl<'a> Compiler<'a> {
             uniforms: Vec::new(),
             storage_buffers: Vec::new(),
             push_constants: None,
+            image_query_levels: Vec::new(),
             first_instance_register: None,
             textures: Vec::new(),
             input_locations: Vec::new(),
@@ -764,8 +800,28 @@ impl<'a> Compiler<'a> {
     fn compile(mut self, index: usize) -> Result<CompiledShader> {
         let entry = &self.module.entry_points[index];
         let entry_info = self.info.get_entry_point(index);
+        let uses_query_levels = self.module.functions.iter().any(|(_, function)| {
+            function.expressions.iter().any(|(_, expression)| {
+                matches!(
+                    expression,
+                    E::ImageQuery {
+                        query: naga::ImageQuery::NumLevels,
+                        ..
+                    }
+                )
+            })
+        }) || entry.function.expressions.iter().any(|(_, expression)| {
+            matches!(
+                expression,
+                E::ImageQuery {
+                    query: naga::ImageQuery::NumLevels,
+                    ..
+                }
+            )
+        });
         let mut uniform_handles = Vec::new();
         let mut storage_handles = Vec::new();
+        let mut image_bindings = Vec::new();
         let mut push_constant_handle = None;
         for (handle, global) in self.module.global_variables.iter() {
             if entry_info[handle].is_empty() {
@@ -797,6 +853,9 @@ impl<'a> Compiler<'a> {
                                 naga::ImageClass::Depth { multi: false } => true,
                                 _ => return Err(unsupported("image class")),
                             };
+                            if uses_query_levels {
+                                image_bindings.push((binding.group, binding.binding));
+                            }
                             Shape::Image(binding.group, binding.binding, dimension, depth)
                         }
                         T::Sampler { .. } => Shape::Sampler(binding.group, binding.binding),
@@ -932,6 +991,20 @@ impl<'a> Compiler<'a> {
                 .filter(|&register| register <= 1024)
                 .ok_or_else(|| unsupported("more than 1024 inline constant registers"))?;
         }
+        image_bindings.sort_unstable();
+        image_bindings.dedup();
+        for (group, binding) in image_bindings {
+            let first_register = next_constant_register;
+            next_constant_register = next_constant_register
+                .checked_add(1)
+                .filter(|&register| register <= 1024)
+                .ok_or_else(|| unsupported("more than 1024 inline constant registers"))?;
+            self.image_query_levels.push(ImageQueryLevelsBinding {
+                group,
+                binding,
+                first_register,
+            });
+        }
         if next_constant_register == 1 {
             self.declarations.push("DCL CONST[0]".into());
         } else if next_constant_register > 1 {
@@ -1011,6 +1084,7 @@ impl<'a> Compiler<'a> {
             uniform_buffers: self.uniforms,
             storage_buffers: self.storage_buffers,
             push_constants: self.push_constants,
+            image_query_levels: self.image_query_levels,
             first_instance_register: self.first_instance_register,
             textures: self.textures,
             input_locations: self.input_locations,
@@ -1030,13 +1104,46 @@ impl<'a> Compiler<'a> {
         if self.call_depth > 32 {
             return Err(unsupported("call nesting greater than 32"));
         }
+        let needs_return_flag =
+            function
+                .body
+                .iter()
+                .enumerate()
+                .any(|(index, statement)| match statement {
+                    S::Return { .. } => index + 1 != function.body.len(),
+                    _ => statement_may_return(statement),
+                });
+        let return_flag = if needs_return_flag {
+            let flag = self.allocate(Shape::Scalar(K::Uint), false)?;
+            let zero = self.immediate(Literal::U32(0))?;
+            self.instruction("MOV", &flag.lanes[0], &[&zero.lanes[0]])?;
+            Some(flag.lanes[0].clone())
+        } else {
+            None
+        };
+        let returned = if needs_return_flag {
+            function
+                .result
+                .as_ref()
+                .map(|result| {
+                    let value =
+                        self.allocate(self.shape(&self.module.types[result.ty].inner)?, true)?;
+                    let zero = self.zero(value.shape.clone())?;
+                    self.store(&value, &zero)?;
+                    Ok::<_, ShaderCompileError>(value)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let mut frame = Frame {
             function,
             info,
             arguments,
             locals: Vec::new(),
             expressions: vec![None; function.expressions.len()],
-            returned: None,
+            returned,
+            return_flag,
         };
         for (_, local) in function.local_variables.iter() {
             frame
@@ -1051,7 +1158,7 @@ impl<'a> Compiler<'a> {
             };
             self.store(&destination, &init)?;
         }
-        self.block(&mut frame, &function.body, 0)?;
+        self.block(&mut frame, &function.body, 0, None)?;
         self.call_depth -= 1;
         Ok(frame.returned)
     }
@@ -1060,7 +1167,9 @@ impl<'a> Compiler<'a> {
         frame: &mut Frame<'a>,
         block: &naga::Block,
         conditional_depth: usize,
+        loop_control: Option<&LoopControl>,
     ) -> Result<()> {
+        let mut return_guards = 0;
         for (index, statement) in block.iter().enumerate() {
             match statement {
                 S::Emit(range) => {
@@ -1068,17 +1177,30 @@ impl<'a> Compiler<'a> {
                         self.expression(frame, handle)?;
                     }
                 }
-                S::Block(block) => self.block(frame, block, conditional_depth)?,
+                S::Block(block) => self.block(frame, block, conditional_depth, loop_control)?,
                 S::Store { pointer, value } => {
                     let pointer = self.expression(frame, *pointer)?;
                     let value = self.expression(frame, *value)?;
                     self.store(&pointer, &value)?;
                 }
                 S::Return { value } => {
-                    if conditional_depth != 0 || index + 1 != block.len() {
-                        return Err(unsupported("early/conditional return"));
+                    if let Some(flag) = frame.return_flag.clone() {
+                        if let Some(value) = value {
+                            let value = self.expression(frame, *value)?;
+                            let destination = frame
+                                .returned
+                                .as_ref()
+                                .ok_or_else(|| unsupported("return value without result"))?;
+                            self.store(destination, &value)?;
+                        }
+                        let one = self.immediate(Literal::U32(1))?;
+                        self.instruction("MOV", &flag, &[&one.lanes[0]])?;
+                    } else {
+                        if conditional_depth != 0 || index + 1 != block.len() {
+                            return Err(unsupported("early/conditional return"));
+                        }
+                        frame.returned = value.map(|h| self.expression(frame, h)).transpose()?;
                     }
-                    frame.returned = value.map(|h| self.expression(frame, h)).transpose()?;
                 }
                 S::Call {
                     function,
@@ -1107,22 +1229,88 @@ impl<'a> Compiler<'a> {
                     let condition = self.expression(frame, *condition)?;
                     self.instructions
                         .push(format!("UIF {}", condition.lanes[0].src()));
-                    self.block(frame, accept, conditional_depth + 1)?;
+                    self.block(frame, accept, conditional_depth + 1, loop_control)?;
                     if !reject.is_empty() {
                         self.instructions.push("ELSE".into());
-                        self.block(frame, reject, conditional_depth + 1)?;
+                        self.block(frame, reject, conditional_depth + 1, loop_control)?;
                     }
                     self.instructions.push("ENDIF".into());
                 }
+                S::Loop {
+                    body,
+                    continuing,
+                    break_if,
+                } => {
+                    let break_flag = self.allocate(Shape::Scalar(K::Uint), false)?;
+                    let zero = self.immediate(Literal::U32(0))?;
+                    self.instructions.push("BGNLOOP".into());
+                    self.instruction("MOV", &break_flag.lanes[0], &[&zero.lanes[0]])?;
+                    // The inner loop lets `continue` leave the body and execute
+                    // Naga's continuing block before the next outer iteration.
+                    self.instructions.push("BGNLOOP".into());
+                    let body_control = LoopControl::Body {
+                        break_flag: break_flag.lanes[0].clone(),
+                    };
+                    self.block(frame, body, conditional_depth + 1, Some(&body_control))?;
+                    self.instructions.push("BRK".into());
+                    self.instructions.push("ENDLOOP".into());
+                    if let Some(flag) = &frame.return_flag {
+                        self.instructions.push(format!("UIF {}", flag.src()));
+                        self.instructions.push("BRK".into());
+                        self.instructions.push("ENDIF".into());
+                    }
+                    self.instructions
+                        .push(format!("UIF {}", break_flag.lanes[0].src()));
+                    self.instructions.push("BRK".into());
+                    self.instructions.push("ENDIF".into());
+                    self.block(
+                        frame,
+                        continuing,
+                        conditional_depth + 1,
+                        Some(&LoopControl::Continuing),
+                    )?;
+                    if let Some(condition) = break_if {
+                        let condition = self.expression(frame, *condition)?;
+                        self.instructions
+                            .push(format!("UIF {}", condition.lanes[0].src()));
+                        self.instructions.push("BRK".into());
+                        self.instructions.push("ENDIF".into());
+                    }
+                    self.instructions.push("ENDLOOP".into());
+                }
+                S::Break => match loop_control {
+                    Some(LoopControl::Body { break_flag }) => {
+                        let one = self.immediate(Literal::U32(1))?;
+                        self.instruction("MOV", break_flag, &[&one.lanes[0]])?;
+                        self.instructions.push("BRK".into());
+                    }
+                    Some(LoopControl::Continuing) => self.instructions.push("BRK".into()),
+                    None => return Err(unsupported("break outside loop")),
+                },
+                S::Continue => match loop_control {
+                    Some(LoopControl::Body { .. }) => self.instructions.push("BRK".into()),
+                    Some(LoopControl::Continuing) => self.instructions.push("CONT".into()),
+                    None => return Err(unsupported("continue outside loop")),
+                },
                 S::Kill if self.stage == ShaderStage::Fragment => {
                     self.instructions.push("KILL".into())
                 }
                 _ => {
                     return Err(unsupported(
-                        "statement (loops, switch, atomics, barriers and image stores are not supported)",
+                        "statement (switch, atomics, barriers and image stores are not supported)",
                     ));
                 }
             }
+            if index + 1 != block.len() && statement_may_return(statement) {
+                if let Some(flag) = &frame.return_flag {
+                    self.instructions.push(format!("UIF {}", flag.src()));
+                    self.instructions.push("ELSE".into());
+                    return_guards += 1;
+                }
+            }
+        }
+        for _ in 0..return_guards {
+            self.instructions.push("ENDIF".into());
         }
         Ok(())
     }
@@ -1516,6 +1704,98 @@ impl<'a> Compiler<'a> {
                 }
                 self.texture_instruction("TXF", slot, target, &coords, shape)?
             }
+            E::ImageQuery { image, query } => {
+                let image = self.expression(frame, image)?;
+                let Shape::Image(group, binding, dimension, depth) = image.shape else {
+                    return Err(unsupported("image query handle"));
+                };
+                if matches!(query, naga::ImageQuery::NumLevels) {
+                    let metadata = self
+                        .image_query_levels
+                        .iter()
+                        .find(|metadata| metadata.group == group && metadata.binding == binding)
+                        .ok_or_else(|| unsupported("missing image mip-level metadata"))?;
+                    Value {
+                        shape,
+                        lanes: vec![Lane {
+                            register: format!("CONST[{}]", metadata.first_register),
+                            component: 0,
+                        }],
+                        writable: false,
+                        indirect: None,
+                    }
+                } else {
+                    let pair = TextureSamplerBinding {
+                        slot: 0,
+                        image_group: group,
+                        image_binding: binding,
+                        sampler_group: 0,
+                        sampler_binding: 0,
+                        uses_sampler: false,
+                        dimension,
+                        depth,
+                        comparison: false,
+                    };
+                    let target = texture_target(&pair);
+                    let slot = self.texture_slot(pair)?;
+                    self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
+                    let coords = self.allocate(Shape::Vector(K::Sint, 4), false)?;
+                    let zero = self.immediate(Literal::I32(0))?;
+                    self.instruction("MOV", &coords.lanes[0], &[&zero.lanes[0]])?;
+                    let selected = match query {
+                        naga::ImageQuery::Size { level } => {
+                            if let Some(level) = level {
+                                let level = self.expression(frame, level)?;
+                                self.instruction("MOV", &coords.lanes[0], &[&level.lanes[0]])?;
+                            }
+                            (0..shape.len()).collect::<Vec<_>>()
+                        }
+                        naga::ImageQuery::NumLevels => unreachable!(),
+                        naga::ImageQuery::NumLayers => vec![2],
+                        naga::ImageQuery::NumSamples => {
+                            return Err(unsupported("multisample image query"));
+                        }
+                    };
+                    let query_result = self.allocate(Shape::Vector(K::Uint, 4), false)?;
+                    let write_mask = match selected.iter().copied().max() {
+                        Some(0) => "x",
+                        Some(1) => "xy",
+                        Some(2) => "xyz",
+                        _ => return Err(unsupported("image query components")),
+                    };
+                    self.instructions.push(format!(
+                        "TXQ {}.{write_mask}, {}, SAMP[{slot}], {target}",
+                        query_result.lanes[0].register, coords.lanes[0].register
+                    ));
+                    Value {
+                        shape,
+                        lanes: selected
+                            .into_iter()
+                            .map(|index| query_result.lanes[index].clone())
+                            .collect(),
+                        writable: false,
+                        indirect: None,
+                    }
+                }
+            }
+            E::Relational { fun, argument } => {
+                let argument = self.expression(frame, argument)?;
+                let opcode = match fun {
+                    naga::RelationalFunction::Any => "OR",
+                    naga::RelationalFunction::All => "AND",
+                    _ => return Err(unsupported("relational function")),
+                };
+                let result = self.allocate(shape, false)?;
+                let first = argument
+                    .lanes
+                    .first()
+                    .ok_or_else(|| unsupported("empty relational argument"))?;
+                self.instruction("MOV", &result.lanes[0], &[first])?;
+                for lane in argument.lanes.iter().skip(1) {
+                    self.instruction(opcode, &result.lanes[0], &[&result.lanes[0], lane])?;
+                }
+                result
+            }
             E::Math {
                 fun,
                 arg,
@@ -1879,6 +2159,84 @@ impl<'a> Compiler<'a> {
             let difference = self.binary(B::Subtract, &b, &a, shape.clone())?;
             let weighted = self.binary(B::Multiply, &difference, &c, shape.clone())?;
             return self.binary(B::Add, &a, &weighted, shape);
+        }
+        if fun == M::SmoothStep {
+            let upper = b.ok_or_else(|| unsupported("smoothstep operands"))?;
+            let value = c.ok_or_else(|| unsupported("smoothstep operands"))?;
+            let offset = self.binary(B::Subtract, &value, &a, shape.clone())?;
+            let range = self.binary(B::Subtract, &upper, &a, shape.clone())?;
+            let ratio = self.binary(B::Divide, &offset, &range, shape.clone())?;
+            let zero = self.immediate(Literal::F32(0.0))?;
+            let one = self.immediate(Literal::F32(1.0))?;
+            let two = self.immediate(Literal::F32(2.0))?;
+            let three = self.immediate(Literal::F32(3.0))?;
+            let t = self.math(M::Clamp, ratio, Some(zero), Some(one), shape.clone())?;
+            let squared = self.binary(B::Multiply, &t, &t, shape.clone())?;
+            let doubled = self.binary(B::Multiply, &two, &t, shape.clone())?;
+            let curve = self.binary(B::Subtract, &three, &doubled, shape.clone())?;
+            return self.binary(B::Multiply, &squared, &curve, shape);
+        }
+        if fun == M::Reflect {
+            let normal = b.ok_or_else(|| unsupported("reflect operands"))?;
+            if a.lanes.len() != normal.lanes.len() || a.shape.kind()? != K::Float {
+                return Err(unsupported("reflect type"));
+            }
+            let dot = self.allocate(Shape::Scalar(K::Float), false)?;
+            let products = a
+                .lanes
+                .iter()
+                .cloned()
+                .zip(normal.lanes.iter().cloned())
+                .collect::<Vec<_>>();
+            self.dot(&dot.lanes[0], &products)?;
+            let doubled = self.binary(B::Add, &dot, &dot, Shape::Scalar(K::Float))?;
+            let scaled = self.binary(B::Multiply, &normal, &doubled, shape.clone())?;
+            return self.binary(B::Subtract, &a, &scaled, shape);
+        }
+        if fun == M::Transpose {
+            let Shape::Matrix(columns, rows) = &a.shape else {
+                return Err(unsupported("transpose type"));
+            };
+            if !matches!(&shape, Shape::Matrix(result_columns, result_rows)
+                if result_columns == rows && result_rows == columns)
+            {
+                return Err(unsupported("transpose result type"));
+            }
+            let lanes = &a.lanes;
+            return Ok(Value {
+                shape,
+                lanes: (0..*rows)
+                    .flat_map(|column| {
+                        (0..*columns).map(move |row| lanes[row * *rows + column].clone())
+                    })
+                    .collect(),
+                writable: false,
+                indirect: None,
+            });
+        }
+        if fun == M::Sign && a.shape.kind()? == K::Float {
+            let zero = self.immediate(Literal::F32(0.0))?;
+            let result = self.allocate(shape, false)?;
+            let positive = self.allocate(result.shape.clone(), false)?;
+            let negative = self.allocate(result.shape.clone(), false)?;
+            for (index, destination) in result.lanes.iter().enumerate() {
+                self.instruction(
+                    "SGE",
+                    &positive.lanes[index],
+                    &[&a.lanes[index], &zero.lanes[0]],
+                )?;
+                self.instruction(
+                    "SGE",
+                    &negative.lanes[index],
+                    &[&zero.lanes[0], &a.lanes[index]],
+                )?;
+                self.instruction(
+                    "SUB",
+                    destination,
+                    &[&positive.lanes[index], &negative.lanes[index]],
+                )?;
+            }
+            return Ok(result);
         }
         if fun == M::Step {
             let x = b.ok_or_else(|| unsupported("step operands"))?;

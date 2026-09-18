@@ -141,19 +141,12 @@ fn compile_pipeline(
 ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
     let reference = resources.programmable_render_pipeline_ref(id)?;
     let pipeline = resources.programmable_render_pipeline_shared(reference)?;
-    if pipeline.color_targets().count() != 1
-        || pipeline
-            .color_targets()
-            .any(|target| target.write_mask() != ir::ColorWriteMask::ALL)
-    {
-        return Err(IrSubmitError::Unsupported(
-            UnsupportedIrFeature::PipelineTargetFormat,
-        ));
-    }
-    if !matches!(
-        pipeline.target_format(),
-        TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
-    ) {
+    if pipeline.color_targets().any(|target| {
+        !matches!(
+            target.format(),
+            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+        )
+    }) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PipelineTargetFormat,
         ));
@@ -220,10 +213,6 @@ fn compile_pipeline(
             .input_locations
             .iter()
             .any(|location| !vertex.output_locations.contains(location))
-        || fragment
-            .output_locations
-            .iter()
-            .any(|&location| location != 0)
     {
         return Err(ir::Error::InvalidDescriptor.into());
     }
@@ -324,6 +313,26 @@ fn compile_pipeline(
                     .first_register
                     .checked_add(binding.size.div_ceil(16))
                     .is_none_or(|end| end > 1024)
+            {
+                return Err(ir::Error::BindingLayoutMismatch.into());
+            }
+        }
+        for query in &shader.image_query_levels {
+            let layout = pipeline
+                .layout()
+                .bind_groups()
+                .get(query.group as usize)
+                .and_then(|group| {
+                    group
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.binding() == query.binding)
+                })
+                .ok_or(ir::Error::BindingLayoutMismatch)?;
+            if !matches!(
+                layout.ty(),
+                ir::BindingType::SampledTexture | ir::BindingType::SampledTextureView { .. }
+            ) || !layout.visibility().contains(visibility)
             {
                 return Err(ir::Error::BindingLayoutMismatch.into());
             }
@@ -554,8 +563,17 @@ pub(super) fn decode_draw(
     if !valid_count {
         return Err(ir::Error::InvalidValue.into());
     }
-    let target = resources.resources.texture(pass.attachment)?;
-    if target.format() != pipeline.target_format()
+    let mut attached =
+        core::iter::once(pass.attachment).chain(pass.additional_attachments.iter().copied());
+    for target in pipeline.color_targets() {
+        let Some(attachment) = attached.next() else {
+            return Err(ir::Error::InvalidDescriptor.into());
+        };
+        if resources.resources.texture(attachment)?.format() != target.format() {
+            return Err(ir::Error::InvalidDescriptor.into());
+        }
+    }
+    if attached.next().is_some()
         || pipeline.depth_state().is_some() && pass.depth_attachment.is_none()
     {
         return Err(ir::Error::InvalidDescriptor.into());
@@ -643,6 +661,33 @@ pub(super) fn decode_draw(
                     });
                 }
             }
+            for query in &shader.image_query_levels {
+                let (texture, levels) = match resource(query.group, query.binding)? {
+                    ir::BindingResource::Texture(texture) => (texture, None),
+                    ir::BindingResource::TextureView { texture, view } => {
+                        (texture, Some(view.mip_level_count()))
+                    }
+                    _ => return Err(ir::Error::BindingLayoutMismatch.into()),
+                };
+                let texture = resources.resources.texture_ref(texture)?;
+                let descriptor = resources.resources.texture(texture)?;
+                if !descriptor.usage().contains(TextureUsage::SAMPLED) {
+                    return Err(ir::Error::InvalidUsage.into());
+                }
+                let levels = levels.unwrap_or(descriptor.mip_level_count());
+                if levels == 0 || levels > descriptor.mip_level_count() {
+                    return Err(ir::Error::InvalidDescriptor.into());
+                }
+                if cached_constants.is_none() {
+                    let mut words = [0; 32];
+                    words[0] = levels;
+                    constants.push(driver::IrConstantBuffer {
+                        stage: shader.stage,
+                        first_register: query.first_register,
+                        words: driver::IrConstantWords::Inline { words, len: 4 },
+                    });
+                }
+            }
             for binding in &shader.textures {
                 let texture = match resource(binding.image_group, binding.image_binding)? {
                     ir::BindingResource::Texture(texture) => texture,
@@ -669,7 +714,8 @@ pub(super) fn decode_draw(
                 let descriptor = resources.resources.texture(texture)?;
                 if !descriptor.usage().contains(TextureUsage::SAMPLED)
                     || texture == pass.attachment
-                    || pass.depth_attachment == Some(texture)
+                    || pass.additional_attachments.contains(&texture)
+                    || pass.depth_attachment == Some(texture) && !pass.submission.depth_read_only
                 {
                     return Err(ir::Error::InvalidUsage.into());
                 }
@@ -853,6 +899,11 @@ pub(super) fn decode_draw(
     }
     let vertex_buffer = vertex_buffers[0];
     let raster = pipeline.raster();
+    let mut additional_color_blends = [None; 7];
+    for (slot, target) in pipeline.color_targets().skip(1).enumerate() {
+        additional_color_blends[slot] =
+            Some((blend_state(target.blend()), target.write_mask().bits()));
+    }
     // Writes are forbidden inside a render pass, so unchanged binding state
     // refers to the same owned constants. Bounds are still checked per draw.
     let programmable = if let Some(cached) = cached {
@@ -884,6 +935,8 @@ pub(super) fn decode_draw(
             slot: reference.slot() + 256,
             fragment: IrFragmentProgram::Solid,
             blend: blend_state(pipeline.blend()),
+            color_write_mask: pipeline.color_targets().next().unwrap().write_mask().bits(),
+            additional_color_blends,
             cull_mode: match raster.cull_mode() {
                 ir::CullMode::None => IrCullMode::None,
                 ir::CullMode::Front => IrCullMode::Front,
@@ -1037,6 +1090,29 @@ mod tests {
         assert_eq!(compiled.vertex.vertex_inputs.len(), 2);
         assert!(compiled.vertex.tgsi.contains("CONST[1]"));
         assert!(compiled.fragment.tgsi.contains("GENERIC[0]"));
+    }
+
+    #[test]
+    fn permits_fragment_output_without_color_attachment() {
+        let table = ResourceTable::new();
+        let source = "struct Transform { mvp: mat4x4<f32>, }; @group(0) @binding(0) var<uniform> transform: Transform;
+            struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) color: vec3<f32>, };
+            struct FragmentOutput { @location(0) color: vec4<f32>, @location(1) unused: vec4<f32>, };
+            @vertex fn vs(@location(0) position: vec3<f32>, @location(1) color: vec3<f32>) -> VertexOutput {
+                var output: VertexOutput; output.position = transform.mvp * vec4<f32>(position, 1.0);
+                output.color = color; return output;
+            }
+            @fragment fn fs(input: VertexOutput) -> FragmentOutput {
+                return FragmentOutput(vec4<f32>(input.color, 1.0), vec4<f32>(1.0));
+            }";
+        let id = pipeline_source(
+            &table,
+            VertexFormat::Float32x3,
+            ir::BindingType::UniformBuffer,
+            source,
+        );
+        let compiled = compile_pipeline(&table, id).unwrap();
+        assert_eq!(compiled.fragment.output_locations, vec![0, 1]);
     }
 
     #[test]

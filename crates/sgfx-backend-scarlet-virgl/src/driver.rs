@@ -596,6 +596,8 @@ pub(crate) struct IrPipelineState {
     pub(crate) slot: usize,
     pub(crate) fragment: IrFragmentProgram,
     pub(crate) blend: IrBlendState,
+    pub(crate) color_write_mask: u8,
+    pub(crate) additional_color_blends: [Option<(IrBlendState, u8)>; 7],
     pub(crate) cull_mode: IrCullMode,
     pub(crate) front_face: IrFrontFace,
     pub(crate) depth: Option<IrDepthState>,
@@ -814,12 +816,21 @@ pub(crate) struct IrTextureCopy {
 /// Complete backend-neutral render submission for one mapped presentation target.
 pub(crate) struct IrSubmission {
     pub(crate) clear_color: Option<[f32; 4]>,
+    pub(crate) additional_colors: Vec<IrColorAttachment>,
     pub(crate) depth_attachment: Option<IrTextureSpec>,
+    pub(crate) depth_read_only: bool,
     pub(crate) clear_depth: Option<f32>,
     pub(crate) render_area: IrRect,
     pub(crate) vertices: Vec<IrVertex>,
     pub(crate) draws: Vec<IrDraw>,
     pub(crate) texture_uploads: Vec<IrTextureUpload>,
+}
+
+/// One additional color output in a render pass.
+#[derive(Clone, Copy)]
+pub(crate) struct IrColorAttachment {
+    pub(crate) texture: IrTextureSpec,
+    pub(crate) clear: Option<[f32; 4]>,
 }
 
 /// Private persistent materialization cache owned by the creating context.

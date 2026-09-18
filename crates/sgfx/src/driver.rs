@@ -1277,7 +1277,11 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
                     max_vertex_buffers: 8,
                     max_vertex_buffer_stride: 2048,
                     max_inter_stage_components: 60,
-                    max_color_attachments: 1,
+                    max_color_attachments: if capabilities.supports_programmable_graphics() {
+                        ir::MAX_COLOR_ATTACHMENTS as u32
+                    } else {
+                        1
+                    },
                     max_compute_shared_memory_size: 0,
                     max_compute_work_group_count: [0; 3],
                     max_compute_work_group_invocations: 0,

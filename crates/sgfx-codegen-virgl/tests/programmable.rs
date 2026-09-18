@@ -28,6 +28,154 @@ fn wgsl(source: &str) -> ShaderModuleDesc {
 }
 
 #[test]
+fn deferred_lighting_shaders_lower_multiple_outputs_and_depth_loads() {
+    let source = wgsl(
+        r#"
+        struct GBuffer { @location(0) color: vec4<f32>, @location(1) normal: vec4<f32> }
+        @fragment fn geometry() -> GBuffer {
+            return GBuffer(vec4(0.25, 0.0, 0.0, 1.0), vec4(0.0, 0.5, 0.9, 1.0));
+        }
+        @group(0) @binding(0) var color: texture_2d<f32>;
+        @group(0) @binding(1) var normal: texture_2d<f32>;
+        @group(0) @binding(2) var depth: texture_depth_2d;
+        @fragment fn lighting(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+            let xy = vec2<i32>(p.xy);
+            return vec4(textureLoad(color, xy, 0).r,
+                        textureLoad(normal, xy, 0).g,
+                        textureLoad(depth, xy, 0), 1.0);
+        }
+    "#,
+    );
+    let geometry = compile_shader(&source, ShaderStage::Fragment, "geometry").unwrap();
+    assert_eq!(geometry.output_locations, vec![0, 1]);
+    assert!(geometry.tgsi.contains("COLOR[0]"));
+    assert!(geometry.tgsi.contains("COLOR[1]"));
+    let lighting = compile_shader(&source, ShaderStage::Fragment, "lighting").unwrap();
+    assert_eq!(lighting.textures.len(), 3);
+    assert!(lighting.tgsi.contains("TXF"));
+}
+
+#[test]
+fn reflect_builtin_lowers_for_stk_lighting_shaders() {
+    let module = wgsl(
+        r#"@fragment fn main(@location(0) incident: vec3<f32>,
+                             @location(1) normal: vec3<f32>) -> @location(0) vec4<f32> {
+            return vec4<f32>(reflect(incident, normal), 1.0);
+        }"#,
+    );
+    let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert!(compiled.tgsi.contains("SUB"));
+}
+
+#[test]
+fn transpose_nonsquare_matrix_lowers_for_stk_lighting_shaders() {
+    let module = wgsl(
+        r#"@fragment fn main(@location(0) first: vec3<f32>,
+                             @location(1) second: vec3<f32>) -> @location(0) vec4<f32> {
+            let transposed = transpose(mat2x3<f32>(first, second));
+            return vec4<f32>(transposed[0], transposed[1]);
+        }"#,
+    );
+    let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert!(compiled.tgsi.contains("COLOR[0]"));
+}
+
+#[test]
+fn lighting_loop_preserves_continue_and_break() {
+    let module = wgsl(
+        r#"@fragment fn main(@location(0) skip: i32) -> @location(0) vec4<f32> {
+            var sum = 0;
+            for (var i = 0; i < 4; i = i + 1) {
+                if (i == skip) { continue; }
+                if (i == 3) { break; }
+                sum = sum + i;
+            }
+            return vec4<f32>(f32(sum), 0.0, 0.0, 1.0);
+        }"#,
+    );
+    let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert_eq!(compiled.tgsi.matches("BGNLOOP").count(), 2);
+    assert_eq!(compiled.tgsi.matches("ENDLOOP").count(), 2);
+    assert!(compiled.tgsi.contains("BRK"));
+}
+
+#[test]
+fn sign_builtin_lowers_for_stk_spot_lights() {
+    let module = wgsl(
+        r#"@fragment fn main(@location(0) scale: f32) -> @location(0) vec4<f32> {
+            return vec4<f32>(sign(scale), 0.0, 0.0, 1.0);
+        }"#,
+    );
+    let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert!(compiled.tgsi.contains("SGE"));
+    assert!(compiled.tgsi.contains("SUB"));
+}
+
+#[test]
+fn conditional_return_exits_lighting_loop() {
+    let module = wgsl(
+        r#"fn light(limit: i32) -> i32 {
+            for (var i = 0; i < 4; i = i + 1) {
+                if (i == limit) { return i; }
+            }
+            return -1;
+        }
+        @fragment fn main(@location(0) limit: i32) -> @location(0) vec4<f32> {
+            return vec4<f32>(f32(light(limit)), 0.0, 0.0, 1.0);
+        }"#,
+    );
+    let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert!(compiled.tgsi.contains("BGNLOOP"));
+    assert!(compiled.tgsi.contains("BRK"));
+    assert!(compiled.tgsi.contains("ELSE"));
+}
+
+#[test]
+fn image_size_and_mip_level_queries_lower_for_stk_displacement() {
+    let module = wgsl(
+        r#"@group(0) @binding(0) var image: texture_2d<f32>;
+        @fragment fn main() -> @location(0) vec4<f32> {
+            let size = textureDimensions(image, 0);
+            let levels = textureNumLevels(image);
+            return vec4<f32>(f32(size.x), f32(size.y), f32(levels), 1.0);
+        }"#,
+    );
+    let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert_eq!(compiled.tgsi.matches("TXQ").count(), 1);
+    assert!(compiled.tgsi.lines().any(|line| line.contains("TXQ ") && line.contains(".xy,")));
+    assert_eq!(compiled.image_query_levels.len(), 1);
+    assert!(compiled.tgsi.contains("CONST[0]"));
+}
+
+#[test]
+fn relational_any_and_all_lower_for_stk_reflections() {
+    let module = wgsl(
+        r#"@fragment fn main(@location(0) a: vec2<i32>,
+                             @location(1) b: vec2<i32>) -> @location(0) vec4<f32> {
+            let changed = any(a != b);
+            let same = all(a == b);
+            return vec4<f32>(select(0.0, 1.0, changed), select(0.0, 1.0, same), 0.0, 1.0);
+        }"#,
+    );
+    let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert!(compiled.tgsi.contains("OR"));
+    assert!(compiled.tgsi.contains("AND"));
+}
+
+#[test]
+fn smoothstep_lowers_for_stk_displacement_mask() {
+    let module = wgsl(
+        r#"@fragment fn main(@location(0) value: vec3<f32>) -> @location(0) vec4<f32> {
+            return vec4<f32>(smoothstep(vec3<f32>(0.1), vec3<f32>(0.9), value), 1.0);
+        }"#,
+    );
+    let compiled = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+    assert!(compiled.tgsi.contains("DIV"));
+    assert!(compiled.tgsi.contains("MIN"));
+    assert!(compiled.tgsi.contains("MAX"));
+}
+
+#[test]
 fn readonly_storage_arrays_preserve_struct_matrix_layout_and_dynamic_indices() {
     let source = r#"
 struct Object { translation: vec3<f32>, joint: u32, transform: mat3x3<f32> };
@@ -199,6 +347,44 @@ fn separate_texture_and_sampler_pairs_lower_for_wgsl_and_spirv() {
 }
 
 #[test]
+fn image_mip_level_query_uses_descriptor_metadata() {
+    let source = r#"
+@group(1) @binding(2) var image: texture_2d<f32>;
+@fragment fn main() -> @location(0) vec4<f32> {
+    return vec4<f32>(f32(textureNumLevels(image)), 0.0, 0.0, 1.0);
+}"#;
+    let shader = compile_shader(&wgsl(source), ShaderStage::Fragment, "main").unwrap();
+    assert_eq!(shader.image_query_levels.len(), 1);
+    assert_eq!(shader.image_query_levels[0].group, 1);
+    assert_eq!(shader.image_query_levels[0].binding, 2);
+    assert!(shader.tgsi.contains("CONST[0]"));
+    assert!(!shader.tgsi.contains("TXQ"));
+}
+
+#[test]
+fn image_size_query_does_not_request_unsupported_mip_level_extension() {
+    let source = r#"
+@group(0) @binding(0) var image: texture_2d<f32>;
+@fragment fn main() -> @location(0) vec4<f32> {
+    let size = textureDimensions(image, 0);
+    return vec4<f32>(vec2<f32>(size), 0.0, 1.0);
+}"#;
+    let shader = compile_shader(&wgsl(source), ShaderStage::Fragment, "main").unwrap();
+    assert!(
+        shader
+            .tgsi
+            .lines()
+            .any(|line| line.contains("TXQ ") && line.contains(".xy,"))
+    );
+    assert!(
+        !shader
+            .tgsi
+            .lines()
+            .any(|line| line.contains("TXQ ") && line.contains(".xyzw,"))
+    );
+}
+
+#[test]
 fn explicit_lod_sampling_and_multiple_pairs_have_distinct_slots() {
     let source = r#"
 @group(0) @binding(0) var a: texture_2d<f32>;
@@ -367,11 +553,6 @@ fn unsupported_shaders_fail_instead_of_emitting_a_compatibility_shader() {
             "@vertex fn main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{var a=array<vec4<f32>,2>(vec4<f32>(0.0),vec4<f32>(1.0));a[i]=vec4<f32>(2.0);return a[0];}",
             ShaderStage::Vertex,
             "store target",
-        ),
-        (
-            "@vertex fn main(@location(0) p:vec4<f32>)->@builtin(position) vec4<f32>{var v=p; for(var i=0;i<3;i++){v.x+=1.0;}return v;}",
-            ShaderStage::Vertex,
-            "statement",
         ),
     ];
     for (source, stage, reason) in cases {

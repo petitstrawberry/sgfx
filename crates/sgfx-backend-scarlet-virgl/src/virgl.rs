@@ -808,6 +808,7 @@ impl Context {
             upload_arenas: Vec::new(),
             buffers: empty_slots(IR_BUFFER_SLOTS)?,
             textures: empty_slots(IR_TEXTURE_SLOTS)?,
+            depth_sample_copies: empty_slots(IR_TEXTURE_SLOTS)?,
             texture_specs: empty_slots(IR_TEXTURE_SLOTS)?,
             samplers: empty_slots(IR_SAMPLER_SLOTS)?,
             pipelines: empty_slots(IR_PIPELINE_SLOTS)?,
@@ -988,6 +989,7 @@ pub(crate) struct IrResources {
     upload_arenas: Vec<Arc<UploadArena>>,
     buffers: Vec<Option<IrBuffer>>,
     textures: Vec<Option<IrTexture>>,
+    depth_sample_copies: Vec<Option<Texture>>,
     texture_specs: Vec<Option<IrTextureSpec>>,
     samplers: Vec<Option<IrSampler>>,
     pipelines: Vec<Option<IrPipeline>>,
@@ -1029,6 +1031,7 @@ pub(crate) struct IrStateSnapshot {
     buffers: Vec<Option<u64>>,
     buffer_views: Vec<bool>,
     textures: Vec<(bool, bool)>,
+    depth_copy_views: Vec<bool>,
     samplers: Vec<bool>,
     pipelines: Vec<bool>,
     programmable_pipelines: Vec<bool>,
@@ -1108,6 +1111,14 @@ impl IrResources {
                     })
                 }),
             )?,
+            depth_copy_views: collect(
+                self.depth_sample_copies.len(),
+                self.depth_sample_copies.iter().map(|texture| {
+                    texture
+                        .as_ref()
+                        .is_some_and(|texture| texture.sampler_view_initialized.get())
+                }),
+            )?,
             samplers: collect(
                 self.samplers.len(),
                 self.samplers.iter().map(|value| {
@@ -1157,6 +1168,17 @@ impl IrResources {
                     texture.surface_initialized.set(surface);
                 }
                 None => {}
+            }
+        }
+        for (index, texture) in self.depth_sample_copies.iter().enumerate() {
+            if let Some(texture) = texture {
+                texture.sampler_view_initialized.set(
+                    snapshot
+                        .depth_copy_views
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false),
+                );
             }
         }
         for (index, sampler) in self.samplers.iter().enumerate() {
@@ -1236,6 +1258,13 @@ struct IrPassTarget {
 struct IrPassDepthTarget {
     surface_handle: u32,
     surface_initialized: bool,
+}
+
+struct IrPassColorTarget {
+    surface_handle: u32,
+    resource_id: u32,
+    surface_initialized: bool,
+    clear: Option<[f32; 4]>,
 }
 
 impl IrTexture {
@@ -1392,6 +1421,9 @@ impl Queue {
         resources: &mut IrResources,
         submission: &IrSubmission,
     ) -> HandleResult<()> {
+        for color in &submission.additional_colors {
+            ir_texture(context, resources, color.texture)?;
+        }
         if let Some(texture) = submission.depth_attachment {
             ir_texture(context, resources, texture)?;
         }
@@ -1729,13 +1761,44 @@ impl Queue {
             || submission.vertices.len() > MAX_IR_VERTICES
             || (submission.draws.is_empty()
                 && submission.clear_color.is_none()
-                && submission.clear_depth.is_none())
+                && submission.clear_depth.is_none()
+                && !submission
+                    .additional_colors
+                    .iter()
+                    .any(|color| color.clear.is_some()))
+            || submission.additional_colors.len() > 7
             || !ir_rect_is_within(submission.render_area, target.width, target.height)
             || submission
                 .clear_color
                 .is_some_and(|color| !color.iter().all(|component| component.is_finite()))
         {
             return Err(HandleError::InvalidParameter);
+        }
+
+        let mut additional_colors = Vec::new();
+        additional_colors
+            .try_reserve_exact(submission.additional_colors.len())
+            .map_err(|_| HandleError::OutOfResources)?;
+        for color in &submission.additional_colors {
+            let spec = color.texture;
+            if !spec.render_attachment
+                || spec.present
+                || !matches!(spec.format, IrTextureFormat::Bgra8 | IrTextureFormat::Rgba8)
+                || spec.width != target.width
+                || spec.height != target.height
+                || color
+                    .clear
+                    .is_some_and(|clear| !clear.iter().all(|component| component.is_finite()))
+            {
+                return Err(HandleError::InvalidParameter);
+            }
+            let texture = ir_texture(context, resources, spec)?;
+            additional_colors.push(IrPassColorTarget {
+                surface_handle: texture.surface_handle(),
+                resource_id: texture.resource_id(),
+                surface_initialized: texture.surface_initialized(),
+                clear: color.clear,
+            });
         }
 
         let depth_target = if let Some(spec) = submission.depth_attachment {
@@ -1757,6 +1820,53 @@ impl Queue {
             if submission.clear_depth.is_some() {
                 return Err(HandleError::InvalidParameter);
             }
+            None
+        };
+        if submission.depth_read_only && submission.depth_attachment.is_none() {
+            return Err(HandleError::InvalidParameter);
+        }
+        let depth_sample_copy = if let Some(spec) = submission.depth_attachment.filter(|spec| {
+            submission.depth_read_only
+                && submission.draws.iter().any(|draw| {
+                    draw.programmable.as_ref().is_some_and(|programmable| {
+                        programmable
+                            .textures
+                            .iter()
+                            .any(|binding| binding.texture.slot == spec.slot)
+                    })
+                })
+        }) {
+            let source_resource_id = resources
+                .textures
+                .get(spec.slot)
+                .and_then(Option::as_ref)
+                .ok_or(HandleError::InvalidParameter)?
+                .resource_id();
+            let copy_slot = resources
+                .depth_sample_copies
+                .get_mut(spec.slot)
+                .ok_or(HandleError::InvalidParameter)?;
+            if copy_slot.is_none() {
+                *copy_slot = Some(context.create_ir_texture(IrTextureSpec {
+                    render_attachment: false,
+                    sampled: true,
+                    copy_destination: false,
+                    ..spec
+                })?);
+            }
+            let copy = copy_slot.as_ref().ok_or(HandleError::InvalidParameter)?;
+            if copy.width != spec.width || copy.height != spec.height {
+                return Err(HandleError::InvalidParameter);
+            }
+            Some((
+                spec.slot,
+                source_resource_id,
+                copy.resource_id,
+                copy.sampler_view_handle,
+                copy.sampler_view_initialized.get(),
+                spec,
+            ))
+        } else {
             None
         };
 
@@ -1794,6 +1904,11 @@ impl Queue {
         if !target.surface_initialized {
             push_surface(&mut commands, target.surface_handle, target.resource_id);
         }
+        for color in &additional_colors {
+            if !color.surface_initialized {
+                push_surface(&mut commands, color.surface_handle, color.resource_id);
+            }
+        }
         if let (Some(depth_spec), Some(depth_target)) =
             (submission.depth_attachment, depth_target.as_ref())
             && !depth_target.surface_initialized
@@ -1808,6 +1923,21 @@ impl Queue {
                 depth_target.surface_handle,
                 texture.resource_id(),
             );
+        }
+        if let Some((_, source, destination, view, view_initialized, spec)) = depth_sample_copy {
+            let rect = crate::driver::IrRect {
+                x: 0,
+                y: 0,
+                width: spec.width,
+                height: spec.height,
+            };
+            // Sampling an attached depth image is an OpenGL feedback loop even
+            // with depth writes disabled. Keep the depth test attached to the
+            // original and bind a copy of its contents for shader reads.
+            push_depth_blit(&mut commands, destination, rect, source, rect);
+            if !view_initialized {
+                push_ir_sampler_view(&mut commands, view, destination, spec);
+            }
         }
         for upload in &submission.texture_uploads {
             let texture = ir_texture(context, resources, IrTextureSpec { ..upload.texture })?;
@@ -1888,6 +2018,7 @@ impl Queue {
         push_ir_bind_pass_state(
             &mut commands,
             target.surface_handle,
+            &additional_colors,
             depth_target
                 .as_ref()
                 .map_or(0, |depth| depth.surface_handle),
@@ -1927,6 +2058,16 @@ impl Queue {
                     depth_target.surface_handle,
                     submission.render_area,
                     clear_depth,
+                )?;
+            }
+        }
+        for color in &additional_colors {
+            if let Some(clear) = color.clear {
+                push_ir_clear_surface(
+                    &mut commands,
+                    color.surface_handle,
+                    submission.render_area,
+                    clear,
                 )?;
             }
         }
@@ -1986,6 +2127,7 @@ impl Queue {
                     pipeline,
                     draw,
                     &mut programmable_bindings,
+                    depth_sample_copy.map(|(slot, _, _, view, _, _)| (slot, view)),
                 )?;
                 // The fixed path must restore all state after a programmable draw.
                 bound_programmable = true;
@@ -2109,10 +2251,20 @@ impl Queue {
                 texture.set_sampler_view_initialized();
             }
         }
+        if let Some((slot, _, _, _, _, _)) = depth_sample_copy
+            && let Some(Some(copy)) = resources.depth_sample_copies.get(slot)
+        {
+            copy.sampler_view_initialized.set(true);
+        }
         if let Some(depth) = submission.depth_attachment
             && let Some(Some(texture)) = resources.textures.get(depth.slot)
         {
             texture.set_surface_initialized();
+        }
+        for color in &submission.additional_colors {
+            if let Some(Some(texture)) = resources.textures.get(color.texture.slot) {
+                texture.set_surface_initialized();
+            }
         }
         Ok(())
     }
@@ -2706,6 +2858,18 @@ fn ir_pipeline_states_equal(left: IrPipelineState, right: IrPipelineState) -> bo
     left.slot == right.slot
         && ir_fragment_programs_equal(left.fragment, right.fragment)
         && ir_blend_states_equal(left.blend, right.blend)
+        && left.color_write_mask == right.color_write_mask
+        && left
+            .additional_color_blends
+            .iter()
+            .zip(right.additional_color_blends.iter())
+            .all(|(left, right)| match (left, right) {
+                (None, None) => true,
+                (Some((left_blend, left_mask)), Some((right_blend, right_mask))) => {
+                    left_mask == right_mask && ir_blend_states_equal(*left_blend, *right_blend)
+                }
+                _ => false,
+            })
         && ir_cull_modes_equal(left.cull_mode, right.cull_mode)
         && ir_front_faces_equal(left.front_face, right.front_face)
         && match (left.depth, right.depth) {
@@ -3327,6 +3491,41 @@ fn push_resource_copy(
     push_dword(commands, 1);
 }
 
+fn push_depth_blit(
+    commands: &mut Vec<u8>,
+    destination_resource: u32,
+    destination: crate::driver::IrRect,
+    source_resource: u32,
+    source: crate::driver::IrRect,
+) {
+    push_dword(commands, command_header(VIRGL_CCMD_BLIT, 0, 21));
+    push_dword(commands, 0x10); // PIPE_MASK_Z, nearest filtering, no scissor.
+    push_dword(commands, 0);
+    push_dword(commands, 0);
+    for word in [
+        destination_resource,
+        0,
+        VIRGL_FORMAT_Z32_FLOAT,
+        destination.x,
+        destination.y,
+        0,
+        destination.width,
+        destination.height,
+        1,
+        source_resource,
+        0,
+        VIRGL_FORMAT_Z32_FLOAT,
+        source.x,
+        source.y,
+        0,
+        source.width,
+        source.height,
+        1,
+    ] {
+        push_dword(commands, word);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_mip_blit(
     commands: &mut Vec<u8>,
@@ -3820,6 +4019,7 @@ fn push_programmable_draw(
     state: &IrPipeline,
     draw: &IrDraw,
     bindings: &mut ProgrammableBindings,
+    depth_sample_copy: Option<(usize, u32)>,
 ) -> HandleResult<()> {
     let programmable = draw
         .programmable
@@ -3920,7 +4120,12 @@ fn push_programmable_draw(
             bindings,
             stage,
             binding.slot,
-            texture.programmable_sampler_view_handle(),
+            depth_sample_copy
+                .filter(|(slot, _)| *slot == binding.texture.slot)
+                .map_or_else(
+                    || texture.programmable_sampler_view_handle(),
+                    |(_, view)| view,
+                ),
             sampler_handle,
         )?;
     }
@@ -4018,23 +4223,26 @@ fn push_ir_pipeline(commands: &mut Vec<u8>, pipeline: &IrPipeline) {
         command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_BLEND, 11),
     );
     push_dword(commands, pipeline.blend_handle);
-    push_dword(commands, 0);
-    push_dword(commands, 0);
-    let blend = pipeline.state.blend;
     push_dword(
         commands,
-        VIRGL_BLEND_ENABLE
-            | (ir_blend_op(blend.color.operation) << 1)
-            | (ir_blend_factor(blend.color.source_factor) << VIRGL_BLEND_RGB_SRC_FACTOR_SHIFT)
-            | (ir_blend_factor(blend.color.destination_factor) << VIRGL_BLEND_RGB_DST_FACTOR_SHIFT)
-            | (ir_blend_op(blend.alpha.operation) << 14)
-            | (ir_blend_factor(blend.alpha.source_factor) << VIRGL_BLEND_ALPHA_SRC_FACTOR_SHIFT)
-            | (ir_blend_factor(blend.alpha.destination_factor)
-                << VIRGL_BLEND_ALPHA_DST_FACTOR_SHIFT)
-            | (0xf << VIRGL_BLEND_COLORMASK_SHIFT),
+        u32::from(
+            pipeline
+                .state
+                .additional_color_blends
+                .iter()
+                .any(Option::is_some),
+        ),
     );
-    for _ in 0..7 {
-        push_dword(commands, 0);
+    push_dword(commands, 0);
+    push_dword(
+        commands,
+        ir_blend_target(pipeline.state.blend, pipeline.state.color_write_mask),
+    );
+    for target in pipeline.state.additional_color_blends {
+        push_dword(
+            commands,
+            target.map_or(0, |(blend, mask)| ir_blend_target(blend, mask)),
+        );
     }
     push_dword(
         commands,
@@ -4055,6 +4263,17 @@ fn push_ir_pipeline(commands: &mut Vec<u8>, pipeline: &IrPipeline) {
     if let (Some(handle), Some(depth)) = (pipeline.dsa_handle, pipeline.state.depth) {
         push_ir_dsa(commands, handle, depth);
     }
+}
+
+fn ir_blend_target(blend: IrBlendState, color_write_mask: u8) -> u32 {
+    VIRGL_BLEND_ENABLE
+        | (ir_blend_op(blend.color.operation) << 1)
+        | (ir_blend_factor(blend.color.source_factor) << VIRGL_BLEND_RGB_SRC_FACTOR_SHIFT)
+        | (ir_blend_factor(blend.color.destination_factor) << VIRGL_BLEND_RGB_DST_FACTOR_SHIFT)
+        | (ir_blend_op(blend.alpha.operation) << 14)
+        | (ir_blend_factor(blend.alpha.source_factor) << VIRGL_BLEND_ALPHA_SRC_FACTOR_SHIFT)
+        | (ir_blend_factor(blend.alpha.destination_factor) << VIRGL_BLEND_ALPHA_DST_FACTOR_SHIFT)
+        | (u32::from(color_write_mask) << VIRGL_BLEND_COLORMASK_SHIFT)
 }
 
 fn push_ir_dsa(commands: &mut Vec<u8>, handle: u32, depth: crate::driver::IrDepthState) {
@@ -4110,6 +4329,7 @@ fn push_ir_sampler(commands: &mut Vec<u8>, sampler: &IrSampler) {
 fn push_ir_bind_pass_state(
     commands: &mut Vec<u8>,
     surface_handle: u32,
+    additional_surface_handles: &[IrPassColorTarget],
     depth_surface_handle: u32,
     vertex_resource_id: u32,
     width: u32,
@@ -4128,11 +4348,18 @@ fn push_ir_bind_pass_state(
     );
     push_dword(
         commands,
-        command_header(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3),
+        command_header(
+            VIRGL_CCMD_SET_FRAMEBUFFER_STATE,
+            0,
+            3 + additional_surface_handles.len() as u32,
+        ),
     );
-    push_dword(commands, 1);
+    push_dword(commands, 1 + additional_surface_handles.len() as u32);
     push_dword(commands, depth_surface_handle);
     push_dword(commands, surface_handle);
+    for color in additional_surface_handles {
+        push_dword(commands, color.surface_handle);
+    }
     push_dword(
         commands,
         command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3),
@@ -4860,7 +5087,7 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::IrDepthState;
+    use crate::driver::{IrBlendComponent, IrDepthState};
 
     #[test]
     fn buffer_delta_uploads_preserve_neighboring_words_and_repair_stale_storage() {
@@ -5493,6 +5720,7 @@ mod tests {
         push_ir_bind_pass_state(
             &mut commands,
             11,
+            &[],
             0,
             12,
             640,
@@ -5527,12 +5755,122 @@ mod tests {
     }
 
     #[test]
+    fn ir_mrt_packets_bind_two_surfaces_and_independent_color_masks() {
+        let extra = [IrPassColorTarget {
+            surface_handle: 22,
+            resource_id: 23,
+            surface_initialized: false,
+            clear: Some([0.0, 0.0, 0.2, 1.0]),
+        }];
+        let mut commands = Vec::new();
+        push_ir_bind_pass_state(
+            &mut commands,
+            11,
+            &extra,
+            0,
+            12,
+            640,
+            480,
+            FramebufferOrientation::UPPER_LEFT,
+            13,
+            14,
+        );
+        let words = dwords(&commands);
+        assert!(words.windows(5).any(|packet| packet
+            == [
+                command_header(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 4),
+                2,
+                0,
+                11,
+                22,
+            ]));
+
+        let replace = IrBlendComponent {
+            source_factor: IrBlendFactor::One,
+            destination_factor: IrBlendFactor::Zero,
+            operation: IrBlendOp::Add,
+        };
+        let blend = IrBlendState {
+            color: replace,
+            alpha: replace,
+        };
+        let pipeline = IrPipeline {
+            blend_handle: 31,
+            rasterizer_handle: 32,
+            dsa_handle: None,
+            state: IrPipelineState {
+                slot: 0,
+                fragment: IrFragmentProgram::Solid,
+                blend,
+                color_write_mask: 0xf,
+                additional_color_blends: [Some((blend, 0x3)), None, None, None, None, None, None],
+                cull_mode: IrCullMode::None,
+                front_face: IrFrontFace::CounterClockwise,
+                depth: None,
+            },
+            initialized: Cell::new(false),
+        };
+        commands.clear();
+        push_ir_pipeline(&mut commands, &pipeline);
+        let words = dwords(&commands);
+        assert_eq!(
+            words[0],
+            command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_BLEND, 11)
+        );
+        assert_eq!(words[1], 31);
+        assert_eq!(words[2], 1);
+        assert_eq!(words[4] >> VIRGL_BLEND_COLORMASK_SHIFT, 0xf);
+        assert_eq!(words[5] >> VIRGL_BLEND_COLORMASK_SHIFT, 0x3);
+        assert_eq!(words[6..12], [0; 6]);
+    }
+
+    #[test]
+    fn read_only_depth_copy_uses_depth_blit_instead_of_color_or_resource_copy() {
+        let rect = crate::driver::IrRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let mut commands = Vec::new();
+        push_depth_blit(&mut commands, 19, rect, 11, rect);
+        assert_eq!(
+            dwords(&commands),
+            [
+                command_header(VIRGL_CCMD_BLIT, 0, 21),
+                0x10,
+                0,
+                0,
+                19,
+                0,
+                VIRGL_FORMAT_Z32_FLOAT,
+                0,
+                0,
+                0,
+                8,
+                8,
+                1,
+                11,
+                0,
+                VIRGL_FORMAT_Z32_FLOAT,
+                0,
+                0,
+                0,
+                8,
+                8,
+                1,
+            ]
+        );
+    }
+
+    #[test]
     fn ir_depth_packets_create_bind_test_write_and_clear_z32() {
         let mut commands = Vec::new();
         push_depth_surface(&mut commands, 21, 22);
         push_ir_bind_pass_state(
             &mut commands,
             11,
+            &[],
             21,
             12,
             640,
