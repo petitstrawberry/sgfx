@@ -349,8 +349,8 @@ enum DeviceBackend {
 #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
 struct WgpuDevice {
     context: Rc<sgfx_backend_wgpu::Context>,
-    instance: wgpu::Instance,
-    adapter: wgpu::Adapter,
+    _instance: wgpu::Instance,
+    _adapter: wgpu::Adapter,
 }
 
 impl Device {
@@ -480,8 +480,8 @@ impl Device {
         // SAFETY: forwarded from this method's contract.
         unsafe {
             sgfx_backend_wgpu::WindowContext::from_core_animation_layer(
-                device.instance.clone(),
-                &device.adapter,
+                device._instance.clone(),
+                &device._adapter,
                 device.context.as_ref().clone(),
                 layer,
                 width,
@@ -1184,8 +1184,8 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
         id: next_device_id(),
         backend: DeviceBackend::Wgpu(WgpuDevice {
             context: Rc::new(context),
-            instance: wgpu_adapter.instance.clone(),
-            adapter: adapter.clone(),
+            _instance: wgpu_adapter.instance.clone(),
+            _adapter: adapter.clone(),
         }),
     })
 }
