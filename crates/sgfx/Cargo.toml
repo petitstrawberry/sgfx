@@ -9,8 +9,6 @@ repository = "https://github.com/petitstrawberry/sgfx"
 default = [
     "std",
     "backend-wgpu",
-    "backend-scarlet-virgl",
-    "backend-scarlet-adreno",
 ]
 std = [
     "sgfx-core/std",
