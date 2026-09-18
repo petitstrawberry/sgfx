@@ -8,8 +8,8 @@
 pub(crate) mod command;
 mod pipeline;
 pub(crate) mod resource;
-mod types;
 mod texture_view;
+mod types;
 pub use texture_view::{TextureViewDesc, TextureViewDimension};
 
 pub use command::{
@@ -18,9 +18,9 @@ pub use command::{
 };
 pub use pipeline::{
     BlendComponent, BlendFactor, BlendOp, BlendState, CompareFunction, CullMode, DepthState,
-    DrawUniforms, FragmentProgram, FrontFace, IndexFormat, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
-    PrimitiveTopology, RasterState, RenderPipelineDesc, TextureSampleMode, VertexAttribute,
-    VertexBufferLayout, VertexFormat,
+    DrawUniforms, FragmentProgram, FrontFace, IndexFormat, MAX_VERTEX_ATTRIBUTES,
+    MAX_VERTEX_BUFFERS, PrimitiveTopology, RasterState, RenderPipelineDesc, TextureSampleMode,
+    VertexAttribute, VertexBufferLayout, VertexFormat,
 };
 pub use resource::{
     AddressMode, BufferDesc, BufferId, BufferRef, BufferUsage, FilterMode,
@@ -42,6 +42,6 @@ pub use resource::{
 pub use shader::*;
 mod owned;
 pub use owned::{
-    OwnedColorAttachment, OwnedCommand, OwnedCommandBuffer, OwnedDepthAttachment, OwnedRenderPassDesc,
-    OwnedResourceBarrier,
+    OwnedColorAttachment, OwnedCommand, OwnedCommandBuffer, OwnedDepthAttachment,
+    OwnedRenderPassDesc, OwnedResourceBarrier,
 };

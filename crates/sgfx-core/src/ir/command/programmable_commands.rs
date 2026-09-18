@@ -16,7 +16,10 @@ impl PendingWrite {
     fn aliases(self, other: Self) -> bool {
         match (self, other) {
             (Self::Buffer(a), Self::Buffer(b)) => a == b,
-            (Self::Texture(a) | Self::TextureMip(a, _), Self::Texture(b) | Self::TextureMip(b, _)) => a == b,
+            (
+                Self::Texture(a) | Self::TextureMip(a, _),
+                Self::Texture(b) | Self::TextureMip(b, _),
+            ) => a == b,
             _ => false,
         }
     }
@@ -144,7 +147,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                         self.pending_writes
                             .retain(|pending| *pending != PendingWrite::Texture(id));
                     }
-                    self.pending_writes.retain(|pending| *pending != PendingWrite::TextureMip(id, mip));
+                    self.pending_writes
+                        .retain(|pending| *pending != PendingWrite::TextureMip(id, mip));
                     self.announced_accesses.retain(|entry| !matches!(entry,
                         AnnouncedAccess::Texture(other, other_mip, _) if *other == id && *other_mip == mip));
                 }
@@ -164,8 +168,13 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         desc.mip_extent(mip)?;
         Self::require_texture_usage(desc.usage(), before.usage())?;
         Self::require_texture_usage(desc.usage(), after.usage())?;
-        if (self.pending_writes.contains(&PendingWrite::TextureMip(texture.id(), mip))
-            || (mip == 0 && self.pending_writes.contains(&PendingWrite::Texture(texture.id()))))
+        if (self
+            .pending_writes
+            .contains(&PendingWrite::TextureMip(texture.id(), mip))
+            || (mip == 0
+                && self
+                    .pending_writes
+                    .contains(&PendingWrite::Texture(texture.id()))))
             && before != TextureAccess::StorageWrite
         {
             return Err(Error::InvalidResourceAccess);
@@ -221,8 +230,13 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         access: TextureAccess,
     ) -> Result<()> {
         self.resources.texture(texture)?.mip_extent(mip)?;
-        if self.pending_writes.contains(&PendingWrite::TextureMip(texture.id(), mip))
-            || (mip == 0 && self.pending_writes.contains(&PendingWrite::Texture(texture.id())))
+        if self
+            .pending_writes
+            .contains(&PendingWrite::TextureMip(texture.id(), mip))
+            || (mip == 0
+                && self
+                    .pending_writes
+                    .contains(&PendingWrite::Texture(texture.id())))
         {
             return Err(Error::MissingBarrier);
         }
@@ -272,15 +286,30 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
                             _ => BufferAccess::StorageReadWrite,
                         };
                         self.check_buffer_access(reference, access)?;
-                        if writes && (vertices.iter().flatten().any(|(buffer, _)| *buffer == reference) || index == Some(reference)) {
+                        if writes
+                            && (vertices
+                                .iter()
+                                .flatten()
+                                .any(|(buffer, _)| *buffer == reference)
+                                || index == Some(reference))
+                        {
                             return Err(Error::ResourceAccessConflict);
                         }
                     }
                     BindingResource::TextureView { texture, view } => {
                         let reference = self.resources.texture_ref(texture)?;
-                        for mip in view.base_mip_level()..view.base_mip_level() + view.mip_level_count() {
-                            self.check_texture_mip_access(reference, mip,
-                                if writes { TextureAccess::StorageWrite } else { TextureAccess::Sampled })?;
+                        for mip in
+                            view.base_mip_level()..view.base_mip_level() + view.mip_level_count()
+                        {
+                            self.check_texture_mip_access(
+                                reference,
+                                mip,
+                                if writes {
+                                    TextureAccess::StorageWrite
+                                } else {
+                                    TextureAccess::Sampled
+                                },
+                            )?;
                         }
                         if attachments.contains(&reference) {
                             return Err(Error::AttachmentFeedback);
@@ -322,10 +351,13 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             let key = match resource {
                 BindingResource::Buffer { buffer, .. } => PendingWrite::Buffer(buffer),
                 BindingResource::TextureView { texture, view } => {
-                    for mip in view.base_mip_level()..view.base_mip_level() + view.mip_level_count() {
+                    for mip in view.base_mip_level()..view.base_mip_level() + view.mip_level_count()
+                    {
                         let key = PendingWrite::TextureMip(texture, mip);
                         used.push(key);
-                        if writes { pending.push(key); }
+                        if writes {
+                            pending.push(key);
+                        }
                     }
                     continue;
                 }
@@ -468,8 +500,15 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .encoder
             .resources
             .programmable_render_pipeline_shared(pipeline)?;
-        if desc.color_targets().map(|target| target.format()).ne(self.color_formats.iter().flatten().copied())
-            || (self.depth_read_only && desc.depth_state().is_some_and(|depth| depth.write_enabled()))
+        if desc.color_targets().map(|target| target.format()).ne(self
+            .color_formats
+            .iter()
+            .flatten()
+            .copied())
+            || (self.depth_read_only
+                && desc
+                    .depth_state()
+                    .is_some_and(|depth| depth.write_enabled()))
             || desc
                 .depth_state()
                 .is_some_and(|depth| Some(depth.format()) != self.depth_format)
@@ -521,11 +560,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         )
     }
     fn validate_cumulative_accesses(&mut self, accesses: &GroupAccesses) -> Result<()> {
-        if accesses
-            .writes
-            .iter()
-            .any(|resource| self.used_resources.iter().any(|used| resource.aliases(*used)))
-        {
+        if accesses.writes.iter().any(|resource| {
+            self.used_resources
+                .iter()
+                .any(|used| resource.aliases(*used))
+        }) {
             return Err(Error::ResourceAccessConflict);
         }
         self.used_resources
@@ -546,16 +585,39 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         Ok(desc)
     }
     /// Draw multiple instances with shader-generated instance data.
-    pub fn draw_instanced(&mut self, count: u32, first: u32, instances: u32, first_instance: u32) -> Result<()> {
+    pub fn draw_instanced(
+        &mut self,
+        count: u32,
+        first: u32,
+        instances: u32,
+        first_instance: u32,
+    ) -> Result<()> {
         self.draw_programmable(count, first, instances, first_instance)
     }
     /// Draw multiple indexed instances with shader-generated instance data.
-    pub fn draw_indexed_instanced(&mut self, count: u32, first: u32, base_vertex: i32, instances: u32, first_instance: u32) -> Result<()> {
+    pub fn draw_indexed_instanced(
+        &mut self,
+        count: u32,
+        first: u32,
+        base_vertex: i32,
+        instances: u32,
+        first_instance: u32,
+    ) -> Result<()> {
         self.draw_indexed_programmable(count, first, base_vertex, instances, first_instance)
     }
-    pub(super) fn draw_programmable(&mut self, count: u32, first: u32, instances: u32, first_instance: u32) -> Result<()> {
-        if instances == 0 { return Err(Error::InvalidValue); }
-        first_instance.checked_add(instances).ok_or(Error::Overflow)?;
+    pub(super) fn draw_programmable(
+        &mut self,
+        count: u32,
+        first: u32,
+        instances: u32,
+        first_instance: u32,
+    ) -> Result<()> {
+        if instances == 0 {
+            return Err(Error::InvalidValue);
+        }
+        first_instance
+            .checked_add(instances)
+            .ok_or(Error::Overflow)?;
         let desc = self.validate_programmable_count(count)?;
         first.checked_add(count).ok_or(Error::Overflow)?;
         for (slot, layout) in desc.vertex_buffers().iter().enumerate() {
@@ -574,11 +636,19 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         let writes = self.programmable_writes(&desc, false)?;
         self.validate_cumulative_accesses(&writes)?;
         self.encoder.record_with_writes(
-            if instances == 1 && first_instance == 0 { Command::Draw {
-                vertex_count: count,
-                first_vertex: first,
-            }} else { Command::DrawInstanced { vertex_count:count, first_vertex:first,
-                instance_count:instances, first_instance } },
+            if instances == 1 && first_instance == 0 {
+                Command::Draw {
+                    vertex_count: count,
+                    first_vertex: first,
+                }
+            } else {
+                Command::DrawInstanced {
+                    vertex_count: count,
+                    first_vertex: first,
+                    instance_count: instances,
+                    first_instance,
+                }
+            },
             &writes,
         )?;
         self.used_resources.extend_from_slice(&writes.used);
@@ -592,8 +662,12 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         instances: u32,
         first_instance: u32,
     ) -> Result<()> {
-        if instances == 0 { return Err(Error::InvalidValue); }
-        first_instance.checked_add(instances).ok_or(Error::Overflow)?;
+        if instances == 0 {
+            return Err(Error::InvalidValue);
+        }
+        first_instance
+            .checked_add(instances)
+            .ok_or(Error::Overflow)?;
         let desc = self.validate_programmable_count(count)?;
         first.checked_add(count).ok_or(Error::Overflow)?;
         for (slot, layout) in desc.vertex_buffers().iter().enumerate() {
@@ -621,12 +695,21 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         let writes = self.programmable_writes(&desc, true)?;
         self.validate_cumulative_accesses(&writes)?;
         self.encoder.record_with_writes(
-            if instances == 1 && first_instance == 0 { Command::DrawIndexed {
-                index_count: count,
-                first_index: first,
-                base_vertex,
-            }} else { Command::DrawIndexedInstanced { index_count:count, first_index:first,
-                base_vertex, instance_count:instances, first_instance } },
+            if instances == 1 && first_instance == 0 {
+                Command::DrawIndexed {
+                    index_count: count,
+                    first_index: first,
+                    base_vertex,
+                }
+            } else {
+                Command::DrawIndexedInstanced {
+                    index_count: count,
+                    first_index: first,
+                    base_vertex,
+                    instance_count: instances,
+                    first_instance,
+                }
+            },
             &writes,
         )?;
         self.used_resources.extend_from_slice(&writes.used);

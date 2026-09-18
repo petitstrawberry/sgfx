@@ -361,7 +361,11 @@ impl BindGroupDesc {
                     if !desc.usage().contains(required) {
                         return Err(Error::InvalidUsage);
                     }
-                    let minimum_alignment = if ty == BindingType::UniformBuffer { 16 } else { 4 };
+                    let minimum_alignment = if ty == BindingType::UniformBuffer {
+                        16
+                    } else {
+                        4
+                    };
                     if size == 0
                         || !offset.is_multiple_of(minimum_alignment)
                         || !size.is_multiple_of(4)
@@ -377,17 +381,23 @@ impl BindGroupDesc {
                     if !desc.usage().contains(TextureUsage::SAMPLED) {
                         return Err(Error::InvalidUsage);
                     }
-                    if desc.format() == TextureFormat::Depth32Float || desc.array_layer_count() != 1 {
+                    if desc.format() == TextureFormat::Depth32Float || desc.array_layer_count() != 1
+                    {
                         return Err(Error::InvalidDescriptor);
                     }
                 }
-                (BindingResource::TextureView { texture, view }, BindingType::SampledTextureView { dimension, depth }) => {
+                (
+                    BindingResource::TextureView { texture, view },
+                    BindingType::SampledTextureView { dimension, depth },
+                ) => {
                     let desc = resources.texture(resources.texture_ref(texture)?)?;
                     view.validate(desc)?;
                     if !desc.usage().contains(TextureUsage::SAMPLED) {
                         return Err(Error::InvalidUsage);
                     }
-                    if view.dimension() != dimension || (view.format() == TextureFormat::Depth32Float) != depth {
+                    if view.dimension() != dimension
+                        || (view.format() == TextureFormat::Depth32Float) != depth
+                    {
                         return Err(Error::BindingLayoutMismatch);
                     }
                 }
@@ -396,22 +406,34 @@ impl BindGroupDesc {
                     if !desc.usage().contains(TextureUsage::STORAGE) {
                         return Err(Error::InvalidUsage);
                     }
-                    if desc.format() != format || desc.array_layer_count() != 1 || desc.mip_level_count() != 1 {
+                    if desc.format() != format
+                        || desc.array_layer_count() != 1
+                        || desc.mip_level_count() != 1
+                    {
                         return Err(Error::BindingLayoutMismatch);
                     }
                 }
-                (BindingResource::TextureView { texture, view }, BindingType::StorageTexture { format, .. }) => {
+                (
+                    BindingResource::TextureView { texture, view },
+                    BindingType::StorageTexture { format, .. },
+                ) => {
                     let desc = resources.texture(resources.texture_ref(texture)?)?;
                     view.validate(desc)?;
                     if !desc.usage().contains(TextureUsage::STORAGE) {
                         return Err(Error::InvalidUsage);
                     }
-                    if view.format() != format || view.dimension() != super::TextureViewDimension::D2
-                        || view.mip_level_count() != 1 || view.array_layer_count() != 1 {
+                    if view.format() != format
+                        || view.dimension() != super::TextureViewDimension::D2
+                        || view.mip_level_count() != 1
+                        || view.array_layer_count() != 1
+                    {
                         return Err(Error::BindingLayoutMismatch);
                     }
                 }
-                (BindingResource::Sampler(sampler), ty @ (BindingType::Sampler | BindingType::ComparisonSampler)) => {
+                (
+                    BindingResource::Sampler(sampler),
+                    ty @ (BindingType::Sampler | BindingType::ComparisonSampler),
+                ) => {
                     let desc = resources.sampler(resources.sampler_ref(sampler)?)?;
                     if desc.compare().is_some() != (ty == BindingType::ComparisonSampler) {
                         return Err(Error::BindingLayoutMismatch);
@@ -448,8 +470,10 @@ pub(crate) fn resource_alias(left: BindingResource, right: BindingResource) -> b
         (BindingResource::Buffer { buffer: a, .. }, BindingResource::Buffer { buffer: b, .. }) => {
             a == b
         }
-        (BindingResource::Texture(a) | BindingResource::TextureView { texture: a, .. },
-         BindingResource::Texture(b) | BindingResource::TextureView { texture: b, .. }) => a == b,
+        (
+            BindingResource::Texture(a) | BindingResource::TextureView { texture: a, .. },
+            BindingResource::Texture(b) | BindingResource::TextureView { texture: b, .. },
+        ) => a == b,
         _ => false,
     }
 }
@@ -532,7 +556,9 @@ impl ProgrammableRenderPipelineDesc {
     }
     /// Replace fragment output formats and per-output blend/write state.
     pub fn with_color_targets(mut self, targets: Vec<super::ColorTargetState>) -> Result<Self> {
-        if targets.is_empty() || targets.len() > super::MAX_COLOR_ATTACHMENTS { return Err(Error::InvalidDescriptor); }
+        if targets.is_empty() || targets.len() > super::MAX_COLOR_ATTACHMENTS {
+            return Err(Error::InvalidDescriptor);
+        }
         self.target_format = targets[0].format();
         self.blend = targets[0].blend();
         self.color_write_mask = targets[0].write_mask();
@@ -541,17 +567,24 @@ impl ProgrammableRenderPipelineDesc {
     }
     /// Return fragment outputs in location order.
     pub fn color_targets(&self) -> impl Iterator<Item = super::ColorTargetState> + '_ {
-        core::iter::once(super::ColorTargetState::new(self.target_format, self.blend, self.color_write_mask).expect("validated color target"))
-            .chain(self.additional_targets.iter().copied())
+        core::iter::once(
+            super::ColorTargetState::new(self.target_format, self.blend, self.color_write_mask)
+                .expect("validated color target"),
+        )
+        .chain(self.additional_targets.iter().copied())
     }
     /// Replace vertex input with consecutive buffer slots. Attribute locations
     /// must be unique across slots and respect the total attribute limit.
     pub fn with_vertex_buffers(mut self, buffers: Vec<VertexBufferLayout>) -> Result<Self> {
-        if buffers.len() > MAX_VERTEX_BUFFERS { return Err(Error::ResourceLimitExceeded); }
+        if buffers.len() > MAX_VERTEX_BUFFERS {
+            return Err(Error::ResourceLimitExceeded);
+        }
         let mut locations = Vec::new();
         for buffer in &buffers {
             for attribute in buffer.attributes() {
-                if attribute.location() >= MAX_VERTEX_ATTRIBUTES as u32 || locations.contains(&attribute.location()) {
+                if attribute.location() >= MAX_VERTEX_ATTRIBUTES as u32
+                    || locations.contains(&attribute.location())
+                {
                     return Err(Error::InvalidDescriptor);
                 }
                 locations.push(attribute.location());
@@ -561,7 +594,9 @@ impl ProgrammableRenderPipelineDesc {
         Ok(self)
     }
     /// Return the layouts indexed by vertex buffer slot.
-    pub fn vertex_buffers(&self) -> &[VertexBufferLayout] { &self.vertex_buffers }
+    pub fn vertex_buffers(&self) -> &[VertexBufferLayout] {
+        &self.vertex_buffers
+    }
     /// Add depth testing and optional depth writes.
     pub fn with_depth_state(mut self, depth: DepthState) -> Result<Self> {
         if depth.format() != TextureFormat::Depth32Float {

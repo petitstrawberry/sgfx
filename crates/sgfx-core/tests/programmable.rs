@@ -4,28 +4,91 @@ use sgfx_core::ir::*;
 fn instanced_draw_ranges_survive_owned_replay() {
     let table = ResourceTable::new();
     let format = TextureFormat::Rgba8Unorm;
-    let target = table.define_texture(TextureDesc::new(format, Extent2D::new(8,8).unwrap(),
-        TextureUsage::RENDER_ATTACHMENT).unwrap()).unwrap();
-    let pipeline = table.define_programmable_render_pipeline(ProgrammableRenderPipelineDesc::new(
-        shader(&table, ShaderStage::Vertex), shader(&table, ShaderStage::Fragment), PipelineLayoutDesc::new(vec![]).unwrap(),
-        format, None, PrimitiveTopology::TriangleList,
-        BlendState::REPLACE, RasterState::new(CullMode::None, FrontFace::CounterClockwise)).unwrap()).unwrap();
+    let target = table
+        .define_texture(
+            TextureDesc::new(
+                format,
+                Extent2D::new(8, 8).unwrap(),
+                TextureUsage::RENDER_ATTACHMENT,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let pipeline = table
+        .define_programmable_render_pipeline(
+            ProgrammableRenderPipelineDesc::new(
+                shader(&table, ShaderStage::Vertex),
+                shader(&table, ShaderStage::Fragment),
+                PipelineLayoutDesc::new(vec![]).unwrap(),
+                format,
+                None,
+                PrimitiveTopology::TriangleList,
+                BlendState::REPLACE,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let indices = buffer(&table, BufferUsage::INDEX);
     let recording = OwnedCommandBuffer::new(vec![
-        OwnedCommand::BeginRenderPass(OwnedRenderPassDesc { target:target.id(), depth:None, area:PixelRect::new(0,0,8,8).unwrap(), load:LoadOp::Load, store:StoreOp::Store }),
+        OwnedCommand::BeginRenderPass(OwnedRenderPassDesc {
+            target: target.id(),
+            depth: None,
+            area: PixelRect::new(0, 0, 8, 8).unwrap(),
+            load: LoadOp::Load,
+            store: StoreOp::Store,
+        }),
         OwnedCommand::SetProgrammablePipeline(pipeline.id()),
-        OwnedCommand::SetIndexBuffer { buffer:indices.id(), offset:0, format:IndexFormat::Uint16 },
-        OwnedCommand::DrawInstanced { vertex_count:3, first_vertex:0, instance_count:4, first_instance:7 },
-        OwnedCommand::DrawIndexedInstanced { index_count:3, first_index:0, base_vertex:2, instance_count:5, first_instance:9 },
+        OwnedCommand::SetIndexBuffer {
+            buffer: indices.id(),
+            offset: 0,
+            format: IndexFormat::Uint16,
+        },
+        OwnedCommand::DrawInstanced {
+            vertex_count: 3,
+            first_vertex: 0,
+            instance_count: 4,
+            first_instance: 7,
+        },
+        OwnedCommand::DrawIndexedInstanced {
+            index_count: 3,
+            first_index: 0,
+            base_vertex: 2,
+            instance_count: 5,
+            first_instance: 9,
+        },
         OwnedCommand::EndRenderPass,
     ]);
     let commands = recording.record(&table).unwrap();
-    assert!(matches!(commands.commands()[3], Command::DrawInstanced { instance_count:4, first_instance:7, .. }));
-    assert!(matches!(commands.commands()[4], Command::DrawIndexedInstanced { instance_count:5, first_instance:9, base_vertex:2, .. }));
+    assert!(matches!(
+        commands.commands()[3],
+        Command::DrawInstanced {
+            instance_count: 4,
+            first_instance: 7,
+            ..
+        }
+    ));
+    assert!(matches!(
+        commands.commands()[4],
+        Command::DrawIndexedInstanced {
+            instance_count: 5,
+            first_instance: 9,
+            base_vertex: 2,
+            ..
+        }
+    ));
     for (count, first, error) in [(0, 0, Error::InvalidValue), (2, u32::MAX, Error::Overflow)] {
         let mut invalid = recording.commands().to_vec();
-        invalid[3] = OwnedCommand::DrawInstanced { vertex_count:3, first_vertex:0, instance_count:count, first_instance:first };
-        assert_eq!(OwnedCommandBuffer::new(invalid).validate(&table), Err(error));
+        invalid[3] = OwnedCommand::DrawInstanced {
+            vertex_count: 3,
+            first_vertex: 0,
+            instance_count: count,
+            first_instance: first,
+        };
+        assert_eq!(
+            OwnedCommandBuffer::new(invalid).validate(&table),
+            Err(error)
+        );
     }
 }
 
@@ -39,7 +102,11 @@ fn comparison_samplers_require_a_matching_binding_type() {
         AddressMode::ClampToEdge,
     );
     assert_eq!(ordinary.compare(), None);
-    for compare in [None, Some(CompareFunction::LessEqual), Some(CompareFunction::Greater)] {
+    for compare in [
+        None,
+        Some(CompareFunction::LessEqual),
+        Some(CompareFunction::Greater),
+    ] {
         let desc = ordinary.with_compare(compare);
         assert_eq!(desc.compare(), compare);
         let sampler = table.define_sampler(desc).unwrap();
@@ -47,9 +114,15 @@ fn comparison_samplers_require_a_matching_binding_type() {
             let result = BindGroupDesc::new(
                 &table,
                 layout(ty),
-                vec![BindGroupEntry::new(0, BindingResource::Sampler(sampler.id()))],
+                vec![BindGroupEntry::new(
+                    0,
+                    BindingResource::Sampler(sampler.id()),
+                )],
             );
-            assert_eq!(result.is_ok(), compare.is_some() == (ty == BindingType::ComparisonSampler));
+            assert_eq!(
+                result.is_ok(),
+                compare.is_some() == (ty == BindingType::ComparisonSampler)
+            );
         }
     }
 }
@@ -916,101 +989,264 @@ fn solid_draw_does_not_access_or_consume_a_stale_texture_binding() {
 #[test]
 fn multiple_vertex_slots_validate_layouts_binding_bounds_and_write_aliases() {
     let table = ResourceTable::new();
-    let input = |location, format: VertexFormat| VertexBufferLayout::new(format.byte_size(),
-        vec![VertexAttribute::new(location, format, 0)]).unwrap();
-    let desc = ProgrammableRenderPipelineDesc::new(shader(&table, ShaderStage::Vertex),
-        shader(&table, ShaderStage::Fragment), PipelineLayoutDesc::new(vec![]).unwrap(),
-        TextureFormat::Rgba8Unorm, None, PrimitiveTopology::TriangleList, BlendState::REPLACE,
-        RasterState::new(CullMode::None, FrontFace::CounterClockwise)).unwrap();
-    assert!(desc.clone().with_vertex_buffers(vec![input(0, VertexFormat::Float32x2), input(0, VertexFormat::Sint32)]).is_err());
-    assert!(desc.clone().with_vertex_buffers((0..9).map(|i| input(i, VertexFormat::Sint32)).collect()).is_err());
-    let desc = desc.with_vertex_buffers(vec![input(0, VertexFormat::Float32x2), input(1, VertexFormat::Sint32)]).unwrap();
-    let pipeline = table.define_programmable_render_pipeline(desc.clone()).unwrap();
-    let target = table.define_texture(TextureDesc::new(TextureFormat::Rgba8Unorm,
-        Extent2D::new(4,4).unwrap(), TextureUsage::RENDER_ATTACHMENT).unwrap()).unwrap();
+    let input = |location, format: VertexFormat| {
+        VertexBufferLayout::new(
+            format.byte_size(),
+            vec![VertexAttribute::new(location, format, 0)],
+        )
+        .unwrap()
+    };
+    let desc = ProgrammableRenderPipelineDesc::new(
+        shader(&table, ShaderStage::Vertex),
+        shader(&table, ShaderStage::Fragment),
+        PipelineLayoutDesc::new(vec![]).unwrap(),
+        TextureFormat::Rgba8Unorm,
+        None,
+        PrimitiveTopology::TriangleList,
+        BlendState::REPLACE,
+        RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+    )
+    .unwrap();
+    assert!(
+        desc.clone()
+            .with_vertex_buffers(vec![
+                input(0, VertexFormat::Float32x2),
+                input(0, VertexFormat::Sint32)
+            ])
+            .is_err()
+    );
+    assert!(
+        desc.clone()
+            .with_vertex_buffers((0..9).map(|i| input(i, VertexFormat::Sint32)).collect())
+            .is_err()
+    );
+    let desc = desc
+        .with_vertex_buffers(vec![
+            input(0, VertexFormat::Float32x2),
+            input(1, VertexFormat::Sint32),
+        ])
+        .unwrap();
+    let pipeline = table
+        .define_programmable_render_pipeline(desc.clone())
+        .unwrap();
+    let target = table
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::Rgba8Unorm,
+                Extent2D::new(4, 4).unwrap(),
+                TextureUsage::RENDER_ATTACHMENT,
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let vertices = buffer(&table, BufferUsage::VERTEX);
-    let values = table.define_buffer(BufferDesc::new(16, BufferUsage::VERTEX | BufferUsage::STORAGE).unwrap()).unwrap();
-    let pass_desc = RenderPassDesc::new(&table, target, PixelRect::new(0,0,4,4).unwrap(), LoadOp::DontCare, StoreOp::Store).unwrap();
+    let values = table
+        .define_buffer(BufferDesc::new(16, BufferUsage::VERTEX | BufferUsage::STORAGE).unwrap())
+        .unwrap();
+    let pass_desc = RenderPassDesc::new(
+        &table,
+        target,
+        PixelRect::new(0, 0, 4, 4).unwrap(),
+        LoadOp::DontCare,
+        StoreOp::Store,
+    )
+    .unwrap();
     let mut encoder = CommandEncoder::new(&table);
     let mut pass = encoder.begin_render_pass(pass_desc).unwrap();
     pass.set_programmable_pipeline(pipeline).unwrap();
     pass.set_vertex_buffer(vertices, 0).unwrap();
-    assert_eq!(pass.draw(3,0), Err(Error::VertexBufferNotSet));
-    assert_eq!(pass.set_vertex_buffer_slot(8, values, 0), Err(Error::OutOfBounds));
+    assert_eq!(pass.draw(3, 0), Err(Error::VertexBufferNotSet));
+    assert_eq!(
+        pass.set_vertex_buffer_slot(8, values, 0),
+        Err(Error::OutOfBounds)
+    );
     pass.set_vertex_buffer_slot(1, values, 8).unwrap();
-    assert_eq!(pass.draw(3,0), Err(Error::OutOfBounds));
+    assert_eq!(pass.draw(3, 0), Err(Error::OutOfBounds));
     pass.set_vertex_buffer_slot(1, values, 0).unwrap();
-    pass.draw(3,0).unwrap();
+    pass.draw(3, 0).unwrap();
     pass.end().unwrap();
     encoder.finish().unwrap();
-    let storage_layout = BindGroupLayoutDesc::new(vec![BindGroupLayoutEntry::new(0, ShaderStages::FRAGMENT,
-        BindingType::StorageBuffer { read_only: false })]).unwrap();
-    let pipeline = table.define_programmable_render_pipeline(ProgrammableRenderPipelineDesc::new(
-        shader(&table, ShaderStage::Vertex), shader(&table, ShaderStage::Fragment),
-        PipelineLayoutDesc::new(vec![storage_layout.clone()]).unwrap(), TextureFormat::Rgba8Unorm,
-        None, PrimitiveTopology::TriangleList, BlendState::REPLACE,
-        RasterState::new(CullMode::None, FrontFace::CounterClockwise)).unwrap()
-        .with_vertex_buffers(desc.vertex_buffers().to_vec()).unwrap()).unwrap();
-    let group = table.define_bind_group(BindGroupDesc::new(&table, storage_layout, vec![BindGroupEntry::new(0,
-        BindingResource::Buffer { buffer: values.id(), offset: 0, size: 16 })]).unwrap()).unwrap();
+    let storage_layout = BindGroupLayoutDesc::new(vec![BindGroupLayoutEntry::new(
+        0,
+        ShaderStages::FRAGMENT,
+        BindingType::StorageBuffer { read_only: false },
+    )])
+    .unwrap();
+    let pipeline = table
+        .define_programmable_render_pipeline(
+            ProgrammableRenderPipelineDesc::new(
+                shader(&table, ShaderStage::Vertex),
+                shader(&table, ShaderStage::Fragment),
+                PipelineLayoutDesc::new(vec![storage_layout.clone()]).unwrap(),
+                TextureFormat::Rgba8Unorm,
+                None,
+                PrimitiveTopology::TriangleList,
+                BlendState::REPLACE,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap()
+            .with_vertex_buffers(desc.vertex_buffers().to_vec())
+            .unwrap(),
+        )
+        .unwrap();
+    let group = table
+        .define_bind_group(
+            BindGroupDesc::new(
+                &table,
+                storage_layout,
+                vec![BindGroupEntry::new(
+                    0,
+                    BindingResource::Buffer {
+                        buffer: values.id(),
+                        offset: 0,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let mut encoder = CommandEncoder::new(&table);
     let mut pass = encoder.begin_render_pass(pass_desc).unwrap();
     pass.set_programmable_pipeline(pipeline).unwrap();
-    pass.set_vertex_buffer(vertices,0).unwrap();
-    pass.set_vertex_buffer_slot(1, values,0).unwrap();
-    pass.set_bind_group(0,group).unwrap();
-    assert_eq!(pass.draw(3,0), Err(Error::ResourceAccessConflict));
+    pass.set_vertex_buffer(vertices, 0).unwrap();
+    pass.set_vertex_buffer_slot(1, values, 0).unwrap();
+    pass.set_bind_group(0, group).unwrap();
+    assert_eq!(pass.draw(3, 0), Err(Error::ResourceAccessConflict));
 }
 #[test]
 fn storage_texture_views_select_one_mip_and_layer() {
     let table = ResourceTable::new();
-    let desc = TextureDesc::new(TextureFormat::Rgba8Unorm, Extent2D::new(8, 8).unwrap(),
-        TextureUsage::STORAGE | TextureUsage::SAMPLED).unwrap()
-        .with_mip_level_count(4).unwrap().with_array_layer_count(6).unwrap();
+    let desc = TextureDesc::new(
+        TextureFormat::Rgba8Unorm,
+        Extent2D::new(8, 8).unwrap(),
+        TextureUsage::STORAGE | TextureUsage::SAMPLED,
+    )
+    .unwrap()
+    .with_mip_level_count(4)
+    .unwrap()
+    .with_array_layer_count(6)
+    .unwrap();
     let texture = table.define_texture(desc).unwrap();
     let bindings = layout(BindingType::StorageTexture {
-        format: TextureFormat::Rgba8Unorm, access: StorageTextureAccess::WriteOnly,
+        format: TextureFormat::Rgba8Unorm,
+        access: StorageTextureAccess::WriteOnly,
     });
-    let bind = |resource| BindGroupDesc::new(&table, bindings.clone(),
-        vec![BindGroupEntry::new(0, resource)]);
+    let bind = |resource| {
+        BindGroupDesc::new(
+            &table,
+            bindings.clone(),
+            vec![BindGroupEntry::new(0, resource)],
+        )
+    };
     assert!(bind(BindingResource::Texture(texture.id())).is_err());
-    let view = |dimension, levels, layers| TextureViewDesc::new(desc, desc.format(),
-        dimension, 1, levels, 0, layers).unwrap();
-    assert!(bind(BindingResource::TextureView { texture: texture.id(),
-        view: view(TextureViewDimension::D2, 1, 1) }).is_ok());
-    for invalid in [view(TextureViewDimension::D2, 2, 1),
+    let view = |dimension, levels, layers| {
+        TextureViewDesc::new(desc, desc.format(), dimension, 1, levels, 0, layers).unwrap()
+    };
+    assert!(
+        bind(BindingResource::TextureView {
+            texture: texture.id(),
+            view: view(TextureViewDimension::D2, 1, 1)
+        })
+        .is_ok()
+    );
+    for invalid in [
+        view(TextureViewDimension::D2, 2, 1),
         view(TextureViewDimension::Cube, 1, 6),
-        view(TextureViewDimension::D2Array, 1, 6)] {
-        assert!(bind(BindingResource::TextureView { texture: texture.id(), view: invalid }).is_err());
+        view(TextureViewDimension::D2Array, 1, 6),
+    ] {
+        assert!(
+            bind(BindingResource::TextureView {
+                texture: texture.id(),
+                view: invalid
+            })
+            .is_err()
+        );
     }
 }
 
 #[test]
 fn storage_view_writes_require_a_barrier_on_the_written_mip() {
     let table = ResourceTable::new();
-    let desc = TextureDesc::new(TextureFormat::Rgba8Unorm, Extent2D::new(8, 8).unwrap(),
-        TextureUsage::STORAGE | TextureUsage::SAMPLED).unwrap().with_mip_level_count(4).unwrap();
+    let desc = TextureDesc::new(
+        TextureFormat::Rgba8Unorm,
+        Extent2D::new(8, 8).unwrap(),
+        TextureUsage::STORAGE | TextureUsage::SAMPLED,
+    )
+    .unwrap()
+    .with_mip_level_count(4)
+    .unwrap();
     let texture = table.define_texture(desc).unwrap();
-    let ty = BindingType::StorageTexture { format: desc.format(), access: StorageTextureAccess::WriteOnly };
+    let ty = BindingType::StorageTexture {
+        format: desc.format(),
+        access: StorageTextureAccess::WriteOnly,
+    };
     let pipeline = compute(&table, ty);
-    let view = TextureViewDesc::new(desc, desc.format(), TextureViewDimension::D2, 1, 1, 0, 1).unwrap();
-    let bindings = table.define_bind_group(BindGroupDesc::new(&table, layout(ty),
-        vec![BindGroupEntry::new(0, BindingResource::TextureView { texture: texture.id(), view })]).unwrap()).unwrap();
+    let view =
+        TextureViewDesc::new(desc, desc.format(), TextureViewDimension::D2, 1, 1, 0, 1).unwrap();
+    let bindings = table
+        .define_bind_group(
+            BindGroupDesc::new(
+                &table,
+                layout(ty),
+                vec![BindGroupEntry::new(
+                    0,
+                    BindingResource::TextureView {
+                        texture: texture.id(),
+                        view,
+                    },
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let mut encoder = CommandEncoder::new(&table);
-    fn dispatch_checked<'r>(encoder: &mut CommandEncoder<'r, '_>, pipeline: ComputePipelineRef<'r>, bindings: BindGroupRef<'r>) -> Result<()> {
+    fn dispatch_checked<'r>(
+        encoder: &mut CommandEncoder<'r, '_>,
+        pipeline: ComputePipelineRef<'r>,
+        bindings: BindGroupRef<'r>,
+    ) -> Result<()> {
         let mut pass = encoder.begin_compute_pass()?;
-        pass.set_pipeline(pipeline)?; pass.set_bind_group(0, bindings)?;
-        let result = pass.dispatch(1,1,1); pass.end()?; result
+        pass.set_pipeline(pipeline)?;
+        pass.set_bind_group(0, bindings)?;
+        let result = pass.dispatch(1, 1, 1);
+        pass.end()?;
+        result
     }
     dispatch_checked(&mut encoder, pipeline, bindings).unwrap();
-    assert_eq!(dispatch_checked(&mut encoder, pipeline, bindings), Err(Error::MissingBarrier));
-    encoder.resource_barrier(ResourceBarrier::TextureMip { texture, mip_level:0,
-        before:TextureAccess::StorageWrite, after:TextureAccess::Sampled }).unwrap();
-    assert_eq!(dispatch_checked(&mut encoder, pipeline, bindings), Err(Error::MissingBarrier));
-    assert_eq!(encoder.resource_barrier(ResourceBarrier::TextureMip { texture, mip_level:1,
-        before:TextureAccess::Sampled, after:TextureAccess::StorageWrite }), Err(Error::InvalidResourceAccess));
-    encoder.resource_barrier(ResourceBarrier::TextureMip { texture, mip_level:1,
-        before:TextureAccess::StorageWrite, after:TextureAccess::StorageWrite }).unwrap();
+    assert_eq!(
+        dispatch_checked(&mut encoder, pipeline, bindings),
+        Err(Error::MissingBarrier)
+    );
+    encoder
+        .resource_barrier(ResourceBarrier::TextureMip {
+            texture,
+            mip_level: 0,
+            before: TextureAccess::StorageWrite,
+            after: TextureAccess::Sampled,
+        })
+        .unwrap();
+    assert_eq!(
+        dispatch_checked(&mut encoder, pipeline, bindings),
+        Err(Error::MissingBarrier)
+    );
+    assert_eq!(
+        encoder.resource_barrier(ResourceBarrier::TextureMip {
+            texture,
+            mip_level: 1,
+            before: TextureAccess::Sampled,
+            after: TextureAccess::StorageWrite
+        }),
+        Err(Error::InvalidResourceAccess)
+    );
+    encoder
+        .resource_barrier(ResourceBarrier::TextureMip {
+            texture,
+            mip_level: 1,
+            before: TextureAccess::StorageWrite,
+            after: TextureAccess::StorageWrite,
+        })
+        .unwrap();
     dispatch_checked(&mut encoder, pipeline, bindings).unwrap();
     encoder.finish().unwrap();
 }
