@@ -152,7 +152,7 @@ pub(crate) fn cube_indices(options: Options) -> Vec<u8> {
     for index in triangles.into_iter().flatten() {
         let index = index as u32 + options.base_vertex.saturating_neg().max(0) as u32;
         if options.index_u32 {
-            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+            bytes.extend_from_slice(&index.to_le_bytes());
         } else {
             bytes.extend_from_slice(&(index as u16).to_le_bytes());
         }

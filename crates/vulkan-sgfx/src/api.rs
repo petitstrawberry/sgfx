@@ -16,6 +16,7 @@ use std::{
 };
 
 type VkResult<T> = Result<T, vk::Result>;
+type BufferUploads = (Vec<ir::OwnedCommand>, Vec<(vk::Buffer, vk::DeviceMemory)>);
 type Job = Box<dyn FnOnce(&mut Runtime) + Send>;
 enum Request {
     Run(Job),
@@ -3278,7 +3279,7 @@ fn take_positioned<'a, T>(
 fn snapshot_buffer_uploads(
     resources: &crate::resources::Resources,
     used: &[vk::Buffer],
-) -> VkResult<(Vec<ir::OwnedCommand>, Vec<(vk::Buffer, vk::DeviceMemory)>)> {
+) -> VkResult<BufferUploads> {
     let mut ops = Vec::new();
     let mut fresh_uploads = Vec::new();
     // Every upload is copied into SGFX-owned command storage before submission

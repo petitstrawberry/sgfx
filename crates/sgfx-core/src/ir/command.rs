@@ -281,6 +281,8 @@ impl<'r> RenderPassDesc<'r> {
 ///
 /// Commands are exposed only through [`CommandBuffer::commands`]. Resource
 /// references remain lifetime-branded and cannot be constructed from raw IDs.
+// Render-pass descriptors stay inline to avoid allocating while recording commands.
+#[allow(clippy::large_enum_variant)]
 pub enum Command<'r, 'data> {
     /// Scale a complete color mip level into a complete destination mip level.
     /// The operation is a GPU transfer; filtering uses texel-center coordinates.

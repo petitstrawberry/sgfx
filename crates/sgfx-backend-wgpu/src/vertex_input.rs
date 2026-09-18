@@ -97,28 +97,28 @@ fn input_type(
     binding: Option<&naga::Binding>,
     locations: &[u32],
 ) -> Result<Handle<Type>> {
-    if let Some(naga::Binding::Location { location, .. }) = binding {
-        if locations.contains(location) {
-            if !matches!(
-                types[original].inner,
-                TypeInner::Vector {
-                    scalar: naga::Scalar {
-                        kind: ScalarKind::Float,
-                        width: 4
-                    },
-                    ..
-                }
-            ) {
-                return Err(Error::Unsupported(UnsupportedFeature::Pipeline));
-            }
-            return Ok(types.insert(
-                Type {
-                    name: None,
-                    inner: TypeInner::Scalar(naga::Scalar::U32),
+    if let Some(naga::Binding::Location { location, .. }) = binding
+        && locations.contains(location)
+    {
+        if !matches!(
+            types[original].inner,
+            TypeInner::Vector {
+                scalar: naga::Scalar {
+                    kind: ScalarKind::Float,
+                    width: 4
                 },
-                Span::UNDEFINED,
-            ));
+                ..
+            }
+        ) {
+            return Err(Error::Unsupported(UnsupportedFeature::Pipeline));
         }
+        return Ok(types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Scalar(naga::Scalar::U32),
+            },
+            Span::UNDEFINED,
+        ));
     }
     if let TypeInner::Struct { mut members, span } = types[original].inner.clone() {
         let mut changed = false;

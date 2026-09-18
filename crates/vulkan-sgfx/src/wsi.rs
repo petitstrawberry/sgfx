@@ -762,7 +762,7 @@ mod tests {
                 crate::instance::create_instance(&create, std::ptr::null(), &mut instance,),
                 vk::Result::SUCCESS
             );
-            let layer = 1usize as *const vk::CAMetalLayer;
+            let layer = std::ptr::dangling::<vk::CAMetalLayer>();
             let info = vk::MetalSurfaceCreateInfoEXT::default().layer(layer);
             let mut surface = vk::SurfaceKHR::null();
             assert_eq!(

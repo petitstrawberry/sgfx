@@ -17,7 +17,7 @@ pub(crate) fn freeze(
         .collect();
     let types: HashMap<_, _> = code
         .iter()
-        .filter(|i| matches!(i[0] & 65535, 20 | 21 | 22))
+        .filter(|i| matches!(i[0] & 65535, 20..=22))
         .map(|i| (i.get(1).copied().unwrap_or(0), *i))
         .collect();
     let mut constants = HashMap::<u32, u32>::new();
@@ -89,15 +89,15 @@ pub(crate) fn freeze(
 
 fn fold(op: u32, args: &[u32]) -> Option<u32> {
     let truth = |v: bool| u32::from(v);
-    Some(match args {
-        &[a] => match op {
+    Some(match *args {
+        [a] => match op {
             113 | 114 | 124 => a,    // 32-bit conversions and bitcast
             126 => a.wrapping_neg(), // SNegate
             168 => truth(a == 0),    // LogicalNot
             200 => !a,               // Not
             _ => return None,
         },
-        &[a, b] => match op {
+        [a, b] => match op {
             128 => a.wrapping_add(b),
             130 => a.wrapping_sub(b),
             132 => a.wrapping_mul(b),
@@ -135,7 +135,7 @@ fn fold(op: u32, args: &[u32]) -> Option<u32> {
             199 => a & b,
             _ => return None,
         },
-        &[condition, a, b] if op == 169 => {
+        [condition, a, b] if op == 169 => {
             if condition != 0 {
                 a
             } else {

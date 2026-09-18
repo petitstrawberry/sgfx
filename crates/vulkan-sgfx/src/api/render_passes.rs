@@ -91,16 +91,15 @@ pub(super) fn end(rec: &mut ResolvedRecording) -> VkResult<()> {
         if let (Some(before), Ok(after)) = (
             before,
             texture_access(active.pass.attachments[index].final_layout),
-        ) {
-            if *before != after {
-                rec.ops.push(ir::OwnedCommand::ResourceBarrier(
-                    ir::OwnedResourceBarrier::Texture {
-                        texture: active.images[index].1,
-                        before: *before,
-                        after,
-                    },
-                ));
-            }
+        ) && *before != after
+        {
+            rec.ops.push(ir::OwnedCommand::ResourceBarrier(
+                ir::OwnedResourceBarrier::Texture {
+                    texture: active.images[index].1,
+                    before: *before,
+                    after,
+                },
+            ));
         }
     }
     rec.render = None;
@@ -111,16 +110,16 @@ impl ActiveRenderPass {
     fn access(&mut self, index: usize, after: ir::TextureAccess, rec: &mut ResolvedRecording) {
         let before = self.accesses[index]
             .or_else(|| texture_access(self.pass.attachments[index].initial_layout).ok());
-        if let Some(before) = before {
-            if before != after {
-                rec.ops.push(ir::OwnedCommand::ResourceBarrier(
-                    ir::OwnedResourceBarrier::Texture {
-                        texture: self.images[index].1,
-                        before,
-                        after,
-                    },
-                ));
-            }
+        if let Some(before) = before
+            && before != after
+        {
+            rec.ops.push(ir::OwnedCommand::ResourceBarrier(
+                ir::OwnedResourceBarrier::Texture {
+                    texture: self.images[index].1,
+                    before,
+                    after,
+                },
+            ));
         }
         self.accesses[index] = Some(after);
     }

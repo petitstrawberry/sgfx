@@ -11,6 +11,7 @@ const DECORATE: u32 = 71;
 const SAMPLED_IMAGE: u32 = 86;
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     fn sampler_function(depth: bool) -> Vec<u32> {
@@ -574,15 +575,14 @@ pub(crate) fn sampled_image_swizzles(
     }
     let mut roots = HashMap::new();
     for (&id, &binding) in &bindings {
-        if let Some(&group) = groups.get(&id) {
-            if let Some((_, _, mapping)) =
+        if let Some(&group) = groups.get(&id)
+            && let Some((_, _, mapping)) =
                 views.iter().find(|(g, b, _)| *g == group && *b == binding)
-            {
-                if mapping.iter().any(|v| *v > 5) {
-                    return Err(unsupported);
-                }
-                roots.insert(id, *mapping);
+        {
+            if mapping.iter().any(|v| *v > 5) {
+                return Err(unsupported);
             }
+            roots.insert(id, *mapping);
         }
     }
     let mut next = words[3];
@@ -599,53 +599,55 @@ pub(crate) fn sampled_image_swizzles(
     let mut lowered = Vec::new();
     for op in &ops {
         let opcode = op[0] & 0xffff;
-        if matches!(opcode, LOAD | SAMPLED_IMAGE | 83 | 100) && op.len() >= 4 {
-            if let Some(mapping) = roots.get(&op[3]).copied() {
-                roots.insert(op[2], mapping);
-            }
+        if matches!(opcode, LOAD | SAMPLED_IMAGE | 83 | 100)
+            && op.len() >= 4
+            && let Some(mapping) = roots.get(&op[3]).copied()
+        {
+            roots.insert(op[2], mapping);
         }
-        if (87..=98).contains(&opcode) && op.len() >= 4 {
-            if let Some(mapping) = roots.get(&op[3]) {
-                if !matches!(opcode, 87 | 88 | 91 | 92 | 95 | 98) {
-                    return Err(unsupported);
-                }
-                let ty = op[1];
-                let scalar = *vectors
-                    .get(&ty)
-                    .filter(|scalar| floats.contains(scalar))
-                    .ok_or(unsupported)?;
-                let constant = if let Some(value) = constant_vectors.get(&ty) {
-                    *value
-                } else {
-                    let zero = id()?;
-                    let one = id()?;
-                    let value = id()?;
-                    emit(&mut constants, 43, &[scalar, zero, 0]);
-                    emit(&mut constants, 43, &[scalar, one, 1.0f32.to_bits()]);
-                    emit(&mut constants, 44, &[ty, value, zero, one, zero, one]);
-                    constant_vectors.insert(ty, value);
-                    value
-                };
-                let raw = id()?;
-                let mut sample = op.to_vec();
-                sample[2] = raw;
-                lowered.extend(sample);
-                emit(
-                    &mut lowered,
-                    79,
-                    &[
-                        ty,
-                        op[2],
-                        raw,
-                        constant,
-                        u32::from(mapping[0]),
-                        u32::from(mapping[1]),
-                        u32::from(mapping[2]),
-                        u32::from(mapping[3]),
-                    ],
-                );
-                continue;
+        if (87..=98).contains(&opcode)
+            && op.len() >= 4
+            && let Some(mapping) = roots.get(&op[3])
+        {
+            if !matches!(opcode, 87 | 88 | 91 | 92 | 95 | 98) {
+                return Err(unsupported);
             }
+            let ty = op[1];
+            let scalar = *vectors
+                .get(&ty)
+                .filter(|scalar| floats.contains(scalar))
+                .ok_or(unsupported)?;
+            let constant = if let Some(value) = constant_vectors.get(&ty) {
+                *value
+            } else {
+                let zero = id()?;
+                let one = id()?;
+                let value = id()?;
+                emit(&mut constants, 43, &[scalar, zero, 0]);
+                emit(&mut constants, 43, &[scalar, one, 1.0f32.to_bits()]);
+                emit(&mut constants, 44, &[ty, value, zero, one, zero, one]);
+                constant_vectors.insert(ty, value);
+                value
+            };
+            let raw = id()?;
+            let mut sample = op.to_vec();
+            sample[2] = raw;
+            lowered.extend(sample);
+            emit(
+                &mut lowered,
+                79,
+                &[
+                    ty,
+                    op[2],
+                    raw,
+                    constant,
+                    u32::from(mapping[0]),
+                    u32::from(mapping[1]),
+                    u32::from(mapping[2]),
+                    u32::from(mapping[3]),
+                ],
+            );
+            continue;
         }
         lowered.extend_from_slice(op);
     }
