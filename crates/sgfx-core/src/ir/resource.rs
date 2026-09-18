@@ -1,7 +1,7 @@
 //! Logical resource descriptors, validated resource tables, and branded references.
 
 use alloc::{rc::Rc, vec::Vec};
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::fmt;
 use core::ops::{BitOr, BitOrAssign};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -610,13 +610,20 @@ impl<'data> TextureWrite<'data> {
 pub struct ResourceTable {
     id: usize,
     textures: RefCell<Vec<TextureDesc>>,
-    buffers: RefCell<Vec<BufferDesc>>,
+    buffers: RefCell<Vec<BufferSlot>>,
+    free_buffer: Cell<Option<usize>>,
     samplers: RefCell<Vec<SamplerDesc>>,
     pipelines: RefCell<Vec<RenderPipelineDesc>>,
     shader_modules: RefCell<Vec<ShaderModuleDesc>>,
     bind_groups: RefCell<Vec<Rc<BindGroupDesc>>>,
     compute_pipelines: RefCell<Vec<ComputePipelineDesc>>,
     programmable_pipelines: RefCell<Vec<Rc<ProgrammableRenderPipelineDesc>>>,
+}
+
+struct BufferSlot {
+    descriptor: Option<BufferDesc>,
+    generation: u64,
+    next_free: Option<usize>,
 }
 
 impl ResourceTable {
@@ -629,6 +636,7 @@ impl ResourceTable {
             id: NEXT_RESOURCE_TABLE_ID.fetch_add(1, Ordering::Relaxed),
             textures: RefCell::new(Vec::new()),
             buffers: RefCell::new(Vec::new()),
+            free_buffer: Cell::new(None),
             samplers: RefCell::new(Vec::new()),
             pipelines: RefCell::new(Vec::new()),
             shader_modules: RefCell::new(Vec::new()),
@@ -659,8 +667,49 @@ impl ResourceTable {
     /// # Returns
     /// A buffer reference, or a bounded-allocation error.
     pub fn define_buffer(&self, desc: BufferDesc) -> Result<BufferRef<'_>> {
-        let index = Self::push(&self.buffers, desc, MAX_BUFFERS)?;
-        Ok(BufferRef { owner: self, index })
+        let mut buffers = self.buffers.borrow_mut();
+        if let Some(index) = self.free_buffer.get() {
+            let slot = &mut buffers[index];
+            self.free_buffer.set(slot.next_free.take());
+            slot.descriptor = Some(desc);
+            return Ok(BufferRef {
+                owner: self,
+                index,
+                generation: slot.generation,
+            });
+        }
+        if buffers.len() >= MAX_BUFFERS {
+            return Err(Error::ResourceLimitExceeded);
+        }
+        buffers.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        let index = buffers.len();
+        buffers.push(BufferSlot {
+            descriptor: Some(desc),
+            generation: 0,
+            next_free: None,
+        });
+        Ok(BufferRef {
+            owner: self,
+            index,
+            generation: 0,
+        })
+    }
+
+    /// Retire a buffer identity so its bounded slot can be reused safely.
+    /// References from an earlier generation no longer resolve.
+    pub fn release_buffer(&self, id: BufferId) -> Result<()> {
+        self.buffer_ref(id)?;
+        let mut buffers = self.buffers.borrow_mut();
+        let slot = &mut buffers[id.index];
+        let next_generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or(Error::ResourceLimitExceeded)?;
+        slot.descriptor = None;
+        slot.generation = next_generation;
+        slot.next_free = self.free_buffer.get();
+        self.free_buffer.set(Some(id.index));
+        Ok(())
     }
     /// Define a sampler descriptor and return its table-branded reference.
     ///
@@ -719,10 +768,20 @@ impl ResourceTable {
     /// A reference branded with this borrow of the owning table, or
     /// [`Error::ResourceTableMismatch`] when `id` belongs to another table.
     pub fn buffer_ref(&self, id: BufferId) -> Result<BufferRef<'_>> {
-        self.validate_id(id.owner, id.index, &self.buffers)?;
+        if id.owner != self.id {
+            return Err(Error::ResourceTableMismatch);
+        }
+        let buffers = self.buffers.borrow();
+        if buffers
+            .get(id.index)
+            .is_none_or(|slot| slot.generation != id.generation || slot.descriptor.is_none())
+        {
+            return Err(Error::InvalidDescriptor);
+        }
         Ok(BufferRef {
             owner: self,
             index: id.index,
+            generation: id.generation,
         })
     }
 
@@ -952,7 +1011,8 @@ impl ResourceTable {
         self.buffers
             .borrow()
             .get(reference.index)
-            .copied()
+            .filter(|slot| slot.generation == reference.generation)
+            .and_then(|slot| slot.descriptor)
             .ok_or(Error::InvalidDescriptor)
     }
     /// Return the validated descriptor for a sampler reference.
@@ -1028,6 +1088,7 @@ pub struct TextureRef<'r> {
 pub struct BufferRef<'r> {
     pub(crate) owner: &'r ResourceTable,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 /// Reference to a sampler retained by one [`ResourceTable`].
 #[derive(Clone, Copy)]
@@ -1054,6 +1115,7 @@ pub struct TextureId {
 pub struct BufferId {
     owner: usize,
     index: usize,
+    generation: u64,
 }
 
 /// Persistent table-qualified identity of a logical sampler.
@@ -1127,6 +1189,7 @@ impl BufferRef<'_> {
         BufferId {
             owner: self.owner.id,
             index: self.index,
+            generation: self.generation,
         }
     }
 }

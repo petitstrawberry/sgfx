@@ -438,6 +438,27 @@ fn resource_limit_keeps_existing_descriptors_resolvable() {
 }
 
 #[test]
+fn retired_buffer_slots_are_reused_without_reviving_old_ids() {
+    let table = ResourceTable::new();
+    let descriptor = BufferDesc::new(4, BufferUsage::COPY_DST).expect("descriptor");
+    let first = table.define_buffer(descriptor).expect("first").id();
+    table.release_buffer(first).expect("retire first");
+    assert!(table.buffer_ref(first).is_err());
+    assert!(table.release_buffer(first).is_err());
+
+    for _ in 0..(MAX_BUFFERS * 2) {
+        let current = table.define_buffer(descriptor).expect("reused slot").id();
+        assert_ne!(current, first);
+        assert_eq!(
+            table.buffer(table.buffer_ref(current).expect("current")),
+            Ok(descriptor)
+        );
+        assert!(table.buffer_ref(first).is_err());
+        table.release_buffer(current).expect("retire current");
+    }
+}
+
+#[test]
 fn dropping_a_pass_without_end_does_not_finish_the_stream() {
     let table = ResourceTable::new();
     let target = color_target(&table);
