@@ -57,8 +57,8 @@ wgpu = { version = "24", features = ["spirv"], optional = true }
 [target.'cfg(target_os = "scarlet")'.dependencies]
 scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "54bfdf3048a100fc4bfba5198e59bdb184702871", optional = true }
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "54bfdf3048a100fc4bfba5198e59bdb184702871", default-features = false, optional = true }
-sgfx-backend-scarlet-maxwell = { git = "https://github.com/petitstrawberry/scarlet-project-switch", rev = "a0c94c6fe9d3c53362dd19343e9ef557172a2c88", default-features = false, optional = true }
-sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "db4ed9b517141ca3245a16a6127b5025d3b2327f", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
+sgfx-backend-scarlet-maxwell = { git = "https://github.com/petitstrawberry/scarlet-project-switch", rev = "a292d523f2669c776153a465549d8ad60420bc64", default-features = false, optional = true }
+sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "0c4d9d2029770780e18a65481e4241f7c1ef60a1", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
 sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-features = false, optional = true }
 
 # Linux-ABI clients in Scarlet opt into the native GPU transport explicitly.
