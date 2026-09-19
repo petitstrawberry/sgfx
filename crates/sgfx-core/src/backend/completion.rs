@@ -119,6 +119,13 @@ pub trait CommandSubmitter: CommandExecutor {
     /// Owned backend receipt, independent of command/executor borrow lifetimes.
     type Submission: Completion<Error = Self::Error> + 'static;
 
+    /// Report whether this executor's negotiated transport accepts async work.
+    /// This is a capability query, not a capacity reservation or GPU wait.
+    /// Conservative by default for executors without transport negotiation.
+    fn supports_async_submission(&self) -> bool {
+        false
+    }
+
     /// Accept a complete logical command stream without waiting for its GPU work.
     ///
     /// # Arguments
