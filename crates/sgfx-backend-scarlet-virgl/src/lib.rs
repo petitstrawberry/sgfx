@@ -774,6 +774,10 @@ impl sgfx_core::backend::CommandExecutor for Executor<'_> {
 impl sgfx_core::backend::CommandSubmitter for Executor<'_> {
     type Submission = Submission;
 
+    fn supports_async_submission(&self) -> bool {
+        self.queue.backend.check_async_support().is_ok()
+    }
+
     /// Submit portable commands with owned completion tracking.
     ///
     /// # Arguments
