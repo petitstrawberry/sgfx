@@ -548,7 +548,11 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         let tight = write
             .destination()
             .width()
-            .checked_mul(desc.format().bytes_per_pixel())
+            .checked_mul(
+                desc.format()
+                    .bytes_per_pixel()
+                    .ok_or(Error::InvalidDescriptor)?,
+            )
             .ok_or(Error::Overflow)?;
         if write.bytes_per_row() < tight {
             return Err(Error::InvalidValue);

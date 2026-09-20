@@ -362,6 +362,24 @@ impl MappedTargetSession {
         }
     }
 
+    /// Import a ready shared YCbCr image with an explicit RGB sampling conversion.
+    /// The session retains the backing lease through GPU completion.
+    pub fn import_ycbcr_texture(
+        &mut self,
+        texture: ir::TextureId,
+        handle: Handle,
+        conversion: ir::YcbcrConversion,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "backend-scarlet-maxwell")]
+            Self::Maxwell(session) => session
+                .import_ycbcr_texture(texture, handle, conversion)
+                .map_err(Error::ScarletMaxwellIr),
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::ScarletBackendUnsupported),
+        }
+    }
+
     /// Detach and release a previously imported sampled texture.
     pub fn release_imported_texture(&mut self, texture: ir::TextureId) -> Result<()> {
         match self {

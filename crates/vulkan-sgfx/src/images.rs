@@ -40,7 +40,12 @@ impl Image {
                 let size = self.mip_extent(mip).expect("validated image mip count");
                 u64::from(size.width)
                     * u64::from(size.height)
-                    * u64::from(texture_format(self.format).unwrap().bytes_per_pixel())
+                    * u64::from(
+                        texture_format(self.format)
+                            .unwrap()
+                            .bytes_per_pixel()
+                            .expect("Vulkan supported packed format"),
+                    )
                     * u64::from(self.array_layers)
             })
             .sum()

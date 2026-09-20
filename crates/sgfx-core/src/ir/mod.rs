@@ -45,3 +45,5 @@ pub use owned::{
     OwnedColorAttachment, OwnedCommand, OwnedCommandBuffer, OwnedDepthAttachment,
     OwnedRenderPassDesc, OwnedResourceBarrier,
 };
+
+pub use resource::{ChromaLocation, YcbcrConversion, YcbcrMatrix, YcbcrRange};

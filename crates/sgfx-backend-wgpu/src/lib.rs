@@ -1993,7 +1993,12 @@ fn encode_texture_upload(
     let area = write.destination();
     let row_size = area
         .width()
-        .checked_mul(texture.logical_format.bytes_per_pixel())
+        .checked_mul(
+            texture
+                .logical_format
+                .bytes_per_pixel()
+                .ok_or(Error::Unsupported(UnsupportedFeature::TextureFormat))?,
+        )
         .ok_or(Error::Unsupported(UnsupportedFeature::ResourceSize))?;
     let stride = row_size
         .checked_next_multiple_of(raw::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -2151,6 +2156,7 @@ fn raw_format(format: TextureFormat) -> Option<raw::TextureFormat> {
         TextureFormat::Rgba8Unorm => Some(raw::TextureFormat::Rgba8Unorm),
         TextureFormat::Rgba8UnormSrgb => Some(raw::TextureFormat::Rgba8UnormSrgb),
         TextureFormat::R8Unorm => Some(raw::TextureFormat::R8Unorm),
+        TextureFormat::Nv12 => None,
         TextureFormat::Depth32Float => Some(raw::TextureFormat::Depth32Float),
     }
 }

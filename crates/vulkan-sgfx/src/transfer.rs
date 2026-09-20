@@ -115,7 +115,8 @@ pub(crate) fn upload(
     let memory = resources.memories.get(&memory).ok_or(invalid)?;
     let bpp = crate::images::texture_format(target.format)
         .ok_or(unsupported)?
-        .bytes_per_pixel();
+        .bytes_per_pixel()
+        .ok_or(unsupported)?;
     let mut ops = Vec::with_capacity(regions.len());
     for region in regions {
         if region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR

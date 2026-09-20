@@ -3041,6 +3041,11 @@ fn texture_spec(
         format: match descriptor.format() {
             TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => IrTextureFormat::Bgra8,
             TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => IrTextureFormat::Rgba8,
+            TextureFormat::Nv12 => {
+                return Err(IrSubmitError::Unsupported(
+                    UnsupportedIrFeature::TextureSampling,
+                ));
+            }
             TextureFormat::R8Unorm => IrTextureFormat::R8,
             TextureFormat::Depth32Float => IrTextureFormat::Depth32Float,
         },

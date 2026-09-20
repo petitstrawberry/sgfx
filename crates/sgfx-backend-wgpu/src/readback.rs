@@ -94,7 +94,12 @@ impl Resources {
             let width = extent.width();
             let height = extent.height();
             let row_size = width
-                .checked_mul(descriptor.format().bytes_per_pixel())
+                .checked_mul(
+                    descriptor
+                        .format()
+                        .bytes_per_pixel()
+                        .ok_or(Error::Unsupported(UnsupportedFeature::TextureFormat))?,
+                )
                 .ok_or(Error::Unsupported(UnsupportedFeature::ResourceSize))?;
             let alignment = raw::COPY_BYTES_PER_ROW_ALIGNMENT;
             let row_stride = row_size
@@ -323,7 +328,7 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-            let row_size = 3 * format.bytes_per_pixel();
+            let row_size = 3 * format.bytes_per_pixel().unwrap();
             let pixels: Vec<u8> = (0..row_size * 2)
                 .map(|value| (value * 7 + 3) as u8)
                 .collect();

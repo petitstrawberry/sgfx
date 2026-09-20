@@ -38,6 +38,9 @@ pub enum TextureFormat {
     Rgba8UnormSrgb,
     /// One eight-bit normalized red channel.
     R8Unorm,
+    /// Two-plane 8-bit 4:2:0 Y plus interleaved CbCr, sampled with an explicit conversion.
+    /// Currently import-only: one mip, one layer, and SAMPLED usage.
+    Nv12,
     /// One 32-bit floating-point depth component.
     Depth32Float,
 }
@@ -47,15 +50,16 @@ impl TextureFormat {
     ///
     /// # Returns
     ///
-    /// The portable byte size for this format.
-    pub const fn bytes_per_pixel(self) -> u32 {
+    /// The packed byte size, or `None` for a multi-plane format.
+    pub const fn bytes_per_pixel(self) -> Option<u32> {
         match self {
             Self::Bgra8Unorm
             | Self::Rgba8Unorm
             | Self::Bgra8UnormSrgb
             | Self::Rgba8UnormSrgb
-            | Self::Depth32Float => 4,
-            Self::R8Unorm => 1,
+            | Self::Depth32Float => Some(4),
+            Self::R8Unorm => Some(1),
+            Self::Nv12 => None,
         }
     }
 
@@ -141,6 +145,32 @@ impl BitOrAssign for TextureUsage {
     }
 }
 
+/// Encoded YCbCr matrix used when sampling a multi-plane image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YcbcrMatrix {
+    Bt601,
+    Bt709,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YcbcrRange {
+    Limited,
+    Full,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromaLocation {
+    Cosited,
+    Midpoint,
+}
+/// Immutable sampling conversion, independent of decoder and storage modifier.
+/// Produces encoded RGB; it does not perform transfer-function or gamut mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YcbcrConversion {
+    pub matrix: YcbcrMatrix,
+    pub range: YcbcrRange,
+    pub chroma_x: ChromaLocation,
+    pub chroma_y: ChromaLocation,
+}
+
 /// Validated descriptor for a logical texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureDesc {
@@ -166,7 +196,8 @@ impl TextureDesc {
     /// A descriptor, or [`Error::InvalidDescriptor`] for empty usage or a
     /// depth format carrying usage other than `RENDER_ATTACHMENT` or `SAMPLED`.
     pub const fn new(format: TextureFormat, extent: Extent2D, usage: TextureUsage) -> Result<Self> {
-        if usage.0 == 0
+        if (matches!(format, TextureFormat::Nv12) && usage.0 != TextureUsage::SAMPLED.0)
+            || usage.0 == 0
             || (usage.contains(TextureUsage::STORAGE)
                 && !matches!(format, TextureFormat::Rgba8Unorm))
             || (matches!(format, TextureFormat::Depth32Float)
@@ -216,8 +247,10 @@ impl TextureDesc {
         if count == 0
             || count > maximum
             || (count > 1
-                && (self.format == TextureFormat::Depth32Float
-                    || self.usage.contains(TextureUsage::PRESENT)))
+                && (matches!(
+                    self.format,
+                    TextureFormat::Depth32Float | TextureFormat::Nv12
+                ) || self.usage.contains(TextureUsage::PRESENT)))
         {
             return Err(Error::InvalidDescriptor);
         }
@@ -234,7 +267,9 @@ impl TextureDesc {
     pub fn with_array_layer_count(mut self, count: u32) -> Result<Self> {
         if count == 0
             || count > 2048
-            || (count != 1 && self.usage.contains(TextureUsage::PRESENT))
+            || (count != 1
+                && (self.usage.contains(TextureUsage::PRESENT)
+                    || self.format == TextureFormat::Nv12))
             || (self.cube_compatible && count < 6)
         {
             return Err(Error::InvalidDescriptor);
@@ -282,10 +317,24 @@ impl TextureDesc {
         let mut size = 0u64;
         for level in 0..self.mip_level_count {
             let extent = self.mip_extent(level)?;
-            let bytes = u64::from(extent.width())
+            let pixels = u64::from(extent.width())
                 .checked_mul(u64::from(extent.height()))
-                .and_then(|v| v.checked_mul(u64::from(self.format.bytes_per_pixel())))
                 .ok_or(Error::Overflow)?;
+            let bytes = if self.format == TextureFormat::Nv12 {
+                let chroma = u64::from(extent.width().div_ceil(2))
+                    .checked_mul(u64::from(extent.height().div_ceil(2)))
+                    .and_then(|v| v.checked_mul(2))
+                    .ok_or(Error::Overflow)?;
+                pixels.checked_add(chroma).ok_or(Error::Overflow)?
+            } else {
+                pixels
+                    .checked_mul(u64::from(
+                        self.format
+                            .bytes_per_pixel()
+                            .ok_or(Error::InvalidDescriptor)?,
+                    ))
+                    .ok_or(Error::Overflow)?
+            };
             size = size.checked_add(bytes).ok_or(Error::Overflow)?;
         }
         size.checked_mul(u64::from(self.array_layer_count))
