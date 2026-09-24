@@ -3,6 +3,8 @@ use sgfx_core::ir::*;
 #[test]
 fn instanced_draw_ranges_survive_owned_replay() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let format = TextureFormat::Rgba8Unorm;
     let target = table
         .define_texture(
@@ -95,6 +97,8 @@ fn instanced_draw_ranges_survive_owned_replay() {
 #[test]
 fn comparison_samplers_require_a_matching_binding_type() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let ordinary = SamplerDesc::new(
         FilterMode::Linear,
         FilterMode::Linear,
@@ -249,6 +253,8 @@ fn push_constant_ranges_validate_alignment_limits_and_stage_overlap() {
 #[test]
 fn owned_push_constants_replay_without_copying_and_require_pipeline_and_scope() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let layout = PipelineLayoutDesc::new(vec![])
         .unwrap()
         .with_push_constant_ranges(vec![
@@ -345,6 +351,8 @@ fn owned_viewports_validate_values_attachment_bounds_and_pass_scope() {
         Err(Error::InvalidValue)
     );
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = table
         .define_texture(
             TextureDesc::new(
@@ -389,7 +397,11 @@ fn owned_viewports_validate_values_attachment_bounds_and_pass_scope() {
 #[test]
 fn binding_validation_checks_ownership_ranges_alignment_and_usage() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let other = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    other.enable_abi_commands();
     let local = buffer(&table, BufferUsage::UNIFORM);
     let foreign = buffer(&other, BufferUsage::UNIFORM);
     for (id, offset, size, expected) in [
@@ -435,6 +447,8 @@ fn binding_validation_checks_ownership_ranges_alignment_and_usage() {
 #[test]
 fn storage_offsets_follow_the_ir_minimum_and_backends_enforce_their_own_limit() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let storage = table
         .define_buffer(BufferDesc::new(256, BufferUsage::STORAGE).unwrap())
         .unwrap();
@@ -460,7 +474,11 @@ fn storage_offsets_follow_the_ir_minimum_and_backends_enforce_their_own_limit() 
 #[test]
 fn descriptor_ownership_is_checked_again_when_defining_resources() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let other = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    other.enable_abi_commands();
     let local = buffer(&table, BufferUsage::UNIFORM);
     let desc = BindGroupDesc::new(
         &table,
@@ -493,6 +511,8 @@ fn descriptor_ownership_is_checked_again_when_defining_resources() {
 #[test]
 fn compute_requires_pipeline_exact_bindings_and_positive_bounded_grid() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = buffer(&table, BufferUsage::STORAGE | BufferUsage::UNIFORM);
     let pipeline = compute(&table, BindingType::StorageBuffer { read_only: true });
     let wrong = group(&table, target, BindingType::UniformBuffer);
@@ -528,6 +548,8 @@ fn compute_requires_pipeline_exact_bindings_and_positive_bounded_grid() {
 #[test]
 fn storage_write_requires_matching_barrier_before_copy_or_next_dispatch() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = buffer(
         &table,
         BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
@@ -579,6 +601,8 @@ fn storage_write_requires_matching_barrier_before_copy_or_next_dispatch() {
 #[test]
 fn storage_writes_cannot_be_reused_inside_the_same_pass_without_a_dependency() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = buffer(&table, BufferUsage::STORAGE);
     let ty = BindingType::StorageBuffer { read_only: false };
     let pipeline = compute(&table, ty);
@@ -604,6 +628,8 @@ fn storage_writes_cannot_be_reused_inside_the_same_pass_without_a_dependency() {
 #[test]
 fn rejects_write_aliases_across_descriptor_sets() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = buffer(&table, BufferUsage::STORAGE);
     let read = BindingType::StorageBuffer { read_only: true };
     let write = BindingType::StorageBuffer { read_only: false };
@@ -628,6 +654,8 @@ fn rejects_write_aliases_across_descriptor_sets() {
 #[test]
 fn programmable_draw_can_generate_vertices_without_fixed_uniforms() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let pipeline = table
         .define_programmable_render_pipeline(
             ProgrammableRenderPipelineDesc::new(
@@ -676,6 +704,8 @@ fn programmable_draw_can_generate_vertices_without_fixed_uniforms() {
 #[test]
 fn storage_texture_write_requires_barrier_before_using_it_as_attachment() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = table
         .define_texture(
             TextureDesc::new(
@@ -732,7 +762,11 @@ fn storage_texture_write_requires_barrier_before_using_it_as_attachment() {
 #[test]
 fn buffer_copy_rejects_foreign_alias_misaligned_and_overflow_ranges() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let other = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    other.enable_abi_commands();
     let source = buffer(&table, BufferUsage::COPY_SRC | BufferUsage::COPY_DST);
     let destination = buffer(&table, BufferUsage::COPY_DST);
     let foreign = buffer(&other, BufferUsage::COPY_DST);
@@ -766,6 +800,8 @@ fn buffer_copy_rejects_foreign_alias_misaligned_and_overflow_ranges() {
 #[test]
 fn barrier_destination_is_checked_and_failed_access_does_not_consume_it() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = buffer(
         &table,
         BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
@@ -820,6 +856,8 @@ fn graphics<'r>(table: &'r ResourceTable, ty: BindingType) -> ProgrammableRender
 #[test]
 fn render_pass_rejects_storage_write_to_resource_read_by_an_earlier_draw() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let data = buffer(&table, BufferUsage::STORAGE);
     let read = BindingType::StorageBuffer { read_only: true };
     let write = BindingType::StorageBuffer { read_only: false };
@@ -861,6 +899,8 @@ fn render_pass_rejects_storage_write_to_resource_read_by_an_earlier_draw() {
 #[test]
 fn nonindexed_draw_ignores_an_unused_index_binding_when_checking_storage_aliases() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let data = buffer(&table, BufferUsage::STORAGE | BufferUsage::INDEX);
     let write = BindingType::StorageBuffer { read_only: false };
     let pipeline = graphics(&table, write);
@@ -898,6 +938,8 @@ fn nonindexed_draw_ignores_an_unused_index_binding_when_checking_storage_aliases
 #[test]
 fn solid_draw_does_not_access_or_consume_a_stale_texture_binding() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let extent = Extent2D::new(8, 8).unwrap();
     let area = PixelRect::new(0, 0, 8, 8).unwrap();
     let source = table
@@ -989,6 +1031,8 @@ fn solid_draw_does_not_access_or_consume_a_stale_texture_binding() {
 #[test]
 fn multiple_vertex_slots_validate_layouts_binding_bounds_and_write_aliases() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let input = |location, format: VertexFormat| {
         VertexBufferLayout::new(
             format.byte_size(),
@@ -1117,6 +1161,8 @@ fn multiple_vertex_slots_validate_layouts_binding_bounds_and_write_aliases() {
 #[test]
 fn storage_texture_views_select_one_mip_and_layer() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let desc = TextureDesc::new(
         TextureFormat::Rgba8Unorm,
         Extent2D::new(8, 8).unwrap(),
@@ -1168,6 +1214,8 @@ fn storage_texture_views_select_one_mip_and_layer() {
 #[test]
 fn storage_view_writes_require_a_barrier_on_the_written_mip() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let desc = TextureDesc::new(
         TextureFormat::Rgba8Unorm,
         Extent2D::new(8, 8).unwrap(),

@@ -82,6 +82,8 @@ fn cube_view_preserves_allocation_and_subresource_bounds() {
 #[test]
 fn sampled_views_require_matching_dimension_and_depth_type() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let desc = cube_allocation();
     let texture = table.define_texture(desc).unwrap();
     let view =
@@ -113,6 +115,8 @@ fn sampled_views_require_matching_dimension_and_depth_type() {
             valid
         );
         let other = ResourceTable::new();
+        #[cfg(feature = "backend-abi")]
+        other.enable_abi_commands();
         assert!(
             BindGroupDesc::new(
                 &other,
@@ -133,6 +137,8 @@ fn sampled_views_require_matching_dimension_and_depth_type() {
 #[test]
 fn uploads_select_one_layer_and_reject_out_of_range_layers() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let texture = table.define_texture(cube_allocation()).unwrap();
     let bytes = [0x55; 4];
     let write = TextureWrite::new(PixelRect::new(0, 0, 1, 1).unwrap(), 4, &bytes)

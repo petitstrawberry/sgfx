@@ -324,6 +324,25 @@ pub struct BindGroupDesc {
     entries: Vec<BindGroupEntry>,
 }
 impl BindGroupDesc {
+    /// A mirrored historical definition may reference a buffer retired since
+    /// the definition was created. Preserve it just as the originating table
+    /// does; recording/using the group validates its live resource identities.
+    #[cfg(feature = "backend-abi")]
+    pub(crate) fn from_abi(
+        layout: BindGroupLayoutDesc,
+        entries: Vec<BindGroupEntry>,
+    ) -> Result<Self> {
+        if entries.len() != layout.entries.len()
+            || entries
+                .iter()
+                .zip(&layout.entries)
+                .any(|(entry, layout)| entry.binding != layout.binding)
+        {
+            return Err(Error::BindingLayoutMismatch);
+        }
+        Ok(Self { layout, entries })
+    }
+
     /// Construct bindings, checking exact layout coverage, ownership, usage and ranges.
     pub fn new(
         resources: &ResourceTable,

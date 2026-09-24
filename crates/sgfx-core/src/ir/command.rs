@@ -1,6 +1,10 @@
 //! Validated logical upload, copy, and render commands.
 
+#[cfg(feature = "backend-abi")]
+use super::abi::commands::Storage as CommandStorage;
 use alloc::vec::Vec;
+#[cfg(not(feature = "backend-abi"))]
+type CommandStorage<'r, 'data> = Vec<Command<'r, 'data>>;
 
 mod programmable_commands;
 use super::{
@@ -283,6 +287,7 @@ impl<'r> RenderPassDesc<'r> {
 /// references remain lifetime-branded and cannot be constructed from raw IDs.
 // Render-pass descriptors stay inline to avoid allocating while recording commands.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy)]
 pub enum Command<'r, 'data> {
     /// Scale a complete color mip level into a complete destination mip level.
     /// The operation is a GPU transfer; filtering uses texel-center coordinates.
@@ -459,7 +464,7 @@ pub enum Command<'r, 'data> {
 /// Encoder that records validated logical graphics commands.
 pub struct CommandEncoder<'r, 'data> {
     resources: &'r ResourceTable,
-    commands: Vec<Command<'r, 'data>>,
+    commands: CommandStorage<'r, 'data>,
     pass_open: bool,
     pending_writes: Vec<PendingWrite>,
     announced_accesses: Vec<AnnouncedAccess>,
@@ -474,10 +479,13 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
     ///
     /// # Returns
     /// An empty encoder with the fixed [`MAX_COMMANDS`] bound.
-    pub const fn new(resources: &'r ResourceTable) -> Self {
+    pub fn new(resources: &'r ResourceTable) -> Self {
         Self {
             resources,
+            #[cfg(not(feature = "backend-abi"))]
             commands: Vec::new(),
+            #[cfg(feature = "backend-abi")]
+            commands: CommandStorage::new(resources),
             pass_open: false,
             pending_writes: Vec::new(),
             announced_accesses: Vec::new(),
@@ -1250,7 +1258,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
 /// Finished, immutable logical command buffer with separate resource and data lifetimes.
 pub struct CommandBuffer<'r, 'data> {
     pub(crate) resources: &'r ResourceTable,
-    pub(crate) commands: Vec<Command<'r, 'data>>,
+    pub(crate) commands: CommandStorage<'r, 'data>,
 }
 
 impl<'r, 'data> CommandBuffer<'r, 'data> {
@@ -1270,7 +1278,14 @@ impl<'r, 'data> CommandBuffer<'r, 'data> {
     /// The validated command slice. Its resource references cannot be forged
     /// because their owner and index fields are not public.
     pub fn commands(&self) -> &[Command<'r, 'data>] {
-        &self.commands
+        #[cfg(not(feature = "backend-abi"))]
+        {
+            &self.commands
+        }
+        #[cfg(feature = "backend-abi")]
+        {
+            self.commands.as_slice(self.resources)
+        }
     }
 
     /// Return the number of recorded commands.

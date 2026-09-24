@@ -51,6 +51,8 @@ impl CommandSubmitter for LegacyExecutor {
 #[test]
 fn existing_executor_boundary_remains_object_safe() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let commands = CommandEncoder::new(&table).finish().expect("empty stream");
     let mut legacy = LegacyExecutor;
     let executor: &mut dyn CommandExecutor<Error = ()> = &mut legacy;
@@ -65,6 +67,8 @@ fn receipt_outlives_executor_table_and_commands() {
         S::Submission: core::fmt::Debug,
     {
         let table = ResourceTable::new();
+        #[cfg(feature = "backend-abi")]
+        table.enable_abi_commands();
         let commands = CommandEncoder::new(&table).finish().expect("empty stream");
         executor.submit(&commands).expect("checkpoint")
     }

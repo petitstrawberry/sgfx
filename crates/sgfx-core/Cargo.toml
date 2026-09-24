@@ -8,8 +8,10 @@ repository = "https://github.com/petitstrawberry/sgfx"
 [features]
 default = []
 std = []
+backend-abi = ["dep:sgfx-backend-abi"]
 
 [dependencies]
+sgfx-backend-abi = { path = "../sgfx-backend-abi", optional = true }
 
 [lib]
 name = "sgfx_core"

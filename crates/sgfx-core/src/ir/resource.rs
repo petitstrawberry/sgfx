@@ -657,22 +657,24 @@ impl<'data> TextureWrite<'data> {
 
 /// Table that owns validated logical resource descriptors.
 pub struct ResourceTable {
-    id: usize,
-    textures: RefCell<Vec<TextureDesc>>,
-    buffers: RefCell<Vec<BufferSlot>>,
-    free_buffer: Cell<Option<usize>>,
-    samplers: RefCell<Vec<SamplerDesc>>,
-    pipelines: RefCell<Vec<RenderPipelineDesc>>,
-    shader_modules: RefCell<Vec<ShaderModuleDesc>>,
-    bind_groups: RefCell<Vec<Rc<BindGroupDesc>>>,
-    compute_pipelines: RefCell<Vec<ComputePipelineDesc>>,
-    programmable_pipelines: RefCell<Vec<Rc<ProgrammableRenderPipelineDesc>>>,
+    pub(crate) id: usize,
+    pub(crate) textures: RefCell<Vec<TextureDesc>>,
+    pub(crate) buffers: RefCell<Vec<BufferSlot>>,
+    pub(crate) free_buffer: Cell<Option<usize>>,
+    pub(crate) samplers: RefCell<Vec<SamplerDesc>>,
+    pub(crate) pipelines: RefCell<Vec<RenderPipelineDesc>>,
+    pub(crate) shader_modules: RefCell<Vec<ShaderModuleDesc>>,
+    pub(crate) bind_groups: RefCell<Vec<Rc<BindGroupDesc>>>,
+    pub(crate) compute_pipelines: RefCell<Vec<ComputePipelineDesc>>,
+    pub(crate) programmable_pipelines: RefCell<Vec<Rc<ProgrammableRenderPipelineDesc>>>,
+    #[cfg(feature = "backend-abi")]
+    pub(crate) abi: super::abi::State,
 }
 
-struct BufferSlot {
-    descriptor: Option<BufferDesc>,
-    generation: u64,
-    next_free: Option<usize>,
+pub(crate) struct BufferSlot {
+    pub(crate) descriptor: Option<BufferDesc>,
+    pub(crate) generation: u64,
+    pub(crate) next_free: Option<usize>,
 }
 
 impl ResourceTable {
@@ -683,6 +685,8 @@ impl ResourceTable {
     pub fn new() -> Self {
         Self {
             id: NEXT_RESOURCE_TABLE_ID.fetch_add(1, Ordering::Relaxed),
+            #[cfg(feature = "backend-abi")]
+            abi: super::abi::State::new(),
             textures: RefCell::new(Vec::new()),
             buffers: RefCell::new(Vec::new()),
             free_buffer: Cell::new(None),
@@ -704,7 +708,7 @@ impl ResourceTable {
     /// # Returns
     /// A texture reference, or a bounded-allocation error.
     pub fn define_texture(&self, desc: TextureDesc) -> Result<TextureRef<'_>> {
-        let index = Self::push(&self.textures, desc, MAX_TEXTURES)?;
+        let index = self.push(&self.textures, desc, MAX_TEXTURES)?;
         Ok(TextureRef { owner: self, index })
     }
     /// Define a buffer descriptor and return its table-branded reference.
@@ -721,6 +725,8 @@ impl ResourceTable {
             let slot = &mut buffers[index];
             self.free_buffer.set(slot.next_free.take());
             slot.descriptor = Some(desc);
+            #[cfg(feature = "backend-abi")]
+            self.abi_changed();
             return Ok(BufferRef {
                 owner: self,
                 index,
@@ -737,6 +743,8 @@ impl ResourceTable {
             generation: 0,
             next_free: None,
         });
+        #[cfg(feature = "backend-abi")]
+        self.abi_changed();
         Ok(BufferRef {
             owner: self,
             index,
@@ -758,6 +766,8 @@ impl ResourceTable {
         slot.generation = next_generation;
         slot.next_free = self.free_buffer.get();
         self.free_buffer.set(Some(id.index));
+        #[cfg(feature = "backend-abi")]
+        self.abi_changed();
         Ok(())
     }
     /// Define a sampler descriptor and return its table-branded reference.
@@ -769,7 +779,7 @@ impl ResourceTable {
     /// # Returns
     /// A sampler reference, or a bounded-allocation error.
     pub fn define_sampler(&self, desc: SamplerDesc) -> Result<SamplerRef<'_>> {
-        let index = Self::push(&self.samplers, desc, MAX_SAMPLERS)?;
+        let index = self.push(&self.samplers, desc, MAX_SAMPLERS)?;
         Ok(SamplerRef { owner: self, index })
     }
     /// Define a render-pipeline descriptor and return its table-branded reference.
@@ -784,7 +794,7 @@ impl ResourceTable {
         &self,
         desc: RenderPipelineDesc,
     ) -> Result<RenderPipelineRef<'_>> {
-        let index = Self::push(&self.pipelines, desc, MAX_RENDER_PIPELINES)?;
+        let index = self.push(&self.pipelines, desc, MAX_RENDER_PIPELINES)?;
         Ok(RenderPipelineRef { owner: self, index })
     }
 
@@ -872,7 +882,7 @@ impl ResourceTable {
 
     /// Define an immutable shader module and return its branded reference.
     pub fn define_shader_module(&self, desc: ShaderModuleDesc) -> Result<ShaderModuleRef<'_>> {
-        let index = Self::push(&self.shader_modules, desc, 256)?;
+        let index = self.push(&self.shader_modules, desc, 256)?;
         Ok(ShaderModuleRef { owner: self, index })
     }
     /// Resolve a persistent shader module identity in its owning table.
@@ -897,7 +907,7 @@ impl ResourceTable {
     /// Define an immutable bind group and return its branded reference.
     pub fn define_bind_group(&self, desc: BindGroupDesc) -> Result<BindGroupRef<'_>> {
         desc.validate(self)?;
-        let index = Self::push(&self.bind_groups, Rc::new(desc), MAX_BIND_GROUP_DEFINITIONS)?;
+        let index = self.push(&self.bind_groups, Rc::new(desc), MAX_BIND_GROUP_DEFINITIONS)?;
         Ok(BindGroupRef { owner: self, index })
     }
     /// Resolve a persistent bind group identity in its owning table.
@@ -932,7 +942,7 @@ impl ResourceTable {
         desc: ComputePipelineDesc,
     ) -> Result<ComputePipelineRef<'_>> {
         self.shader_module_ref(desc.shader().module())?;
-        let index = Self::push(&self.compute_pipelines, desc, 256)?;
+        let index = self.push(&self.compute_pipelines, desc, 256)?;
         Ok(ComputePipelineRef { owner: self, index })
     }
     /// Resolve a persistent compute pipeline identity in its owning table.
@@ -964,7 +974,7 @@ impl ResourceTable {
     ) -> Result<ProgrammableRenderPipelineRef<'_>> {
         self.shader_module_ref(desc.vertex().module())?;
         self.shader_module_ref(desc.fragment().module())?;
-        let index = Self::push(&self.programmable_pipelines, Rc::new(desc), 256)?;
+        let index = self.push(&self.programmable_pipelines, Rc::new(desc), 256)?;
         Ok(ProgrammableRenderPipelineRef { owner: self, index })
     }
     /// Resolve a persistent programmable render pipeline identity in its owning table.
@@ -1003,7 +1013,12 @@ impl ResourceTable {
             .ok_or(Error::InvalidDescriptor)
     }
 
-    fn push<T>(items: &RefCell<Vec<T>>, value: T, maximum: usize) -> Result<usize> {
+    pub(super) fn push<T>(
+        &self,
+        items: &RefCell<Vec<T>>,
+        value: T,
+        maximum: usize,
+    ) -> Result<usize> {
         let mut items = items.borrow_mut();
         if items.len() >= maximum {
             return Err(Error::ResourceLimitExceeded);
@@ -1011,6 +1026,8 @@ impl ResourceTable {
         items.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
         let index = items.len();
         items.push(value);
+        #[cfg(feature = "backend-abi")]
+        self.abi_changed();
         Ok(index)
     }
 
@@ -1155,30 +1172,30 @@ pub struct RenderPipelineRef<'r> {
 /// Persistent table-qualified identity of a logical texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextureId {
-    owner: usize,
-    index: usize,
+    pub(crate) owner: usize,
+    pub(crate) index: usize,
 }
 
 /// Persistent table-qualified identity of a logical buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferId {
-    owner: usize,
-    index: usize,
-    generation: u64,
+    pub(crate) owner: usize,
+    pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 
 /// Persistent table-qualified identity of a logical sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SamplerId {
-    owner: usize,
-    index: usize,
+    pub(crate) owner: usize,
+    pub(crate) index: usize,
 }
 
 /// Persistent table-qualified identity of a logical render pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RenderPipelineId {
-    owner: usize,
-    index: usize,
+    pub(crate) owner: usize,
+    pub(crate) index: usize,
 }
 
 impl TextureRef<'_> {
@@ -1324,8 +1341,8 @@ pub struct ShaderModuleRef<'r> {
 /// Persistent table-qualified shader module identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShaderModuleId {
-    owner: usize,
-    index: usize,
+    pub(crate) owner: usize,
+    pub(crate) index: usize,
 }
 impl ShaderModuleRef<'_> {
     /// Return the stable table-local backend slot.
@@ -1351,8 +1368,8 @@ pub struct BindGroupRef<'r> {
 /// Persistent table-qualified bind group identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BindGroupId {
-    owner: usize,
-    index: usize,
+    pub(crate) owner: usize,
+    pub(crate) index: usize,
 }
 impl BindGroupRef<'_> {
     /// Return the stable table-local backend slot.
@@ -1378,8 +1395,8 @@ pub struct ComputePipelineRef<'r> {
 /// Persistent table-qualified compute pipeline identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComputePipelineId {
-    owner: usize,
-    index: usize,
+    pub(crate) owner: usize,
+    pub(crate) index: usize,
 }
 impl ComputePipelineRef<'_> {
     /// Return the stable table-local backend slot.
@@ -1405,8 +1422,8 @@ pub struct ProgrammableRenderPipelineRef<'r> {
 /// Persistent table-qualified programmable render pipeline identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProgrammableRenderPipelineId {
-    owner: usize,
-    index: usize,
+    pub(crate) owner: usize,
+    pub(crate) index: usize,
 }
 impl ProgrammableRenderPipelineRef<'_> {
     /// Return the stable table-local backend slot.

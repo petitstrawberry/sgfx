@@ -60,6 +60,8 @@ fn rejects_depth_color_target() {
 #[test]
 fn rejects_depth_pipeline_without_attachment() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = color_target(&table);
     let depth_pipeline = table
         .define_render_pipeline(
@@ -88,6 +90,8 @@ fn rejects_depth_pipeline_without_attachment() {
 #[test]
 fn accepts_matching_depth_and_validates_its_clear() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = color_target(&table);
     let depth = table
         .define_texture(
@@ -133,6 +137,8 @@ fn accepts_matching_depth_and_validates_its_clear() {
 #[test]
 fn depth_attachment_does_not_require_depth_testing_in_the_ir() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = color_target(&table);
     let depth = table
         .define_texture(
@@ -161,6 +167,8 @@ fn depth_attachment_does_not_require_depth_testing_in_the_ir() {
 #[test]
 fn persistent_ids_survive_table_moves_but_do_not_alias_other_tables() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let texture = color_target(&table).id();
     let buffer = table
         .define_buffer(BufferDesc::new(24, BufferUsage::VERTEX).expect("buffer descriptor"))
@@ -197,6 +205,8 @@ fn persistent_ids_survive_table_moves_but_do_not_alias_other_tables() {
         pipeline
     );
     let other = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    other.enable_abi_commands();
     assert_eq!(
         color_target(&other).slot(),
         moved.texture_ref(texture).expect("texture").slot()
@@ -250,6 +260,8 @@ fn rejects_invalid_values_and_depth_usages() {
 #[test]
 fn invalid_uploads_do_not_record_commands_or_copy_borrowed_bytes() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let buffer = table
         .define_buffer(BufferDesc::new(4, BufferUsage::COPY_DST).expect("descriptor"))
         .expect("buffer");
@@ -281,6 +293,8 @@ fn invalid_uploads_do_not_record_commands_or_copy_borrowed_bytes() {
 #[test]
 fn texture_upload_requires_only_the_last_rows_actual_pixels() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let texture = table
         .define_texture(
             TextureDesc::new(
@@ -314,6 +328,8 @@ fn texture_upload_requires_only_the_last_rows_actual_pixels() {
 #[test]
 fn self_copy_rejects_overlap_but_accepts_disjoint_rectangles() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let texture = table
         .define_texture(
             TextureDesc::new(
@@ -340,6 +356,8 @@ fn self_copy_rejects_overlap_but_accepts_disjoint_rectangles() {
 #[test]
 fn invalid_bindings_preserve_valid_draw_state() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = color_target(&table);
     let good = table
         .define_render_pipeline(pipeline(TextureFormat::Bgra8Unorm).expect("good descriptor"))
@@ -392,6 +410,8 @@ fn invalid_bindings_preserve_valid_draw_state() {
 #[test]
 fn command_limit_preserves_the_pass_end_slot() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let buffer = table
         .define_buffer(BufferDesc::new(1, BufferUsage::COPY_DST).expect("buffer descriptor"))
         .expect("buffer");
@@ -422,6 +442,8 @@ fn command_limit_preserves_the_pass_end_slot() {
 #[test]
 fn resource_limit_keeps_existing_descriptors_resolvable() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let descriptor = BufferDesc::new(4, BufferUsage::COPY_DST).expect("descriptor");
     let first = table.define_buffer(descriptor).expect("first buffer").id();
     for _ in 1..MAX_BUFFERS {
@@ -440,6 +462,8 @@ fn resource_limit_keeps_existing_descriptors_resolvable() {
 #[test]
 fn retired_buffer_slots_are_reused_without_reviving_old_ids() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let descriptor = BufferDesc::new(4, BufferUsage::COPY_DST).expect("descriptor");
     let first = table.define_buffer(descriptor).expect("first").id();
     table.release_buffer(first).expect("retire first");
@@ -461,6 +485,8 @@ fn retired_buffer_slots_are_reused_without_reviving_old_ids() {
 #[test]
 fn dropping_a_pass_without_end_does_not_finish_the_stream() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let target = color_target(&table);
     let desc =
         RenderPassDesc::new(&table, target, area(), LoadOp::Load, StoreOp::Store).expect("pass");

@@ -3,6 +3,8 @@ use sgfx_core::ir::*;
 #[test]
 fn owned_multiple_attachments_resolve_all_identities_and_preserve_read_only_depth() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let a = texture(&table, TextureFormat::Rgba8Unorm, 8);
     let b = texture(&table, TextureFormat::Bgra8Unorm, 8);
     let depth = texture(&table, TextureFormat::Depth32Float, 8);
@@ -76,6 +78,8 @@ fn pipeline(
 #[test]
 fn multiple_color_targets_validate_counts_formats_and_all_attachment_aliases() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let a = texture(&table, TextureFormat::Rgba8Unorm, 8);
     let b = texture(&table, TextureFormat::Bgra8Unorm, 8);
     let small = texture(&table, TextureFormat::Rgba8Unorm, 4);
@@ -148,6 +152,8 @@ fn multiple_color_targets_validate_counts_formats_and_all_attachment_aliases() {
 #[test]
 fn depth_sampling_requires_read_only_attachment_and_disallows_depth_writes() {
     let table = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    table.enable_abi_commands();
     let color = texture(&table, TextureFormat::Rgba8Unorm, 8);
     let depth = texture(&table, TextureFormat::Depth32Float, 8);
     let area = PixelRect::new(0, 0, 8, 8).unwrap();

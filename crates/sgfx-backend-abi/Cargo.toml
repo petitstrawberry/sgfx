@@ -1,0 +1,9 @@
+[package]
+name = "sgfx-backend-abi"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Versioned C interface for independently loaded SGFX backends"
+
+[lib]
+path = "src/lib.rs"
