@@ -224,6 +224,18 @@ unsafe extern "system" fn create_image(
             return Err(UNSUPPORTED);
         }
         let ir_format = texture_format(format).ok_or(UNSUPPORTED)?;
+        // Transfer clears execute as GPU attachment clears. Reserve that
+        // internal usage without changing the application's Vulkan usage.
+        if image_usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
+            && mip_levels == 1
+            && array_layers == 1
+            && matches!(
+                format,
+                vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+            )
+        {
+            usage |= ir::TextureUsage::RENDER_ATTACHMENT;
+        }
         if matches!(
             format,
             vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB

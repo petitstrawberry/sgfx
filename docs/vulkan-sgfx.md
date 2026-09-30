@@ -3,7 +3,7 @@
 `vulkan-sgfx` is a loader-discoverable, **non-conformant development ICD**. It
 implements a bounded executable subset to exercise Vulkan → SGFX portable IR →
 backend execution, macOS presentation through Metal, and Linux ABI presentation
-through Scarlet SWS with `VK_KHR_display`. Its manifest and
+through Scarlet SWS with `VK_KHR_display` and `VK_KHR_wayland_surface`. Its manifest and
 physical device use the Vulkan 1.0 ABI version. This is not a claim of Vulkan
 1.0 conformance: substantial mandatory core functionality is absent. Do not
 select it as a general application driver. Cross-platform WSI, resource
@@ -90,6 +90,20 @@ remain incomplete.
   GPU swapchain images are returned only on actual compositor release. The
   ordinary C `examples/display.c` checks 60 presentations and clean shutdown
   on Scarlet AArch64 QEMU. This does not yet establish vkQuake2 game rendering.
+- Linux Wayland WSI targets the application's existing surface, including Wine
+  GPU subsurfaces. A private `wp_scarlet_sgfx_v1` registration imports BGRA8
+  native GPU images into SWS surface scenes. Private libwayland proxy wrappers
+  and event queues preserve the application's listeners. FIFO waits for frame
+  callbacks, reuse waits for buffer release, and queue work completes before
+  compositor sampling. Replacement swapchains may use a different extent.
+- `vkCmdClearColorImage` clears single-mip/layer RGBA8/BGRA8 UNORM transfer
+  destinations using GPU render-pass clear operations, with complete range
+  validation before emission. Other formats and subresource clears are rejected.
+- Linux advertises `VK_KHR_get_physical_device_properties2` and
+  `VK_KHR_external_memory_capabilities` for Wine's adapter queries. KHR queries
+  wrap the supported core properties; device/driver UUIDs are stable and LUID
+  validity is false. External buffer/image queries expose no supported handle
+  type. This does not add external Vulkan memory export or import.
 
 Each `vkCmd*` records into command-buffer-local owned storage on the calling
 thread. Submit resolves the Vulkan handles and descriptor state into
@@ -269,9 +283,10 @@ and verify the chosen Mesa driver. The Linux check also used
 ## Limits and remaining work
 
 - **Not Vulkan conformant.** The ICD implements a bounded executable subset.
-  WSI currently covers macOS Metal, FIFO mode, opaque composition, and
-  fixed-size swapchains. Other platform surfaces, window-resize handling in the
-  example, timeline semaphores, secondary command buffers, descriptor indexing,
+  WSI currently covers macOS Metal and Scarlet Linux display/Wayland,
+  FIFO mode and opaque composition. Windows presentation is through Wine's
+  Win32-to-Wayland driver and Box64's native Vulkan wrapper. Direct3D/DXVK,
+  general games, other platform surfaces, timeline semaphores, secondary command buffers, descriptor indexing,
   pipeline caches, queries, events, sparse resources, external memory, multisampling,
   indirect operations, partial/flipped/converting blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
@@ -296,6 +311,11 @@ and verify the chosen Mesa driver. The Linux check also used
   `cdylib`, so this cube result uses a linked frontend. The separate Linux/musl
   `scarlet-wsi` build is an actual `.so` ICD loaded by the ordinary Khronos
   loader on Scarlet's Linux ABI, with 60 KHR_display presentations verified.
+  The glibc Linux build also passes GPU clear/readback through the standard
+  loader and Wayland presentation through a SHM parent/GPU child. Identical
+  Win64 probes under Wine/Box64 pass 4096-pixel readback and 40 presentations
+  across two swapchain sizes. These checks establish a bounded path, not
+  Vulkan conformance or general Windows application compatibility.
   A618 still
   rejects programmable execution and is not advertised as a Vulkan adapter.
 - **Conservative memory and transfer costs.** Referenced host-visible buffers

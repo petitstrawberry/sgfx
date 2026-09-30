@@ -6,12 +6,16 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod api;
+mod clear;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod display;
 mod images;
 mod input_attachments;
 mod instance;
+#[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+mod linux_wsi;
 mod push_constants;
+mod properties2;
 mod render_pass;
 mod resources;
 mod runtime;

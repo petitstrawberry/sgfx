@@ -686,6 +686,12 @@ enum RecordedCommand {
         buffer: vk::Buffer,
         regions: Vec<vk::BufferImageCopy>,
     },
+    ClearColorImage {
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        color: [f32; 4],
+        ranges: Vec<vk::ImageSubresourceRange>,
+    },
     CopyBuffer {
         source: vk::Buffer,
         destination: vk::Buffer,
@@ -812,6 +818,7 @@ impl Recording {
                 return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
             }
             RecordedCommand::CopyImageToBuffer { .. }
+            | RecordedCommand::ClearColorImage { .. }
             | RecordedCommand::BlitImage { .. }
             | RecordedCommand::CopyBuffer { .. }
             | RecordedCommand::CopyBufferToImage { .. }
@@ -1052,6 +1059,21 @@ impl RecordedCommand {
                 render_passes::begin(rt, rec, *render_pass, *framebuffer, *area, clears)?;
             }
             Self::NextSubpass => render_passes::next(rec)?,
+            Self::ClearColorImage {
+                image,
+                layout,
+                color,
+                ranges,
+            } => {
+                let data = rt
+                    .resources
+                    .images
+                    .get(image)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let commands = crate::clear::color_commands(data, *layout, *color, ranges)?;
+                rec.ops.extend(commands);
+                rec.used_images.push(*image);
+            }
             Self::EndRenderPass => render_passes::end(rec)?,
             Self::SetViewport(viewport) => rec.viewport = Some(*viewport),
             Self::SetScissor(scissor) => rec.scissor = Some(*scissor),
@@ -2013,6 +2035,37 @@ unsafe extern "system" fn cmd_next_subpass(
         return;
     }
     record(command, RecordedCommand::NextSubpass)
+}
+
+unsafe extern "system" fn cmd_clear_color_image(
+    command: vk::CommandBuffer,
+    image: vk::Image,
+    layout: vk::ImageLayout,
+    color: *const vk::ClearColorValue,
+    count: u32,
+    ranges: *const vk::ImageSubresourceRange,
+) {
+    let result = (|| {
+        let color = color
+            .as_ref()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+            .float32;
+        ir::Color::rgba(color[0], color[1], color[2], color[3])
+            .map_err(crate::resources::failure)?;
+        if count == 0 || count > 64 {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        Ok(RecordedCommand::ClearColorImage {
+            image,
+            layout,
+            color,
+            ranges: slice(ranges, count)?.to_vec(),
+        })
+    })();
+    match result {
+        Ok(command_data) => record(command, command_data),
+        Err(error) => record_error(command, error),
+    }
 }
 unsafe extern "system" fn cmd_end_render_pass(command: vk::CommandBuffer) {
     record(command, RecordedCommand::EndRenderPass)
@@ -3513,6 +3566,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdNextSubpass" => entry!(cmd_next_subpass),
         b"vkCmdEndRenderPass" => entry!(cmd_end_render_pass),
         b"vkCmdCopyImageToBuffer" => entry!(cmd_copy_image_to_buffer),
+        b"vkCmdClearColorImage" => entry!(cmd_clear_color_image),
         b"vkCmdCopyBuffer" => entry!(cmd_copy_buffer),
         b"vkCmdCopyBufferToImage" => entry!(cmd_copy_buffer_to_image),
         b"vkCmdSetViewport" => entry!(cmd_set_viewport),

@@ -132,9 +132,12 @@ pub unsafe extern "system" fn vk_icdGetPhysicalDeviceProcAddr(
     #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
     {
         let name = unsafe { CStr::from_ptr(name) };
-        let function = crate::wsi::lookup_physical(name);
+        let function =
+            crate::wsi::lookup_physical(name).or_else(|| crate::properties2::lookup(name));
         #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-        let function = function.or_else(|| crate::display::lookup(name));
+        let function = function
+            .or_else(|| crate::display::lookup(name))
+            .or_else(|| crate::linux_wsi::lookup(name));
         function
     }
     #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi"))))]
@@ -264,8 +267,15 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
         ),
         _ => {
+            if let Some(function) = crate::properties2::lookup(name) {
+                return Some(function);
+            }
             #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
             if let Some(function) = crate::display::lookup(name) {
+                return Some(function);
+            }
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            if let Some(function) = crate::linux_wsi::lookup(name) {
                 return Some(function);
             }
             crate::api::lookup_device(name)
@@ -424,6 +434,18 @@ fn instance_extensions() -> &'static [(&'static CStr, u32)] {
         &[
             (vk::KHR_SURFACE_NAME, vk::KHR_SURFACE_SPEC_VERSION),
             (vk::KHR_DISPLAY_NAME, vk::KHR_DISPLAY_SPEC_VERSION),
+            (
+                vk::KHR_WAYLAND_SURFACE_NAME,
+                vk::KHR_WAYLAND_SURFACE_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME,
+                vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_EXTERNAL_MEMORY_CAPABILITIES_NAME,
+                vk::KHR_EXTERNAL_MEMORY_CAPABILITIES_SPEC_VERSION,
+            ),
         ]
     }
     #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi"))))]
@@ -569,7 +591,7 @@ unsafe extern "system" fn enumerate_device_layer_properties(
     unsafe { enumerate_instance_layer_properties(count, output) }
 }
 
-unsafe extern "system" fn get_physical_device_features(
+pub(crate) unsafe extern "system" fn get_physical_device_features(
     _physical: vk::PhysicalDevice,
     output: *mut vk::PhysicalDeviceFeatures,
 ) {
@@ -578,7 +600,7 @@ unsafe extern "system" fn get_physical_device_features(
     }
 }
 
-unsafe extern "system" fn get_physical_device_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_properties(
     physical: vk::PhysicalDevice,
     output: *mut vk::PhysicalDeviceProperties,
 ) {
@@ -760,7 +782,7 @@ unsafe extern "system" fn get_physical_device_properties(
     unsafe { *output = properties };
 }
 
-unsafe extern "system" fn get_physical_device_memory_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_memory_properties(
     physical: vk::PhysicalDevice,
     output: *mut vk::PhysicalDeviceMemoryProperties,
 ) {
@@ -785,7 +807,7 @@ unsafe extern "system" fn get_physical_device_memory_properties(
     unsafe { *output = properties };
 }
 
-unsafe extern "system" fn get_physical_device_queue_family_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_queue_family_properties(
     physical: vk::PhysicalDevice,
     count: *mut u32,
     output: *mut vk::QueueFamilyProperties,
@@ -827,7 +849,7 @@ unsafe extern "system" fn get_physical_device_queue_family_properties(
     }
 }
 
-unsafe extern "system" fn get_physical_device_format_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
     physical: vk::PhysicalDevice,
     format: vk::Format,
     output: *mut vk::FormatProperties,
@@ -917,7 +939,7 @@ unsafe extern "system" fn get_physical_device_format_properties(
     unsafe { *output = properties };
 }
 
-unsafe extern "system" fn get_physical_device_image_format_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_image_format_properties(
     physical: vk::PhysicalDevice,
     format: vk::Format,
     image_type: vk::ImageType,
