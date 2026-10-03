@@ -25,6 +25,45 @@ pub struct Submission {
     signal: Arc<Signal>,
 }
 
+#[cfg(feature = "backend-abi")]
+impl Submission {
+    /// Transfer the existing receipt allocation to an opaque ABI handle.
+    /// This neither allocates a wrapper nor exposes the Arc layout to callers.
+    pub fn into_abi_object(self) -> *mut core::ffi::c_void {
+        Arc::into_raw(self.signal).cast_mut().cast()
+    }
+
+    /// Observe an opaque receipt using the library that created it.
+    ///
+    /// # Safety
+    /// `object` must be a live handle returned by `into_abi_object` in this library.
+    pub unsafe fn wait_abi_object(
+        object: *mut core::ffi::c_void,
+        timeout: Option<Duration>,
+    ) -> Result<CompletionStatus, IrSubmitError> {
+        // SAFETY: the caller retains ownership of this receipt during the call.
+        unsafe { &*object.cast::<Signal>() }.wait(timeout)
+    }
+
+    /// Retain a receipt without allocating another completion object.
+    /// # Safety
+    /// `object` is a live receipt allocated by this library.
+    pub unsafe fn clone_abi_object(object: *mut core::ffi::c_void) {
+        unsafe {
+            Arc::increment_strong_count(object.cast::<Signal>());
+        }
+    }
+
+    /// Release an opaque receipt without waiting for accepted GPU work.
+    ///
+    /// # Safety
+    /// `object` must be an unconsumed handle from `into_abi_object` in this library.
+    pub unsafe fn drop_abi_object(object: *mut core::ffi::c_void) {
+        // SAFETY: consumes exactly the strong reference transferred by into_raw.
+        drop(unsafe { Arc::from_raw(object.cast::<Signal>()) });
+    }
+}
+
 impl fmt::Debug for Submission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

@@ -83,8 +83,11 @@ Release inputs must not require sibling checkouts or developer-local path
 patches. The patch in this repository's [workspace manifest](../Cargo.toml)
 is different: it points to its own tracked `crates/sgfx-core` so the external
 Adreno dependency and local workspace crates share one core. Git consumers do
-not inherit that patch and do not need to copy it. Repository-contained path
-dependencies and tracked vendored sources remain valid.
+not inherit that patch. While testing the unpublished dynamic-backend changes,
+downstream workspaces need the same local core override; release builds must
+advance the coordinated revisions instead. Repository-contained path
+dependencies and tracked vendored sources remain valid. See
+[dynamic backends](dynamic-backends.md) for this development configuration.
 
 ## Features and backend selection
 
@@ -93,10 +96,11 @@ See the [facade manifest](../crates/sgfx/Cargo.toml) for the feature definitions
 | Build configuration | Available facade |
 | --- | --- |
 | Defaults on a host target | Rust std and WGPU window/session execution. |
-| Defaults on `riscv64gc-unknown-scarlet` or `aarch64-unknown-scarlet` | Rust std and compiled native VirGL/Adreno backends; the opened GPU determines automatic selection. |
+| Defaults on `riscv64gc-unknown-scarlet` or `aarch64-unknown-scarlet` | Rust std, runtime-loaded VirGL, and compiled Adreno/Maxwell; the opened GPU determines automatic selection. |
 | `default-features = false`, no features | IR/trait reexports and selection types, but no executor or usable backend. |
 | No defaults, `backend-wgpu` | Host WGPU integration without SGFX environment lookup. WGPU itself still requires std. |
-| No defaults, `std` | The normal runtime bundle, including all three `backend-*` features, subject to target gating. This is not a backend-free std configuration. |
+| No defaults, `std` | Rust std support; select an execution backend separately. |
+| No defaults, `std, backend-dynamic` | Scarlet runtime discovery of installed complete backends through the C ABI. VirGL is currently supplied as a plugin. |
 | No defaults, `legacy-scarlet-std` | Older Scarlet userspace runtime configuration; `scarlet-std` is its compatibility alias. Not the normal std targets. |
 
 Use `Instance::new()` to read `SGFX_BACKEND`, or

@@ -682,7 +682,8 @@ impl Context {
         &self,
         resources: &mut IrResources,
         spec: IrTextureSpec,
-    ) -> HandleResult<Vec<u8>> {
+        pixels: &mut [u8],
+    ) -> HandleResult<()> {
         if resources.context_handle != self.handle_id()
             || !matches!(spec.format, IrTextureFormat::Bgra8 | IrTextureFormat::Rgba8)
             || !self.device.capabilities.supports_image_readback()
@@ -708,23 +709,21 @@ impl Context {
             .checked_div(stride)
             .filter(|rows| *rows != 0)
             .ok_or(HandleError::InvalidParameter)?;
-        let mut pixels = Vec::new();
-        pixels
-            .try_reserve_exact(length)
-            .map_err(|_| HandleError::OutOfResources)?;
-        pixels.resize(length, 0);
+        if pixels.len() != length {
+            return Err(HandleError::InvalidParameter);
+        }
         let mut y = 0;
         while y < spec.height {
             let height = (spec.height - y).min(rows);
             self.raw.readback_image_bgra(
                 &texture.raw,
-                &mut pixels,
+                pixels,
                 stride,
                 GpuImageBgraRect::new(0, y, spec.width, height),
             )?;
             y += height;
         }
-        Ok(pixels)
+        Ok(())
     }
 
     pub(crate) fn release_texture(&self, texture: Texture) -> HandleResult<()> {
@@ -1489,6 +1488,14 @@ impl Queue {
 
     pub(crate) fn wait_idle(&self) -> HandleResult<()> {
         wait_scheduled(&self.scheduler)
+    }
+
+    #[cfg(feature = "backend-abi")]
+    pub(crate) fn is_idle(&self) -> HandleResult<bool> {
+        self.scheduler
+            .borrow()
+            .as_ref()
+            .map_or(Ok(true), |s| s.is_idle())
     }
 
     fn max_command_size(&self) -> usize {

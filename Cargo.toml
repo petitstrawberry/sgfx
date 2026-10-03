@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/sgfx-backend-loader",
+    "crates/sgfx-backend-scarlet-virgl-plugin",
+    "crates/sgfx-backend-abi",
     "crates/sgfx",
     "crates/sgfx-core",
     "crates/sgfx-codegen-virgl",
@@ -9,9 +12,15 @@ members = [
     "crates/vulkan-sgfx",
 ]
 default-members = [
+    "crates/sgfx-backend-loader",
+    "crates/sgfx-backend-abi",
     "crates/sgfx",
     "crates/sgfx-core",
     "crates/sgfx-codegen-virgl",
     "crates/sgfx-backend-wgpu",
     "crates/vulkan-sgfx",
 ]
+
+# The facade and every backend must use the core being developed in this tree.
+[patch."https://github.com/petitstrawberry/sgfx"]
+sgfx-core = { path = "crates/sgfx-core" }

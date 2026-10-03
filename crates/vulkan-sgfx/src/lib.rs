@@ -5,6 +5,11 @@
 //! contracts, device selection, and explicit limitations.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+// The ICD may embed its own std after LTO. Native startup symbols belong to
+// that runtime and must not interpose the application's or backend's std.
+#[cfg(target_os = "scarlet")]
+core::arch::global_asm!(".hidden __scarlet_getauxval", ".hidden __scarlet_start");
+
 mod api;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod display;

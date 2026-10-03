@@ -78,8 +78,7 @@ impl IrResources {
         if self.submission_failed {
             return Err(IrSubmitError::SubmissionFailed);
         }
-        let buffer = self.resources.buffer_ref(id)?;
-        let descriptor = self.resources.buffer(buffer)?;
+        let descriptor = self.resources.buffer(self.resources.buffer_ref(id)?)?;
         if offset.checked_add(size).ok_or(ir::Error::Overflow)? > descriptor.size() {
             return Err(ir::Error::OutOfBounds.into());
         }
@@ -88,6 +87,30 @@ impl IrResources {
             .try_reserve_exact(usize::try_from(size).map_err(|_| ir::Error::Overflow)?)
             .map_err(|_| IrSubmitError::OutOfMemory)?;
         output.resize(size as usize, 0);
+        self.read_buffer_into(id, offset, &mut output)?;
+        Ok(output)
+    }
+
+    /// Read into the caller's allocation, including across the dynamic ABI.
+    pub fn read_buffer_into(
+        &self,
+        id: ir::BufferId,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), IrSubmitError> {
+        if self.submission_failed {
+            return Err(IrSubmitError::SubmissionFailed);
+        }
+        let buffer = self.resources.buffer_ref(id)?;
+        let descriptor = self.resources.buffer(buffer)?;
+        if offset
+            .checked_add(output.len() as u64)
+            .ok_or(ir::Error::Overflow)?
+            > descriptor.size()
+        {
+            return Err(ir::Error::OutOfBounds.into());
+        }
+        output.fill(0);
         if let Some(shadow) = self.shadow(buffer)? {
             let start = usize::try_from(offset).map_err(|_| ir::Error::Overflow)?;
             if start < shadow.len() {
@@ -95,7 +118,7 @@ impl IrResources {
                 output[..length].copy_from_slice(&shadow[start..start + length]);
             }
         }
-        Ok(output)
+        Ok(())
     }
 
     #[cfg(feature = "programmable")]
@@ -424,31 +447,67 @@ impl Context {
                 UnsupportedIrFeature::TargetFormat,
             ));
         }
+        let length =
+            usize::try_from(descriptor.byte_size()?).map_err(|_| IrSubmitError::OutOfMemory)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(length)
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        output.resize(length, 0);
+        self.read_texture_into(resources, id, &mut output)?;
+        Ok(output)
+    }
+
+    /// Read directly into a host-owned output allocation.
+    pub fn read_texture_into(
+        &self,
+        resources: &mut IrResources,
+        id: ir::TextureId,
+        bytes: &mut [u8],
+    ) -> Result<(), IrSubmitError> {
+        if resources.submission_failed {
+            return Err(IrSubmitError::SubmissionFailed);
+        }
+        if resources.context_id != self.backend.context_id() {
+            return Err(IrSubmitError::ContextMismatch);
+        }
+        let reference = resources.resources.texture_ref(id)?;
+        let descriptor = resources.resources.texture(reference)?;
+        if descriptor.mip_level_count() != 1 || descriptor.array_layer_count() != 1 {
+            return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
+        }
+        if !descriptor.usage().contains(TextureUsage::COPY_SRC) {
+            return Err(ir::Error::InvalidUsage.into());
+        }
+        if !matches!(
+            descriptor.format(),
+            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+        ) {
+            return Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::TargetFormat,
+            ));
+        }
         let spec = texture_spec(reference, descriptor)?;
-        let mut bytes = match resources.mapped_image(reference) {
+        if descriptor.byte_size()? != bytes.len() as u64 {
+            return Err(ir::Error::OutOfBounds.into());
+        }
+        match resources.mapped_image(reference) {
             Ok(image) => {
-                let length = usize::try_from(descriptor.byte_size()?)
-                    .map_err(|_| IrSubmitError::OutOfMemory)?;
                 let stride = spec.width.checked_mul(4).ok_or(ir::Error::OutOfBounds)?;
-                let mut pixels = Vec::new();
-                pixels
-                    .try_reserve_exact(length)
-                    .map_err(|_| IrSubmitError::OutOfMemory)?;
-                pixels.resize(length, 0);
                 // A mapped render target is owned by the imported image, rather
                 // than the backend's internal texture allocation. This path
                 // waits for scheduled work before reading that same GPU image.
                 self.backend.readback_image_bgra(
                     &image.as_ref().backend,
-                    &mut pixels,
+                    bytes,
                     stride,
                     PixelRect::new(0, 0, spec.width, spec.height),
                 )?;
-                pixels
             }
-            Err(IrSubmitError::ImageNotMapped) => self
-                .backend
-                .readback_ir_texture(&mut resources.backend, spec)?,
+            Err(IrSubmitError::ImageNotMapped) => {
+                self.backend
+                    .readback_ir_texture(&mut resources.backend, spec, bytes)?
+            }
             Err(error) => return Err(error),
         };
         if spec.format == IrTextureFormat::Rgba8 {
@@ -456,7 +515,7 @@ impl Context {
                 pixel.swap(0, 2);
             }
         }
-        Ok(bytes)
+        Ok(())
     }
 }
 

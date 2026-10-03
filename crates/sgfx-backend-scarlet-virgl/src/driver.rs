@@ -109,10 +109,11 @@ impl Context {
         &self,
         resources: &mut IrResources,
         texture: IrTextureSpec,
-    ) -> HandleResult<Vec<u8>> {
+        pixels: &mut [u8],
+    ) -> HandleResult<()> {
         match (self, resources) {
             (Self::Virgl(context), IrResources::Virgl(resources)) => {
-                context.readback_ir_texture(resources, texture)
+                context.readback_ir_texture(resources, texture, pixels)
             }
         }
     }
@@ -248,6 +249,13 @@ pub(crate) enum Queue {
 }
 
 impl Queue {
+    #[cfg(feature = "backend-abi")]
+    pub(crate) fn is_idle(&self) -> HandleResult<bool> {
+        match self {
+            Self::Virgl(queue) => queue.is_idle(),
+        }
+    }
+
     pub(crate) fn wait_idle(&self) -> HandleResult<()> {
         match self {
             Self::Virgl(queue) => queue.wait_idle(),

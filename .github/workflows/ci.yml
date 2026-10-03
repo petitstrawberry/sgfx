@@ -57,6 +57,8 @@ jobs:
       - name: Test portable crates
         run: |
           cargo test --locked -p sgfx-core
+          cargo test --locked -p sgfx-core --features backend-abi
+          cargo test --locked -p sgfx-backend-abi -p sgfx-backend-loader
           cargo test --locked -p sgfx-codegen-virgl
           cargo test --locked -p sgfx-backend-wgpu
           cargo test --locked -p sgfx
@@ -73,11 +75,13 @@ jobs:
       - name: Lint portable crates
         run: |
           cargo-clippy clippy --locked --manifest-path crates/sgfx-core/Cargo.toml --all-targets --no-deps -- -D warnings
+          cargo-clippy clippy --locked -p sgfx-core -p sgfx-backend-loader --features sgfx-core/backend-abi --all-targets --no-deps -- -D warnings
           cargo-clippy clippy --locked -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx -p vulkan-sgfx --all-targets --no-deps -- -D warnings
       - name: Test and lint facade feature boundaries
         run: |
           cargo test --locked -p sgfx --no-default-features
           cargo test --locked -p sgfx --no-default-features --features backend-wgpu
+          cargo test --locked -p sgfx --no-default-features --features std,backend-dynamic,backend-wgpu
           cargo-clippy clippy --locked -p sgfx --no-default-features --all-targets --no-deps -- -D warnings
           cargo-clippy clippy --locked -p sgfx --no-default-features --features backend-wgpu --all-targets --no-deps -- -D warnings
       - name: Check public API documentation
@@ -119,6 +123,10 @@ jobs:
         run: |
           cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features
           cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --no-deps -- -D warnings
+      - name: Check the dynamic facade and VirGL plugin
+        # The standard target cannot link cdylibs yet. Real ELF staging and
+        # execution use scripts/build-dynamic-backends.py and its isolated spec.
+        run: cargo-clippy clippy --locked -p sgfx -p sgfx-backend-scarlet-virgl-plugin --target '${{ matrix.target }}' --no-default-features --features sgfx/std,sgfx/backend-dynamic --no-deps -- -D warnings
       - name: Check native public API documentation
         env:
           RUSTDOCFLAGS: -D warnings

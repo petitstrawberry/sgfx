@@ -1,0 +1,17 @@
+[package]
+name = "sgfx-backend-scarlet-virgl-plugin"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "sgfx_scarlet_virgl"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+sgfx-backend-abi = { path = "../sgfx-backend-abi" }
+sgfx-core = { path = "../sgfx-core", features = ["backend-abi"] }
+sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", features = ["backend-abi"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

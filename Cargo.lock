@@ -1699,13 +1699,29 @@ dependencies = [
  "gpu-raw",
  "pollster",
  "raw-window-handle",
+ "scarlet-os",
  "scarlet-std",
+ "sgfx-backend-abi",
+ "sgfx-backend-loader",
  "sgfx-backend-scarlet-adreno",
  "sgfx-backend-scarlet-maxwell",
  "sgfx-backend-scarlet-virgl",
+ "sgfx-backend-scarlet-virgl-compat",
  "sgfx-backend-wgpu",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140)",
+ "sgfx-core",
  "wgpu",
+]
+
+[[package]]
+name = "sgfx-backend-abi"
+version = "1.0.0"
+
+[[package]]
+name = "sgfx-backend-loader"
+version = "1.0.0"
+dependencies = [
+ "scarlet-std",
+ "sgfx-backend-abi",
 ]
 
 [[package]]
@@ -1719,7 +1735,7 @@ dependencies = [
  "scarlet-os",
  "scarlet-std",
  "sgfx-codegen-adreno-a6xx",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140)",
+ "sgfx-core",
 ]
 
 [[package]]
@@ -1732,7 +1748,7 @@ dependencies = [
  "scarlet-os",
  "scarlet-std",
  "sgfx-codegen-maxwell",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140)",
+ "sgfx-core",
 ]
 
 [[package]]
@@ -1743,7 +1759,23 @@ dependencies = [
  "scarlet-os",
  "scarlet-std",
  "sgfx-codegen-virgl",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140)",
+ "sgfx-core",
+]
+
+[[package]]
+name = "sgfx-backend-scarlet-virgl-compat"
+version = "1.0.0"
+dependencies = [
+ "sgfx-backend-scarlet-virgl",
+]
+
+[[package]]
+name = "sgfx-backend-scarlet-virgl-plugin"
+version = "1.0.0"
+dependencies = [
+ "sgfx-backend-abi",
+ "sgfx-backend-scarlet-virgl",
+ "sgfx-core",
 ]
 
 [[package]]
@@ -1754,7 +1786,7 @@ dependencies = [
  "naga",
  "pollster",
  "raw-window-handle",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140)",
+ "sgfx-core",
  "wgpu",
 ]
 
@@ -1766,7 +1798,7 @@ dependencies = [
  "adreno-a6xx-layout",
  "adreno-a6xx-pm4",
  "adreno-a6xx-shader-pack",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140)",
+ "sgfx-core",
 ]
 
 [[package]]
@@ -1776,7 +1808,7 @@ source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=d3b1
 dependencies = [
  "maxwell-shader-pack",
  "maxwell-submit-wire",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140)",
+ "sgfx-core",
 ]
 
 [[package]]
@@ -1784,17 +1816,15 @@ name = "sgfx-codegen-virgl"
 version = "1.0.0"
 dependencies = [
  "naga",
- "sgfx-core 1.0.0 (git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140)",
+ "sgfx-core",
 ]
 
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-
-[[package]]
-name = "sgfx-core"
-version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140#5ea41a0dfd6992bb1c0fce06c8e65425dc978140"
+dependencies = [
+ "sgfx-backend-abi",
+]
 
 [[package]]
 name = "shlex"

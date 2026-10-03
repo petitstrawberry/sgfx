@@ -1,0 +1,11 @@
+[package]
+name = "sgfx-backend-scarlet-virgl-compat"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+[features]
+default = []
+std = ["sgfx-backend-scarlet-virgl/std"]
+scarlet-std = ["sgfx-backend-scarlet-virgl/scarlet-std"]
+[dependencies]
+sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-features = false }

@@ -31,6 +31,8 @@ Rust backend/facade interfaces, feature composition, and unfinished review.
 - `sgfx`: execution facade and platform backend selection
 - `sgfx-backend-wgpu`: host WGPU execution backend
 - `sgfx-backend-scarlet-virgl`: Scarlet VirGL execution backend
+- `sgfx-backend-abi`, `sgfx-backend-loader`: versioned backend ABI and runtime discovery
+- `sgfx-backend-scarlet-virgl-plugin`: Scarlet VirGL `cdylib`
 - `sgfx-codegen-virgl`: platform-neutral VirGL command encoding helpers
 - `vulkan-sgfx`: experimental Vulkan ICD using the programmable IR, with
   offscreen execution and macOS Metal WSI
@@ -55,10 +57,12 @@ must select a compatible revision/lockfile set and rebuild its components.
 
 The intended application-facing graphics boundary is the Vulkan C ABI. The
 experimental `vulkan-sgfx` frontend depends only on the SGFX execution facade;
-the product build links that facade, core, and its selected complete backend
-into one ICD/library. The host build uses WGPU and the Scarlet QEMU build uses
-VirGL. Independently loading SGFX Rust components is not planned. Native
-Scarlet dynamic-loader support and Vulkan conformance remain future work.
+the product build links that facade and core into the ICD/library. The host
+build embeds WGPU. Native 64-bit Scarlet loads VirGL through a versioned C ABI
+from the installed `libsgfx_scarlet_virgl.so`; commands and uploads cross its boundary without copying. See
+[dynamic backends](docs/dynamic-backends.md) for installation, ownership,
+toolchain requirements and the native comparison fixture. Vulkan conformance
+remains future work.
 Resource ownership, ordering, completion and failure semantics still form the
 common backend contract. See the [approved policy](docs/1.0-contract.md#2-coordinated-rust-implementation-policy).
 
@@ -71,8 +75,10 @@ sgfx = { git = "https://github.com/petitstrawberry/sgfx" }
 
 The workspace pins coordinated Git dependencies such as Scarlet, Adreno, and
 the shared `sgfx-core` type source to exact commits. Downstream applications
-should also retain their resolved revisions in `Cargo.lock`. No workspace
-source patch is required.
+should also retain their resolved revisions in `Cargo.lock`. This development
+workspace patches `sgfx-core` to the local ABI-enabled source; downstream users
+testing the unpublished dynamic backend need the same override until the
+coordinated Git revisions are advanced.
 
 See [dependencies and locked revisions](docs/reference.md#dependencies-and-locked-revisions)
 for the native source set, shared Rust type identity and workspace patch policy.

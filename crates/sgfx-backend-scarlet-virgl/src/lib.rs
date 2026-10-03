@@ -242,11 +242,18 @@ impl Device {
 }
 
 /// Rendering context that owns application graphics objects.
+#[derive(Clone)]
 pub struct Context {
     backend: Rc<driver::Context>,
 }
 
 impl Context {
+    /// Poll all accepted work without waiting, for resource retirement at ABI boundaries.
+    #[cfg(feature = "backend-abi")]
+    pub fn is_idle(&self) -> HandleResult<bool> {
+        self.create_queue()?.backend.is_idle()
+    }
+
     /// Create an empty persistent cache for one logical IR resource table.
     ///
     /// # Arguments
@@ -587,6 +594,20 @@ pub struct MappedTargetSession {
 }
 
 impl MappedTargetSession {
+    /// Observe whether all accepted work in this context has retired, without
+    /// waiting or retaining an extra completion receipt on the submission path.
+    #[cfg(feature = "backend-abi")]
+    pub fn is_idle(&self) -> Result<bool, IrSubmitError> {
+        self.queue.backend.is_idle().map_err(IrSubmitError::Backend)
+    }
+
+    /// Retire a logical buffer's private cache after its accepted GPU work has
+    /// completed. Used when synchronizing a dynamic client's resource table.
+    #[cfg(feature = "backend-abi")]
+    pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<(), IrSubmitError> {
+        self.resources.release_buffer(id)
+    }
+
     /// Import a transferred shared BGRA image into a logical sampled texture.
     pub fn import_shared_bgra_texture(
         &mut self,

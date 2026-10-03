@@ -290,6 +290,15 @@ impl NativeScheduler {
         Ok(())
     }
 
+    #[cfg(feature = "backend-abi")]
+    pub(crate) fn is_idle(&self) -> HandleResult<bool> {
+        let scheduler = lock(&self.shared.scheduler);
+        if scheduler.failure().is_some() {
+            return Err(HandleError::SystemError(-1));
+        }
+        Ok(scheduler.is_empty())
+    }
+
     pub(crate) fn check(&self) -> HandleResult<()> {
         if lock(&self.shared.scheduler).failure().is_some() {
             Err(HandleError::SystemError(-1))

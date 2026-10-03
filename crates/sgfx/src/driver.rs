@@ -4,6 +4,9 @@
 //! devices, resource caches, queues, and completion receipts without importing
 //! WGPU, Scarlet GPU transport, or a backend crate.
 
+// The same dispatch code wraps native errors and passes through dynamic errors.
+#![cfg_attr(sgfx_dynamic_virgl, allow(clippy::useless_conversion))]
+
 use alloc::{rc::Rc, string::String, vec::Vec};
 use core::{
     fmt,
@@ -12,6 +15,18 @@ use core::{
 };
 
 use sgfx_core::backend::{Completion, CompletionStatus, SubmitError};
+
+#[cfg(sgfx_dynamic_virgl)]
+use crate::dynamic::{PresentationImage as VirglImage, driver::Submission as VirglSubmission};
+#[cfg(all(
+    not(sgfx_dynamic_virgl),
+    any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-native-api")
+    ),
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+))]
+use crate::virgl::{Image as VirglImage, Submission as VirglSubmission};
 
 use crate::{BackendKind, BackendPreference, Error, Result, ir};
 
@@ -243,7 +258,7 @@ impl Adapter {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             AdapterBackend::ScarletVirgl(adapter) => create_virgl_device(adapter),
         }
@@ -259,7 +274,7 @@ enum AdapterBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirgl(ScarletAdapter),
 }
@@ -297,7 +312,7 @@ impl Instance {
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            feature = "backend-scarlet-virgl"
+            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
         ))]
         if matches!(
             preference,
@@ -307,6 +322,8 @@ impl Instance {
         }
         if !matches!(preference, BackendPreference::Auto) && adapters.is_empty() {
             let kind = match preference {
+                #[cfg(feature = "backend-dynamic")]
+                BackendPreference::Other(name) => BackendKind::Other(name),
                 BackendPreference::Auto => unreachable!(),
                 BackendPreference::Wgpu => BackendKind::Wgpu,
                 BackendPreference::Metal => BackendKind::Metal,
@@ -342,9 +359,9 @@ enum DeviceBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
-    ScarletVirgl(Rc<sgfx_backend_scarlet_virgl::Context>),
+    ScarletVirgl(Rc<crate::virgl::Context>),
 }
 
 #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
@@ -368,7 +385,7 @@ impl Device {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             DeviceBackend::ScarletVirgl(context) => context
                 .create_ir_resources(table)
@@ -376,7 +393,7 @@ impl Device {
                     device_id: self.id,
                     backend: ResourcesBackend::ScarletVirgl(resources),
                 })
-                .map_err(Error::ScarletVirglIr),
+                .map_err(Error::from),
         }
     }
 
@@ -393,7 +410,7 @@ impl Device {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             DeviceBackend::ScarletVirgl(context) => context
                 .create_queue()
@@ -404,7 +421,7 @@ impl Device {
                         context: Rc::clone(context),
                     },
                 })
-                .map_err(Error::ScarletVirglHandle),
+                .map_err(Error::from),
         }
     }
 
@@ -416,7 +433,7 @@ impl Device {
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            feature = "backend-scarlet-virgl"
+            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
         )
     ))]
     pub fn create_presentation_image(
@@ -447,7 +464,7 @@ impl Device {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             DeviceBackend::ScarletVirgl(context) => {
                 if format != ir::TextureFormat::Bgra8Unorm {
@@ -459,7 +476,7 @@ impl Device {
                         device_id: self.id,
                         backend: PresentationImageBackend::ScarletVirgl(Rc::new(image)),
                     })
-                    .map_err(Error::ScarletVirglHandle)
+                    .map_err(Error::from)
             }
         }
     }
@@ -506,7 +523,7 @@ impl Device {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     )
 ))]
 pub struct PresentationImage {
@@ -521,7 +538,7 @@ pub struct PresentationImage {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     )
 ))]
 enum PresentationImageBackend {
@@ -532,9 +549,9 @@ enum PresentationImageBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
-    ScarletVirgl(Rc<sgfx_backend_scarlet_virgl::Image>),
+    ScarletVirgl(Rc<VirglImage>),
 }
 
 #[cfg(any(
@@ -544,7 +561,7 @@ enum PresentationImageBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     )
 ))]
 impl PresentationImage {
@@ -557,7 +574,7 @@ impl PresentationImage {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             PresentationImageBackend::ScarletVirgl(image) => image.width(),
         }
@@ -572,7 +589,7 @@ impl PresentationImage {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             PresentationImageBackend::ScarletVirgl(image) => image.height(),
         }
@@ -587,7 +604,7 @@ impl PresentationImage {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             PresentationImageBackend::ScarletVirgl(_) => ir::TextureFormat::Bgra8Unorm,
         }
@@ -599,14 +616,11 @@ impl PresentationImage {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     pub fn duplicate_shared_handle(&self) -> Result<crate::Handle> {
         let PresentationImageBackend::ScarletVirgl(image) = &self.backend;
-        image
-            .shared_handle()
-            .duplicate()
-            .map_err(Error::ScarletVirglHandle)
+        image.shared_handle().duplicate().map_err(Error::from)
     }
 }
 
@@ -650,9 +664,9 @@ enum ResourcesBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
-    ScarletVirgl(sgfx_backend_scarlet_virgl::IrResources),
+    ScarletVirgl(crate::virgl::IrResources),
 }
 
 impl Resources {
@@ -667,10 +681,10 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
-                resources.release_buffer(id).map_err(Error::ScarletVirglIr)
+                resources.release_buffer(id).map_err(Error::from)
             }
         }
     }
@@ -683,7 +697,7 @@ impl Resources {
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            feature = "backend-scarlet-virgl"
+            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
         )
     ))]
     pub fn map_presentation_image(
@@ -709,14 +723,14 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             (
                 ResourcesBackend::ScarletVirgl(resources),
                 PresentationImageBackend::ScarletVirgl(image),
             ) => resources
                 .map_image(texture, Rc::clone(image))
-                .map_err(Error::ScarletVirglIr),
+                .map_err(Error::from),
         }
     }
 
@@ -728,7 +742,7 @@ impl Resources {
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            feature = "backend-scarlet-virgl"
+            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
         )
     ))]
     pub fn unmap_presentation_image(&mut self, texture: ir::TextureId) {
@@ -745,7 +759,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 let _ = resources.unmap_image(texture);
@@ -764,11 +778,11 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
-            ResourcesBackend::ScarletVirgl(resources) => resources
-                .validate_shader_module(id)
-                .map_err(Error::ScarletVirglIr),
+            ResourcesBackend::ScarletVirgl(resources) => {
+                resources.validate_shader_module(id).map_err(Error::from)
+            }
         }
     }
 
@@ -786,11 +800,11 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => resources
                 .validate_programmable_render_pipeline(id)
-                .map_err(Error::ScarletVirglIr),
+                .map_err(Error::from),
         }
     }
 
@@ -805,11 +819,11 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
-            ResourcesBackend::ScarletVirgl(resources) => resources
-                .validate_compute_pipeline(id)
-                .map_err(Error::ScarletVirglIr),
+            ResourcesBackend::ScarletVirgl(resources) => {
+                resources.validate_compute_pipeline(id).map_err(Error::from)
+            }
         }
     }
 
@@ -825,11 +839,11 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
-            ResourcesBackend::ScarletVirgl(resources) => resources
-                .read_buffer(id, offset, size)
-                .map_err(Error::ScarletVirglIr),
+            ResourcesBackend::ScarletVirgl(resources) => {
+                resources.read_buffer(id, offset, size).map_err(Error::from)
+            }
         }
     }
 }
@@ -848,11 +862,11 @@ enum QueueBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirgl {
-        queue: sgfx_backend_scarlet_virgl::Queue,
-        context: Rc<sgfx_backend_scarlet_virgl::Context>,
+        queue: crate::virgl::Queue,
+        context: Rc<crate::virgl::Context>,
     },
 }
 
@@ -884,7 +898,7 @@ impl Queue {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             (
                 QueueBackend::ScarletVirgl { queue, context },
@@ -895,7 +909,7 @@ impl Queue {
                     backend: SubmissionBackend::ScarletVirgl(receipt),
                 })
                 .map_err(|error| {
-                    error.map(Error::ScarletVirglIr, |receipt| Submission {
+                    error.map(Error::from, |receipt| Submission {
                         backend: SubmissionBackend::ScarletVirgl(receipt),
                     })
                 }),
@@ -929,22 +943,16 @@ impl Queue {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             (
                 QueueBackend::ScarletVirgl { context, .. },
                 ResourcesBackend::ScarletVirgl(resources),
             ) => {
                 if mip_level != 0 {
-                    return Err(Error::ScarletVirglIr(
-                        sgfx_backend_scarlet_virgl::IrSubmitError::Unsupported(
-                            sgfx_backend_scarlet_virgl::UnsupportedIrFeature::Mipmaps,
-                        ),
-                    ));
+                    return Err(Error::ScarletBackendUnsupported);
                 }
-                context
-                    .read_texture(resources, id)
-                    .map_err(Error::ScarletVirglIr)
+                context.read_texture(resources, id).map_err(Error::from)
             }
             _ => Err(Error::ResourceDeviceMismatch),
         }
@@ -966,9 +974,9 @@ enum SubmissionBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        feature = "backend-scarlet-virgl"
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
-    ScarletVirgl(sgfx_backend_scarlet_virgl::Submission),
+    ScarletVirgl(VirglSubmission),
 }
 
 impl fmt::Debug for Submission {
@@ -981,7 +989,7 @@ impl fmt::Debug for Submission {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             SubmissionBackend::ScarletVirgl(receipt) => receipt.fmt(formatter),
         }
@@ -1000,11 +1008,9 @@ impl Completion for Submission {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
-            SubmissionBackend::ScarletVirgl(receipt) => {
-                receipt.poll().map_err(Error::ScarletVirglIr)
-            }
+            SubmissionBackend::ScarletVirgl(receipt) => receipt.poll().map_err(Error::from),
         }
     }
 
@@ -1017,11 +1023,9 @@ impl Completion for Submission {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                feature = "backend-scarlet-virgl"
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
-            SubmissionBackend::ScarletVirgl(receipt) => {
-                receipt.wait(timeout).map_err(Error::ScarletVirglIr)
-            }
+            SubmissionBackend::ScarletVirgl(receipt) => receipt.wait(timeout).map_err(Error::from),
         }
     }
 }
@@ -1196,7 +1200,7 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    feature = "backend-scarlet-virgl"
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 #[derive(Clone)]
 struct ScarletAdapter {
@@ -1209,7 +1213,7 @@ struct ScarletAdapter {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    feature = "backend-scarlet-virgl"
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 fn discover_virgl_adapters() -> Vec<Adapter> {
     use alloc::format;
@@ -1224,10 +1228,17 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
         let Ok(raw) = gpu.query_info() else {
             continue;
         };
-        if !sgfx_backend_scarlet_virgl::Device::supports(&raw) {
+        if !crate::virgl::Device::supports(&raw) {
             continue;
         }
-        let capabilities = sgfx_backend_scarlet_virgl::Capabilities::from_query_info(&raw);
+        #[cfg(not(sgfx_dynamic_virgl))]
+        let capabilities = crate::virgl::Capabilities::from_query_info(&raw);
+        #[cfg(sgfx_dynamic_virgl)]
+        let capabilities =
+            match crate::dynamic::Device::open_with_backend(&path, Some("scarlet-virgl")) {
+                Ok(device) => device.capabilities(),
+                Err(_) => continue,
+            };
         adapters.push(Adapter {
             ordinal: 0,
             info: AdapterInfo {
@@ -1314,7 +1325,7 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    feature = "backend-scarlet-virgl"
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 fn create_virgl_device(adapter: &ScarletAdapter) -> Result<Device> {
     use gpu_raw::Gpu;
@@ -1324,9 +1335,14 @@ fn create_virgl_device(adapter: &ScarletAdapter) -> Result<Device> {
     if info.backend_id_bytes() != adapter.backend_id.as_slice() {
         return Err(Error::BackendDeviceMismatch(BackendKind::ScarletVirgl));
     }
-    let device = sgfx_backend_scarlet_virgl::Device::from_gpu(gpu, info)
-        .map_err(Error::ScarletVirglHandle)?;
-    let context = device.create_context().map_err(Error::ScarletVirglHandle)?;
+    #[cfg(not(sgfx_dynamic_virgl))]
+    let device = crate::virgl::Device::from_gpu(gpu, info).map_err(Error::from)?;
+    #[cfg(sgfx_dynamic_virgl)]
+    let device = {
+        drop(gpu);
+        crate::dynamic::Device::open_with_backend(&adapter.path, Some("scarlet-virgl"))?
+    };
+    let context = device.create_context().map_err(Error::from)?;
     Ok(Device {
         id: next_device_id(),
         backend: DeviceBackend::ScarletVirgl(Rc::new(context)),

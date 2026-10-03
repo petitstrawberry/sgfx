@@ -222,9 +222,17 @@ impl IrResources {
     pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<(), IrSubmitError> {
         let slot = self.resources.buffer_ref(id)?.slot();
         self.backend.release_buffer(slot);
-        self.buffer_shadows[slot] = None;
-        self.buffer_revisions[slot] = 0;
-        self.canonical_buffer_revisions[slot] = None;
+        // A mirrored table can append and retire a buffer before its first
+        // submission has grown these materialization caches.
+        if let Some(shadow) = self.buffer_shadows.get_mut(slot) {
+            *shadow = None;
+        }
+        if let Some(revision) = self.buffer_revisions.get_mut(slot) {
+            *revision = 0;
+        }
+        if let Some(revision) = self.canonical_buffer_revisions.get_mut(slot) {
+            *revision = None;
+        }
         Ok(())
     }
 
@@ -1197,6 +1205,13 @@ impl ExecutionPlan {
         // Reject the complete unsupported stream before resolving images,
         // building buffer shadows, materializing resources, or submitting work.
         // A valid programmable stream is not malformed fixed-function IR.
+        #[cfg(feature = "backend-abi")]
+        if commands.has_compute_commands()? {
+            return Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::ProgrammableExecution,
+            ));
+        }
+        #[cfg(not(feature = "backend-abi"))]
         for command in commands.commands() {
             let unsupported = match command {
                 Command::BeginComputePass
@@ -1213,7 +1228,19 @@ impl ExecutionPlan {
         let mut active = None;
         let mut seen_pass = false;
 
-        for command in commands.commands() {
+        #[cfg(feature = "backend-abi")]
+        let mut sequence = commands.command_reader();
+        #[cfg(not(feature = "backend-abi"))]
+        let mut sequence = commands.commands().iter();
+        loop {
+            #[cfg(feature = "backend-abi")]
+            let Some(command) = sequence.next_command()? else {
+                break;
+            };
+            #[cfg(not(feature = "backend-abi"))]
+            let Some(command) = sequence.next() else {
+                break;
+            };
             match command {
                 Command::BlitTexture {
                     source,

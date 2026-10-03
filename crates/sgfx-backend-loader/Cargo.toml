@@ -1,0 +1,19 @@
+[package]
+name = "sgfx-backend-loader"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+default = ["std"]
+std = []
+legacy-scarlet-std = ["dep:scarlet-std"]
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", optional = true }
+
+[dependencies]
+sgfx-backend-abi = { path = "../sgfx-backend-abi" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

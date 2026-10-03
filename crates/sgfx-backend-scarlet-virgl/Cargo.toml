@@ -6,6 +6,7 @@ license = "MIT"
 repository = "https://github.com/petitstrawberry/sgfx"
 
 [features]
+backend-abi = ["sgfx-core/backend-abi"]
 default = ["std"]
 std = ["dep:scarlet-os", "gpu-raw/std", "programmable"]
 scarlet-std = ["dep:scarlet-std", "gpu-raw/scarlet-std"]
