@@ -7,6 +7,63 @@ use ir::*;
 use sgfx_core::backend::{Completion, CompletionStatus};
 
 #[test]
+fn triangle_fans_are_rejected_during_preflight_without_gpu_access() {
+    let table = ResourceTable::new();
+    let module = shader(
+        &table,
+        &format!(
+            "{FULLSCREEN_VERTEX}\n@fragment fn fragment() -> @location(0) vec4<f32> {{ return vec4<f32>(1.0); }}"
+        ),
+    );
+    let pipeline = table
+        .define_programmable_render_pipeline(
+            ProgrammableRenderPipelineDesc::new(
+                entry(module, ShaderStage::Vertex, "vertex"),
+                entry(module, ShaderStage::Fragment, "fragment"),
+                PipelineLayoutDesc::new(vec![]).unwrap(),
+                TextureFormat::Rgba8Unorm,
+                None,
+                PrimitiveTopology::TriangleFan,
+                BlendState::REPLACE,
+                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let target = table
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::Rgba8Unorm,
+                Extent2D::new(4, 4).unwrap(),
+                TextureUsage::RENDER_ATTACHMENT,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut encoder = CommandEncoder::new(&table);
+    let mut pass = encoder
+        .begin_render_pass(
+            RenderPassDesc::new(
+                &table,
+                target,
+                PixelRect::new(0, 0, 4, 4).unwrap(),
+                LoadOp::Load,
+                StoreOp::Store,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    pass.set_programmable_pipeline(pipeline).unwrap();
+    pass.draw(5, 0).unwrap();
+    pass.end().unwrap();
+    let commands = encoder.finish().unwrap();
+    assert!(matches!(
+        crate::validate_indexed_topologies(&commands),
+        Err(Error::Unsupported(crate::UnsupportedFeature::TriangleFan))
+    ));
+}
+
+#[test]
 fn multiple_outputs_and_read_only_depth_feed_a_lighting_pass_on_gpu() {
     let _guard = HEADLESS_WGPU_TEST_LOCK.lock().unwrap();
     let Some(device) = headless_device() else {

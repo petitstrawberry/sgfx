@@ -28,6 +28,143 @@ fn wgsl(source: &str) -> ShaderModuleDesc {
 }
 
 #[test]
+fn fragment_input_interpolation_controls_tgsi_independently_of_vertex_output() {
+    for vertex_interpolation in ["flat", "linear", "perspective"] {
+        for (fragment_interpolation, tgsi) in [
+            ("flat", "CONSTANT"),
+            ("linear", "LINEAR"),
+            ("perspective", "PERSPECTIVE"),
+        ] {
+            let source = format!(
+                "struct VertexOutput {{
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) @interpolate({vertex_interpolation}) value: vec4<f32>,
+                 }};
+                 @vertex fn vs(@location(0) position: vec3<f32>) -> VertexOutput {{
+                    return VertexOutput(vec4<f32>(position, 1.0), vec4<f32>(position, 1.0));
+                 }}
+                 @fragment fn fs(@location(0) @interpolate({fragment_interpolation}) value: vec4<f32>) -> @location(0) vec4<f32> {{
+                    return value;
+                 }}"
+            );
+            for module in [wgsl(&source), spirv(&source)] {
+                let vertex = compile_shader(&module, ShaderStage::Vertex, "vs").unwrap();
+                let fragment = compile_shader(&module, ShaderStage::Fragment, "fs").unwrap();
+                assert!(
+                    vertex
+                        .tgsi
+                        .lines()
+                        .any(|line| line == "DCL OUT[1], GENERIC[0]")
+                );
+                assert!(
+                    fragment
+                        .tgsi
+                        .contains(&format!("DCL IN[0], GENERIC[0], {tgsi}"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn spirv_point_size_preserves_value_without_aliasing_last_user_varying() {
+    // WGSL has no point_size spelling; construct the valid SPIR-V interface
+    // through Naga instead of substituting a shader-specific constant.
+    let mut module = naga::front::wgsl::parse_str(
+        r#"
+        struct Output {
+            @builtin(position) position: vec4<f32>,
+            @location(15) color: vec4<f32>,
+            @location(14) point_size: f32,
+        }
+        @vertex fn main(@location(0) value: vec4<f32>) -> Output {
+            return Output(vec4(value.xyz, 1.0), value, value.w + 0.5);
+        }
+    "#,
+    )
+    .unwrap();
+    let result_type = module.entry_points[0].function.result.as_ref().unwrap().ty;
+    let mut result = module.types[result_type].clone();
+    let naga::TypeInner::Struct {
+        ref mut members, ..
+    } = result.inner
+    else {
+        panic!("expected result struct");
+    };
+    members
+        .iter_mut()
+        .find(|m| m.name.as_deref() == Some("point_size"))
+        .unwrap()
+        .binding = Some(naga::Binding::BuiltIn(naga::BuiltIn::PointSize));
+    module.types.replace(result_type, result);
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+    let mut options = naga::back::spv::Options::default();
+    options
+        .flags
+        .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
+    let desc = ShaderModuleDesc::spirv(
+        naga::back::spv::write_vec(&module, &info, &options, None).unwrap(),
+    )
+    .unwrap();
+    let shader = compile_shader(&desc, ShaderStage::Vertex, "main").unwrap();
+    assert_eq!(shader.output_locations, vec![15]);
+    assert!(shader.tgsi.contains("DCL OUT[16], GENERIC[15]"));
+    assert!(shader.tgsi.contains("DCL OUT[17], PSIZE"));
+    assert!(
+        shader
+            .tgsi
+            .lines()
+            .any(|line| line.contains("MOV OUT[17].x, TEMP["))
+    );
+    assert!(shader.tgsi.contains("ADD "));
+    if let Ok(directory) = std::env::var("SGFX_TGSI_EXPORT_DIR") {
+        std::fs::write(
+            std::path::Path::new(&directory).join("point-size.vert.tgsi"),
+            &shader.tgsi,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn front_facing_converts_signed_float_face_to_boolean_mask() {
+    let source = r#"
+        @fragment fn main(@builtin(front_facing) front: bool,
+                          @builtin(position) position: vec4<f32>,
+                          @location(15) color: vec4<f32>) -> @location(0) vec4<f32> {
+            return select(-color, color, front) + position * 0.0;
+        }
+    "#;
+    for desc in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&desc, ShaderStage::Fragment, "main").unwrap();
+        assert!(shader.tgsi.contains("DCL IN[15], GENERIC[15]"));
+        assert!(shader.tgsi.contains("DCL IN[16], POSITION, LINEAR"));
+        assert!(shader.tgsi.contains("DCL IN[17], FACE, CONSTANT"));
+        // 0 < FACE: +1 front is true, -1 back is false; result is a UINT mask.
+        let comparison = shader
+            .tgsi
+            .lines()
+            .find(|line| line.contains("FSLT "))
+            .unwrap();
+        assert!(comparison.contains(", IMM["));
+        assert!(comparison.ends_with(", IN[17].xxxx"));
+        assert!(shader.tgsi.contains("UCMP "));
+        if let Ok(directory) = std::env::var("SGFX_TGSI_EXPORT_DIR") {
+            std::fs::write(
+                std::path::Path::new(&directory).join("front-facing.frag.tgsi"),
+                &shader.tgsi,
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
 fn deferred_lighting_shaders_lower_multiple_outputs_and_depth_loads() {
     let source = wgsl(
         r#"
@@ -461,6 +598,92 @@ struct U { a: f32, b: vec3<f32>, c: mat4x4<f32> };
     );
     assert!(shader.tgsi.contains("CONST[1].xxxx")); // vec3 starts at byte 16.
     assert!(shader.tgsi.contains("CONST[8].xxxx")); // second buffer + matrix byte offset.
+}
+
+#[test]
+fn uniform_required_size_tracks_scalar_and_vector_reads_without_trailing_padding() {
+    for (expression, required_size) in [
+        ("vec4<f32>(uniforms.values[0].x)", 4),
+        ("vec4<f32>(uniforms.values[0].y)", 8),
+        ("vec4<f32>(uniforms.values[0].z)", 12),
+        ("vec4<f32>(uniforms.values[1].y)", 24),
+        ("vec4<f32>(uniforms.values[1].z)", 28),
+        ("vec4<f32>(uniforms.values[1].w)", 32),
+        ("uniforms.values[1]", 32),
+    ] {
+        let source = format!(
+            r#"
+struct Uniforms {{ values: array<vec4<f32>, 2> }};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@fragment fn main() -> @location(0) vec4<f32> {{ return {expression}; }}
+"#
+        );
+        for module in [wgsl(&source), spirv(&source)] {
+            let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+            let binding = &shader.uniform_buffers[0];
+            assert_eq!(binding.size, 32, "{expression}");
+            assert_eq!(binding.required_size, required_size, "{expression}");
+            assert!(shader.tgsi.contains("DCL CONST[0..1]"));
+        }
+    }
+}
+
+#[test]
+fn uniform_required_size_covers_aggregate_loads_and_dynamic_index_candidates() {
+    for (body, required_size) in [
+        ("let all = uniforms; return vec4<f32>(all.values[0].x);", 32),
+        ("return uniforms.values[index];", 32),
+        ("return vec4<f32>(uniforms.values[index].y);", 24),
+        ("return vec4<f32>(uniforms.values[1][index]);", 32),
+    ] {
+        let source = format!(
+            r#"
+struct Uniforms {{ values: array<vec4<f32>, 2> }};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@fragment fn main(@location(0) @interpolate(flat) index: u32) -> @location(0) vec4<f32> {{
+    {body}
+}}
+"#
+        );
+        for module in [wgsl(&source), spirv(&source)] {
+            let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+            let binding = &shader.uniform_buffers[0];
+            assert_eq!(binding.size, 32, "{body}");
+            assert_eq!(binding.required_size, required_size, "{body}");
+        }
+    }
+}
+
+#[test]
+fn uniform_required_sizes_are_relative_to_each_binding_and_exclude_push_constants() {
+    let source = r#"
+struct Uniforms { values: array<vec4<f32>, 2> };
+struct Push { value: vec4<f32> };
+@group(2) @binding(1) var<uniform> right: Uniforms;
+@group(0) @binding(7) var<uniform> left: Uniforms;
+var<push_constant> push: Push;
+@fragment fn main() -> @location(0) vec4<f32> {
+    return vec4<f32>(left.values[0].y + right.values[1].y) + push.value;
+}
+"#;
+    for module in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+        assert_eq!(
+            shader
+                .uniform_buffers
+                .iter()
+                .map(|binding| (
+                    binding.group,
+                    binding.binding,
+                    binding.first_register,
+                    binding.size,
+                    binding.required_size
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 7, 0, 32, 8), (2, 1, 2, 32, 24)]
+        );
+        assert_eq!(shader.push_constants.unwrap().first_register, 4);
+    }
 }
 
 #[test]

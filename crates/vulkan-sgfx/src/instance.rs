@@ -132,9 +132,12 @@ pub unsafe extern "system" fn vk_icdGetPhysicalDeviceProcAddr(
     #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
     {
         let name = unsafe { CStr::from_ptr(name) };
-        let function = crate::wsi::lookup_physical(name);
+        let function =
+            crate::wsi::lookup_physical(name).or_else(|| crate::properties2::lookup(name));
         #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-        let function = function.or_else(|| crate::display::lookup(name));
+        let function = function
+            .or_else(|| crate::display::lookup(name))
+            .or_else(|| crate::linux_wsi::lookup(name));
         function
     }
     #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi"))))]
@@ -264,8 +267,15 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
         ),
         _ => {
+            if let Some(function) = crate::properties2::lookup(name) {
+                return Some(function);
+            }
             #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
             if let Some(function) = crate::display::lookup(name) {
+                return Some(function);
+            }
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            if let Some(function) = crate::linux_wsi::lookup(name) {
                 return Some(function);
             }
             crate::api::lookup_device(name)
@@ -424,6 +434,18 @@ fn instance_extensions() -> &'static [(&'static CStr, u32)] {
         &[
             (vk::KHR_SURFACE_NAME, vk::KHR_SURFACE_SPEC_VERSION),
             (vk::KHR_DISPLAY_NAME, vk::KHR_DISPLAY_SPEC_VERSION),
+            (
+                vk::KHR_WAYLAND_SURFACE_NAME,
+                vk::KHR_WAYLAND_SURFACE_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME,
+                vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_EXTERNAL_MEMORY_CAPABILITIES_NAME,
+                vk::KHR_EXTERNAL_MEMORY_CAPABILITIES_SPEC_VERSION,
+            ),
         ]
     }
     #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi"))))]
@@ -433,18 +455,120 @@ fn instance_extensions() -> &'static [(&'static CStr, u32)] {
 fn device_extensions() -> &'static [(&'static CStr, u32)] {
     #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
     {
-        &[(vk::KHR_SWAPCHAIN_NAME, vk::KHR_SWAPCHAIN_SPEC_VERSION)]
+        &[
+            (vk::KHR_SWAPCHAIN_NAME, vk::KHR_SWAPCHAIN_SPEC_VERSION),
+            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            (vk::KHR_MAINTENANCE1_NAME, vk::KHR_MAINTENANCE1_SPEC_VERSION),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (vk::KHR_MAINTENANCE2_NAME, vk::KHR_MAINTENANCE2_SPEC_VERSION),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (vk::KHR_MULTIVIEW_NAME, vk::KHR_MULTIVIEW_SPEC_VERSION),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (
+                vk::KHR_CREATE_RENDERPASS2_NAME,
+                vk::KHR_CREATE_RENDERPASS2_SPEC_VERSION,
+            ),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (
+                vk::KHR_IMAGELESS_FRAMEBUFFER_NAME,
+                vk::KHR_IMAGELESS_FRAMEBUFFER_SPEC_VERSION,
+            ),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (
+                vk::KHR_IMAGE_FORMAT_LIST_NAME,
+                vk::KHR_IMAGE_FORMAT_LIST_SPEC_VERSION,
+            ),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (
+                vk::KHR_DESCRIPTOR_UPDATE_TEMPLATE_NAME,
+                vk::KHR_DESCRIPTOR_UPDATE_TEMPLATE_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_TIMELINE_SEMAPHORE_NAME,
+                vk::KHR_TIMELINE_SEMAPHORE_SPEC_VERSION,
+            ),
+        ]
     }
     #[cfg(target_os = "scarlet")]
     {
-        &[(crate::scarlet_image::DEVICE_EXTENSION_NAME, 1)]
+        &[
+            (crate::scarlet_image::DEVICE_EXTENSION_NAME, 1),
+            (vk::KHR_MAINTENANCE1_NAME, vk::KHR_MAINTENANCE1_SPEC_VERSION),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (vk::KHR_MAINTENANCE2_NAME, vk::KHR_MAINTENANCE2_SPEC_VERSION),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (vk::KHR_MULTIVIEW_NAME, vk::KHR_MULTIVIEW_SPEC_VERSION),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (
+                vk::KHR_CREATE_RENDERPASS2_NAME,
+                vk::KHR_CREATE_RENDERPASS2_SPEC_VERSION,
+            ),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (
+                vk::KHR_IMAGELESS_FRAMEBUFFER_NAME,
+                vk::KHR_IMAGELESS_FRAMEBUFFER_SPEC_VERSION,
+            ),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (
+                vk::KHR_IMAGE_FORMAT_LIST_NAME,
+                vk::KHR_IMAGE_FORMAT_LIST_SPEC_VERSION,
+            ),
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            (
+                vk::KHR_DESCRIPTOR_UPDATE_TEMPLATE_NAME,
+                vk::KHR_DESCRIPTOR_UPDATE_TEMPLATE_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_TIMELINE_SEMAPHORE_NAME,
+                vk::KHR_TIMELINE_SEMAPHORE_SPEC_VERSION,
+            ),
+        ]
     }
     #[cfg(not(any(
         target_os = "macos",
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-wsi")
     )))]
-    &[]
+    &[(
+        vk::KHR_TIMELINE_SEMAPHORE_NAME,
+        vk::KHR_TIMELINE_SEMAPHORE_SPEC_VERSION,
+    )]
 }
 
 unsafe fn enabled_instance_extensions<'a>(
@@ -569,16 +693,28 @@ unsafe extern "system" fn enumerate_device_layer_properties(
     unsafe { enumerate_instance_layer_properties(count, output) }
 }
 
-unsafe extern "system" fn get_physical_device_features(
-    _physical: vk::PhysicalDevice,
+pub(crate) unsafe extern "system" fn get_physical_device_features(
+    physical: vk::PhysicalDevice,
     output: *mut vk::PhysicalDeviceFeatures,
 ) {
     if !output.is_null() {
-        unsafe { *output = vk::PhysicalDeviceFeatures::default() };
+        let mut features = vk::PhysicalDeviceFeatures::default();
+        if let Some(adapter) = physical_adapter(physical) {
+            let capabilities = adapter.capabilities();
+            // The Scarlet VirGL backend preserves each color target's blend
+            // state, including separate RGB/alpha equations and write masks.
+            // Do not infer this support for other backends from their limits.
+            features.independent_blend = u32::from(
+                adapter.info().backend() == sgfx::BackendKind::ScarletVirgl
+                    && capabilities.supports_programmable_graphics()
+                    && capabilities.limits().max_color_attachments > 1,
+            );
+        }
+        unsafe { *output = features };
     }
 }
 
-unsafe extern "system" fn get_physical_device_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_properties(
     physical: vk::PhysicalDevice,
     output: *mut vk::PhysicalDeviceProperties,
 ) {
@@ -616,6 +752,13 @@ unsafe extern "system" fn get_physical_device_properties(
         let compute = capabilities.supports_compute();
         let graphics = capabilities.supports_graphics();
         properties.limits = vk::PhysicalDeviceLimits {
+            max_image_dimension1_d: if info.backend() == sgfx::BackendKind::ScarletVirgl {
+                limits
+                    .max_image_dimension_2d
+                    .min(crate::images::MAX_IMAGE_DIMENSION)
+            } else {
+                0
+            },
             max_image_dimension2_d: limits
                 .max_image_dimension_2d
                 .min(crate::images::MAX_IMAGE_DIMENSION),
@@ -628,6 +771,9 @@ unsafe extern "system" fn get_physical_device_properties(
                 0
             },
             max_uniform_buffer_range: limits.max_uniform_buffer_range,
+            // Format feature bits separately decide which texel-view formats
+            // are shader-accessible. Bound view metadata uses this byte budget.
+            max_texel_buffer_elements: limits.max_storage_buffer_range / 4,
             max_storage_buffer_range: if storage_buffers {
                 limits.max_storage_buffer_range
             } else {
@@ -760,7 +906,7 @@ unsafe extern "system" fn get_physical_device_properties(
     unsafe { *output = properties };
 }
 
-unsafe extern "system" fn get_physical_device_memory_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_memory_properties(
     physical: vk::PhysicalDevice,
     output: *mut vk::PhysicalDeviceMemoryProperties,
 ) {
@@ -785,7 +931,7 @@ unsafe extern "system" fn get_physical_device_memory_properties(
     unsafe { *output = properties };
 }
 
-unsafe extern "system" fn get_physical_device_queue_family_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_queue_family_properties(
     physical: vk::PhysicalDevice,
     count: *mut u32,
     output: *mut vk::QueueFamilyProperties,
@@ -827,7 +973,7 @@ unsafe extern "system" fn get_physical_device_queue_family_properties(
     }
 }
 
-unsafe extern "system" fn get_physical_device_format_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
     physical: vk::PhysicalDevice,
     format: vk::Format,
     output: *mut vk::FormatProperties,
@@ -852,7 +998,10 @@ unsafe extern "system" fn get_physical_device_format_properties(
     if (capabilities.supports_rgba8_color_attachment()
         && matches!(
             format,
-            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::R8_UNORM
+            vk::Format::R8G8B8A8_UNORM
+                | vk::Format::R8G8B8A8_SRGB
+                | vk::Format::R8_UNORM
+                | vk::Format::R8G8_UNORM
         ))
         || (capabilities.supports_bgra8_color_attachment()
             && matches!(
@@ -860,8 +1009,6 @@ unsafe extern "system" fn get_physical_device_format_properties(
                 vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB
             ))
     {
-        // In Vulkan 1.0, transfer support follows image-format support; the
-        // TRANSFER_SRC/DST format-feature bits belong to maintenance1 / 1.1.
         properties.optimal_tiling_features = vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
         if !srgb || capabilities.supports_srgb_color_attachments() {
@@ -872,7 +1019,10 @@ unsafe extern "system" fn get_physical_device_format_properties(
     if capabilities.supports_image_blits()
         && matches!(
             format,
-            vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
+            vk::Format::R8G8B8A8_UNORM
+                | vk::Format::B8G8R8A8_UNORM
+                | vk::Format::R8_UNORM
+                | vk::Format::R8G8_UNORM
         )
     {
         properties.optimal_tiling_features |=
@@ -888,6 +1038,36 @@ unsafe extern "system" fn get_physical_device_format_properties(
     }
     if capabilities.supports_storage_images() && format == vk::Format::R8G8B8A8_UNORM {
         properties.optimal_tiling_features |= vk::FormatFeatureFlags::STORAGE_IMAGE;
+    }
+    #[cfg(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
+    for (usage, feature) in [
+        (
+            vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::FormatFeatureFlags::TRANSFER_SRC,
+        ),
+        (
+            vk::ImageUsageFlags::TRANSFER_DST,
+            vk::FormatFeatureFlags::TRANSFER_DST,
+        ),
+    ] {
+        let mut image_properties = vk::ImageFormatProperties::default();
+        if unsafe {
+            get_physical_device_image_format_properties(
+                physical,
+                format,
+                vk::ImageType::TYPE_2D,
+                vk::ImageTiling::OPTIMAL,
+                usage,
+                vk::ImageCreateFlags::empty(),
+                &mut image_properties,
+            )
+        } == vk::Result::SUCCESS
+        {
+            properties.optimal_tiling_features |= feature;
+        }
     }
     if capabilities.supports_extended_vertex_formats()
         && matches!(
@@ -917,7 +1097,7 @@ unsafe extern "system" fn get_physical_device_format_properties(
     unsafe { *output = properties };
 }
 
-unsafe extern "system" fn get_physical_device_image_format_properties(
+pub(crate) unsafe extern "system" fn get_physical_device_image_format_properties(
     physical: vk::PhysicalDevice,
     format: vk::Format,
     image_type: vk::ImageType,
@@ -934,7 +1114,7 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         return vk::Result::ERROR_FORMAT_NOT_SUPPORTED;
     };
     let capabilities = adapter.capabilities();
-    let mut supported_usage = crate::images::image_usage(format);
+    let mut supported_usage = crate::images::extended_image_usage(format, flags);
     if !capabilities.supports_storage_images() {
         supported_usage &= !vk::ImageUsageFlags::STORAGE;
     }
@@ -966,11 +1146,13 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
             | vk::Format::R8G8B8A8_SRGB
             | vk::Format::B8G8R8A8_SRGB
             | vk::Format::R8_UNORM
+            | vk::Format::R8G8_UNORM
     ) {
         let color_attachment = match format {
-            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB | vk::Format::R8_UNORM => {
-                capabilities.supports_rgba8_color_attachment()
-            }
+            vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+            | vk::Format::R8_UNORM
+            | vk::Format::R8G8_UNORM => capabilities.supports_rgba8_color_attachment(),
             vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
                 capabilities.supports_bgra8_color_attachment()
             }
@@ -990,9 +1172,14 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         supported_usage = vk::ImageUsageFlags::empty();
     }
     if supported_usage.is_empty()
-        || image_type != vk::ImageType::TYPE_2D
+        || !(image_type == vk::ImageType::TYPE_2D
+            || (image_type == vk::ImageType::TYPE_1D
+                && adapter.info().backend() == sgfx::BackendKind::ScarletVirgl
+                && !flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)))
         || tiling != vk::ImageTiling::OPTIMAL
-        || !(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::CUBE_COMPATIBLE)
+        || !(vk::ImageCreateFlags::MUTABLE_FORMAT
+            | vk::ImageCreateFlags::CUBE_COMPATIBLE
+            | vk::ImageCreateFlags::EXTENDED_USAGE)
             .contains(flags)
         || (flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)
             && capabilities.limits().max_image_array_layers < 6)
@@ -1010,7 +1197,11 @@ unsafe extern "system" fn get_physical_device_image_format_properties(
         *output = vk::ImageFormatProperties {
             max_extent: vk::Extent3D {
                 width: max_dimension,
-                height: max_dimension,
+                height: if image_type == vk::ImageType::TYPE_1D {
+                    1
+                } else {
+                    max_dimension
+                },
                 depth: 1,
             },
             max_mip_levels: if usage.intersects(
@@ -1282,7 +1473,7 @@ mod tests {
                 ),
                 vk::Result::SUCCESS
             );
-            assert_eq!(count, usize::from(cfg!(target_os = "macos")) as u32);
+            assert_eq!(count, device_extensions().len() as u32);
             destroy_instance(instance, ptr::null());
         }
     }

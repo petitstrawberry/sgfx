@@ -401,6 +401,9 @@ impl Resources {
                             ir::PrimitiveTopology::TriangleStrip => {
                                 raw::PrimitiveTopology::TriangleStrip
                             }
+                            ir::PrimitiveTopology::TriangleFan => {
+                                return Err(Error::Unsupported(UnsupportedFeature::TriangleFan));
+                            }
                         },
                         front_face: match desc.raster().front_face() {
                             ir::FrontFace::Clockwise => raw::FrontFace::Cw,
@@ -685,6 +688,9 @@ pub(super) fn shader_stages(stages: ir::ShaderStages) -> raw::ShaderStages {
 
 fn texture_view_dimension(dimension: ir::TextureViewDimension) -> raw::TextureViewDimension {
     match dimension {
+        ir::TextureViewDimension::D1 => raw::TextureViewDimension::D1,
+        // D1-array allocations are explicitly rejected by texture materialization.
+        ir::TextureViewDimension::D1Array => raw::TextureViewDimension::D2Array,
         ir::TextureViewDimension::D2 => raw::TextureViewDimension::D2,
         ir::TextureViewDimension::D2Array => raw::TextureViewDimension::D2Array,
         ir::TextureViewDimension::Cube => raw::TextureViewDimension::Cube,

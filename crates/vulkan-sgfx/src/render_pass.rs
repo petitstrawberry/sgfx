@@ -37,8 +37,7 @@ impl RenderPass {
 }
 
 pub(crate) unsafe fn parse(info: &vk::RenderPassCreateInfo<'_>) -> Result<RenderPass, vk::Result> {
-    if !info.p_next.is_null()
-        || !info.flags.is_empty()
+    if !info.flags.is_empty()
         || info.s_type != vk::StructureType::RENDER_PASS_CREATE_INFO
         || !(1..=8).contains(&info.attachment_count)
         || info.p_attachments.is_null()
@@ -51,7 +50,18 @@ pub(crate) unsafe fn parse(info: &vk::RenderPassCreateInfo<'_>) -> Result<Render
     }
     let attachments =
         std::slice::from_raw_parts(info.p_attachments, info.attachment_count as usize).to_vec();
-    for a in &attachments {
+    let mut attachments = attachments;
+    for a in &mut attachments {
+        a.initial_layout = normalize_depth_layout(a.initial_layout);
+        a.final_layout = normalize_depth_layout(a.final_layout);
+        // Stencil operations affect only a stencil aspect. All currently
+        // supported formats are color or depth-only, and Zink legitimately
+        // supplies STORE even for D32. Canonicalize these ignored operations;
+        // this does not add stencil-format or stencil-operation support.
+        if !crate::images::image_aspect(a.format).contains(vk::ImageAspectFlags::STENCIL) {
+            a.stencil_load_op = vk::AttachmentLoadOp::DONT_CARE;
+            a.stencil_store_op = vk::AttachmentStoreOp::DONT_CARE;
+        }
         let depth = a.format == vk::Format::D32_SFLOAT;
         let valid_layout = |layout| match layout {
             vk::ImageLayout::GENERAL | vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => true,
@@ -86,6 +96,7 @@ pub(crate) unsafe fn parse(info: &vk::RenderPassCreateInfo<'_>) -> Result<Render
             return Err(UNSUPPORTED);
         }
     }
+    validate_extensions(info, &attachments)?;
     let mut subpasses = Vec::new();
     let mut first_use = vec![true; attachments.len()];
     for subpass in std::slice::from_raw_parts(info.p_subpasses, info.subpass_count as usize) {
@@ -125,6 +136,8 @@ pub(crate) unsafe fn parse(info: &vk::RenderPassCreateInfo<'_>) -> Result<Render
             .as_ref()
             .filter(|r| r.attachment != vk::ATTACHMENT_UNUSED)
             .map(|reference| {
+                let mut reference = *reference;
+                reference.layout = normalize_depth_layout(reference.layout);
                 let index = reference.attachment as usize;
                 if attachments
                     .get(index)
@@ -151,7 +164,8 @@ pub(crate) unsafe fn parse(info: &vk::RenderPassCreateInfo<'_>) -> Result<Render
             .transpose()?;
         let mut inputs = Vec::new();
         for i in 0..subpass.input_attachment_count as usize {
-            let reference = &*subpass.p_input_attachments.add(i);
+            let mut reference = *subpass.p_input_attachments.add(i);
+            reference.layout = normalize_depth_layout(reference.layout);
             if reference.attachment == vk::ATTACHMENT_UNUSED {
                 inputs.push(None);
                 continue;
@@ -238,4 +252,77 @@ pub(crate) unsafe fn parse(info: &vk::RenderPassCreateInfo<'_>) -> Result<Render
         attachments,
         subpasses,
     })
+}
+
+// D32 is the only supported depth format: there is no stencil aspect to carry.
+pub(crate) fn normalize_depth_layout(layout: vk::ImageLayout) -> vk::ImageLayout {
+    match layout {
+        vk::ImageLayout::DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL => {
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        }
+        vk::ImageLayout::DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL => {
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+        }
+        _ => layout,
+    }
+}
+unsafe fn validate_extensions(
+    info: &vk::RenderPassCreateInfo<'_>,
+    attachments: &[vk::AttachmentDescription],
+) -> Result<(), vk::Result> {
+    let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
+    for _ in 0..32 {
+        let Some(base) = node.as_ref() else {
+            return Ok(());
+        };
+        match base.s_type {
+            vk::StructureType::RENDER_PASS_MULTIVIEW_CREATE_INFO => {
+                let mv = &*node.cast::<vk::RenderPassMultiviewCreateInfo<'_>>();
+                if !(mv.subpass_count == 0 || mv.subpass_count == info.subpass_count)
+                    || !(mv.dependency_count == 0 || mv.dependency_count == info.dependency_count)
+                    || mv.correlation_mask_count != 0
+                {
+                    return Err(UNSUPPORTED);
+                }
+                if crate::api::slice(mv.p_view_masks, mv.subpass_count)?
+                    .iter()
+                    .any(|&m| m != 0)
+                    || crate::api::slice(mv.p_view_offsets, mv.dependency_count)?
+                        .iter()
+                        .any(|&o| o != 0)
+                {
+                    return Err(UNSUPPORTED);
+                }
+            }
+            vk::StructureType::RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO => {
+                let aspects = &*node.cast::<vk::RenderPassInputAttachmentAspectCreateInfo<'_>>();
+                for r in
+                    crate::api::slice(aspects.p_aspect_references, aspects.aspect_reference_count)?
+                {
+                    if r.subpass >= info.subpass_count {
+                        return Err(UNSUPPORTED);
+                    }
+                    let subpass = &*info.p_subpasses.add(r.subpass as usize);
+                    let inputs = crate::api::slice(
+                        subpass.p_input_attachments,
+                        subpass.input_attachment_count,
+                    )?;
+                    let reference = inputs
+                        .get(r.input_attachment_index as usize)
+                        .ok_or(UNSUPPORTED)?;
+                    if reference.attachment != vk::ATTACHMENT_UNUSED {
+                        let attachment = attachments
+                            .get(reference.attachment as usize)
+                            .ok_or(UNSUPPORTED)?;
+                        if r.aspect_mask != crate::images::image_aspect(attachment.format) {
+                            return Err(UNSUPPORTED);
+                        }
+                    }
+                }
+            }
+            _ => return Err(UNSUPPORTED),
+        }
+        node = base.p_next;
+    }
+    Err(UNSUPPORTED)
 }

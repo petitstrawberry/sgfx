@@ -16,8 +16,11 @@ scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a5
 scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", optional = true }
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false }
 sgfx-codegen-virgl = { path = "../sgfx-codegen-virgl" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "5ea41a0dfd6992bb1c0fce06c8e65425dc978140", default-features = false }
+sgfx-core = { path = "../sgfx-core", default-features = false }
 
 [lib]
 name = "sgfx_backend_scarlet_virgl"
 path = "src/lib.rs"
+
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }

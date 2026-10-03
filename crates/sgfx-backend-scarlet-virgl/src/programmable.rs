@@ -144,7 +144,10 @@ fn compile_pipeline(
     if pipeline.color_targets().any(|target| {
         !matches!(
             target.format(),
-            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+            TextureFormat::Bgra8Unorm
+                | TextureFormat::Rgba8Unorm
+                | TextureFormat::R8Unorm
+                | TextureFormat::Rg8Unorm
         )
     }) {
         return Err(IrSubmitError::Unsupported(
@@ -153,7 +156,9 @@ fn compile_pipeline(
     }
     if !matches!(
         pipeline.topology(),
-        PrimitiveTopology::TriangleList | PrimitiveTopology::TriangleStrip
+        PrimitiveTopology::TriangleList
+            | PrimitiveTopology::TriangleStrip
+            | PrimitiveTopology::TriangleFan
     ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PrimitiveTopology,
@@ -178,7 +183,9 @@ fn compile_pipeline(
                     | ir::BindingType::StorageBuffer { read_only: true }
                     | ir::BindingType::SampledTexture
                     | ir::BindingType::SampledTextureView {
-                        dimension: ir::TextureViewDimension::D2
+                        dimension: ir::TextureViewDimension::D1
+                            | ir::TextureViewDimension::D1Array
+                            | ir::TextureViewDimension::D2
                             | ir::TextureViewDimension::D2Array
                             | ir::TextureViewDimension::Cube,
                         depth: _
@@ -195,10 +202,16 @@ fn compile_pipeline(
     let compile = |entry: &ir::ShaderEntryPoint| {
         let module = resources.shader_module(resources.shader_module_ref(entry.module())?)?;
         compile_shader(&module, entry.stage(), entry.entry_point())
+            .map(|shader| {
+                (
+                    shader,
+                    matches!(module.source(), ir::ShaderSource::SpirV(_)),
+                )
+            })
             .map_err(IrSubmitError::ShaderCompile)
     };
-    let vertex = compile(pipeline.vertex())?;
-    let fragment = compile(pipeline.fragment())?;
+    let (vertex, vertex_spirv) = compile(pipeline.vertex())?;
+    let (fragment, fragment_spirv) = compile(pipeline.fragment())?;
     let attributes = || {
         pipeline
             .vertex_buffers()
@@ -214,6 +227,16 @@ fn compile_pipeline(
             .iter()
             .any(|location| !vertex.output_locations.contains(location))
     {
+        #[cfg(feature = "std")]
+        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            std::eprintln!(
+                "[SGFX VirGL] missing pipeline interface: attributes={:?} VS inputs={:?} VS outputs={:?} FS inputs={:?}",
+                attributes().collect::<Vec<_>>(),
+                vertex.inputs,
+                vertex.outputs,
+                fragment.inputs
+            );
+        }
         return Err(ir::Error::InvalidDescriptor.into());
     }
     for input in &vertex.inputs {
@@ -221,15 +244,23 @@ fn compile_pipeline(
         let attribute = attributes()
             .find(|attribute| attribute.location() == input.location)
             .ok_or(ir::Error::InvalidDescriptor)?;
-        let (scalar, components) = match attribute.format() {
-            VertexFormat::Sint32 => (IoScalar::Sint, 1),
-            VertexFormat::Uint32 => (IoScalar::Uint, 1),
-            VertexFormat::Sint16x4 => (IoScalar::Sint, 4),
-            VertexFormat::Float16x2 | VertexFormat::Float32x2 => (IoScalar::Float, 2),
-            VertexFormat::Float32x3 => (IoScalar::Float, 3),
-            _ => (IoScalar::Float, 4),
+        let scalar = match attribute.format() {
+            VertexFormat::Sint32 | VertexFormat::Sint16x4 => IoScalar::Sint,
+            VertexFormat::Uint32 => IoScalar::Uint,
+            _ => IoScalar::Float,
         };
-        if scalar != input.scalar || components != input.components {
+        // Vertex fetch supplies a four-component value independently of the
+        // shader's vector width. VirGL retains the attribute's actual format,
+        // and its host GL fetch fills absent components with (0, 0, 0, 1), as
+        // Vulkan requires. A vec2 buffer may therefore feed a vec4 input; excess
+        // components are likewise ignored. Scalar interpretation must match.
+        if scalar != input.scalar {
+            #[cfg(feature = "std")]
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                std::eprintln!(
+                    "[SGFX VirGL] vertex attribute mismatch: shader={input:?} attribute={attribute:?}"
+                );
+            }
             return Err(ir::Error::InvalidDescriptor.into());
         }
     }
@@ -239,10 +270,19 @@ fn compile_pipeline(
             .iter()
             .find(|output| output.location == input.location)
             .ok_or(ir::Error::InvalidDescriptor)?;
+        // Vulkan/SPIR-V interface matching excludes interpolation decorations:
+        // the fragment IN declaration controls TGSI interpolation. Preserve
+        // WGSL's stricter cross-stage interpolation matching rule.
         if input.components != output.components
             || input.scalar != output.scalar
-            || input.interpolation != output.interpolation
+            || !(vertex_spirv && fragment_spirv) && input.interpolation != output.interpolation
         {
+            #[cfg(feature = "std")]
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                std::eprintln!(
+                    "[SGFX VirGL] stage interface mismatch: vertex={output:?} fragment={input:?}"
+                );
+            }
             return Err(ir::Error::InvalidDescriptor.into());
         }
     }
@@ -418,7 +458,10 @@ impl Context {
         }
         if !matches!(
             descriptor.format(),
-            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+            TextureFormat::Bgra8Unorm
+                | TextureFormat::Rgba8Unorm
+                | TextureFormat::R8Unorm
+                | TextureFormat::Rg8Unorm
         ) {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::TargetFormat,
@@ -451,12 +494,57 @@ impl Context {
                 .readback_ir_texture(&mut resources.backend, spec)?,
             Err(error) => return Err(error),
         };
-        if spec.format == IrTextureFormat::Rgba8 {
+        pack_color_readback(&mut bytes, spec.format);
+        Ok(bytes)
+    }
+}
+
+fn color_target_blend(target: ir::ColorTargetState) -> (driver::IrBlendState, u8) {
+    let mut blend = blend_state(target.blend());
+    let mut mask = target.write_mask().bits();
+    if matches!(
+        target.format(),
+        TextureFormat::R8Unorm | TextureFormat::Rg8Unorm
+    ) {
+        // Missing destination alpha is one, independent of the wider BGRA
+        // transport allocation. Do not allow writes to nonexistent channels.
+        let factor = |factor| match factor {
+            driver::IrBlendFactor::DestinationAlpha => driver::IrBlendFactor::One,
+            driver::IrBlendFactor::OneMinusDestinationAlpha => driver::IrBlendFactor::Zero,
+            other => other,
+        };
+        blend.color.source_factor = factor(blend.color.source_factor);
+        blend.color.destination_factor = factor(blend.color.destination_factor);
+        mask &= if target.format() == TextureFormat::R8Unorm {
+            1
+        } else {
+            3
+        };
+    }
+    (blend, mask)
+}
+
+fn pack_color_readback(bytes: &mut Vec<u8>, format: IrTextureFormat) {
+    match format {
+        IrTextureFormat::Rgba8 => {
             for pixel in bytes.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
             }
         }
-        Ok(bytes)
+        IrTextureFormat::R8 | IrTextureFormat::Rg8 => {
+            let channels = if format == IrTextureFormat::R8 { 1 } else { 2 };
+            let pixels = bytes.len() / 4;
+            for index in 0..pixels {
+                let red = bytes[index * 4 + 2];
+                let green = bytes[index * 4 + 1];
+                bytes[index * channels] = red;
+                if channels == 2 {
+                    bytes[index * channels + 1] = green;
+                }
+            }
+            bytes.truncate(pixels * channels);
+        }
+        _ => {}
     }
 }
 
@@ -542,6 +630,32 @@ fn constant_words(
 }
 
 #[cfg(feature = "programmable")]
+fn uniform_words(
+    binding: &sgfx_codegen_virgl::programmable::UniformBufferBinding,
+    bytes: &[u8],
+    offset: u64,
+    size: u64,
+) -> Result<driver::IrConstantWords, IrSubmitError> {
+    // The descriptor covers every byte the shader can read. The source block
+    // can declare unused trailing fields, and TGSI still reserves the complete
+    // vec4 register span; those transport-only bytes are initialized to zero.
+    if binding.required_size > binding.size
+        || size < u64::from(binding.required_size)
+        || size > 16 * 1024
+        || offset > u64::from(u32::MAX)
+    {
+        return Err(ir::Error::OutOfBounds.into());
+    }
+    let end = offset
+        .checked_add(u64::from(binding.required_size))
+        .ok_or(ir::Error::Overflow)?;
+    let start = usize::try_from(offset).map_err(|_| ir::Error::Overflow)?;
+    let end = usize::try_from(end).map_err(|_| ir::Error::Overflow)?;
+    let bytes = bytes.get(start..end).ok_or(ir::Error::OutOfBounds)?;
+    constant_words(bytes, binding.size.next_multiple_of(16) as usize)
+}
+
+#[cfg(feature = "programmable")]
 pub(super) fn decode_draw(
     resources: &IrResources,
     pending: &PendingBuffers,
@@ -558,7 +672,7 @@ pub(super) fn decode_draw(
         .programmable_render_pipeline_shared(reference)?;
     let valid_count = match pipeline.topology() {
         PrimitiveTopology::TriangleList => count > 0 && count.is_multiple_of(3),
-        PrimitiveTopology::TriangleStrip => count >= 3,
+        PrimitiveTopology::TriangleStrip | PrimitiveTopology::TriangleFan => count >= 3,
     };
     if !valid_count {
         return Err(ir::Error::InvalidValue.into());
@@ -725,7 +839,13 @@ pub(super) fn decode_draw(
                 {
                     return Err(ir::Error::InvalidUsage.into());
                 }
-                let dimension = if descriptor.cube_compatible() {
+                let dimension = if descriptor.dimension_1d() {
+                    if descriptor.array_layer_count() > 1 {
+                        ir::TextureViewDimension::D1Array
+                    } else {
+                        ir::TextureViewDimension::D1
+                    }
+                } else if descriptor.cube_compatible() {
                     ir::TextureViewDimension::Cube
                 } else if descriptor.array_layer_count() > 1 {
                     ir::TextureViewDimension::D2Array
@@ -823,24 +943,17 @@ pub(super) fn decode_draw(
                 else {
                     return Err(ir::Error::BindingLayoutMismatch.into());
                 };
-                let constant_size = binding.size.next_multiple_of(16);
-                if size < u64::from(binding.size)
-                    || size > 16 * 1024
-                    || offset > u64::from(u32::MAX)
-                {
-                    return Err(ir::Error::OutOfBounds.into());
-                }
                 let buffer = resources.resources.buffer_ref(buffer)?;
                 let bytes = pending.bytes(resources, buffer)?;
-                let end = offset
-                    .checked_add(u64::from(binding.size))
-                    .ok_or(ir::Error::Overflow)?;
-                if end > bytes.as_slice().len() as u64 {
-                    return Err(ir::Error::OutOfBounds.into());
-                }
-                let start = usize::try_from(offset).map_err(|_| ir::Error::Overflow)?;
-                let end = usize::try_from(end).map_err(|_| ir::Error::Overflow)?;
-                let words = constant_words(&bytes.as_slice()[start..end], constant_size as usize)?;
+                let words = uniform_words(binding, bytes.as_slice(), offset, size).inspect_err(|_error| {
+                    #[cfg(feature = "std")]
+                    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                        eprintln!(
+                            "[SGFX VirGL] uniform snapshot failed: {_error:?} stage={:?} group={} binding={} declared_bytes={} required_bytes={} bound_bytes={size} offset={offset} available={}",
+                            shader.stage, binding.group, binding.binding, binding.size, binding.required_size, bytes.as_slice().len(),
+                        );
+                    }
+                })?;
                 constants
                     .try_reserve(1)
                     .map_err(|_| IrSubmitError::OutOfMemory)?;
@@ -911,6 +1024,14 @@ pub(super) fn decode_draw(
             .and_then(|start| start.checked_add(attribute_end))
             .ok_or(ir::Error::Overflow)?;
         if end > bytes.as_slice().len() as u64 {
+            #[cfg(feature = "std")]
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX VirGL] vertex shadow out of bounds: slot={slot} offset={offset} maximum={maximum} stride={} attribute_end={attribute_end} end={end} available={}",
+                    layout.stride(),
+                    bytes.as_slice().len(),
+                );
+            }
             return Err(ir::Error::OutOfBounds.into());
         }
         vertex_buffers[slot] = Some(IrVertexBufferBinding {
@@ -922,8 +1043,7 @@ pub(super) fn decode_draw(
     let raster = pipeline.raster();
     let mut additional_color_blends = [None; 7];
     for (slot, target) in pipeline.color_targets().skip(1).enumerate() {
-        additional_color_blends[slot] =
-            Some((blend_state(target.blend()), target.write_mask().bits()));
+        additional_color_blends[slot] = Some(color_target_blend(target));
     }
     // Writes are forbidden inside a render pass, so unchanged binding state
     // refers to the same owned constants. Bounds are still checked per draw.
@@ -955,8 +1075,8 @@ pub(super) fn decode_draw(
         pipeline: IrPipelineState {
             slot: reference.slot() + 256,
             fragment: IrFragmentProgram::Solid,
-            blend: blend_state(pipeline.blend()),
-            color_write_mask: pipeline.color_targets().next().unwrap().write_mask().bits(),
+            blend: color_target_blend(pipeline.color_targets().next().unwrap()).0,
+            color_write_mask: color_target_blend(pipeline.color_targets().next().unwrap()).1,
             additional_color_blends,
             cull_mode: match raster.cull_mode() {
                 ir::CullMode::None => IrCullMode::None,
@@ -1050,9 +1170,21 @@ mod tests {
         uniform_type: ir::BindingType,
         source: &str,
     ) -> ir::ProgrammableRenderPipelineId {
-        let module = table
-            .define_shader_module(ir::ShaderModuleDesc::wgsl(source.into()).unwrap())
-            .unwrap();
+        pipeline_module(
+            table,
+            vertex_format,
+            uniform_type,
+            ir::ShaderModuleDesc::wgsl(source.into()).unwrap(),
+        )
+    }
+
+    fn pipeline_module(
+        table: &ResourceTable,
+        vertex_format: VertexFormat,
+        uniform_type: ir::BindingType,
+        module: ir::ShaderModuleDesc,
+    ) -> ir::ProgrammableRenderPipelineId {
+        let module = table.define_shader_module(module).unwrap();
         let layout = ir::PipelineLayoutDesc::new(vec![
             ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
                 0,
@@ -1191,6 +1323,40 @@ mod tests {
         assert!(constant_words(&[0; 3], 16).is_err());
         assert!(constant_words(&[0; 20], 16).is_err());
         assert!(constant_words(&[0; 16], 20).is_err());
+    }
+
+    #[test]
+    fn uniform_snapshots_validate_accessed_bytes_and_zero_unused_register_tails() {
+        for (elements, access, required) in [(2, "1].y", 24), (1, "0].y", 8), (1, "0].z", 12)] {
+            let source = alloc::format!(
+                "@group(0) @binding(0) var<uniform> values: array<vec4<u32>, {elements}>;
+                 @fragment fn fs() -> @location(0) vec4<f32> {{
+                    return vec4<f32>(f32(values[{access}));
+                 }}"
+            );
+            let module = ir::ShaderModuleDesc::wgsl(source).unwrap();
+            let shader = compile_shader(&module, ir::ShaderStage::Fragment, "fs").unwrap();
+            let binding = &shader.uniform_buffers[0];
+            assert_eq!(binding.required_size, required);
+            assert_eq!(binding.size, elements * 16);
+            let expected: Vec<u32> = (1..=required / 4).collect();
+            let mut bytes = vec![0xff; 16];
+            bytes.extend(expected.iter().flat_map(|word| word.to_ne_bytes()));
+            let words = uniform_words(binding, &bytes, 16, u64::from(required)).unwrap();
+            assert_eq!(&words[..expected.len()], expected.as_slice());
+            assert_eq!(words.len(), binding.size as usize / 4);
+            assert!(words[expected.len()..].iter().all(|word| *word == 0));
+            // The same shader must still reject a descriptor or shadow that
+            // omits its last scalar, despite the transport bank's zero fill.
+            assert!(matches!(
+                uniform_words(binding, &bytes, 16, u64::from(required - 4)),
+                Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds))
+            ));
+            assert!(matches!(
+                uniform_words(binding, &bytes[..bytes.len() - 4], 16, u64::from(required)),
+                Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds))
+            ));
+        }
     }
 
     #[test]
@@ -1378,17 +1544,146 @@ mod tests {
     }
 
     #[test]
-    fn rejects_vertex_fetch_type_mismatch_before_materialization() {
+    fn permits_vertex_fetch_component_defaults_and_unused_components() {
+        let vec4_source = SHADER
+            .replace("position: vec3<f32>", "position: vec4<f32>")
+            .replace("vec4<f32>(position, 1.0)", "position");
+        for (source, shader_components) in [(SHADER, 3), (vec4_source.as_str(), 4)] {
+            for format in [
+                VertexFormat::Float32x2,
+                VertexFormat::Float32x3,
+                VertexFormat::Float32x4,
+                VertexFormat::Float16x2,
+                VertexFormat::Unorm8x4,
+            ] {
+                let table = ResourceTable::new();
+                let id = pipeline_source(&table, format, ir::BindingType::UniformBuffer, source);
+                let compiled = compile_pipeline(&table, id).unwrap();
+                assert_eq!(compiled.vertex.inputs[0].components, shader_components);
+                assert_eq!(compiled.vertex_buffers[0].attributes()[0].format(), format);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_vertex_fetch_scalar_type_mismatch_before_materialization() {
         let table = ResourceTable::new();
-        let id = pipeline(
-            &table,
-            VertexFormat::Float32x2,
-            ir::BindingType::UniformBuffer,
-        );
+        let id = pipeline(&table, VertexFormat::Uint32, ir::BindingType::UniformBuffer);
         assert!(matches!(
             compile_pipeline(&table, id),
             Err(IrSubmitError::InvalidIr(ir::Error::InvalidDescriptor))
         ));
+    }
+
+    fn stage_interface_source(
+        vertex_interpolation: &str,
+        fragment_input: &str,
+    ) -> alloc::string::String {
+        alloc::format!(
+            "struct VertexOutput {{
+                @builtin(position) position: vec4<f32>,
+                @location(0) @interpolate({vertex_interpolation}) value: vec4<f32>,
+             }};
+             @vertex fn vs(@location(0) position: vec3<f32>) -> VertexOutput {{
+                return VertexOutput(vec4<f32>(position, 1.0), vec4<f32>(position, 1.0));
+             }}
+             @fragment fn fs({fragment_input}) -> @location(0) vec4<f32> {{
+                return vec4<f32>(f32(value.x));
+             }}"
+        )
+    }
+
+    fn spirv_module(source: &str) -> ir::ShaderModuleDesc {
+        let module = naga::front::wgsl::parse_str(source).unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+        let mut options = naga::back::spv::Options::default();
+        options
+            .flags
+            .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
+        ir::ShaderModuleDesc::spirv(
+            naga::back::spv::write_vec(&module, &info, &options, None).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn spirv_fragment_input_selects_interpolation_independently_of_vertex_output() {
+        for vertex_interpolation in ["flat", "linear", "perspective"] {
+            for (fragment_interpolation, tgsi) in [
+                ("flat", "CONSTANT"),
+                ("linear", "LINEAR"),
+                ("perspective", "PERSPECTIVE"),
+            ] {
+                let table = ResourceTable::new();
+                let source = stage_interface_source(
+                    vertex_interpolation,
+                    &alloc::format!(
+                        "@location(0) @interpolate({fragment_interpolation}) value: vec4<f32>"
+                    ),
+                );
+                let id = pipeline_module(
+                    &table,
+                    VertexFormat::Float32x3,
+                    ir::BindingType::UniformBuffer,
+                    spirv_module(&source),
+                );
+                let compiled = compile_pipeline(&table, id).unwrap();
+                assert!(
+                    compiled
+                        .vertex
+                        .tgsi
+                        .lines()
+                        .any(|line| line == "DCL OUT[1], GENERIC[0]")
+                );
+                let wgsl_id = pipeline_source(
+                    &table,
+                    VertexFormat::Float32x3,
+                    ir::BindingType::UniformBuffer,
+                    &source,
+                );
+                if vertex_interpolation == fragment_interpolation {
+                    compile_pipeline(&table, wgsl_id).unwrap();
+                } else {
+                    assert!(matches!(
+                        compile_pipeline(&table, wgsl_id),
+                        Err(IrSubmitError::InvalidIr(ir::Error::InvalidDescriptor))
+                    ));
+                }
+                assert!(
+                    compiled
+                        .fragment
+                        .tgsi
+                        .contains(&alloc::format!("DCL IN[0], GENERIC[0], {tgsi}"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stage_interface_still_rejects_missing_locations_and_incompatible_types() {
+        for input in [
+            "@location(1) @interpolate(linear) value: vec4<f32>",
+            "@location(0) @interpolate(linear) value: vec3<f32>",
+            "@location(0) @interpolate(flat) value: vec4<u32>",
+        ] {
+            let table = ResourceTable::new();
+            let source = stage_interface_source("flat", input);
+            let id = pipeline_module(
+                &table,
+                VertexFormat::Float32x3,
+                ir::BindingType::UniformBuffer,
+                spirv_module(&source),
+            );
+            assert!(matches!(
+                compile_pipeline(&table, id),
+                Err(IrSubmitError::InvalidIr(ir::Error::InvalidDescriptor))
+            ));
+        }
     }
 
     #[test]
@@ -1433,5 +1728,47 @@ mod tests {
                 UnsupportedIrFeature::ExplicitBarrier
             ))
         ));
+    }
+    #[test]
+    fn narrow_color_readback_preserves_rendered_channels_and_omits_transport_padding() {
+        let physical = vec![7, 21, 11, 9, 8, 22, 12, 10];
+        let mut red = physical.clone();
+        pack_color_readback(&mut red, IrTextureFormat::R8);
+        assert_eq!(red, [11, 12]);
+        let mut rg = physical.clone();
+        pack_color_readback(&mut rg, IrTextureFormat::Rg8);
+        assert_eq!(rg, [11, 21, 12, 22]);
+        let mut rgba = physical;
+        pack_color_readback(&mut rgba, IrTextureFormat::Rgba8);
+        assert_eq!(rgba, [11, 21, 7, 9, 12, 22, 8, 10]);
+    }
+
+    #[test]
+    fn narrow_color_blend_uses_implicit_destination_alpha_and_channel_masks() {
+        let blend = ir::BlendState::new(
+            ir::BlendComponent::new(
+                ir::BlendFactor::DestinationAlpha,
+                ir::BlendFactor::OneMinusDestinationAlpha,
+                ir::BlendOp::Add,
+            ),
+            ir::BlendComponent::new(
+                ir::BlendFactor::One,
+                ir::BlendFactor::Zero,
+                ir::BlendOp::Add,
+            ),
+        );
+        for (format, expected_mask) in [(TextureFormat::R8Unorm, 1), (TextureFormat::Rg8Unorm, 3)] {
+            let target = ir::ColorTargetState::new(format, blend, ir::ColorWriteMask::ALL).unwrap();
+            let (lowered, mask) = color_target_blend(target);
+            assert_eq!(mask, expected_mask);
+            assert!(matches!(
+                lowered.color.source_factor,
+                driver::IrBlendFactor::One
+            ));
+            assert!(matches!(
+                lowered.color.destination_factor,
+                driver::IrBlendFactor::Zero
+            ));
+        }
     }
 }

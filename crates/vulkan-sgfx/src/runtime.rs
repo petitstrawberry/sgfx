@@ -5,6 +5,9 @@ use std::rc::Rc;
 pub(crate) type BackendError = sgfx::Error;
 
 pub(crate) fn backend_failure(error: BackendError) -> ash::vk::Result {
+    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        eprintln!("[SGFX Vulkan] backend failure: {error:?}");
+    }
     match error.kind() {
         ErrorKind::InvalidInput | ErrorKind::Unsupported => {
             ash::vk::Result::ERROR_FEATURE_NOT_PRESENT
@@ -23,12 +26,12 @@ pub(crate) struct Runtime {
     pub resources: Resources,
     pub(crate) device: driver::Device,
     pub(crate) capabilities: driver::Capabilities,
+    pub(crate) native_texture_1d: bool,
 
     pub cache: driver::Resources,
     pub queue: driver::Queue,
     pub recordings: crate::api::Recordings,
     pub in_flight: std::sync::Arc<crate::api::InFlight>,
-    pub fences: crate::api::Fences,
     pub device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub lost: bool,
 }
@@ -38,10 +41,10 @@ impl Runtime {
         adapter: driver::Adapter,
         recordings: crate::api::Recordings,
         in_flight: std::sync::Arc<crate::api::InFlight>,
-        fences: crate::api::Fences,
         device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ash::vk::Result> {
         let capabilities = adapter.capabilities();
+        let native_texture_1d = adapter.info().backend() == sgfx::BackendKind::ScarletVirgl;
         let device = adapter.create_device().map_err(backend_failure)?;
         let table = Rc::new(ir::ResourceTable::new());
         let cache = device
@@ -53,11 +56,11 @@ impl Runtime {
             resources: Resources::new(),
             device,
             capabilities,
+            native_texture_1d,
             cache,
             queue,
             recordings,
             in_flight,
-            fences,
             device_lost,
             lost: false,
         })
@@ -74,9 +77,15 @@ impl Runtime {
         crate::api::invalidate_resource_recordings(self);
         self.resources.clear_ir_cache();
         let table = Rc::new(ir::ResourceTable::new());
-        let Ok(cache) = self.device.create_resources(Rc::clone(&table)) else {
-            self.lost = true;
-            return;
+        let cache = match self.device.create_resources(Rc::clone(&table)) {
+            Ok(cache) => cache,
+            Err(error) => {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!("[SGFX Vulkan] idle resource cache recreation failed: {error:?}");
+                }
+                self.lost = true;
+                return;
+            }
         };
         self.cache = cache;
         self.table = table;

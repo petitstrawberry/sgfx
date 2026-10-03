@@ -44,13 +44,14 @@ impl Device {
 
     pub(crate) fn create_context(&self) -> HandleResult<Context> {
         match self {
-            Self::Virgl(device) => Ok(Context::Virgl(device.create_context()?)),
+            Self::Virgl(device) => Ok(Context::Virgl(Rc::new(device.create_context()?))),
         }
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum Context {
-    Virgl(virgl::Context),
+    Virgl(Rc<virgl::Context>),
 }
 
 impl Context {
@@ -663,7 +664,9 @@ pub(crate) fn draw_count_valid(draw: &IrDraw) -> bool {
         .as_ref()
         .map(|draw| draw.pipeline.topology)
     {
-        Some(crate::ir::PrimitiveTopology::TriangleStrip) => draw.vertex_count >= 3,
+        Some(
+            crate::ir::PrimitiveTopology::TriangleStrip | crate::ir::PrimitiveTopology::TriangleFan,
+        ) => draw.vertex_count >= 3,
         _ => draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(3),
     }
 }
@@ -797,6 +800,7 @@ pub(crate) enum IrTextureFormat {
     Bgra8,
     Rgba8,
     R8,
+    Rg8,
     Depth32Float,
 }
 
@@ -811,6 +815,7 @@ pub(crate) struct IrTextureCopy {
     pub(crate) destination_mip: u32,
     /// None requests an exact copy; Some requests a filtered GPU blit.
     pub(crate) filter: Option<IrFilterMode>,
+    pub(crate) flips: [bool; 2],
 }
 
 /// Complete backend-neutral render submission for one mapped presentation target.
@@ -839,9 +844,19 @@ pub(crate) enum IrResources {
 }
 
 impl IrResources {
-    pub(crate) fn release_buffer(&mut self, slot: usize) {
-        match self {
-            Self::Virgl(resources) => resources.release_buffer(slot),
+    pub(crate) fn release_texture(&mut self, context: &Context, slot: usize) -> HandleResult<()> {
+        match (self, context) {
+            (Self::Virgl(resources), Context::Virgl(context)) => {
+                resources.release_texture(context, slot)
+            }
+        }
+    }
+
+    pub(crate) fn release_buffer(&mut self, context: &Context, slot: usize) -> HandleResult<()> {
+        match (self, context) {
+            (Self::Virgl(resources), Context::Virgl(context)) => {
+                resources.release_buffer(context, slot)
+            }
         }
     }
 

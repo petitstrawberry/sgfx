@@ -188,6 +188,25 @@ pub enum OwnedCommand {
         /// Texel filter.
         filter: FilterMode,
     },
+    /// Scale bounded color rectangles on the GPU.
+    BlitTextureRegion {
+        /// Source allocation.
+        source: TextureId,
+        /// Source mip level.
+        source_mip: u32,
+        /// Source rectangle.
+        source_rect: PixelRect,
+        /// Destination allocation.
+        destination: TextureId,
+        /// Destination mip level.
+        destination_mip: u32,
+        /// Destination rectangle.
+        destination_rect: PixelRect,
+        /// Texel filter.
+        filter: FilterMode,
+        /// Reverse source axes within the bounded source rectangle.
+        flips: [bool; 2],
+    },
     /// Upload owned bytes into a logical buffer.
     WriteBuffer {
         /// Destination buffer.
@@ -448,6 +467,25 @@ impl OwnedCommandBuffer {
                     resources.texture_ref(*destination)?,
                     *destination_mip,
                     *filter,
+                )?,
+                OwnedCommand::BlitTextureRegion {
+                    source,
+                    source_mip,
+                    source_rect,
+                    destination,
+                    destination_mip,
+                    destination_rect,
+                    filter,
+                    flips,
+                } => encoder.blit_texture_region_flipped(
+                    resources.texture_ref(*source)?,
+                    *source_mip,
+                    *source_rect,
+                    resources.texture_ref(*destination)?,
+                    *destination_mip,
+                    *destination_rect,
+                    *filter,
+                    *flips,
                 )?,
                 OwnedCommand::WriteBuffer {
                     buffer,
@@ -1085,12 +1123,7 @@ mod tests {
             AddressMode::Repeat,
             AddressMode::ClampToEdge,
         );
-        for (min, max) in [
-            (-1.0, 1.0),
-            (2.0, 1.0),
-            (f32::NAN, 1.0),
-            (0.0, f32::INFINITY),
-        ] {
+        for (min, max) in [(2.0, 1.0), (f32::NAN, 1.0), (0.0, f32::INFINITY)] {
             assert!(
                 sampler
                     .with_mip_filter(FilterMode::Linear, min, max)
@@ -1103,6 +1136,10 @@ mod tests {
                 .unwrap(),
             sampler
         );
+        let negative = sampler
+            .with_mip_filter(FilterMode::Nearest, -1000.0, 1000.0)
+            .unwrap();
+        assert_eq!((negative.min_lod(), negative.max_lod()), (-1000.0, 1000.0));
         let sampler = sampler
             .with_mip_filter(FilterMode::Linear, 1.25, 9.5)
             .unwrap();
@@ -1132,6 +1169,7 @@ mod tests {
         for (topology, accepted) in [
             (PrimitiveTopology::TriangleList, false),
             (PrimitiveTopology::TriangleStrip, true),
+            (PrimitiveTopology::TriangleFan, true),
         ] {
             let pipeline = table
                 .define_programmable_render_pipeline(

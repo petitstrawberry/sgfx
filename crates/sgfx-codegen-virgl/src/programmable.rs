@@ -37,8 +37,11 @@ pub struct UniformBufferBinding {
     pub binding: u32,
     /// First vec4 register in the stage's flattened inline constant bank.
     pub first_register: u32,
-    /// Required byte span, including the source language's padding.
+    /// Declared byte span used to allocate the stage's constant registers.
     pub size: u32,
+    /// Minimum descriptor byte span covering every scalar lane the shader reads.
+    /// Unread trailing declaration elements and padding do not contribute.
+    pub required_size: u32,
 }
 
 /// A read-only storage buffer lowered to an integer buffer texture. The inline
@@ -90,11 +93,11 @@ pub struct TextureSamplerBinding {
 
 fn texture_target(binding: &TextureSamplerBinding) -> &'static str {
     match (binding.dimension, binding.comparison) {
-        (TextureViewDimension::D2, false) => "2D",
-        (TextureViewDimension::D2Array, false) => "2D_ARRAY",
+        (TextureViewDimension::D1 | TextureViewDimension::D2, false) => "2D",
+        (TextureViewDimension::D1Array | TextureViewDimension::D2Array, false) => "2D_ARRAY",
         (TextureViewDimension::Cube, false) => "CUBE",
-        (TextureViewDimension::D2, true) => "SHADOW2D",
-        (TextureViewDimension::D2Array, true) => "SHADOW2D_ARRAY",
+        (TextureViewDimension::D1 | TextureViewDimension::D2, true) => "SHADOW2D",
+        (TextureViewDimension::D1Array | TextureViewDimension::D2Array, true) => "SHADOW2D_ARRAY",
         (TextureViewDimension::Cube, true) => "SHADOWCUBE",
     }
 }
@@ -229,6 +232,9 @@ fn uses_instance_index(
 struct Lane {
     register: String,
     component: usize,
+    /// Absolute byte address in the constant bank, retained only for source
+    /// uniform/push-constant lanes. Temporaries have no constant origin.
+    constant_byte: Option<u32>,
 }
 impl Lane {
     fn src(&self) -> String {
@@ -468,6 +474,7 @@ impl<'a> Compiler<'a> {
                 Lane {
                     register: format!("TEMP[{}]", n / 4),
                     component: n % 4,
+                    constant_byte: None,
                 }
             })
             .collect();
@@ -515,6 +522,7 @@ impl<'a> Compiler<'a> {
             lanes: vec![Lane {
                 register: format!("IMM[{index}]"),
                 component: 0,
+                constant_byte: None,
             }],
             writable: false,
             indirect: None,
@@ -553,6 +561,15 @@ impl<'a> Compiler<'a> {
         }
         let result = self.allocate(value.shape.clone(), false)?;
         for (dst, src) in result.lanes.iter().zip(&value.lanes) {
+            if let Some(address) = src.constant_byte {
+                for binding in &mut self.uniforms {
+                    let start = binding.first_register * 16;
+                    if let Some(offset) = address.checked_sub(start).filter(|&n| n < binding.size) {
+                        binding.required_size = binding.required_size.max(offset + 4);
+                        break;
+                    }
+                }
+            }
             self.instruction("MOV", dst, &[src])?;
         }
         Ok(result)
@@ -615,6 +632,7 @@ impl<'a> Compiler<'a> {
                     lanes.push(Lane {
                         register: format!("CONST[{}]", address / 16),
                         component: (address % 16 / 4) as usize,
+                        constant_byte: Some(address),
                     });
                 }
             }
@@ -626,6 +644,7 @@ impl<'a> Compiler<'a> {
                         lanes.push(Lane {
                             register: format!("CONST[{}]", address / 16),
                             component: (address % 16 / 4) as usize,
+                            constant_byte: Some(address),
                         });
                     }
                 }
@@ -759,6 +778,30 @@ impl<'a> Compiler<'a> {
                     .push("DCL IN[16], POSITION, LINEAR".into());
                 "IN[16]".into()
             }
+            Binding::BuiltIn(BuiltIn::PointSize) if !input && self.stage == ShaderStage::Vertex => {
+                // Location outputs occupy OUT[1..16]; do not alias a varying.
+                // This preserves an explicit SPIR-V point-size output even for
+                // triangle pipelines, where the rasterizer does not consume it.
+                self.declarations.push("DCL OUT[17], PSIZE".into());
+                "OUT[17]".into()
+            }
+            Binding::BuiltIn(BuiltIn::FrontFacing)
+                if input && self.stage == ShaderStage::Fragment =>
+            {
+                // TGSI FACE is +1.0/-1.0, whereas Naga bool values use an
+                // all-bits-set/zero mask. Testing the float's sign also keeps
+                // back-facing -1.0 from being mistaken for a true bit pattern.
+                self.declarations.push("DCL IN[17], FACE, CONSTANT".into());
+                let face = Lane {
+                    register: "IN[17]".into(),
+                    component: 0,
+                    constant_byte: None,
+                };
+                let zero = self.immediate(Literal::F32(0.0))?;
+                let value = self.allocate(Shape::Scalar(K::Bool), false)?;
+                self.instruction("FSLT", &value.lanes[0], &[&zero.lanes[0], &face])?;
+                return Ok(value);
+            }
             Binding::BuiltIn(BuiltIn::VertexIndex)
                 if input && self.stage == ShaderStage::Vertex =>
             {
@@ -778,22 +821,31 @@ impl<'a> Compiler<'a> {
                 let instance = Lane {
                     register: "SV[1]".into(),
                     component: 0,
+                    constant_byte: None,
                 };
                 let base = Lane {
                     register: format!("CONST[{register}]"),
                     component: 0,
+                    constant_byte: None,
                 };
                 let adjusted = self.allocate(shape, false)?;
                 self.instruction("UADD", &adjusted.lanes[0], &[&instance, &base])?;
                 return Ok(adjusted);
             }
-            _ => return Err(unsupported("stage builtin")),
+            _ => {
+                return Err(unsupported(&format!(
+                    "stage builtin {binding:?} in {:?} {}",
+                    self.stage,
+                    if input { "input" } else { "output" }
+                )));
+            }
         };
         Ok(Value {
             lanes: (0..shape.len())
                 .map(|component| Lane {
                     register: register.clone(),
                     component,
+                    constant_byte: None,
                 })
                 .collect(),
             shape,
@@ -844,6 +896,8 @@ impl<'a> Compiler<'a> {
                             class,
                         } => {
                             let dimension = match (dim, arrayed) {
+                                (naga::ImageDimension::D1, false) => TextureViewDimension::D1,
+                                (naga::ImageDimension::D1, true) => TextureViewDimension::D1Array,
                                 (naga::ImageDimension::D2, false) => TextureViewDimension::D2,
                                 (naga::ImageDimension::D2, true) => TextureViewDimension::D2Array,
                                 (naga::ImageDimension::Cube, false) => TextureViewDimension::Cube,
@@ -927,6 +981,7 @@ impl<'a> Compiler<'a> {
                 binding,
                 first_register,
                 size,
+                required_size: 0,
             });
             self.globals[handle.index()] = Some(self.uniform_value(ty, first_register * 16)?);
         }
@@ -1047,10 +1102,12 @@ impl<'a> Compiler<'a> {
             let z = Lane {
                 register: "OUT[0]".into(),
                 component: 2,
+                constant_byte: None,
             };
             let w = Lane {
                 register: "OUT[0]".into(),
                 component: 3,
+                constant_byte: None,
             };
             let two = self.immediate(Literal::F32(2.0))?;
             let temp = self.allocate(Shape::Scalar(K::Float), false)?;
@@ -1321,12 +1378,13 @@ impl<'a> Compiler<'a> {
                     ));
                 }
             }
-            if index + 1 != block.len() && statement_may_return(statement) {
-                if let Some(flag) = &frame.return_flag {
-                    self.instructions.push(format!("UIF {}", flag.src()));
-                    self.instructions.push("ELSE".into());
-                    return_guards += 1;
-                }
+            if index + 1 != block.len()
+                && statement_may_return(statement)
+                && let Some(flag) = &frame.return_flag
+            {
+                self.instructions.push(format!("UIF {}", flag.src()));
+                self.instructions.push("ELSE".into());
+                return_guards += 1;
             }
         }
         for _ in 0..return_guards {
@@ -1610,13 +1668,26 @@ impl<'a> Compiler<'a> {
                 let target = texture_target(&pair);
                 let slot = self.texture_slot(pair)?;
                 let coordinate = self.expression(frame, coordinate)?;
-                let components = if *dimension == TextureViewDimension::Cube {
-                    3
-                } else {
-                    2
+                let one_dimensional = matches!(
+                    dimension,
+                    TextureViewDimension::D1 | TextureViewDimension::D1Array
+                );
+                let components = match dimension {
+                    TextureViewDimension::D1 | TextureViewDimension::D1Array => 1,
+                    TextureViewDimension::Cube => 3,
+                    _ => 2,
                 };
-                if !matches!(coordinate.shape,Shape::Vector(K::Float,n) if n==components)
-                    || array_index.is_some() != (*dimension == TextureViewDimension::D2Array)
+                let valid_coordinate = match coordinate.shape {
+                    Shape::Scalar(K::Float) => components == 1,
+                    Shape::Vector(K::Float, n) => n == components,
+                    _ => false,
+                };
+                if !valid_coordinate
+                    || array_index.is_some()
+                        != matches!(
+                            dimension,
+                            TextureViewDimension::D1Array | TextureViewDimension::D2Array
+                        )
                 {
                     return Err(unsupported("sampling coordinates"));
                 }
@@ -1629,6 +1700,12 @@ impl<'a> Compiler<'a> {
                         &coords.lanes[i],
                         &[coordinate.lanes.get(i).unwrap_or(&zero.lanes[0])],
                     )?;
+                }
+                if one_dimensional {
+                    // Logical 1D images have height-one native 2D storage. The
+                    // center of that row avoids filtering against its border.
+                    let half = self.immediate(Literal::F32(0.5))?;
+                    self.instruction("MOV", &coords.lanes[1], &[&half.lanes[0]])?;
                 }
                 if let Some(layer) = array_index {
                     let layer = self.expression(frame, layer)?;
@@ -1644,7 +1721,10 @@ impl<'a> Compiler<'a> {
                 }
                 if let Some(reference) = depth_ref {
                     let reference = self.expression(frame, reference)?;
-                    let component = if *dimension == TextureViewDimension::D2 {
+                    let component = if matches!(
+                        dimension,
+                        TextureViewDimension::D1 | TextureViewDimension::D2
+                    ) {
                         2
                     } else {
                         3
@@ -1683,7 +1763,11 @@ impl<'a> Compiler<'a> {
                     return Err(unsupported("texel load handle"));
                 };
                 if dimension == TextureViewDimension::Cube
-                    || array_index.is_some() != (dimension == TextureViewDimension::D2Array)
+                    || array_index.is_some()
+                        != matches!(
+                            dimension,
+                            TextureViewDimension::D1Array | TextureViewDimension::D2Array
+                        )
                 {
                     return Err(unsupported("texel load dimension"));
                 }
@@ -1701,7 +1785,16 @@ impl<'a> Compiler<'a> {
                 let target = texture_target(&pair);
                 let slot = self.texture_slot(pair)?;
                 let coordinate = self.expression(frame, coordinate)?;
-                if !matches!(coordinate.shape, Shape::Vector(K::Sint | K::Uint, 2)) {
+                let one_dimensional = matches!(
+                    dimension,
+                    TextureViewDimension::D1 | TextureViewDimension::D1Array
+                );
+                let valid_coordinate = if one_dimensional {
+                    matches!(coordinate.shape, Shape::Scalar(K::Sint | K::Uint))
+                } else {
+                    matches!(coordinate.shape, Shape::Vector(K::Sint | K::Uint, 2))
+                };
+                if !valid_coordinate {
                     return Err(unsupported("texel load coordinates"));
                 }
                 self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
@@ -1740,6 +1833,7 @@ impl<'a> Compiler<'a> {
                         lanes: vec![Lane {
                             register: format!("CONST[{}]", metadata.first_register),
                             component: 0,
+                            constant_byte: None,
                         }],
                         writable: false,
                         indirect: None,
@@ -1959,10 +2053,12 @@ impl<'a> Compiler<'a> {
         let base = Lane {
             register: format!("CONST[{metadata}]"),
             component: 0,
+            constant_byte: None,
         };
         let length = Lane {
             register: format!("CONST[{metadata}]"),
             component: 1,
+            constant_byte: None,
         };
         let shift = self.immediate(Literal::U32(2))?;
         let zero = self.immediate(Literal::U32(0))?;
@@ -2049,6 +2145,7 @@ impl<'a> Compiler<'a> {
         let flag = Lane {
             register: format!("CONST[{}]", base + slot / 4),
             component: (slot % 4) as usize,
+            constant_byte: None,
         };
         self.instructions.push(format!("UIF {}", flag.src()));
         let threshold = self.immediate(Literal::F32(0.04045))?;

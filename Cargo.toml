@@ -15,3 +15,7 @@ default-members = [
     "crates/sgfx-backend-wgpu",
     "crates/vulkan-sgfx",
 ]
+
+# Coordinated local IR development: external backends must share this type source.
+[patch."https://github.com/petitstrawberry/sgfx"]
+sgfx-core = { path = "crates/sgfx-core" }
