@@ -224,9 +224,10 @@ vulkan-cube (current Scarlet executable test path)
   → VirtIO-GPU / VirGL → host renderer
 ```
 
-The Scarlet toolchain currently drops `cdylib` output, so its checked path is a
-linked executable rather than loader-discovered `.so` integration. This
-packaging difference is below the Vulkan calls exercised by the test program.
+The native Scarlet toolchain supports `cdylib` output. The checked Vulkan path
+still links the frontend into the application; native ICD discovery and
+installation remain separate work. Its SGFX facade loads VirGL through the
+native backend plugin described in [dynamic backends](dynamic-backends.md).
 
 ## Run the examples
 
@@ -307,8 +308,8 @@ and verify the chosen Mesa driver. The Linux check also used
 - **Scarlet VirGL is executable through the linked test path.** The
   `aarch64-unknown-scarlet` cube uses the same Vulkan frontend, SGFX facade,
   SPIR-V-to-TGSI lowering, `/dev/gpu0`, VirGL submit/completion, GPU readback,
-  and `DisplaySurface`. The Scarlet toolchain currently drops the requested
-  `cdylib`, so this cube result uses a linked frontend. The separate Linux/musl
+  and `DisplaySurface`. The recorded cube result uses a linked frontend;
+  native ICD discovery is not established by that result. The separate Linux/musl
   `scarlet-wsi` build is an actual `.so` ICD loaded by the ordinary Khronos
   loader on Scarlet's Linux ABI, with 60 KHR_display presentations verified.
   The glibc Linux build also passes GPU clear/readback through the standard

@@ -145,6 +145,10 @@ TLS namespace fix and executable-only CRT split, a sibling Scarlet checkout cont
 loader-smoke/ELF-audit tools, and QEMU with VirGL support. All Rust runtimes in
 the interpreter, application and plugin must agree on the thread/TLS layout.
 The build script refuses the old per-DSO colliding TLS-key implementation.
+The compiler also needs the GNU ELF OSABI fix (`petitstrawberry/rust`
+commit `71dd0425890` or newer): retained AArch64 constructors can make LLD
+emit OSABI 3, which the native compiler must accept before marking its output
+as Scarlet OSABI 83. The build script checks that output without rewriting it.
 
 ```sh
 python3 scripts/build-dynamic-backends.py --arch aarch64 \
