@@ -619,7 +619,10 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .checked_add(instances)
             .ok_or(Error::Overflow)?;
         let desc = self.validate_programmable_count(count)?;
-        first.checked_add(count).ok_or(Error::Overflow)?;
+        let last_vertex = first
+            .checked_add(count)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or(Error::Overflow)?;
         for (slot, layout) in desc.vertex_buffers().iter().enumerate() {
             let (buffer, offset) = self.vertex_buffers[slot].ok_or(Error::VertexBufferNotSet)?;
             let buffer_desc = self.encoder.resources.buffer(buffer)?;
@@ -628,8 +631,21 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             if !offset.is_multiple_of(4) {
                 return Err(Error::InvalidValue);
             }
-            let bytes = (u64::from(first) + u64::from(count))
+            // The last vertex only reads its declared attributes, not the
+            // padding up to the next stride. This matters when two bindings
+            // select interleaved attributes from one allocation at offsets
+            // such as 0 and 8 with a 16-byte stride.
+            let attribute_end = layout
+                .attributes()
+                .iter()
+                .map(|attribute| {
+                    u64::from(attribute.offset()) + u64::from(attribute.format().byte_size())
+                })
+                .max()
+                .unwrap_or(0);
+            let bytes = u64::from(last_vertex)
                 .checked_mul(u64::from(layout.stride()))
+                .and_then(|start| start.checked_add(attribute_end))
                 .ok_or(Error::Overflow)?;
             CommandEncoder::validate_byte_range(offset, bytes, buffer_desc.size())?;
         }
@@ -678,11 +694,17 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             if !offset.is_multiple_of(4) {
                 return Err(Error::InvalidValue);
             }
-            CommandEncoder::validate_byte_range(
-                offset,
-                u64::from(layout.stride()),
-                buffer_desc.size(),
-            )?;
+            // Indices are opaque here; the backend checks the largest fetched
+            // vertex. Require only the first vertex's actual attribute bytes.
+            let attribute_end = layout
+                .attributes()
+                .iter()
+                .map(|attribute| {
+                    u64::from(attribute.offset()) + u64::from(attribute.format().byte_size())
+                })
+                .max()
+                .unwrap_or(0);
+            CommandEncoder::validate_byte_range(offset, attribute_end, buffer_desc.size())?;
         }
         let (buffer, offset, format) = self.index_buffer.ok_or(Error::IndexBufferNotSet)?;
         let buffer_desc = self.encoder.resources.buffer(buffer)?;

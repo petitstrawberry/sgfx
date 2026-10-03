@@ -37,6 +37,7 @@ framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a
 sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-scarlet-virgl"] }
 
 [dev-dependencies]
+sgfx-codegen-virgl = { path = "../sgfx-codegen-virgl", features = ["programmable"] }
 png = "0.18"
 naga = { version = "24", features = ["wgsl-in", "spv-out"] }
 

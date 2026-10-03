@@ -3,7 +3,7 @@
 /// Result type returned by graphics IR operations.
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// Finite positive viewport and normalized depth range.
+/// Finite viewport with positive width, signed height and normalized depth range.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
     x: f32,
@@ -30,7 +30,7 @@ impl Viewport {
             || x < 0.0
             || y < 0.0
             || width <= 0.0
-            || height <= 0.0
+            || !((y + height).is_finite())
             || !(0.0..=1.0).contains(&min_depth)
             || !(0.0..=1.0).contains(&max_depth)
         {
@@ -55,6 +55,13 @@ impl Viewport {
             self.min_depth,
             self.max_depth,
         ]
+    }
+
+    /// Check both endpoints, including the inverted or zero-height Y interval.
+    pub fn is_within(self, extent: Extent2D) -> bool {
+        self.x + self.width <= extent.width() as f32
+            && self.y.min(self.y + self.height) >= 0.0
+            && self.y.max(self.y + self.height) <= extent.height() as f32
     }
 }
 

@@ -14,8 +14,8 @@ mod input_attachments;
 mod instance;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod linux_wsi;
-mod push_constants;
 mod properties2;
+mod push_constants;
 mod render_pass;
 mod resources;
 mod runtime;
@@ -24,7 +24,9 @@ pub mod scarlet_image;
 mod shader_functions;
 mod specialization;
 mod spirv;
+mod stage_inputs;
 mod transfer;
+mod uniform_arrays;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
 mod wsi;
 

@@ -6,7 +6,7 @@ const UNSUPPORTED: vk::Result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
 #[derive(Clone)]
 pub(super) struct ActiveRenderPass {
     pub pass: crate::render_pass::RenderPass,
-    pub framebuffer: vk::Framebuffer,
+    pub views: Vec<vk::ImageView>,
     pub subpass: usize,
     clears: Vec<vk::ClearValue>,
     images: Vec<(vk::Image, ir::TextureId)>,
@@ -22,6 +22,7 @@ pub(super) fn begin(
     framebuffer: vk::Framebuffer,
     area: vk::Rect2D,
     clears: &[vk::ClearValue],
+    attachments: Option<&[vk::ImageView]>,
 ) -> VkResult<()> {
     let pass = rt
         .resources
@@ -37,8 +38,38 @@ pub(super) fn begin(
     {
         return Err(UNSUPPORTED);
     }
-    let images = fb
-        .attachments
+    let views = if let Some(descriptions) = &fb.imageless {
+        let views = attachments.ok_or(INVALID)?;
+        if views.len() != descriptions.len() {
+            return Err(INVALID);
+        }
+        for ((view, d), a) in views.iter().zip(descriptions).zip(&pass.attachments) {
+            let view = rt.resources.views.get(view).ok_or(INVALID)?;
+            let image = rt.resources.images.get(&view.image).ok_or(INVALID)?;
+            if image.flags != d.flags
+                || !image.usage.contains(d.usage)
+                || image.extent.width < d.width
+                || image.extent.height < d.height
+                || image.array_layers != d.layers
+                || image.format != a.format
+                || !d.formats.contains(&image.format)
+                || view.components != [0, 1, 2, 3]
+                || view.desc.base_mip_level() != 0
+                || view.desc.mip_level_count() != 1
+                || view.desc.base_array_layer() != 0
+                || view.desc.array_layer_count() != 1
+            {
+                return Err(UNSUPPORTED);
+            }
+        }
+        views
+    } else {
+        if attachments.is_some_and(|a| !a.is_empty()) {
+            return Err(INVALID);
+        }
+        &fb.attachments
+    };
+    let images = views
         .iter()
         .map(|view| {
             let view = rt.resources.views.get(view).ok_or(INVALID)?;
@@ -56,7 +87,7 @@ pub(super) fn begin(
     rec.render = Some((fb.width, fb.height));
     let mut active = ActiveRenderPass {
         pass: pass.clone(),
-        framebuffer,
+        views: views.to_vec(),
         subpass: 0,
         clears: clears.to_vec(),
         images,
@@ -239,11 +270,10 @@ pub(super) fn validate_bindings(
     }
     let inputs = resources.graphics_inputs.get(&pipeline).ok_or(INVALID)?;
     for input in inputs {
-        if layout
-            .bind_groups()
-            .get(input.group as usize)
-            .is_none_or(|g| !g.entries().iter().any(|e| e.binding() == input.binding * 2))
-        {
+        let Some(group) = layout.bind_groups().get(input.group as usize) else {
+            continue;
+        };
+        if group.entries().is_empty() {
             continue;
         }
         let set = rec
@@ -251,6 +281,14 @@ pub(super) fn validate_bindings(
             .get(&input.group)
             .and_then(|set| resources.descriptor_sets.get(set))
             .ok_or(INVALID)?;
+        let binding = set.source_to_ir(input.binding).ok_or(INVALID)?;
+        if !group
+            .entries()
+            .iter()
+            .any(|entry| entry.binding() == binding)
+        {
+            continue;
+        }
         if set.types.get(&input.binding) != Some(&vk::DescriptorType::INPUT_ATTACHMENT) {
             return Err(INVALID);
         }
@@ -265,12 +303,8 @@ pub(super) fn validate_bindings(
             .copied()
             .flatten()
             .ok_or(INVALID)?;
-        let fb = resources
-            .framebuffers
-            .get(&active.framebuffer)
-            .ok_or(INVALID)?;
         let bound = resources.views.get(view).ok_or(INVALID)?;
-        let attached = resources.views.get(&fb.attachments[index]).ok_or(INVALID)?;
+        let attached = resources.views.get(&active.views[index]).ok_or(INVALID)?;
         if bound.image != attached.image
             || bound.desc != attached.desc
             || bound.components != [0, 1, 2, 3]

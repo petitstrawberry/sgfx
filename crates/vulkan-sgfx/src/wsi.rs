@@ -214,6 +214,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_capabilities(
             current_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
             supported_composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
             supported_usage_flags: vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST,
         };
@@ -310,6 +311,12 @@ pub(crate) struct Swapchain {
 
 fn swapchain_usage(usage: vk::ImageUsageFlags) -> ir::TextureUsage {
     let mut result = ir::TextureUsage::RENDER_ATTACHMENT | ir::TextureUsage::PRESENT;
+    // Presentation images already carry a sampled backend allocation and a
+    // mapped sampler view. Preserve this usage in the logical IR descriptor
+    // so Kopper can sample or read back a previous swapchain image.
+    if usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        result |= ir::TextureUsage::SAMPLED;
+    }
     if usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
         result |= ir::TextureUsage::COPY_SRC;
     }
@@ -319,12 +326,29 @@ fn swapchain_usage(usage: vk::ImageUsageFlags) -> ir::TextureUsage {
     result
 }
 
-fn remove_swapchain_images(runtime: &mut crate::runtime::Runtime, images: &[vk::Image]) {
+fn remove_swapchain_images(
+    runtime: &mut crate::runtime::Runtime,
+    images: &[vk::Image],
+) -> Result<(), vk::Result> {
+    runtime.in_flight.wait();
     for image in images {
-        if let Some(data) = runtime.resources.images.remove(image) {
-            runtime.cache.unmap_presentation_image(data.id);
+        if let Some(id) = runtime.resources.images.get(image).map(|data| data.id) {
+            // Unmap borrowed presentation storage before retiring the slot.
+            // The swapchain retains physical ownership until cleanup completes.
+            runtime.cache.unmap_presentation_image(id);
+            runtime
+                .cache
+                .release_texture(id)
+                .map_err(crate::runtime::backend_failure)?;
+            runtime
+                .table
+                .release_texture(id)
+                .map_err(crate::resources::failure)?;
+            runtime.resources.images.remove(image);
+            runtime.resources.image_view_formats.remove(image);
         }
     }
+    Ok(())
 }
 
 pub(crate) unsafe extern "system" fn create_swapchain(
@@ -341,6 +365,22 @@ pub(crate) unsafe extern "system" fn create_swapchain(
         return INVALID;
     }
     let info = unsafe { &*info };
+    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        eprintln!(
+            "[SGFX Vulkan] swapchain create: format={:?} extent={:?} count={} usage={:?} flags={:?} pnext={:?} present={:?} transform={:?} alpha={:?} families={} family_ptr={:?}",
+            info.image_format,
+            info.image_extent,
+            info.min_image_count,
+            info.image_usage,
+            info.flags,
+            info.p_next,
+            info.present_mode,
+            info.pre_transform,
+            info.composite_alpha,
+            info.queue_family_index_count,
+            info.p_queue_family_indices
+        );
+    }
     let Some(surface) = surfaces().get(&info.surface).cloned() else {
         return vk::Result::ERROR_SURFACE_LOST_KHR;
     };
@@ -430,7 +470,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             {
                 Ok(reference) => reference.id(),
                 Err(error) => {
-                    remove_swapchain_images(runtime, &images);
+                    remove_swapchain_images(runtime, &images)?;
                     return Err(error);
                 }
             };
@@ -441,12 +481,20 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             ) {
                 Ok(image) => image,
                 Err(error) => {
-                    remove_swapchain_images(runtime, &images);
+                    runtime
+                        .table
+                        .release_texture(id)
+                        .map_err(crate::resources::failure)?;
+                    remove_swapchain_images(runtime, &images)?;
                     return Err(crate::runtime::backend_failure(error));
                 }
             };
             if let Err(error) = runtime.cache.map_presentation_image(id, &physical) {
-                remove_swapchain_images(runtime, &images);
+                runtime
+                    .table
+                    .release_texture(id)
+                    .map_err(crate::resources::failure)?;
+                remove_swapchain_images(runtime, &images)?;
                 return Err(crate::runtime::backend_failure(error));
             }
             let image = vk::Image::from_raw(next_id());
@@ -473,7 +521,7 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             images.push(image);
             #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
             if let Err(error) = window.register(&physical) {
-                remove_swapchain_images(runtime, &images);
+                remove_swapchain_images(runtime, &images)?;
                 return Err(error);
             }
             physical_images.push(physical);
@@ -511,8 +559,14 @@ pub(crate) unsafe extern "system" fn destroy_swapchain(
         return;
     }
     let _ = with_device(device, move |runtime| {
-        if let Some(swapchain) = runtime.resources.swapchains.remove(&swapchain) {
-            remove_swapchain_images(runtime, &swapchain.images);
+        if let Some(images) = runtime
+            .resources
+            .swapchains
+            .get(&swapchain)
+            .map(|data| data.images.clone())
+        {
+            remove_swapchain_images(runtime, &images)?;
+            runtime.resources.swapchains.remove(&swapchain);
         }
         Ok(())
     });

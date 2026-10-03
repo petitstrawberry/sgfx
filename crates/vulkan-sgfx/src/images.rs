@@ -64,11 +64,23 @@ pub(crate) struct ImageView {
 
 pub(crate) use crate::render_pass::RenderPass;
 
+#[derive(Clone)]
 pub(crate) struct Framebuffer {
+    pub imageless: Option<Vec<AttachmentInfo>>,
     pub attachments: Vec<vk::ImageView>,
     pub render_pass: RenderPass,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct AttachmentInfo {
+    pub flags: vk::ImageCreateFlags,
+    pub usage: vk::ImageUsageFlags,
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+    pub formats: Vec<vk::Format>,
 }
 
 const UNSUPPORTED: vk::Result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
@@ -80,7 +92,8 @@ pub(crate) fn image_usage(format: vk::Format) -> vk::ImageUsageFlags {
         | vk::Format::B8G8R8A8_UNORM
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::B8G8R8A8_SRGB
-        | vk::Format::R8_UNORM => {
+        | vk::Format::R8_UNORM
+        | vk::Format::R8G8_UNORM => {
             (if format == vk::Format::R8G8B8A8_UNORM {
                 vk::ImageUsageFlags::STORAGE
             } else {
@@ -115,13 +128,37 @@ pub(crate) fn valid_image_usage(usage: vk::ImageUsageFlags) -> bool {
 
 pub(crate) fn texture_format(format: vk::Format) -> Option<ir::TextureFormat> {
     match format {
-        vk::Format::R8G8B8A8_UNORM => Some(ir::TextureFormat::Rgba8Unorm),
-        vk::Format::R8G8B8A8_SRGB => Some(ir::TextureFormat::Rgba8UnormSrgb),
+        vk::Format::R8G8B8A8_UNORM | vk::Format::A8B8G8R8_UNORM_PACK32 => {
+            Some(ir::TextureFormat::Rgba8Unorm)
+        }
+        vk::Format::R8G8B8A8_SRGB | vk::Format::A8B8G8R8_SRGB_PACK32 => {
+            Some(ir::TextureFormat::Rgba8UnormSrgb)
+        }
         vk::Format::B8G8R8A8_UNORM => Some(ir::TextureFormat::Bgra8Unorm),
         vk::Format::B8G8R8A8_SRGB => Some(ir::TextureFormat::Bgra8UnormSrgb),
         vk::Format::R8_UNORM => Some(ir::TextureFormat::R8Unorm),
+        vk::Format::R8G8_UNORM => Some(ir::TextureFormat::Rg8Unorm),
         vk::Format::D32_SFLOAT => Some(ir::TextureFormat::Depth32Float),
         _ => None,
+    }
+}
+
+fn compatible_view_format_list_entry(base: vk::Format, view: vk::Format) -> bool {
+    // A format list limits later view creation; listing a compatible format
+    // does not require allocating a view or make its usage features supported.
+    // Zink lists narrow sRGB partners even when it only creates UNORM views.
+    // Keep their actual format properties and view creation unsupported until
+    // the backend implements the sRGB conversion.
+    if matches!(
+        (base, view),
+        (vk::Format::R8_UNORM, vk::Format::R8_SRGB)
+            | (vk::Format::R8G8_UNORM, vk::Format::R8G8_SRGB)
+    ) {
+        return true;
+    }
+    match (texture_format(base), texture_format(view)) {
+        (Some(base), Some(view)) => base.view_compatible(view),
+        _ => false,
     }
 }
 
@@ -143,18 +180,66 @@ unsafe extern "system" fn create_image(
     allocator: *const vk::AllocationCallbacks<'_>,
     output: *mut vk::Image,
 ) -> vk::Result {
+    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() && !info.is_null() {
+        let i = &*info;
+        eprintln!(
+            "[SGFX Vulkan] image create: format={:?} type={:?} extent={:?} mips={} layers={} samples={:?} usage={:?} flags={:?} pnext={:?}",
+            i.format,
+            i.image_type,
+            i.extent,
+            i.mip_levels,
+            i.array_layers,
+            i.samples,
+            i.usage,
+            i.flags,
+            i.p_next
+        );
+    }
     if info.is_null() || output.is_null() {
         return INVALID;
     }
     *output = vk::Image::null();
     let info = &*info;
-    let supported = image_usage(info.format);
+    let view_formats = if info.p_next.is_null() {
+        None
+    } else {
+        let list = &*info.p_next.cast::<vk::ImageFormatListCreateInfo<'_>>();
+        if list.s_type != vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO || !list.p_next.is_null()
+        {
+            return UNSUPPORTED;
+        }
+        let formats = match crate::api::slice(list.p_view_formats, list.view_format_count) {
+            Ok(v) => v.to_vec(),
+            Err(e) => return e,
+        };
+        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            eprintln!(
+                "[SGFX Vulkan] image format list: {formats:?} pnext={:?}",
+                list.p_next
+            );
+        }
+        if formats
+            .iter()
+            .any(|f| !compatible_view_format_list_entry(info.format, *f))
+        {
+            return UNSUPPORTED;
+        }
+        Some(formats)
+    };
+    let supported = extended_image_usage(info.format, info.flags);
     if !allocator.is_null()
-        || !info.p_next.is_null()
-        || !(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::CUBE_COMPATIBLE)
+        || !(vk::ImageCreateFlags::MUTABLE_FORMAT
+            | vk::ImageCreateFlags::CUBE_COMPATIBLE
+            | vk::ImageCreateFlags::EXTENDED_USAGE)
             .contains(info.flags)
         || info.s_type != vk::StructureType::IMAGE_CREATE_INFO
-        || info.image_type != vk::ImageType::TYPE_2D
+        || !matches!(
+            info.image_type,
+            vk::ImageType::TYPE_1D | vk::ImageType::TYPE_2D
+        )
+        || (info.image_type == vk::ImageType::TYPE_1D
+            && (info.extent.height != 1
+                || info.flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)))
         || supported.is_empty()
         || info.tiling != vk::ImageTiling::OPTIMAL
         || info.samples != vk::SampleCountFlags::TYPE_1
@@ -180,6 +265,7 @@ unsafe extern "system" fn create_image(
     {
         return UNSUPPORTED;
     }
+    let dimension_1d = info.image_type == vk::ImageType::TYPE_1D;
     let extent = info.extent;
     let mip_levels = info.mip_levels;
     let array_layers = info.array_layers;
@@ -210,6 +296,9 @@ unsafe extern "system" fn create_image(
         usage |= ir::TextureUsage::COPY_DST;
     }
     match with_device(device, move |runtime| {
+        if dimension_1d && !runtime.native_texture_1d {
+            return Err(UNSUPPORTED);
+        }
         let size = ir::Extent2D::new(extent.width, extent.height).map_err(|_| INVALID)?;
         // Some applications create a sampled image with STORAGE usage even
         // when this device exposes no storage-image shader support. The
@@ -223,7 +312,23 @@ unsafe extern "system" fn create_image(
         {
             return Err(UNSUPPORTED);
         }
-        let ir_format = texture_format(format).ok_or(UNSUPPORTED)?;
+        let allocation_format = if flags
+            .contains(vk::ImageCreateFlags::EXTENDED_USAGE | vk::ImageCreateFlags::MUTABLE_FORMAT)
+            && image_usage.contains(vk::ImageUsageFlags::STORAGE)
+            && format == vk::Format::R8G8B8A8_SRGB
+        {
+            vk::Format::R8G8B8A8_UNORM
+        } else {
+            format
+        };
+        let ir_format = texture_format(allocation_format).ok_or(UNSUPPORTED)?;
+        // Narrow-to-RGBA transfer blits sample a swizzled view to synthesize
+        // the missing color channels and alpha on the GPU.
+        if image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+            && matches!(format, vk::Format::R8_UNORM | vk::Format::R8G8_UNORM)
+        {
+            usage |= ir::TextureUsage::SAMPLED;
+        }
         // Transfer clears execute as GPU attachment clears. Reserve that
         // internal usage without changing the application's Vulkan usage.
         if image_usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
@@ -231,7 +336,10 @@ unsafe extern "system" fn create_image(
             && array_layers == 1
             && matches!(
                 format,
-                vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+                vk::Format::R8G8B8A8_UNORM
+                    | vk::Format::B8G8R8A8_UNORM
+                    | vk::Format::R8_UNORM
+                    | vk::Format::R8G8_UNORM
             )
         {
             usage |= ir::TextureUsage::RENDER_ATTACHMENT;
@@ -273,6 +381,8 @@ unsafe extern "system" fn create_image(
             .with_array_layer_count(array_layers)
             .map_err(|_| UNSUPPORTED)?
             .with_cube_compatible(flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE))
+            .map_err(|_| UNSUPPORTED)?
+            .with_dimension_1d(dimension_1d)
             .map_err(|_| UNSUPPORTED)?;
         let id = runtime
             .table
@@ -280,6 +390,9 @@ unsafe extern "system" fn create_image(
             .map_err(crate::resources::failure)?
             .id();
         let handle = vk::Image::from_raw(next_id());
+        if let Some(formats) = view_formats {
+            runtime.resources.image_view_formats.insert(handle, formats);
+        }
         runtime.resources.images.insert(
             handle,
             Image {
@@ -302,7 +415,14 @@ unsafe extern "system" fn create_image(
             *output = handle;
             vk::Result::SUCCESS
         }
-        Err(error) => error,
+        Err(error) => {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX Vulkan] image creation failed: format={format:?} extent={extent:?} result={error:?}"
+                );
+            }
+            error
+        }
     }
 }
 
@@ -318,11 +438,27 @@ unsafe extern "system" fn destroy_image(
                 .images
                 .get(&image)
                 .is_some_and(|image| image.swapchain.is_none());
-            if removable && let Some(_data) = runtime.resources.images.remove(&image) {
+            if removable {
+                let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
+                let id = data.id;
+                // Do not wait on driver deferred packets here: this closure runs
+                // on the device worker that consumes them. Only submitted GPU
+                // receipts are drained before physical and logical retirement.
+                runtime.in_flight.wait();
                 #[cfg(target_os = "scarlet")]
-                if _data.shared.is_some() {
-                    runtime.cache.unmap_presentation_image(_data.id);
+                if data.shared.is_some() {
+                    runtime.cache.unmap_presentation_image(id);
                 }
+                runtime
+                    .cache
+                    .release_texture(id)
+                    .map_err(crate::runtime::backend_failure)?;
+                runtime
+                    .table
+                    .release_texture(id)
+                    .map_err(crate::resources::failure)?;
+                runtime.resources.image_view_formats.remove(&image);
+                runtime.resources.images.remove(&image);
             }
             Ok(())
         });
@@ -356,7 +492,7 @@ unsafe extern "system" fn bind_image_memory(
     memory: vk::DeviceMemory,
     offset: vk::DeviceSize,
 ) -> vk::Result {
-    status(with_device(device, move |runtime| {
+    let result = status(with_device(device, move |runtime| {
         let size = runtime
             .resources
             .images
@@ -374,7 +510,13 @@ unsafe extern "system" fn bind_image_memory(
         }
         image.bound = Some((memory, offset));
         Ok(())
-    }))
+    }));
+    if result != vk::Result::SUCCESS && std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        eprintln!(
+            "[SGFX Vulkan] image memory binding failed: image={image:?} memory={memory:?} offset={offset} result={result:?}"
+        );
+    }
+    result
 }
 
 unsafe extern "system" fn create_image_view(
@@ -389,13 +531,28 @@ unsafe extern "system" fn create_image_view(
     *output = vk::ImageView::null();
     let info = &*info;
     let range = info.subresource_range;
+    let view_usage = if info.p_next.is_null() {
+        None
+    } else {
+        let usage = &*info.p_next.cast::<vk::ImageViewUsageCreateInfo<'_>>();
+        if usage.s_type != vk::StructureType::IMAGE_VIEW_USAGE_CREATE_INFO
+            || !usage.p_next.is_null()
+            || usage.usage.is_empty()
+        {
+            return UNSUPPORTED;
+        }
+        Some(usage.usage)
+    };
     if !allocator.is_null()
-        || !info.p_next.is_null()
         || !info.flags.is_empty()
         || info.s_type != vk::StructureType::IMAGE_VIEW_CREATE_INFO
         || !matches!(
             info.view_type,
-            vk::ImageViewType::TYPE_2D | vk::ImageViewType::TYPE_2D_ARRAY | vk::ImageViewType::CUBE
+            vk::ImageViewType::TYPE_1D
+                | vk::ImageViewType::TYPE_1D_ARRAY
+                | vk::ImageViewType::TYPE_2D
+                | vk::ImageViewType::TYPE_2D_ARRAY
+                | vk::ImageViewType::CUBE
         )
         || image_usage(info.format).is_empty()
         || range.aspect_mask != image_aspect(info.format)
@@ -432,7 +589,17 @@ unsafe extern "system" fn create_image_view(
     let format = info.format;
     match with_device(device, move |runtime| {
         let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
+        if runtime
+            .resources
+            .image_view_formats
+            .get(&image)
+            .is_some_and(|formats| !formats.is_empty() && !formats.contains(&format))
+        {
+            return Err(INVALID);
+        }
         if !data.usable()
+            || view_usage
+                .is_some_and(|u| !data.usage.contains(u) || !image_usage(format).contains(u))
             || (data.format != format && !data.flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT))
         {
             return Err(INVALID);
@@ -483,6 +650,8 @@ unsafe extern "system" fn create_image_view(
             desc,
             texture_format(format).ok_or(UNSUPPORTED)?,
             match view_type {
+                vk::ImageViewType::TYPE_1D => ir::TextureViewDimension::D1,
+                vk::ImageViewType::TYPE_1D_ARRAY => ir::TextureViewDimension::D1Array,
                 vk::ImageViewType::TYPE_2D_ARRAY => ir::TextureViewDimension::D2Array,
                 vk::ImageViewType::CUBE => ir::TextureViewDimension::Cube,
                 _ => ir::TextureViewDimension::D2,
@@ -525,6 +694,27 @@ unsafe extern "system" fn destroy_image_view(
     }
 }
 
+pub(crate) fn insert_render_pass(
+    runtime: &mut crate::runtime::Runtime,
+    pass: RenderPass,
+) -> Result<vk::RenderPass, vk::Result> {
+    if pass
+        .subpasses
+        .iter()
+        .any(|s| s.colors.len() > runtime.capabilities.limits().max_color_attachments as usize)
+        || (pass
+            .subpasses
+            .iter()
+            .any(|s| !s.inputs.is_empty() || s.read_only_depth)
+            && !runtime.capabilities.supports_typed_texture_views())
+    {
+        return Err(UNSUPPORTED);
+    }
+    let handle = vk::RenderPass::from_raw(next_id());
+    runtime.resources.render_passes.insert(handle, pass);
+    Ok(handle)
+}
+
 unsafe extern "system" fn create_render_pass(
     device: vk::Device,
     info: *const vk::RenderPassCreateInfo<'_>,
@@ -542,23 +732,7 @@ unsafe extern "system" fn create_render_pass(
         Ok(pass) => pass,
         Err(error) => return error,
     };
-    match with_device(device, move |runtime| {
-        if pass
-            .subpasses
-            .iter()
-            .any(|s| s.colors.len() > runtime.capabilities.limits().max_color_attachments as usize)
-            || (pass
-                .subpasses
-                .iter()
-                .any(|s| !s.inputs.is_empty() || s.read_only_depth)
-                && !runtime.capabilities.supports_typed_texture_views())
-        {
-            return Err(UNSUPPORTED);
-        }
-        let handle = vk::RenderPass::from_raw(next_id());
-        runtime.resources.render_passes.insert(handle, pass);
-        Ok(handle)
-    }) {
+    match with_device(device, move |runtime| insert_render_pass(runtime, pass)) {
         Ok(handle) => {
             *output = handle;
             vk::Result::SUCCESS
@@ -591,20 +765,73 @@ unsafe extern "system" fn create_framebuffer(
     }
     *output = vk::Framebuffer::null();
     let info = &*info;
+    let imageless = info.flags == vk::FramebufferCreateFlags::IMAGELESS;
+    let descriptions = if imageless {
+        let Some(a) = info
+            .p_next
+            .cast::<vk::FramebufferAttachmentsCreateInfo<'_>>()
+            .as_ref()
+        else {
+            return INVALID;
+        };
+        if a.s_type != vk::StructureType::FRAMEBUFFER_ATTACHMENTS_CREATE_INFO
+            || !a.p_next.is_null()
+            || a.attachment_image_info_count != info.attachment_count
+        {
+            return UNSUPPORTED;
+        }
+        let infos =
+            match crate::api::slice(a.p_attachment_image_infos, a.attachment_image_info_count) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+        let mut descriptions = Vec::new();
+        for a in infos {
+            if a.s_type != vk::StructureType::FRAMEBUFFER_ATTACHMENT_IMAGE_INFO
+                || !a.p_next.is_null()
+                || a.width < info.width
+                || a.height < info.height
+                || a.layer_count != 1
+                || a.view_format_count == 0
+            {
+                return UNSUPPORTED;
+            }
+            let formats = match crate::api::slice(a.p_view_formats, a.view_format_count) {
+                Ok(v) => v.to_vec(),
+                Err(e) => return e,
+            };
+            descriptions.push(AttachmentInfo {
+                flags: a.flags,
+                usage: a.usage,
+                width: a.width,
+                height: a.height,
+                layers: a.layer_count,
+                formats,
+            });
+        }
+        Some(descriptions)
+    } else {
+        if !info.p_next.is_null() {
+            return UNSUPPORTED;
+        }
+        None
+    };
     if !allocator.is_null()
-        || !info.p_next.is_null()
-        || !info.flags.is_empty()
+        || !(info.flags.is_empty() || imageless)
         || info.s_type != vk::StructureType::FRAMEBUFFER_CREATE_INFO
         || !(1..=8).contains(&info.attachment_count)
-        || info.p_attachments.is_null()
+        || (!imageless && info.p_attachments.is_null())
         || info.layers != 1
         || info.width == 0
         || info.height == 0
     {
         return UNSUPPORTED;
     }
-    let views =
-        std::slice::from_raw_parts(info.p_attachments, info.attachment_count as usize).to_vec();
+    let views = if imageless {
+        vec![]
+    } else {
+        std::slice::from_raw_parts(info.p_attachments, info.attachment_count as usize).to_vec()
+    };
     let render_pass = info.render_pass;
     let (width, height) = (info.width, info.height);
     match with_device(device, move |runtime| {
@@ -613,7 +840,16 @@ unsafe extern "system" fn create_framebuffer(
             .render_passes
             .get(&render_pass)
             .ok_or(INVALID)?;
-        if views.len() != pass.attachments.len() {
+        if let Some(descriptions) = &descriptions {
+            if descriptions.len() != pass.attachments.len()
+                || descriptions
+                    .iter()
+                    .zip(&pass.attachments)
+                    .any(|(d, a)| !d.formats.contains(&a.format))
+            {
+                return Err(INVALID);
+            }
+        } else if views.len() != pass.attachments.len() {
             return Err(INVALID);
         }
         for (index, view) in views.iter().enumerate() {
@@ -624,7 +860,10 @@ unsafe extern "system" fn create_framebuffer(
             }
             if view.components != [0, 1, 2, 3]
                 || image.array_layers != 1
-                || view.desc.dimension() != ir::TextureViewDimension::D2
+                || !matches!(
+                    view.desc.dimension(),
+                    ir::TextureViewDimension::D1 | ir::TextureViewDimension::D2
+                )
                 || view.desc.base_mip_level() != 0
                 || view.desc.mip_level_count() != 1
                 || view.desc.base_array_layer() != 0
@@ -665,6 +904,7 @@ unsafe extern "system" fn create_framebuffer(
         runtime.resources.framebuffers.insert(
             handle,
             Framebuffer {
+                imageless: descriptions,
                 attachments: views,
                 render_pass,
                 width,
@@ -863,11 +1103,12 @@ unsafe fn graphics_state(
     }
     let mut dynamic_viewport = false;
     let mut dynamic_scissor = false;
+    let mut dynamic_depth_bias = false;
     if let Some(dynamic) = info.p_dynamic_state.as_ref() {
         if dynamic.s_type != vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO
             || !dynamic.p_next.is_null()
             || !dynamic.flags.is_empty()
-            || dynamic.dynamic_state_count > 2
+            || dynamic.dynamic_state_count > 8
             || (dynamic.dynamic_state_count > 0 && dynamic.p_dynamic_states.is_null())
         {
             return Err(UNSUPPORTED);
@@ -876,6 +1117,12 @@ unsafe fn graphics_state(
             match *dynamic.p_dynamic_states.add(i) {
                 vk::DynamicState::VIEWPORT if !dynamic_viewport => dynamic_viewport = true,
                 vk::DynamicState::SCISSOR if !dynamic_scissor => dynamic_scissor = true,
+                vk::DynamicState::DEPTH_BIAS => dynamic_depth_bias = true,
+                vk::DynamicState::LINE_WIDTH
+                | vk::DynamicState::BLEND_CONSTANTS
+                | vk::DynamicState::STENCIL_REFERENCE
+                | vk::DynamicState::STENCIL_COMPARE_MASK
+                | vk::DynamicState::STENCIL_WRITE_MASK => (),
                 _ => return Err(UNSUPPORTED),
             }
         }
@@ -898,7 +1145,9 @@ unsafe fn graphics_state(
         || !assembly.flags.is_empty()
         || !matches!(
             assembly.topology,
-            vk::PrimitiveTopology::TRIANGLE_LIST | vk::PrimitiveTopology::TRIANGLE_STRIP
+            vk::PrimitiveTopology::TRIANGLE_LIST
+                | vk::PrimitiveTopology::TRIANGLE_STRIP
+                | vk::PrimitiveTopology::TRIANGLE_FAN
         )
         || assembly.primitive_restart_enable != vk::FALSE
         || !viewport.p_next.is_null()
@@ -916,7 +1165,11 @@ unsafe fn graphics_state(
             raster.cull_mode,
             vk::CullModeFlags::NONE | vk::CullModeFlags::FRONT | vk::CullModeFlags::BACK
         )
-        || raster.depth_bias_enable != vk::FALSE
+        || (raster.depth_bias_enable != vk::FALSE
+            && !dynamic_depth_bias
+            && (raster.depth_bias_constant_factor != 0.0
+                || raster.depth_bias_clamp != 0.0
+                || raster.depth_bias_slope_factor != 0.0))
         || raster.line_width != 1.0
         || !matches!(
             raster.front_face,
@@ -1061,10 +1314,10 @@ unsafe fn graphics_state(
         vertex: vertex_layout(vertex)?,
         depth,
         raster: ir::RasterState::new(cull, front),
-        topology: if assembly.topology == vk::PrimitiveTopology::TRIANGLE_STRIP {
-            ir::PrimitiveTopology::TriangleStrip
-        } else {
-            ir::PrimitiveTopology::TriangleList
+        topology: match assembly.topology {
+            vk::PrimitiveTopology::TRIANGLE_STRIP => ir::PrimitiveTopology::TriangleStrip,
+            vk::PrimitiveTopology::TRIANGLE_FAN => ir::PrimitiveTopology::TriangleFan,
+            _ => ir::PrimitiveTopology::TriangleList,
         },
     })
 }
@@ -1083,7 +1336,7 @@ unsafe extern "system" fn create_graphics_pipelines(
     for index in 0..count as usize {
         *output.add(index) = vk::Pipeline::null();
     }
-    if !allocator.is_null() || cache != vk::PipelineCache::null() {
+    if !allocator.is_null() {
         return UNSUPPORTED;
     }
     // Each successful element remains usable if a later descriptor is rejected,
@@ -1102,6 +1355,49 @@ unsafe extern "system" fn create_graphics_pipelines(
         ) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] graphics parse: flags={:?} pnext={:?} raster={:?} depth={:?} vertex={:?}",
+                        info.flags,
+                        info.p_next,
+                        info.p_rasterization_state.as_ref(),
+                        info.p_depth_stencil_state.as_ref(),
+                        info.p_vertex_input_state.as_ref()
+                    );
+                    if let Some(d) = info.p_dynamic_state.as_ref() {
+                        eprintln!(
+                            "[SGFX Vulkan] dynamic states: {:?}",
+                            crate::api::slice(d.p_dynamic_states, d.dynamic_state_count)
+                        );
+                    }
+                    eprintln!(
+                        "[SGFX Vulkan] graphics parse states: assembly={:?} viewport={:?} samples={:?} blend={:?} stages={:?}",
+                        info.p_input_assembly_state.as_ref(),
+                        info.p_viewport_state.as_ref(),
+                        info.p_multisample_state.as_ref(),
+                        info.p_color_blend_state.as_ref(),
+                        crate::api::slice(info.p_stages, info.stage_count)
+                    );
+                    if let Some(blend) = info.p_color_blend_state.as_ref() {
+                        eprintln!(
+                            "[SGFX Vulkan] graphics blend attachments: {:?}",
+                            crate::api::slice(blend.p_attachments, blend.attachment_count)
+                        );
+                    }
+                    if let Some(vertex) = info.p_vertex_input_state.as_ref() {
+                        eprintln!(
+                            "[SGFX Vulkan] graphics vertex layout: bindings={:?} attributes={:?}",
+                            crate::api::slice(
+                                vertex.p_vertex_binding_descriptions,
+                                vertex.vertex_binding_description_count
+                            ),
+                            crate::api::slice(
+                                vertex.p_vertex_attribute_descriptions,
+                                vertex.vertex_attribute_description_count
+                            )
+                        );
+                    }
+                }
                 first_error.get_or_insert(error);
                 continue;
             }
@@ -1112,6 +1408,7 @@ unsafe extern "system" fn create_graphics_pipelines(
         // Shader-module normalization already compensates for Vulkan's positive
         // viewport height. Framebuffer winding therefore maps without reversal.
         match with_device(device, move |runtime| {
+            crate::api::bootstrap::validate_cache(&runtime.resources, cache)?;
             let pass = runtime
                 .resources
                 .render_passes
@@ -1137,6 +1434,12 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .collect::<Result<Vec<_>, vk::Result>>()?;
             let target_format = targets[0].format();
             let input_depths = pass.input_depths(subpass_index);
+            let binding_maps = runtime
+                .resources
+                .pipeline_binding_maps
+                .get(&layout)
+                .ok_or(INVALID)?
+                .clone();
             let layout = runtime
                 .resources
                 .pipeline_layouts
@@ -1148,7 +1451,7 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .shaders
                 .get_mut(&vertex_module)
                 .ok_or(INVALID)?
-                .variant(&runtime.table, &vertex_values)?;
+                .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)?;
             let input_bindings = runtime
                 .resources
                 .shaders
@@ -1160,7 +1463,12 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .shaders
                 .get_mut(&fragment_module)
                 .ok_or(INVALID)?
-                .variant_for_subpass(&runtime.table, &fragment_values, &input_depths)?;
+                .variant_for_layout(
+                    &runtime.table,
+                    &fragment_values,
+                    &input_depths,
+                    &binding_maps,
+                )?;
             let vertex = ir::ShaderEntryPoint::new(
                 runtime
                     .table
@@ -1240,6 +1548,9 @@ unsafe extern "system" fn create_graphics_pipelines(
         }) {
             Ok(handle) => *output.add(index) = handle,
             Err(error) => {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!("[SGFX Vulkan] graphics compilation: {error:?}");
+                }
                 first_error.get_or_insert(error);
             }
         }
@@ -1277,6 +1588,35 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrow_srgb_format_list_metadata_does_not_enable_unsupported_views() {
+        for (linear, srgb) in [
+            (vk::Format::R8_UNORM, vk::Format::R8_SRGB),
+            (vk::Format::R8G8_UNORM, vk::Format::R8G8_SRGB),
+        ] {
+            assert!(compatible_view_format_list_entry(linear, linear));
+            assert!(compatible_view_format_list_entry(linear, srgb));
+            assert!(texture_format(srgb).is_none());
+            assert!(image_usage(srgb).is_empty());
+            assert!(!compatible_view_format_list_entry(
+                linear,
+                vk::Format::R8G8B8A8_UNORM
+            ));
+            assert!(!compatible_view_format_list_entry(
+                linear,
+                vk::Format::UNDEFINED
+            ));
+        }
+        assert!(!compatible_view_format_list_entry(
+            vk::Format::R8_UNORM,
+            vk::Format::R8G8_SRGB
+        ));
+        assert!(!compatible_view_format_list_entry(
+            vk::Format::R8G8_UNORM,
+            vk::Format::R8_SRGB
+        ));
+    }
 
     #[test]
     fn interleaved_vertex_layout_is_bounded_and_formats_are_preserved() {
@@ -1399,5 +1739,90 @@ mod tests {
         depth.depth_bounds_test_enable = vk::FALSE;
         depth.stencil_test_enable = vk::TRUE;
         assert!(unsafe { graphics_state(&base.depth_stencil_state(&depth)) }.is_err());
+
+        // Zink declares these dynamic states even for its zero-bias blit
+        // pipeline. Static bias factors are ignored when bias is dynamic;
+        // vkCmdSetDepthBias separately rejects any nonzero command values.
+        depth.stencil_test_enable = vk::FALSE;
+        depth.depth_test_enable = vk::FALSE;
+        let mut biased_raster = raster.depth_bias_enable(true);
+        let dynamics = [
+            vk::DynamicState::LINE_WIDTH,
+            vk::DynamicState::DEPTH_BIAS,
+            vk::DynamicState::BLEND_CONSTANTS,
+            vk::DynamicState::STENCIL_REFERENCE,
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+        ];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamics);
+        for depth_enabled in [vk::FALSE, vk::TRUE] {
+            depth.depth_test_enable = depth_enabled;
+            assert!(
+                unsafe {
+                    graphics_state(
+                        &base
+                            .rasterization_state(&biased_raster)
+                            .depth_stencil_state(&depth),
+                    )
+                }
+                .is_ok()
+            );
+            assert!(
+                unsafe {
+                    graphics_state(
+                        &base
+                            .rasterization_state(&biased_raster)
+                            .depth_stencil_state(&depth)
+                            .dynamic_state(&dynamic),
+                    )
+                }
+                .is_ok()
+            );
+        }
+        biased_raster.depth_bias_constant_factor = 1.0;
+        assert!(
+            unsafe {
+                graphics_state(
+                    &base
+                        .rasterization_state(&biased_raster)
+                        .depth_stencil_state(&depth),
+                )
+            }
+            .is_err()
+        );
+        assert!(
+            unsafe {
+                graphics_state(
+                    &base
+                        .rasterization_state(&biased_raster)
+                        .depth_stencil_state(&depth)
+                        .dynamic_state(&dynamic),
+                )
+            }
+            .is_ok()
+        );
+        let fan_assembly = assembly.topology(vk::PrimitiveTopology::TRIANGLE_FAN);
+        let parsed = unsafe {
+            graphics_state(
+                &base
+                    .input_assembly_state(&fan_assembly)
+                    .dynamic_state(&dynamic),
+            )
+        }
+        .unwrap();
+        assert_eq!(parsed.topology, ir::PrimitiveTopology::TriangleFan);
     }
+}
+
+pub(crate) fn extended_image_usage(
+    format: vk::Format,
+    flags: vk::ImageCreateFlags,
+) -> vk::ImageUsageFlags {
+    let mut usage = image_usage(format);
+    if flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
+        && format == vk::Format::R8G8B8A8_SRGB
+    {
+        usage |= image_usage(vk::Format::R8G8B8A8_UNORM);
+    }
+    usage
 }

@@ -295,8 +295,14 @@ pub enum Command<'r, 'data> {
         destination: TextureRef<'r>,
         /// Destination mip level.
         destination_mip: u32,
+        /// Rectangle in the source mip.
+        source_rect: PixelRect,
+        /// Rectangle in the destination mip.
+        destination_rect: PixelRect,
         /// Nearest or linear sampling.
         filter: FilterMode,
+        /// Reverse source sampling horizontally/vertically within the bounded rectangle.
+        flips: [bool; 2],
     },
     /// Copy non-overlapping byte ranges between logical buffers.
     CopyBufferToBuffer {
@@ -579,19 +585,78 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         destination_mip: u32,
         filter: FilterMode,
     ) -> Result<()> {
+        let src = self.resources.texture(source)?.mip_extent(source_mip)?;
+        let dst = self
+            .resources
+            .texture(destination)?
+            .mip_extent(destination_mip)?;
+        self.blit_texture_region(
+            source,
+            source_mip,
+            PixelRect::new(0, 0, src.width(), src.height())?,
+            destination,
+            destination_mip,
+            PixelRect::new(0, 0, dst.width(), dst.height())?,
+            filter,
+        )
+    }
+
+    /// Scale bounded, positive-direction color rectangles on the GPU.
+    #[allow(clippy::too_many_arguments)] // Explicit source/destination subresources match blit_texture.
+    pub fn blit_texture_region(
+        &mut self,
+        source: TextureRef<'r>,
+        source_mip: u32,
+        source_rect: PixelRect,
+        destination: TextureRef<'r>,
+        destination_mip: u32,
+        destination_rect: PixelRect,
+        filter: FilterMode,
+    ) -> Result<()> {
+        self.blit_texture_region_flipped(
+            source,
+            source_mip,
+            source_rect,
+            destination,
+            destination_mip,
+            destination_rect,
+            filter,
+            [false; 2],
+        )
+    }
+
+    /// Blit bounded color rectangles with independently reversed source axes.
+    #[allow(clippy::too_many_arguments)] // Adds axis selection to the same explicit blit API.
+    pub fn blit_texture_region_flipped(
+        &mut self,
+        source: TextureRef<'r>,
+        source_mip: u32,
+        source_rect: PixelRect,
+        destination: TextureRef<'r>,
+        destination_mip: u32,
+        destination_rect: PixelRect,
+        filter: FilterMode,
+        flips: [bool; 2],
+    ) -> Result<()> {
         self.ensure_outside_pass()?;
         let src = self.resources.texture(source)?;
         let dst = self.resources.texture(destination)?;
         Self::require_texture_usage(src.usage(), TextureUsage::COPY_SRC)?;
         Self::require_texture_usage(dst.usage(), TextureUsage::COPY_DST)?;
-        src.mip_extent(source_mip)?;
-        dst.mip_extent(destination_mip)?;
-        if src.format() != dst.format()
+        if !source_rect.is_within(src.mip_extent(source_mip)?)
+            || !destination_rect.is_within(dst.mip_extent(destination_mip)?)
+        {
+            return Err(Error::OutOfBounds);
+        }
+        if !src.format().blit_compatible(dst.format())
             || src.array_layer_count() != 1
             || dst.array_layer_count() != 1
             || !matches!(
                 src.format(),
-                TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
+                TextureFormat::Rgba8Unorm
+                    | TextureFormat::Bgra8Unorm
+                    | TextureFormat::R8Unorm
+                    | TextureFormat::Rg8Unorm
             )
         {
             return Err(Error::InvalidDescriptor);
@@ -610,7 +675,10 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             source_mip,
             destination,
             destination_mip,
+            source_rect,
+            destination_rect,
             filter,
+            flips,
         })
     }
 
@@ -1063,9 +1131,8 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
 
     /// Set a viewport wholly within the color attachment.
     pub fn set_viewport(&mut self, viewport: Viewport) -> Result<()> {
-        let [x, y, width, height, _, _] = viewport.components();
         let target = self.encoder.resources.texture(self.target)?.extent();
-        if x + width > target.width() as f32 || y + height > target.height() as f32 {
+        if !viewport.is_within(target) {
             return Err(Error::OutOfBounds);
         }
         self.encoder.push(Command::SetViewport(viewport))

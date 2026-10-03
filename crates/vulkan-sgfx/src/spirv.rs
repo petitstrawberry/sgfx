@@ -14,6 +14,277 @@ const SAMPLED_IMAGE: u32 = 86;
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    #[test]
+    fn captured_openttd_palette_programs_preserve_real_texture_bindings() {
+        use sgfx::ir;
+        use std::collections::BTreeMap;
+
+        // Mesa 25.0.7 Zink captures from OpenTTD 15.3. Both programs use the
+        // same vertex module; neither contains specialization constants.
+        for (bytes, fragment_required_size, dimensions) in [
+            (
+                include_bytes!("../tests/fixtures/zink/openttd-3textures.frag.spv").as_slice(),
+                8,
+                vec![
+                    ir::TextureViewDimension::D2,
+                    ir::TextureViewDimension::D1,
+                    ir::TextureViewDimension::D2,
+                ],
+            ),
+            (
+                include_bytes!("../tests/fixtures/zink/openttd-4textures.frag.spv").as_slice(),
+                12,
+                vec![
+                    ir::TextureViewDimension::D2,
+                    ir::TextureViewDimension::D1,
+                    ir::TextureViewDimension::D2,
+                    ir::TextureViewDimension::D1,
+                ],
+            ),
+        ] {
+            // Captured UBO bindings 0/4 remain 0/8, while sparse combined
+            // image bindings 128.. map to adjacent image/sampler pairs.
+            let maps = [
+                BTreeMap::from([(0, 0), (4, 8)]),
+                BTreeMap::new(),
+                (0..dimensions.len() as u32)
+                    .map(|index| (128 + index, index * 2))
+                    .collect(),
+            ];
+            let table = ir::ResourceTable::new();
+            let compile = |stage, bytes: &[u8]| {
+                let words = bytes
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                    .collect();
+                let normalized =
+                    crate::resources::normalize_spirv_for_layout(words, &maps).unwrap();
+                let compiled =
+                    sgfx_codegen_virgl::programmable::compile_shader(&normalized, stage, "main")
+                        .unwrap();
+                let module = table.define_shader_module(normalized).unwrap();
+                let entry = ir::ShaderEntryPoint::new(module, stage, "main".into()).unwrap();
+                (entry, compiled)
+            };
+            let (vertex_entry, vertex) = compile(
+                ir::ShaderStage::Vertex,
+                include_bytes!("../tests/fixtures/zink/openttd.vert.spv"),
+            );
+            let (fragment_entry, fragment) = compile(ir::ShaderStage::Fragment, bytes);
+            assert_eq!(vertex.outputs, fragment.inputs);
+            assert_eq!(fragment.textures.len(), dimensions.len());
+            assert!(vertex.textures.is_empty());
+            assert_eq!(
+                vertex
+                    .uniform_buffers
+                    .iter()
+                    .map(|binding| (binding.group, binding.binding))
+                    .collect::<Vec<_>>(),
+                [(0, 0)]
+            );
+            assert_eq!(
+                fragment
+                    .uniform_buffers
+                    .iter()
+                    .map(|binding| (binding.group, binding.binding))
+                    .collect::<Vec<_>>(),
+                [(0, 8)]
+            );
+            // The game binds only the scalar bytes it uses, excluding the
+            // trailing padding in the SPIR-V uniform block declarations.
+            assert_eq!(vertex.uniform_buffers[0].size, 32);
+            assert_eq!(vertex.uniform_buffers[0].required_size, 24);
+            assert_eq!(fragment.uniform_buffers[0].size, 16);
+            assert_eq!(
+                fragment.uniform_buffers[0].required_size,
+                fragment_required_size
+            );
+            // TGSI slots follow first use, not descriptor order. Check each
+            // complete image/sampler pair by its captured logical binding.
+            let actual = fragment
+                .textures
+                .iter()
+                .map(|binding| {
+                    assert_eq!(binding.image_group, 2);
+                    assert_eq!(binding.sampler_group, 2);
+                    assert_eq!(binding.sampler_binding, binding.image_binding + 1);
+                    assert!(binding.uses_sampler);
+                    assert!(!binding.depth);
+                    assert!(!binding.comparison);
+                    (binding.image_binding, binding.dimension)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let expected = dimensions
+                .iter()
+                .enumerate()
+                .map(|(index, &dimension)| (index as u32 * 2, dimension))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(actual, expected);
+
+            // Vulkan combined-image layouts do not declare dimensionality.
+            // Recover the exact D2/D1 palette layout observed in the GPU run.
+            let layout = ir::PipelineLayoutDesc::new(vec![
+                ir::BindGroupLayoutDesc::new(vec![
+                    ir::BindGroupLayoutEntry::new(
+                        0,
+                        ir::ShaderStages::VERTEX,
+                        ir::BindingType::UniformBuffer,
+                    ),
+                    ir::BindGroupLayoutEntry::new(
+                        8,
+                        ir::ShaderStages::FRAGMENT,
+                        ir::BindingType::UniformBuffer,
+                    ),
+                ])
+                .unwrap(),
+                ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+                ir::BindGroupLayoutDesc::new(
+                    expected
+                        .keys()
+                        .flat_map(|&binding| {
+                            [
+                                ir::BindGroupLayoutEntry::new(
+                                    binding,
+                                    ir::ShaderStages::FRAGMENT,
+                                    ir::BindingType::SampledTexture,
+                                ),
+                                ir::BindGroupLayoutEntry::new(
+                                    binding + 1,
+                                    ir::ShaderStages::FRAGMENT,
+                                    ir::BindingType::Sampler,
+                                ),
+                            ]
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+            let specialized =
+                specialize_layout(&table, &layout, &[&vertex_entry, &fragment_entry]).unwrap();
+            assert_eq!(&specialized.bind_groups()[..2], &layout.bind_groups()[..2]);
+            let expected_textures = ir::BindGroupLayoutDesc::new(
+                expected
+                    .iter()
+                    .flat_map(|(&binding, &dimension)| {
+                        [
+                            ir::BindGroupLayoutEntry::new(
+                                binding,
+                                ir::ShaderStages::FRAGMENT,
+                                ir::BindingType::SampledTextureView {
+                                    dimension,
+                                    depth: false,
+                                },
+                            ),
+                            ir::BindGroupLayoutEntry::new(
+                                binding + 1,
+                                ir::ShaderStages::FRAGMENT,
+                                ir::BindingType::Sampler,
+                            ),
+                        ]
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            assert_eq!(specialized.bind_groups()[2], expected_textures);
+        }
+    }
+
+    #[test]
+    fn captured_zink_texture_preserves_component_packed_fragment_input() {
+        let maps = [
+            std::collections::BTreeMap::from([(0, 0), (4, 8)]),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([(128, 0)]),
+        ];
+        let mut compiled = Vec::new();
+        for (stage, bytes) in [
+            (
+                sgfx::ir::ShaderStage::Vertex,
+                include_bytes!("../tests/fixtures/zink/texture.vert.spv").as_slice(),
+            ),
+            (
+                sgfx::ir::ShaderStage::Fragment,
+                include_bytes!("../tests/fixtures/zink/texture.frag.spv").as_slice(),
+            ),
+        ] {
+            let words = bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect();
+            let normalized = crate::resources::normalize_spirv_for_layout(words, &maps).unwrap();
+            let shader =
+                sgfx_codegen_virgl::programmable::compile_shader(&normalized, stage, "main")
+                    .unwrap();
+            if let Ok(directory) = std::env::var("SGFX_TGSI_EXPORT_DIR") {
+                std::fs::write(
+                    std::path::Path::new(&directory).join(format!("zink-texture-{stage:?}.tgsi")),
+                    &shader.tgsi,
+                )
+                .unwrap();
+            }
+            compiled.push(shader);
+        }
+        // Mesa exports one vec4 but consumes its xy and w through separately
+        // Component-decorated inputs. The normalized interface must stay vec4.
+        assert_eq!(compiled[1].inputs.len(), 1);
+        assert_eq!(compiled[1].inputs[0].location, 0);
+        assert_eq!(compiled[1].inputs[0].components, 4);
+        assert_eq!(compiled[1].inputs, compiled[0].outputs);
+        assert_eq!(compiled[1].textures.len(), 1);
+        assert_eq!(compiled[1].textures[0].image_group, 2);
+        assert_eq!(compiled[1].textures[0].image_binding, 0);
+        assert_eq!(compiled[1].textures[0].sampler_binding, 1);
+    }
+
+    #[test]
+    fn captured_zink_triangle_normalizes_and_compiles_both_stages() {
+        // Mesa 25.0.7 ZINK_DEBUG=spirv capture from the SGFX clear/triangle
+        // probe. These are actual generated shaders, not fixed replacements.
+        let mut compiled = Vec::new();
+        for (stage, bytes) in [
+            (
+                sgfx::ir::ShaderStage::Vertex,
+                include_bytes!("../tests/fixtures/zink/triangle.vert.spv").as_slice(),
+            ),
+            (
+                sgfx::ir::ShaderStage::Fragment,
+                include_bytes!("../tests/fixtures/zink/triangle.frag.spv").as_slice(),
+            ),
+        ] {
+            let words = bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect();
+            let normalized = crate::resources::normalize_spirv(words).unwrap();
+            let shader =
+                sgfx_codegen_virgl::programmable::compile_shader(&normalized, stage, "main")
+                    .unwrap();
+            println!(
+                "{stage:?}: inputs={:?} outputs={:?} uniforms={:?}",
+                shader.inputs, shader.outputs, shader.uniform_buffers
+            );
+            if let Ok(directory) = std::env::var("SGFX_TGSI_EXPORT_DIR") {
+                std::fs::write(
+                    std::path::Path::new(&directory).join(format!("zink-triangle-{stage:?}.tgsi")),
+                    &shader.tgsi,
+                )
+                .unwrap();
+            }
+            compiled.push(shader);
+        }
+        assert!(compiled[0].tgsi.contains("PSIZE"));
+        for input in &compiled[1].inputs {
+            let output = compiled[0]
+                .outputs
+                .iter()
+                .find(|output| output.location == input.location)
+                .unwrap();
+            assert_eq!(output.scalar, input.scalar);
+            assert_eq!(output.components, input.components);
+            assert_eq!(output.interpolation, input.interpolation);
+        }
+    }
     fn sampler_function(depth: bool) -> Vec<u32> {
         let mut words = vec![0x07230203, 0x00010000, 0, 26, 0];
         for (opcode, operands) in [
@@ -478,6 +749,8 @@ pub(crate) fn specialize_layout(
                             _ => return Err(unsupported),
                         };
                         let dimension = match (dim, arrayed) {
+                            (naga::ImageDimension::D1, false) => ir::TextureViewDimension::D1,
+                            (naga::ImageDimension::D1, true) => ir::TextureViewDimension::D1Array,
                             (naga::ImageDimension::D2, false) => ir::TextureViewDimension::D2,
                             (naga::ImageDimension::D2, true) => ir::TextureViewDimension::D2Array,
                             (naga::ImageDimension::Cube, false) => ir::TextureViewDimension::Cube,

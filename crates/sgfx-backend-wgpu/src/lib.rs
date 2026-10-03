@@ -116,6 +116,8 @@ pub enum UnsupportedFeature {
     /// Indexed strips need explicit restart semantics or a faithful index
     /// conversion. WGPU's implicit restart must not reinterpret ordinary indices.
     IndexedTriangleStrip,
+    /// WGPU has no native triangle-fan topology; conversion is not implemented.
+    TriangleFan,
     /// A sampled texture format is incompatible with the selected fragment
     /// program.
     TextureFormat,
@@ -132,6 +134,12 @@ pub enum UnsupportedFeature {
     ProgrammableOnWeb,
     /// A buffer binding violates this WGPU device's offset alignment or size limits.
     BindingLimits,
+    /// WGPU cannot retain negative LOD clamps when they change min/mag selection.
+    SamplerLod,
+    /// Partial source or destination mip blits need a regional sampling pass.
+    PartialBlit,
+    /// Signed or zero-height viewports require a different WGPU lowering.
+    SignedViewport,
     /// Dispatch dimensions exceed the device workgroup-count limit.
     DispatchLimits,
 }
@@ -258,7 +266,10 @@ impl Context {
             || height == 0
             || !matches!(
                 format,
-                TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm | TextureFormat::R8Unorm
+                TextureFormat::Bgra8Unorm
+                    | TextureFormat::Rgba8Unorm
+                    | TextureFormat::R8Unorm
+                    | TextureFormat::Rg8Unorm
             )
         {
             return Err(Error::InvalidState);
@@ -804,11 +815,33 @@ impl Resources {
         self.resources.as_ref()
     }
 
+    /// Remove a retired texture's allocation and dependent cached views.
+    /// Encoded commands retain their own strong resource references.
+    pub fn release_texture(&mut self, id: TextureId) -> Result<()> {
+        self.resources.texture_ref(id)?;
+        self.textures.retain(|(candidate, _)| *candidate != id);
+        self.mapped_images.retain(|(candidate, _)| *candidate != id);
+        self.programmable.groups.clear();
+        Ok(())
+    }
+
     /// Remove the cached allocation for a retired logical buffer.
     pub fn release_buffer(&mut self, id: BufferId) -> Result<()> {
         self.resources.buffer_ref(id)?;
         self.buffers.retain(|(candidate, _)| *candidate != id);
         self.programmable.groups.clear();
+        Ok(())
+    }
+
+    /// Drop a bind group's cached materialization once its recorded commands
+    /// have been encoded. Encoded/submitted WGPU commands retain their own
+    /// resource references; retiring this cache does not require a GPU wait.
+    /// The caller separately retires the identity in the resource table.
+    pub fn release_bind_group(&mut self, id: ir::BindGroupId) -> Result<()> {
+        self.resources.bind_group_ref(id)?;
+        self.programmable
+            .groups
+            .retain(|(candidate, _)| *candidate != id);
         Ok(())
     }
 
@@ -870,6 +903,9 @@ impl Resources {
 
     fn texture(&mut self, reference: TextureRef<'_>) -> Result<Arc<GpuTexture>> {
         let descriptor = self.resources.texture(reference)?;
+        if descriptor.dimension_1d() {
+            return Err(Error::Unsupported(UnsupportedFeature::SurfaceFormat));
+        }
         let id = reference.id();
         if let Some((_, image)) = self
             .mapped_images
@@ -948,6 +984,11 @@ impl Resources {
         if let Some((_, sampler)) = self.samplers.iter().find(|(candidate, _)| *candidate == id) {
             return Ok(Arc::clone(sampler));
         }
+        // Clamping negative LODs to zero preserves filtering only when min
+        // and mag filters agree; otherwise it can change which filter is used.
+        if descriptor.min_lod() < 0.0 && descriptor.min_filter() != descriptor.mag_filter() {
+            return Err(Error::Unsupported(UnsupportedFeature::SamplerLod));
+        }
         let sampler = Arc::new(self.context.device.raw_device().create_sampler(
             &raw::SamplerDescriptor {
                 label: Some("sgfx wgpu sampler"),
@@ -959,8 +1000,8 @@ impl Resources {
                 mipmap_filter: filter_mode(descriptor.mip_filter()),
                 // Logical textures have at most 32 levels. Larger Vulkan LOD
                 // maxima are equivalent to this physical clamp.
-                lod_min_clamp: descriptor.min_lod().min(32.0),
-                lod_max_clamp: descriptor.max_lod().min(32.0),
+                lod_min_clamp: descriptor.min_lod().clamp(0.0, 32.0),
+                lod_max_clamp: descriptor.max_lod().clamp(0.0, 32.0),
                 compare: descriptor.compare().map(compare_function),
                 ..raw::SamplerDescriptor::default()
             },
@@ -1043,6 +1084,9 @@ fn validate_indexed_topologies(commands: &CommandBuffer<'_, '_>) -> Result<()> {
     let mut pipeline = None;
     for command in commands.commands() {
         match command {
+            Command::SetViewport(viewport) if viewport.components()[3] <= 0.0 => {
+                return Err(Error::Unsupported(UnsupportedFeature::SignedViewport));
+            }
             Command::BeginRenderPass(_) | Command::EndRenderPass | Command::SetPipeline(_) => {
                 pipeline = None
             }
@@ -1053,6 +1097,9 @@ fn validate_indexed_topologies(commands: &CommandBuffer<'_, '_>) -> Result<()> {
                         .programmable_render_pipeline(*reference)?
                         .topology(),
                 );
+                if pipeline == Some(ir::PrimitiveTopology::TriangleFan) {
+                    return Err(Error::Unsupported(UnsupportedFeature::TriangleFan));
+                }
             }
             Command::DrawIndexed { .. } | Command::DrawIndexedInstanced { .. }
                 if pipeline == Some(ir::PrimitiveTopology::TriangleStrip) =>
@@ -1264,8 +1311,25 @@ impl Queue {
                     source_mip,
                     destination,
                     destination_mip,
+                    source_rect,
+                    destination_rect,
                     filter,
+                    flips,
                 } => {
+                    let src = resources
+                        .resources
+                        .texture(*source)?
+                        .mip_extent(*source_mip)?;
+                    let dst = resources
+                        .resources
+                        .texture(*destination)?
+                        .mip_extent(*destination_mip)?;
+                    if *flips != [false; 2]
+                        || *source_rect != ir::PixelRect::new(0, 0, src.width(), src.height())?
+                        || *destination_rect != ir::PixelRect::new(0, 0, dst.width(), dst.height())?
+                    {
+                        return Err(Error::Unsupported(UnsupportedFeature::PartialBlit));
+                    }
                     let source = resources.texture(*source)?;
                     let destination = resources.texture(*destination)?;
                     resources.encode_mip_blit(
@@ -2128,7 +2192,10 @@ fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
         usage |= raw::TextureUsages::COPY_SRC;
         if matches!(
             descriptor.format(),
-            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
+            TextureFormat::Rgba8Unorm
+                | TextureFormat::Bgra8Unorm
+                | TextureFormat::R8Unorm
+                | TextureFormat::Rg8Unorm
         ) {
             usage |= raw::TextureUsages::TEXTURE_BINDING;
         }
@@ -2137,7 +2204,10 @@ fn texture_usage(descriptor: TextureDesc) -> Result<raw::TextureUsages> {
         usage |= raw::TextureUsages::COPY_DST;
         if matches!(
             descriptor.format(),
-            TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm
+            TextureFormat::Rgba8Unorm
+                | TextureFormat::Bgra8Unorm
+                | TextureFormat::R8Unorm
+                | TextureFormat::Rg8Unorm
         ) {
             usage |= raw::TextureUsages::RENDER_ATTACHMENT;
         }
@@ -2156,6 +2226,7 @@ fn raw_format(format: TextureFormat) -> Option<raw::TextureFormat> {
         TextureFormat::Rgba8Unorm => Some(raw::TextureFormat::Rgba8Unorm),
         TextureFormat::Rgba8UnormSrgb => Some(raw::TextureFormat::Rgba8UnormSrgb),
         TextureFormat::R8Unorm => Some(raw::TextureFormat::R8Unorm),
+        TextureFormat::Rg8Unorm => Some(raw::TextureFormat::Rg8Unorm),
         TextureFormat::Nv12 => None,
         TextureFormat::Depth32Float => Some(raw::TextureFormat::Depth32Float),
     }

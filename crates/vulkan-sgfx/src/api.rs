@@ -1,4 +1,14 @@
+pub(crate) mod bootstrap;
+mod buffer_operations;
+mod buffer_views;
+pub(crate) mod descriptor_template;
+mod dynamic_states;
+mod maintenance1;
+mod queue;
+mod render_pass2;
 mod render_passes;
+mod timeline;
+mod unsupported;
 use crate::runtime::Runtime;
 use ash::vk::{self, Handle};
 use sgfx::{
@@ -28,6 +38,7 @@ enum CompletionRequest {
         submissions: Vec<sgfx::driver::Submission>,
         fence: Option<Arc<AtomicU8>>,
         signals: Vec<Arc<AtomicU8>>,
+        timeline_signals: Vec<(Arc<timeline::Timeline>, u64)>,
     },
     Stop,
 }
@@ -43,6 +54,17 @@ pub(crate) struct InFlight {
 }
 
 impl InFlight {
+    fn reserve_pending(&self, additional: usize) -> VkResult<()> {
+        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        let total = count
+            .checked_add(additional)
+            .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+        if total > 4096 {
+            return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+        }
+        *count = total;
+        Ok(())
+    }
     fn begin(&self) {
         let mut count = self
             .count
@@ -87,10 +109,16 @@ struct Driver {
     completion_sender: mpsc::Sender<CompletionRequest>,
     completion_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     queue: AtomicU64,
+    queue_sender: mpsc::Sender<queue::Request>,
+    queue_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    timeline_enabled: bool,
+    timelines: Mutex<HashMap<u64, Arc<timeline::Timeline>>>,
+    events: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     fences: Fences,
     semaphores: Semaphores,
     recordings: Recordings,
     in_flight: Arc<InFlight>,
+    pending: Arc<InFlight>,
     lost: Arc<AtomicBool>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -155,6 +183,9 @@ fn call<T: Send + 'static>(
             } else {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime)))
                     .unwrap_or_else(|_| {
+                        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                            eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
+                        }
                         runtime.lost = true;
                         Err(vk::Result::ERROR_DEVICE_LOST)
                     })
@@ -165,8 +196,18 @@ fn call<T: Send + 'static>(
             }
             let _ = tx.send(result);
         })))
-        .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-    rx.recv().map_err(|_| vk::Result::ERROR_DEVICE_LOST)?
+        .map_err(|_| {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!("[SGFX Vulkan] device worker request channel closed");
+            }
+            vk::Result::ERROR_DEVICE_LOST
+        })?;
+    rx.recv().map_err(|_| {
+        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            eprintln!("[SGFX Vulkan] device worker response channel closed");
+        }
+        vk::Result::ERROR_DEVICE_LOST
+    })?
 }
 pub(crate) fn with_device<T: Send + 'static>(
     device: vk::Device,
@@ -185,7 +226,7 @@ pub(crate) fn with_queue<T: Send + 'static>(
 fn status(value: VkResult<()>) -> vk::Result {
     value.map_or_else(|e| e, |_| vk::Result::SUCCESS)
 }
-unsafe fn slice<'a, T>(ptr: *const T, count: u32) -> VkResult<&'a [T]> {
+pub(crate) unsafe fn slice<'a, T>(ptr: *const T, count: u32) -> VkResult<&'a [T]> {
     if count > 4096 || (count != 0 && ptr.is_null()) {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
@@ -196,7 +237,33 @@ unsafe fn slice<'a, T>(ptr: *const T, count: u32) -> VkResult<&'a [T]> {
     })
 }
 
-unsafe fn device_chain_supported(mut next: *const std::ffi::c_void) -> bool {
+fn core_device_features_supported(
+    requested: &vk::PhysicalDeviceFeatures,
+    supported: &vk::PhysicalDeviceFeatures,
+) -> bool {
+    // VkPhysicalDeviceFeatures is a C struct containing only VkBool32 fields.
+    // Validate both the boolean representation and the advertised capability.
+    let fields = std::mem::size_of::<vk::PhysicalDeviceFeatures>() / 4;
+    unsafe {
+        std::slice::from_raw_parts(
+            (requested as *const vk::PhysicalDeviceFeatures).cast::<u32>(),
+            fields,
+        )
+        .iter()
+        .zip(std::slice::from_raw_parts(
+            (supported as *const vk::PhysicalDeviceFeatures).cast::<u32>(),
+            fields,
+        ))
+        .all(|(&request, &support)| {
+            request == vk::FALSE || (request == vk::TRUE && support == vk::TRUE)
+        })
+    }
+}
+
+unsafe fn device_chain_supported(
+    mut next: *const std::ffi::c_void,
+    supported_features: &vk::PhysicalDeviceFeatures,
+) -> bool {
     // The Khronos loader inserts private device-link records before calling an
     // ICD. They are transport metadata, not enabled application features.
     for _ in 0..32 {
@@ -206,6 +273,24 @@ unsafe fn device_chain_supported(mut next: *const std::ffi::c_void) -> bool {
         let header = &*next.cast::<vk::BaseInStructure<'_>>();
         let supported = match header.s_type {
             vk::StructureType::LOADER_DEVICE_CREATE_INFO => true,
+            vk::StructureType::PHYSICAL_DEVICE_FEATURES_2 => {
+                let f = &*next.cast::<vk::PhysicalDeviceFeatures2<'_>>();
+                core_device_features_supported(&f.features, supported_features)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>();
+                matches!(f.timeline_semaphore, vk::FALSE | vk::TRUE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceImagelessFramebufferFeatures<'_>>();
+                matches!(f.imageless_framebuffer, vk::FALSE | vk::TRUE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceMultiviewFeatures<'_>>();
+                f.multiview == 0
+                    && f.multiview_geometry_shader == 0
+                    && f.multiview_tessellation_shader == 0
+            }
             vk::StructureType::PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES => {
                 let features = &*next.cast::<vk::PhysicalDeviceDescriptorIndexingFeatures<'_>>();
                 // Applications may include an extension's feature record with
@@ -259,6 +344,26 @@ unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
     names.iter().all(|&name| {
         !name.is_null() && {
             let name = unsafe { CStr::from_ptr(name) };
+            if name == vk::KHR_TIMELINE_SEMAPHORE_NAME {
+                return true;
+            }
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            if [
+                vk::KHR_MAINTENANCE1_NAME,
+                vk::KHR_MAINTENANCE2_NAME,
+                vk::KHR_MULTIVIEW_NAME,
+                vk::KHR_CREATE_RENDERPASS2_NAME,
+                vk::KHR_IMAGELESS_FRAMEBUFFER_NAME,
+                vk::KHR_IMAGE_FORMAT_LIST_NAME,
+                vk::KHR_DESCRIPTOR_UPDATE_TEMPLATE_NAME,
+            ]
+            .contains(&name)
+            {
+                return true;
+            }
             #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
             {
                 name == vk::KHR_SWAPCHAIN_NAME
@@ -296,22 +401,40 @@ pub(crate) unsafe extern "system" fn create_device(
     }
     *out = vk::Device::null();
     let info = &*info;
+    let mut supported_features = vk::PhysicalDeviceFeatures::default();
+    crate::instance::get_physical_device_features(physical, &mut supported_features);
     if !allocator.is_null()
-        || !device_chain_supported(info.p_next)
+        || !device_chain_supported(info.p_next, &supported_features)
         || !info.flags.is_empty()
         || !device_extensions_supported(info)
     {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
     if !info.p_enabled_features.is_null()
-        && std::slice::from_raw_parts(
-            info.p_enabled_features.cast::<u32>(),
-            std::mem::size_of::<vk::PhysicalDeviceFeatures>() / 4,
-        )
-        .iter()
-        .any(|&v| v != 0)
+        && !core_device_features_supported(&*info.p_enabled_features, &supported_features)
     {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    }
+    let mut timeline_enabled = false;
+    let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
+    while let Some(base) = node.as_ref() {
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES {
+            timeline_enabled = (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
+                .timeline_semaphore
+                == vk::TRUE;
+        }
+        node = base.p_next;
+    }
+    if timeline_enabled
+        && !slice(
+            info.pp_enabled_extension_names,
+            info.enabled_extension_count,
+        )
+        .unwrap()
+        .iter()
+        .any(|&n| CStr::from_ptr(n) == vk::KHR_TIMELINE_SEMAPHORE_NAME)
+    {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
     }
     let qs = match slice(info.p_queue_create_infos, info.queue_create_info_count) {
         Ok(v) => v,
@@ -334,8 +457,8 @@ pub(crate) unsafe extern "system" fn create_device(
     let semaphores: Semaphores = Default::default();
     let recordings: Recordings = Default::default();
     let in_flight = Arc::new(InFlight::default());
+    let pending = Arc::new(InFlight::default());
     let lost = Arc::new(AtomicBool::new(false));
-    let worker_fences = Arc::clone(&fences);
     let worker_recordings = Arc::clone(&recordings);
     let worker_in_flight = Arc::clone(&in_flight);
     let worker_lost = Arc::clone(&lost);
@@ -345,13 +468,7 @@ pub(crate) unsafe extern "system" fn create_device(
         .name("sgfx-vulkan-device".into())
         .spawn(move || {
             let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Runtime::new(
-                    adapter,
-                    worker_recordings,
-                    worker_in_flight,
-                    worker_fences,
-                    worker_lost,
-                )
+                Runtime::new(adapter, worker_recordings, worker_in_flight, worker_lost)
             }));
             let mut runtime = match init {
                 Ok(Ok(rt)) => rt,
@@ -384,6 +501,7 @@ pub(crate) unsafe extern "system" fn create_device(
     }
     let (completion_tx, completion_rx) = mpsc::channel();
     let completion_in_flight = Arc::clone(&in_flight);
+    let completion_pending = Arc::clone(&pending);
     let completion_lost = Arc::clone(&lost);
     let completion_thread = match std::thread::Builder::new()
         .name("sgfx-vulkan-completion".into())
@@ -394,11 +512,14 @@ pub(crate) unsafe extern "system" fn create_device(
                         submissions,
                         fence,
                         signals,
+                        timeline_signals,
                     } => finish_submissions(
                         &submissions,
                         fence.as_ref(),
                         &signals,
+                        &timeline_signals,
                         &completion_in_flight,
+                        &completion_pending,
                         &completion_lost,
                     ),
                     CompletionRequest::Stop => break,
@@ -412,16 +533,32 @@ pub(crate) unsafe extern "system" fn create_device(
             return vk::Result::ERROR_OUT_OF_HOST_MEMORY;
         }
     };
+    let (queue_sender, queue_thread) = match queue::start() {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = completion_tx.send(CompletionRequest::Stop);
+            let _ = completion_thread.join();
+            let _ = tx.send(Request::Stop);
+            let _ = thread.join();
+            return error;
+        }
+    };
     let driver = Arc::new(Driver {
         sender: tx,
         thread: Mutex::new(Some(thread)),
         completion_sender: completion_tx,
         completion_thread: Mutex::new(Some(completion_thread)),
         queue: AtomicU64::new(0),
+        queue_sender,
+        queue_thread: Mutex::new(Some(queue_thread)),
+        timeline_enabled,
+        timelines: Default::default(),
+        events: Default::default(),
         fences,
         semaphores,
         recordings,
         in_flight,
+        pending,
         lost,
     });
     let device = add_handle(Kind::Device, &driver);
@@ -447,7 +584,16 @@ pub(crate) unsafe extern "system" fn destroy_device(
     for id in ids {
         remove_handle(id);
     }
-    driver.in_flight.wait();
+    driver.pending.wait();
+    let _ = driver.queue_sender.send(queue::Request::Stop);
+    if let Some(thread) = driver
+        .queue_thread
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        let _ = thread.join();
+    }
     let _ = driver.completion_sender.send(CompletionRequest::Stop);
     if let Some(thread) = driver
         .completion_thread
@@ -508,7 +654,7 @@ fn wait_idle(driver: &Driver) -> VkResult<()> {
             Ok(())
         }
     })?;
-    driver.in_flight.wait();
+    driver.pending.wait();
     if driver.lost.load(Ordering::Acquire) {
         Err(vk::Result::ERROR_DEVICE_LOST)
     } else {
@@ -543,9 +689,7 @@ struct ReadImage {
     position: usize,
     image: vk::Image,
     buffer: vk::Buffer,
-    offset: u64,
-    width: u32,
-    height: u32,
+    region: crate::transfer::ImageReadbackRegion,
 }
 
 type RecordedMemoryBarrier = (bool, vk::AccessFlags, vk::AccessFlags);
@@ -615,6 +759,7 @@ pub(crate) fn set_pipeline_layout_metadata(
 
 #[derive(Clone)]
 enum RecordedCommand {
+    InertDynamicState,
     BlitImage {
         source: vk::Image,
         source_layout: vk::ImageLayout,
@@ -646,7 +791,7 @@ enum RecordedCommand {
         z: u32,
     },
     BeginRenderPass {
-        extended: bool,
+        attachments: Option<Vec<vk::ImageView>>,
         contents: vk::SubpassContents,
         render_pass: vk::RenderPass,
         framebuffer: vk::Framebuffer,
@@ -696,6 +841,17 @@ enum RecordedCommand {
         source: vk::Buffer,
         destination: vk::Buffer,
         regions: Vec<vk::BufferCopy>,
+    },
+    UpdateBuffer {
+        buffer: vk::Buffer,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    FillBuffer {
+        buffer: vk::Buffer,
+        offset: u64,
+        size: u64,
+        word: u32,
     },
     CopyBufferToImage {
         source: vk::Buffer,
@@ -822,6 +978,8 @@ impl Recording {
             | RecordedCommand::BlitImage { .. }
             | RecordedCommand::CopyBuffer { .. }
             | RecordedCommand::CopyBufferToImage { .. }
+            | RecordedCommand::UpdateBuffer { .. }
+            | RecordedCommand::FillBuffer { .. }
                 if self.render_active =>
             {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -871,6 +1029,7 @@ impl ResolvedRecording {
 impl RecordedCommand {
     fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
         match self {
+            Self::InertDynamicState => (),
             Self::BlitImage {
                 source,
                 source_layout,
@@ -930,6 +1089,16 @@ impl RecordedCommand {
                 {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
+                let binding_maps = rt
+                    .resources
+                    .pipeline_binding_maps
+                    .get(layout)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                let binding_stages = rt
+                    .resources
+                    .pipeline_binding_stages
+                    .get(layout)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
                 let layout = rt
                     .resources
                     .pipeline_layouts
@@ -949,7 +1118,10 @@ impl RecordedCommand {
                         .descriptor_sets
                         .get(set)
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    if layout.bind_groups().get(*first as usize + index) != Some(&descriptor.layout)
+                    let group_index = *first as usize + index;
+                    if layout.bind_groups().get(group_index) != Some(&descriptor.layout)
+                        || binding_maps.get(group_index) != Some(&descriptor.binding_map())
+                        || binding_stages.get(group_index) != Some(&descriptor.stages)
                     {
                         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                     }
@@ -1046,17 +1218,25 @@ impl RecordedCommand {
                 rec.ops.push(ir::OwnedCommand::EndComputePass);
             }
             Self::BeginRenderPass {
-                extended,
+                attachments,
                 contents,
                 render_pass,
                 framebuffer,
                 area,
                 clears,
             } => {
-                if *extended || *contents != vk::SubpassContents::INLINE || rec.render.is_some() {
+                if *contents != vk::SubpassContents::INLINE || rec.render.is_some() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
-                render_passes::begin(rt, rec, *render_pass, *framebuffer, *area, clears)?;
+                render_passes::begin(
+                    rt,
+                    rec,
+                    *render_pass,
+                    *framebuffer,
+                    *area,
+                    clears,
+                    attachments.as_deref(),
+                )?;
             }
             Self::NextSubpass => render_passes::next(rec)?,
             Self::ClearColorImage {
@@ -1227,46 +1407,59 @@ impl RecordedCommand {
                     || !image_data.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                     || !matches!(
                         image_data.format,
-                        vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
+                        vk::Format::R8G8B8A8_UNORM
+                            | vk::Format::B8G8R8A8_UNORM
+                            | vk::Format::R8_UNORM
+                            | vk::Format::R8G8_UNORM
                     )
                 {
                     return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                 }
                 for region in regions {
                     let extent = image_data.mip_extent(region.image_subresource.mip_level)?;
-                    if (region.buffer_row_length != 0 && region.buffer_row_length != extent.width)
-                        || (region.buffer_image_height != 0
-                            && region.buffer_image_height != extent.height)
-                        || region.image_offset != vk::Offset3D::default()
-                        || region.image_extent != extent
-                        || region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
-                        || region.image_subresource.base_array_layer != 0
-                        || region.image_subresource.layer_count != 1
-                    {
-                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-                    }
-                    let size = u64::from(extent.width) * u64::from(extent.height) * 4;
-                    if region.buffer_offset % 4 != 0
-                        || region
-                            .buffer_offset
-                            .checked_add(size)
-                            .is_none_or(|end| end > buffer_data.size)
-                    {
-                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                    }
+                    let bytes_per_pixel = crate::images::texture_format(image_data.format)
+                        .and_then(|format| format.bytes_per_pixel())
+                        .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+                    let readback = crate::transfer::ImageReadbackRegion::new(
+                        extent, bytes_per_pixel, buffer_data.size, region,
+                    ).inspect_err(|error| {
+                        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                            eprintln!("[SGFX Vulkan] image readback region rejected: {error:?} format={:?} extent={extent:?} buffer_size={} region={region:?}", image_data.format, buffer_data.size);
+                        }
+                    })?;
                     rec.copies.push(ReadImage {
                         mip_level: region.image_subresource.mip_level,
                         position: rec.ops.len(),
                         image: *image,
                         buffer: *buffer,
-                        offset: region.buffer_offset,
-                        width: extent.width,
-                        height: extent.height,
+                        region: readback,
                     });
                 }
                 rec.used_buffers.push(*buffer);
                 rec.used_images.push(*image);
                 rec.readback_buffers.push(*buffer);
+            }
+            Self::UpdateBuffer {
+                buffer,
+                offset,
+                data,
+            } => {
+                buffer_operations::apply_write(&rt.resources, rec, *buffer, *offset, data.clone())?
+            }
+            Self::FillBuffer {
+                buffer,
+                offset,
+                size,
+                word,
+            } => {
+                let size_bytes = rt
+                    .resources
+                    .buffers
+                    .get(buffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                    .size;
+                let data = buffer_operations::fill_data(size_bytes, *offset, *size, *word)?;
+                buffer_operations::apply_write(&rt.resources, rec, *buffer, *offset, data)?;
             }
             Self::CopyBufferToImage {
                 source,
@@ -1461,6 +1654,13 @@ impl RecordedCommand {
                             Ok(ir::TextureAccess::RenderAttachment)
                         } else if layout == vk::ImageLayout::GENERAL {
                             if mask.intersects(
+                                vk::AccessFlags::COLOR_ATTACHMENT_READ
+                                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                            ) {
+                                Ok(ir::TextureAccess::RenderAttachment)
+                            } else if mask.intersects(
                                 vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE,
                             ) {
                                 Ok(ir::TextureAccess::StorageWrite)
@@ -1510,8 +1710,57 @@ fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedR
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
     let mut resolved = ResolvedRecording::new();
-    for command in source.commands.iter() {
-        command.apply(rt, &mut resolved)?;
+    for (index, command) in source.commands.iter().enumerate() {
+        if let Err(error) = command.apply(rt, &mut resolved) {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX Vulkan] resolve command {index} {:?}: {error:?}",
+                    std::mem::discriminant(command)
+                );
+                match command {
+                    RecordedCommand::BlitImage {
+                        source,
+                        destination,
+                        regions,
+                        filter,
+                        ..
+                    } => eprintln!(
+                        "[SGFX Vulkan] blit: {:?} -> {:?} regions={regions:?} filter={filter:?}",
+                        rt.resources.images.get(source).map(|i| i.format),
+                        rt.resources.images.get(destination).map(|i| i.format)
+                    ),
+                    RecordedCommand::BeginRenderPass {
+                        contents,
+                        render_pass,
+                        framebuffer,
+                        area,
+                        attachments,
+                        ..
+                    } => eprintln!(
+                        "[SGFX Vulkan] begin pass: {contents:?} pass={render_pass:?} fb={framebuffer:?} area={area:?} attachments={attachments:?}"
+                    ),
+                    RecordedCommand::PipelineBarrier {
+                        source_stage,
+                        destination_stage,
+                        flags,
+                        images,
+                        ..
+                    } => {
+                        eprintln!(
+                            "[SGFX Vulkan] barrier: {source_stage:?} -> {destination_stage:?} flags={flags:?}"
+                        );
+                        for b in images {
+                            eprintln!(
+                                "[SGFX Vulkan] image barrier: {:?} {:?} -> {:?}",
+                                b.5, b.6, b.7
+                            );
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            return Err(error);
+        }
     }
     if resolved.render.is_some() {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -2009,15 +2258,30 @@ unsafe extern "system" fn cmd_begin_render_pass(
     let render_pass = info.render_pass;
     let framebuffer = info.framebuffer;
     let area = info.render_area;
-    let extended = !info.p_next.is_null();
-    if extended || contents != vk::SubpassContents::INLINE {
+    let attachments = if info.p_next.is_null() {
+        None
+    } else {
+        let a = &*info.p_next.cast::<vk::RenderPassAttachmentBeginInfo<'_>>();
+        if a.s_type != vk::StructureType::RENDER_PASS_ATTACHMENT_BEGIN_INFO || !a.p_next.is_null() {
+            record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            return;
+        }
+        match slice(a.p_attachments, a.attachment_count) {
+            Ok(v) => Some(v.to_vec()),
+            Err(e) => {
+                record_error(command, e);
+                return;
+            }
+        }
+    };
+    if contents != vk::SubpassContents::INLINE {
         record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
         return;
     }
     record(
         command,
         RecordedCommand::BeginRenderPass {
-            extended,
+            attachments,
             contents,
             render_pass,
             framebuffer,
@@ -2344,7 +2608,7 @@ fn mark_writable_descriptor_buffers(
                 .entries()
                 .iter()
                 .any(|entry| {
-                    entry.binding() == binding * 2
+                    Some(entry.binding()) == set.source_to_ir(binding)
                         && matches!(
                             entry.ty(),
                             ir::BindingType::StorageBuffer { read_only: false }
@@ -2672,6 +2936,7 @@ fn buffer_access(access: vk::AccessFlags) -> VkResult<ir::BufferAccess> {
     }
 }
 fn texture_access(layout: vk::ImageLayout) -> VkResult<ir::TextureAccess> {
+    let layout = crate::render_pass::normalize_depth_layout(layout);
     match layout {
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
         | vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => {
@@ -2827,7 +3092,6 @@ unsafe extern "system" fn create_semaphore(
     *out = vk::Semaphore::null();
     let info = &*info;
     if info.s_type != vk::StructureType::SEMAPHORE_CREATE_INFO
-        || !info.p_next.is_null()
         || !info.flags.is_empty()
         || !allocator.is_null()
     {
@@ -2837,6 +3101,9 @@ unsafe extern "system" fn create_semaphore(
         Ok(d) => d,
         Err(error) => return error,
     };
+    if !info.p_next.is_null() {
+        return status(timeline::create(&d, info, out));
+    }
     let mut semaphores = d.semaphores.lock().unwrap_or_else(|e| e.into_inner());
     if semaphores.len() >= 4096 {
         return vk::Result::ERROR_TOO_MANY_OBJECTS;
@@ -2853,6 +3120,10 @@ unsafe extern "system" fn destroy_semaphore(
     _: *const vk::AllocationCallbacks<'_>,
 ) {
     if let Ok(d) = driver(device.as_raw(), Kind::Device) {
+        d.timelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&semaphore.as_raw());
         d.semaphores
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2953,244 +3224,31 @@ unsafe extern "system" fn queue_submit(
     submits: *const vk::SubmitInfo<'_>,
     fence: vk::Fence,
 ) -> vk::Result {
-    let submits = match slice(submits, count) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let mut commands = Vec::new();
-    let mut wait_handles = Vec::new();
-    let mut signal_handles = Vec::new();
-    for submit in submits {
-        if !submit.p_next.is_null() {
-            return vk::Result::ERROR_FEATURE_NOT_PRESENT;
-        }
-        let waits = match slice(submit.p_wait_semaphores, submit.wait_semaphore_count) {
-            Ok(v) => v,
-            Err(error) => return error,
-        };
-        let signals = match slice(submit.p_signal_semaphores, submit.signal_semaphore_count) {
-            Ok(v) => v,
-            Err(error) => return error,
-        };
-        if !waits.is_empty() {
-            let stages = match slice(submit.p_wait_dst_stage_mask, submit.wait_semaphore_count) {
-                Ok(v) => v,
-                Err(error) => return error,
-            };
-            if stages.iter().any(|stage| stage.is_empty()) {
-                return vk::Result::ERROR_FEATURE_NOT_PRESENT;
-            }
-        }
-        wait_handles.extend_from_slice(waits);
-        signal_handles.extend_from_slice(signals);
-        let c = match slice(submit.p_command_buffers, submit.command_buffer_count) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        commands.extend(c.iter().map(|c| c.as_raw()));
-    }
-    let d = match driver(queue.as_raw(), Kind::Queue) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-    let mut unique = wait_handles
-        .iter()
-        .chain(&signal_handles)
-        .map(|handle| handle.as_raw())
-        .collect::<Vec<_>>();
-    unique.sort_unstable();
-    if unique.windows(2).any(|pair| pair[0] == pair[1]) {
-        return vk::Result::ERROR_FEATURE_NOT_PRESENT;
-    }
-    let wait_semaphores = match semaphore_refs(&d, &wait_handles) {
-        Ok(semaphores) => semaphores,
-        Err(error) => return error,
-    };
-    let signal_semaphores = match semaphore_refs(&d, &signal_handles) {
-        Ok(semaphores) => semaphores,
-        Err(error) => return error,
-    };
-    for &id in &commands {
-        if !driver(id, Kind::Command).is_ok_and(|v| Arc::ptr_eq(&v, &d)) {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        }
-    }
-    let recorded = {
-        let registry = d
-            .recordings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match commands
-            .iter()
-            .map(|id| {
-                registry
-                    .commands
-                    .get(id)
-                    .cloned()
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
-            })
-            .collect::<VkResult<Vec<RecordingCell>>>()
-        {
-            Ok(recorded) => recorded,
-            Err(error) => return error,
-        }
-    };
-    let recorded = match recorded
-        .iter()
-        .map(|recording| {
-            let recording = recording
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (recording.state == RecordingState::Executable)
-                .then(|| recording.clone())
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
-        })
-        .collect::<VkResult<Vec<_>>>()
-    {
-        Ok(recorded) => recorded,
-        Err(error) => return error,
-    };
-    if let Err(error) = wait_and_consume_semaphores(&d, &wait_semaphores) {
-        return error;
-    }
-    let accepted = call(&d, move |rt| {
-        if rt.lost {
-            return Err(vk::Result::ERROR_DEVICE_LOST);
-        }
-        let fence_state = if fence == vk::Fence::null() {
-            None
-        } else {
-            let fences = rt.fences.lock().unwrap_or_else(|e| e.into_inner());
-            let state = fences
-                .get(&fence.as_raw())
-                .cloned()
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if state.load(Ordering::Acquire) != 0 {
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
-            Some(state)
-        };
-        let recordings = recorded
-            .iter()
-            .map(|recording| resolve_recording(rt, recording))
-            .collect::<VkResult<Vec<_>>>()?;
-        // Validate all object references before any GPU acceptance.
-        for rec in &recordings {
-            validate_objects(rt, rec)?;
-        }
-        for state in &signal_semaphores {
-            if state
-                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                for reserved in &signal_semaphores {
-                    if Arc::ptr_eq(reserved, state) {
-                        break;
-                    }
-                    reserved.store(0, Ordering::Release);
-                }
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
-        }
-        if let Some(state) = &fence_state {
-            state.store(2, Ordering::Release);
-        }
-        let mut submissions = Vec::new();
-        for recording in &recordings {
-            match execute(rt, recording) {
-                Ok(mut accepted) => submissions.append(&mut accepted),
-                Err(error) => {
-                    for submission in &submissions {
-                        let _ = wait_submission(rt, submission);
-                    }
-                    // A partially accepted recording may have changed buffers.
-                    rt.resources.uploaded_unmapped_buffers.clear();
-                    if error == vk::Result::ERROR_DEVICE_LOST {
-                        rt.lost = true;
-                    }
-                    if let Some(state) = &fence_state {
-                        state.store(0, Ordering::Release);
-                    }
-                    for state in &signal_semaphores {
-                        state.store(0, Ordering::Release);
-                    }
-
-                    return Err(error);
-                }
-            }
-        }
-        let submitted = {
-            let registry = rt
-                .recordings
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            commands
-                .iter()
-                .filter_map(|id| registry.commands.get(id).cloned())
-                .collect::<Vec<_>>()
-        };
-        for recording in submitted {
-            let mut recording = recording
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if recording.one_time {
-                recording.state = RecordingState::Invalid;
-            }
-        }
-        if submissions.is_empty() {
-            if let Some(state) = &fence_state {
-                state.store(1, Ordering::Release);
-            }
-            for state in &signal_semaphores {
-                state.store(1, Ordering::Release);
-            }
-        } else {
-            rt.in_flight.begin();
-        }
-        Ok((submissions, fence_state, signal_semaphores))
-    });
-    let (submissions, fence_state, signal_semaphores) = match accepted {
-        Ok(accepted) => accepted,
-        Err(error) => return error,
-    };
-    if submissions.is_empty() {
-        return vk::Result::SUCCESS;
-    }
-    if let Err(error) = d.completion_sender.send(CompletionRequest::Observe {
-        submissions,
-        fence: fence_state,
-        signals: signal_semaphores,
-    }) {
-        let CompletionRequest::Observe {
-            submissions,
-            fence,
-            signals,
-        } = error.0
-        else {
-            unreachable!();
-        };
-        finish_submissions(
-            &submissions,
-            fence.as_ref(),
-            &signals,
-            &d.in_flight,
-            &d.lost,
-        );
-    }
-    vk::Result::SUCCESS
+    status(queue::submit(queue, count, submits, fence))
 }
 
 fn finish_submissions(
     submissions: &[sgfx::driver::Submission],
     fence: Option<&Arc<AtomicU8>>,
     signals: &[Arc<AtomicU8>],
+    timeline_signals: &[(Arc<timeline::Timeline>, u64)],
     in_flight: &InFlight,
+    pending: &InFlight,
     lost: &AtomicBool,
 ) {
-    let complete = submissions
-        .iter()
-        .all(|submission| matches!(submission.wait(None), Ok(CompletionStatus::Complete)));
-    if complete {
+    // Drain every receipt even when one fails: failure does not free other GPU work.
+    let complete = submissions.iter().enumerate().fold(true, |complete, (index, submission)| {
+        let result = submission.wait(None);
+        let finished = matches!(result, Ok(CompletionStatus::Complete));
+        if !finished && std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            eprintln!("[SGFX Vulkan] asynchronous submission completion failed: receipt={index}/{} result={result:?}", submissions.len());
+        }
+        finished & complete
+    });
+    if complete && !lost.load(Ordering::Acquire) {
+        for (timeline, value) in timeline_signals {
+            timeline.complete(*value);
+        }
         if let Some(state) = fence {
             state.store(1, Ordering::Release);
         }
@@ -3199,6 +3257,9 @@ fn finish_submissions(
         }
     } else {
         lost.store(true, Ordering::Release);
+        for (timeline, value) in timeline_signals {
+            timeline.cancel(*value);
+        }
         if let Some(state) = fence {
             state.store(0, Ordering::Release);
         }
@@ -3207,6 +3268,7 @@ fn finish_submissions(
         }
     }
     in_flight.finish();
+    pending.finish();
 }
 fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
     if rec
@@ -3255,6 +3317,12 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
             .get(&d.set)
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         if set.invalid {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX Vulkan] invalid descriptor set {:?}: layout={:?} bindings={:?}",
+                    d.set, set.layout, set.bindings
+                );
+            }
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
         for binding in set.bindings.values() {
@@ -3265,6 +3333,12 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
                 b.bound
                     .is_some_and(|(m, _)| rt.resources.memories.contains_key(&m))
             }) {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] descriptor buffer missing allocation: set={:?} buffer={buffer:?}",
+                        d.set
+                    );
+                }
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
         }
@@ -3279,31 +3353,168 @@ fn submit_owned(
         return Ok(None);
     }
     let owned = ir::OwnedCommandBuffer::new(ops);
-    let commands = owned.record(&rt.table).map_err(crate::resources::failure)?;
+    let commands = owned.record(&rt.table).map_err(|error| {
+        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            trace_owned_recording_failure(&rt.table, &owned, error);
+        }
+        crate::resources::failure(error)
+    })?;
     match rt.queue.submit(&mut rt.cache, &commands) {
         Ok(receipt) => Ok(Some(receipt)),
         Err(SubmitError::Busy) => Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
         Err(SubmitError::Rejected(error)) => Err(crate::runtime::backend_failure(error)),
-        Err(SubmitError::Failed {
-            error: _,
-            completion,
-        }) => {
-            let _ = completion.wait(None);
+        Err(SubmitError::Failed { error, completion }) => {
+            let result = completion.wait(None);
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX Vulkan] submission failed after execution began: error={error:?} completion={result:?}"
+                );
+            }
             rt.lost = true;
             Err(vk::Result::ERROR_DEVICE_LOST)
         }
-        Err(_) => Err(vk::Result::ERROR_DEVICE_LOST),
+        Err(_) => {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX Vulkan] submission returned an unrecognized error; reporting device lost"
+                );
+            }
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        }
+    }
+}
+
+/// Failure-only metadata: never print upload or push-constant payloads.
+fn trace_owned_recording_failure(
+    table: &ir::ResourceTable,
+    owned: &ir::OwnedCommandBuffer,
+    error: ir::Error,
+) {
+    eprintln!(
+        "[SGFX Vulkan] IR recording rejected: {error:?}, {} operations",
+        owned.command_count()
+    );
+    for (index, command) in owned.commands().iter().enumerate().take(512) {
+        match command {
+            ir::OwnedCommand::WriteBuffer {
+                buffer,
+                offset,
+                data,
+            } => {
+                let desc = table.buffer_ref(*buffer).and_then(|id| table.buffer(id));
+                eprintln!(
+                    "[SGFX Vulkan] IR[{index}] WriteBuffer {buffer:?} offset={offset} bytes={} descriptor={desc:?}",
+                    data.len()
+                );
+            }
+            ir::OwnedCommand::WriteTexture {
+                texture,
+                destination,
+                bytes_per_row,
+                data,
+            }
+            | ir::OwnedCommand::WriteTextureMip {
+                texture,
+                destination,
+                bytes_per_row,
+                data,
+                ..
+            }
+            | ir::OwnedCommand::WriteTextureLayer {
+                texture,
+                destination,
+                bytes_per_row,
+                data,
+                ..
+            } => {
+                let desc = table.texture_ref(*texture).and_then(|id| table.texture(id));
+                let (mip, layer) = match command {
+                    ir::OwnedCommand::WriteTextureMip { mip_level, .. } => (*mip_level, 0),
+                    ir::OwnedCommand::WriteTextureLayer {
+                        mip_level,
+                        array_layer,
+                        ..
+                    } => (*mip_level, *array_layer),
+                    _ => (0, 0),
+                };
+                eprintln!(
+                    "[SGFX Vulkan] IR[{index}] WriteTexture {texture:?} mip={mip} layer={layer} destination={destination:?} stride={bytes_per_row} bytes={} descriptor={desc:?}",
+                    data.len()
+                );
+            }
+            ir::OwnedCommand::SetPushConstants {
+                stages,
+                offset,
+                data,
+            } => {
+                eprintln!(
+                    "[SGFX Vulkan] IR[{index}] SetPushConstants stages={stages:?} offset={offset} bytes={}",
+                    data.len()
+                );
+            }
+            ir::OwnedCommand::SetVertexBuffer { buffer, .. }
+            | ir::OwnedCommand::SetVertexBufferSlot { buffer, .. }
+            | ir::OwnedCommand::SetIndexBuffer { buffer, .. } => {
+                let desc = table.buffer_ref(*buffer).and_then(|id| table.buffer(id));
+                eprintln!("[SGFX Vulkan] IR[{index}] {command:?} descriptor={desc:?}");
+            }
+            ir::OwnedCommand::SetProgrammablePipeline(pipeline) => {
+                let desc = table
+                    .programmable_render_pipeline_ref(*pipeline)
+                    .and_then(|id| table.programmable_render_pipeline_shared(id));
+                eprintln!(
+                    "[SGFX Vulkan] IR[{index}] {command:?} vertex_layout={:?}",
+                    desc.as_ref().map(|desc| desc.vertex_buffers())
+                );
+            }
+            ir::OwnedCommand::BeginRenderPass(desc)
+            | ir::OwnedCommand::BeginRenderPassWithAttachments { desc, .. } => {
+                let target = table
+                    .texture_ref(desc.target)
+                    .and_then(|id| table.texture(id));
+                eprintln!("[SGFX Vulkan] IR[{index}] {command:?} target={target:?}");
+                if let Some(depth) = desc.depth {
+                    let target = table
+                        .texture_ref(depth.target)
+                        .and_then(|id| table.texture(id));
+                    eprintln!("[SGFX Vulkan] IR[{index}] depth target={target:?}");
+                }
+                if let ir::OwnedCommand::BeginRenderPassWithAttachments { colors, .. } = command {
+                    for color in colors {
+                        let target = table
+                            .texture_ref(color.target)
+                            .and_then(|id| table.texture(id));
+                        eprintln!("[SGFX Vulkan] IR[{index}] additional color target={target:?}");
+                    }
+                }
+            }
+            ir::OwnedCommand::SetBindGroup { bind_group, .. } => {
+                let desc = table
+                    .bind_group_ref(*bind_group)
+                    .and_then(|id| table.bind_group(id));
+                eprintln!("[SGFX Vulkan] IR[{index}] {command:?} descriptor={desc:?}");
+            }
+            _ => eprintln!("[SGFX Vulkan] IR[{index}] {command:?}"),
+        }
     }
 }
 
 fn wait_submission(rt: &mut Runtime, submission: &sgfx::driver::Submission) -> VkResult<()> {
     match submission.wait(None) {
         Ok(CompletionStatus::Complete) => Ok(()),
-        Ok(CompletionStatus::Pending) | Ok(_) => {
+        Ok(status) => {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX Vulkan] synchronous submission completion did not complete: {status:?}"
+                );
+            }
             rt.lost = true;
             Err(vk::Result::ERROR_DEVICE_LOST)
         }
         Err(error) => {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!("[SGFX Vulkan] synchronous submission completion failed: {error:?}");
+            }
             let result = crate::runtime::backend_failure(error);
             if result == vk::Result::ERROR_DEVICE_LOST {
                 rt.lost = true;
@@ -3388,7 +3599,12 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
     }
     used.sort_unstable_by_key(|b| b.as_raw());
     used.dedup();
-    let (mut ops, fresh_uploads) = snapshot_buffer_uploads(&rt.resources, &used)?;
+    let (mut ops, fresh_uploads) =
+        snapshot_buffer_uploads(&rt.resources, &used).inspect_err(|error| {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!("[SGFX Vulkan] buffer snapshot failed: {error:?} used={used:?}");
+            }
+        })?;
     let mut descriptors = rec.descriptors.as_slice();
     let mut barriers = rec.barriers.as_slice();
     let mut copies = rec.copies.as_slice();
@@ -3407,7 +3623,14 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
                     .limits()
                     .min_storage_buffer_offset_alignment
                     .max(4),
-            )?;
+            ).inspect_err(|error| {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!("[SGFX Vulkan] descriptor materialization failed: {error:?} set={:?} offsets={:?} layout={:?}", d.set, d.dynamic_offsets, d.layout);
+                    if let Some(set) = rt.resources.descriptor_sets.get(&d.set) {
+                        eprintln!("[SGFX Vulkan] descriptor contents: invalid={} layout={:?} types={:?} bindings={:?}", set.invalid, set.layout, set.types, set.bindings);
+                    }
+                }
+            })?;
             ops.push(ir::OwnedCommand::SetBindGroup {
                 index: d.index,
                 bind_group: group,
@@ -3449,19 +3672,12 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
                 .queue
                 .read_texture_mip(&mut rt.cache, image_id, copy.mip_level)
                 .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-            if bytes.len() != (copy.width as usize) * (copy.height as usize) * 4 {
-                return Err(vk::Result::ERROR_DEVICE_LOST);
-            }
             let buffer = rt
                 .resources
                 .buffers
                 .get(&copy.buffer)
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            ops.push(ir::OwnedCommand::WriteBuffer {
-                buffer: buffer.id,
-                offset: copy.offset,
-                data: bytes,
-            });
+            ops.extend(copy.region.writes(&bytes, buffer.id)?);
         }
         if let Some(op) = rec.ops.get(position) {
             ops.push(op.clone());
@@ -3548,6 +3764,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCreateCommandPool" => entry!(create_command_pool),
         b"vkDestroyCommandPool" => entry!(destroy_command_pool),
         b"vkResetCommandPool" => entry!(reset_command_pool),
+        b"vkTrimCommandPoolKHR" => entry!(maintenance1::trim_command_pool),
         b"vkAllocateCommandBuffers" => entry!(allocate_command_buffers),
         b"vkFreeCommandBuffers" => entry!(free_command_buffers),
         b"vkResetCommandBuffer" => entry!(reset_command_buffer),
@@ -3593,7 +3810,16 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkGetImageScarletHandleSGFX" => {
             entry!(crate::scarlet_image::vkGetImageScarletHandleSGFX)
         }
-        _ => crate::resources::lookup(name).or_else(|| crate::images::lookup(name)),
+        _ => descriptor_template::lookup(name)
+            .or_else(|| dynamic_states::lookup(name))
+            .or_else(|| buffer_views::lookup(name))
+            .or_else(|| render_pass2::lookup(name))
+            .or_else(|| timeline::lookup(name))
+            .or_else(|| bootstrap::lookup(name))
+            .or_else(|| buffer_operations::lookup(name))
+            .or_else(|| unsupported::lookup(name))
+            .or_else(|| crate::resources::lookup(name))
+            .or_else(|| crate::images::lookup(name)),
     }
 }
 
@@ -3853,6 +4079,7 @@ mod tests {
                     pool: vk::DescriptorPool::from_raw(7),
                     layout: group_layout.clone(),
                     types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
+                    stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
                     bindings: HashMap::from([(
                         0,
                         crate::resources::DescriptorBinding::Buffer {
@@ -4150,10 +4377,16 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
+            queue_sender: mpsc::channel().0,
+            queue_thread: Mutex::new(None),
+            timeline_enabled: true,
+            timelines: Default::default(),
+            events: Default::default(),
             fences: Default::default(),
             semaphores: Default::default(),
             recordings: Default::default(),
             in_flight: Default::default(),
+            pending: Default::default(),
             lost: Arc::new(AtomicBool::new(false)),
         });
         let command = vk::CommandBuffer::from_raw(add_handle(Kind::Command, &d));
@@ -4214,10 +4447,16 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
+            queue_sender: mpsc::channel().0,
+            queue_thread: Mutex::new(None),
+            timeline_enabled: true,
+            timelines: Default::default(),
+            events: Default::default(),
             fences: Default::default(),
             semaphores: Default::default(),
             recordings: Default::default(),
             in_flight: Default::default(),
+            pending: Default::default(),
             lost: Arc::new(AtomicBool::new(false)),
         });
         let device = vk::Device::from_raw(add_handle(Kind::Device, &d));
@@ -4262,10 +4501,16 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
+            queue_sender: mpsc::channel().0,
+            queue_thread: Mutex::new(None),
+            timeline_enabled: true,
+            timelines: Default::default(),
+            events: Default::default(),
             fences: Default::default(),
             semaphores: Default::default(),
             recordings: Default::default(),
             in_flight: Default::default(),
+            pending: Default::default(),
             lost: Arc::new(AtomicBool::new(false)),
         });
         let device = vk::Device::from_raw(add_handle(Kind::Device, &d));
@@ -4310,13 +4555,15 @@ mod tests {
         };
         unsafe {
             assert!(device_chain_supported(
-                (&base as *const vk::BaseInStructure<'_>).cast()
+                (&base as *const vk::BaseInStructure<'_>).cast(),
+                &vk::PhysicalDeviceFeatures::default(),
             ));
         }
-        base.s_type = vk::StructureType::PHYSICAL_DEVICE_FEATURES_2;
+        base.s_type = vk::StructureType::DEVICE_GROUP_DEVICE_CREATE_INFO;
         unsafe {
             assert!(!device_chain_supported(
-                (&base as *const vk::BaseInStructure<'_>).cast()
+                (&base as *const vk::BaseInStructure<'_>).cast(),
+                &vk::PhysicalDeviceFeatures::default(),
             ));
         }
     }
@@ -4335,7 +4582,12 @@ mod tests {
                     .cast(),
                 ..Default::default()
             };
-            unsafe { device_chain_supported((&loader as *const vk::BaseInStructure<'_>).cast()) }
+            unsafe {
+                device_chain_supported(
+                    (&loader as *const vk::BaseInStructure<'_>).cast(),
+                    &vk::PhysicalDeviceFeatures::default(),
+                )
+            }
         }
         let mut draw = vk::PhysicalDeviceShaderDrawParametersFeatures::default();
         let mut indexing = vk::PhysicalDeviceDescriptorIndexingFeatures::default();
@@ -4356,7 +4608,70 @@ mod tests {
         loader.p_next = &loader;
         unsafe {
             assert!(!device_chain_supported(
-                (&loader as *const vk::BaseInStructure<'_>).cast()
+                (&loader as *const vk::BaseInStructure<'_>).cast(),
+                &vk::PhysicalDeviceFeatures::default(),
+            ));
+        }
+    }
+
+    #[test]
+    fn independent_blend_core_features_reject_unadvertised_and_invalid_requests() {
+        let supported = vk::PhysicalDeviceFeatures::default().independent_blend(true);
+        let disabled = vk::PhysicalDeviceFeatures::default();
+        assert!(core_device_features_supported(&disabled, &supported));
+        assert!(core_device_features_supported(&supported, &supported));
+        assert!(!core_device_features_supported(&supported, &disabled));
+
+        // Exercise every core feature field, so adding independentBlend cannot
+        // accidentally permit an unsupported feature at either end of the ABI.
+        let independent_offset =
+            std::mem::offset_of!(vk::PhysicalDeviceFeatures, independent_blend) / 4;
+        for index in 0..std::mem::size_of::<vk::PhysicalDeviceFeatures>() / 4 {
+            let mut requested = vk::PhysicalDeviceFeatures::default();
+            unsafe {
+                let fields = (&mut requested as *mut vk::PhysicalDeviceFeatures).cast::<u32>();
+                *fields.add(index) = vk::TRUE;
+                assert_eq!(
+                    core_device_features_supported(&requested, &supported),
+                    index == independent_offset,
+                    "core feature field {index}",
+                );
+                *fields.add(index) = 2;
+                assert!(!core_device_features_supported(&requested, &supported));
+            }
+        }
+    }
+
+    #[test]
+    fn independent_blend_features2_matches_legacy_feature_validation() {
+        let supported = vk::PhysicalDeviceFeatures::default().independent_blend(true);
+        let mut requested = vk::PhysicalDeviceFeatures2::default().features(supported);
+        let mut loader = vk::BaseInStructure {
+            s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
+            ..Default::default()
+        };
+        requested.p_next = (&mut loader as *mut vk::BaseInStructure<'_>).cast();
+        let chain = (&requested as *const vk::PhysicalDeviceFeatures2<'_>).cast();
+        unsafe {
+            assert!(device_chain_supported(chain, &supported));
+            assert!(!device_chain_supported(
+                chain,
+                &vk::PhysicalDeviceFeatures::default(),
+            ));
+        }
+        requested.features.logic_op = vk::TRUE;
+        unsafe {
+            assert!(!device_chain_supported(
+                (&requested as *const vk::PhysicalDeviceFeatures2<'_>).cast(),
+                &supported,
+            ));
+        }
+        requested.features.logic_op = vk::FALSE;
+        requested.features.independent_blend = 2;
+        unsafe {
+            assert!(!device_chain_supported(
+                (&requested as *const vk::PhysicalDeviceFeatures2<'_>).cast(),
+                &supported,
             ));
         }
     }

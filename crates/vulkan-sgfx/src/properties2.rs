@@ -27,6 +27,19 @@ unsafe extern "system" fn properties(
             id.device_node_mask = 0;
             id.device_luid_valid = vk::FALSE;
         }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES {
+            (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreProperties<'_>>())
+                .max_timeline_semaphore_value_difference = u64::MAX;
+        }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES {
+            let mv = &mut *node.cast::<vk::PhysicalDeviceMultiviewProperties<'_>>();
+            mv.max_multiview_view_count = 0;
+            mv.max_multiview_instance_index = 0;
+        }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_POINT_CLIPPING_PROPERTIES {
+            (*node.cast::<vk::PhysicalDevicePointClippingProperties<'_>>())
+                .point_clipping_behavior = vk::PointClippingBehavior::ALL_CLIP_PLANES;
+        }
         node = base.p_next;
     }
 }
@@ -55,6 +68,30 @@ unsafe extern "system" fn features(
     if let Some(out) = unsafe { out.as_mut() } {
         unsafe {
             crate::instance::get_physical_device_features(physical, &mut out.features);
+            let mut node = out.p_next.cast::<vk::BaseOutStructure<'_>>();
+            for _ in 0..64 {
+                let Some(base) = node.as_mut() else {
+                    break;
+                };
+                if base.s_type == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES {
+                    (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
+                        .timeline_semaphore =
+                        u32::from(crate::instance::physical_adapter(physical).is_some());
+                }
+                if base.s_type == vk::StructureType::PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES
+                {
+                    (*node.cast::<vk::PhysicalDeviceImagelessFramebufferFeatures<'_>>())
+                        .imageless_framebuffer =
+                        u32::from(crate::instance::physical_adapter(physical).is_some());
+                }
+                if base.s_type == vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_FEATURES {
+                    let mv = &mut *node.cast::<vk::PhysicalDeviceMultiviewFeatures<'_>>();
+                    mv.multiview = 0;
+                    mv.multiview_geometry_shader = 0;
+                    mv.multiview_tessellation_shader = 0;
+                }
+                node = base.p_next;
+            }
         }
     }
 }

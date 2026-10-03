@@ -38,6 +38,8 @@ pub enum TextureFormat {
     Rgba8UnormSrgb,
     /// One eight-bit normalized red channel.
     R8Unorm,
+    /// Two eight-bit normalized red and green channels.
+    Rg8Unorm,
     /// Two-plane 8-bit 4:2:0 Y plus interleaved CbCr, sampled with an explicit conversion.
     /// Currently import-only: one mip, one layer, and SAMPLED usage.
     Nv12,
@@ -46,6 +48,21 @@ pub enum TextureFormat {
 }
 
 impl TextureFormat {
+    /// Color blits preserve components, including narrow color expansion to RGBA/BGRA.
+    pub const fn blit_compatible(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                Self::Rgba8Unorm | Self::Bgra8Unorm,
+                Self::Rgba8Unorm | Self::Bgra8Unorm
+            ) | (Self::R8Unorm, Self::R8Unorm)
+                | (Self::Rg8Unorm, Self::Rg8Unorm)
+                | (
+                    Self::R8Unorm | Self::Rg8Unorm,
+                    Self::Rgba8Unorm | Self::Bgra8Unorm
+                )
+        )
+    }
     /// Return the number of bytes per tightly packed pixel.
     ///
     /// # Returns
@@ -59,6 +76,7 @@ impl TextureFormat {
             | Self::Rgba8UnormSrgb
             | Self::Depth32Float => Some(4),
             Self::R8Unorm => Some(1),
+            Self::Rg8Unorm => Some(2),
             Self::Nv12 => None,
         }
     }
@@ -74,6 +92,7 @@ impl TextureFormat {
                 Self::Rgba8Unorm | Self::Rgba8UnormSrgb,
                 Self::Rgba8Unorm | Self::Rgba8UnormSrgb
             ) | (Self::R8Unorm, Self::R8Unorm)
+                | (Self::Rg8Unorm, Self::Rg8Unorm)
                 | (Self::Depth32Float, Self::Depth32Float)
         )
     }
@@ -180,6 +199,7 @@ pub struct TextureDesc {
     mip_level_count: u32,
     array_layer_count: u32,
     cube_compatible: bool,
+    dimension_1d: bool,
 }
 
 impl TextureDesc {
@@ -212,6 +232,7 @@ impl TextureDesc {
                 mip_level_count: 1,
                 array_layer_count: 1,
                 cube_compatible: false,
+                dimension_1d: false,
             })
         }
     }
@@ -287,12 +308,34 @@ impl TextureDesc {
     /// cube and array texture targets differ. The first six square layers form
     /// a cube; this does not change layer ordering or texel storage.
     pub fn with_cube_compatible(mut self, compatible: bool) -> Result<Self> {
-        if compatible && (self.array_layer_count < 6 || self.extent.width() != self.extent.height())
+        if compatible
+            && (self.dimension_1d
+                || self.array_layer_count < 6
+                || self.extent.width() != self.extent.height())
         {
             return Err(Error::InvalidDescriptor);
         }
         self.cube_compatible = compatible;
         Ok(self)
+    }
+
+    /// Select one-dimensional coordinates over a height-one allocation.
+    pub fn with_dimension_1d(mut self, dimension_1d: bool) -> Result<Self> {
+        if dimension_1d
+            && (self.extent.height() != 1
+                || self.cube_compatible
+                || self.format == TextureFormat::Nv12
+                || self.usage.contains(TextureUsage::PRESENT))
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.dimension_1d = dimension_1d;
+        Ok(self)
+    }
+
+    /// Whether this allocation has one-dimensional coordinates.
+    pub const fn dimension_1d(self) -> bool {
+        self.dimension_1d
     }
 
     /// Return whether the allocation must permit cube sampling.
@@ -533,7 +576,7 @@ impl SamplerDesc {
         self.address_v
     }
 
-    /// Set mip filtering and a finite, nonnegative LOD interval. Keeping
+    /// Set mip filtering and a finite, ordered LOD interval. Keeping
     /// floating values as validated bits preserves descriptor equality.
     pub fn with_mip_filter(
         mut self,
@@ -541,7 +584,7 @@ impl SamplerDesc {
         min_lod: f32,
         max_lod: f32,
     ) -> Result<Self> {
-        if !min_lod.is_finite() || !max_lod.is_finite() || min_lod < 0.0 || max_lod < min_lod {
+        if !min_lod.is_finite() || !max_lod.is_finite() || max_lod < min_lod {
             return Err(Error::InvalidValue);
         }
         self.mip_filter = filter;
@@ -658,19 +701,33 @@ impl<'data> TextureWrite<'data> {
 /// Table that owns validated logical resource descriptors.
 pub struct ResourceTable {
     id: usize,
-    textures: RefCell<Vec<TextureDesc>>,
+    textures: RefCell<Vec<TextureSlot>>,
+    free_texture: Cell<Option<usize>>,
     buffers: RefCell<Vec<BufferSlot>>,
     free_buffer: Cell<Option<usize>>,
     samplers: RefCell<Vec<SamplerDesc>>,
     pipelines: RefCell<Vec<RenderPipelineDesc>>,
     shader_modules: RefCell<Vec<ShaderModuleDesc>>,
-    bind_groups: RefCell<Vec<Rc<BindGroupDesc>>>,
+    bind_groups: RefCell<Vec<BindGroupSlot>>,
+    free_bind_group: Cell<Option<usize>>,
     compute_pipelines: RefCell<Vec<ComputePipelineDesc>>,
     programmable_pipelines: RefCell<Vec<Rc<ProgrammableRenderPipelineDesc>>>,
 }
 
+struct TextureSlot {
+    descriptor: Option<TextureDesc>,
+    generation: u64,
+    next_free: Option<usize>,
+}
+
 struct BufferSlot {
     descriptor: Option<BufferDesc>,
+    generation: u64,
+    next_free: Option<usize>,
+}
+
+struct BindGroupSlot {
+    descriptor: Option<Rc<BindGroupDesc>>,
     generation: u64,
     next_free: Option<usize>,
 }
@@ -684,12 +741,14 @@ impl ResourceTable {
         Self {
             id: NEXT_RESOURCE_TABLE_ID.fetch_add(1, Ordering::Relaxed),
             textures: RefCell::new(Vec::new()),
+            free_texture: Cell::new(None),
             buffers: RefCell::new(Vec::new()),
             free_buffer: Cell::new(None),
             samplers: RefCell::new(Vec::new()),
             pipelines: RefCell::new(Vec::new()),
             shader_modules: RefCell::new(Vec::new()),
             bind_groups: RefCell::new(Vec::new()),
+            free_bind_group: Cell::new(None),
             compute_pipelines: RefCell::new(Vec::new()),
             programmable_pipelines: RefCell::new(Vec::new()),
         }
@@ -704,8 +763,49 @@ impl ResourceTable {
     /// # Returns
     /// A texture reference, or a bounded-allocation error.
     pub fn define_texture(&self, desc: TextureDesc) -> Result<TextureRef<'_>> {
-        let index = Self::push(&self.textures, desc, MAX_TEXTURES)?;
-        Ok(TextureRef { owner: self, index })
+        let mut textures = self.textures.borrow_mut();
+        if let Some(index) = self.free_texture.get() {
+            let slot = &mut textures[index];
+            self.free_texture.set(slot.next_free.take());
+            slot.descriptor = Some(desc);
+            return Ok(TextureRef {
+                owner: self,
+                index,
+                generation: slot.generation,
+            });
+        }
+        if textures.len() >= MAX_TEXTURES {
+            return Err(Error::ResourceLimitExceeded);
+        }
+        textures.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        let index = textures.len();
+        textures.push(TextureSlot {
+            descriptor: Some(desc),
+            generation: 0,
+            next_free: None,
+        });
+        Ok(TextureRef {
+            owner: self,
+            index,
+            generation: 0,
+        })
+    }
+
+    /// Retire a texture identity so its bounded slot can be reused safely.
+    /// References from an earlier generation no longer resolve.
+    pub fn release_texture(&self, id: TextureId) -> Result<()> {
+        self.texture_ref(id)?;
+        let mut textures = self.textures.borrow_mut();
+        let slot = &mut textures[id.index];
+        let next_generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or(Error::ResourceLimitExceeded)?;
+        slot.descriptor = None;
+        slot.generation = next_generation;
+        slot.next_free = self.free_texture.get();
+        self.free_texture.set(Some(id.index));
+        Ok(())
     }
     /// Define a buffer descriptor and return its table-branded reference.
     ///
@@ -799,10 +899,20 @@ impl ResourceTable {
     /// A reference branded with this borrow of the owning table, or
     /// [`Error::ResourceTableMismatch`] when `id` belongs to another table.
     pub fn texture_ref(&self, id: TextureId) -> Result<TextureRef<'_>> {
-        self.validate_id(id.owner, id.index, &self.textures)?;
+        if id.owner != self.id {
+            return Err(Error::ResourceTableMismatch);
+        }
+        let textures = self.textures.borrow();
+        if textures
+            .get(id.index)
+            .is_none_or(|slot| slot.generation != id.generation || slot.descriptor.is_none())
+        {
+            return Err(Error::InvalidDescriptor);
+        }
         Ok(TextureRef {
             owner: self,
             index: id.index,
+            generation: id.generation,
         })
     }
 
@@ -897,15 +1007,67 @@ impl ResourceTable {
     /// Define an immutable bind group and return its branded reference.
     pub fn define_bind_group(&self, desc: BindGroupDesc) -> Result<BindGroupRef<'_>> {
         desc.validate(self)?;
-        let index = Self::push(&self.bind_groups, Rc::new(desc), MAX_BIND_GROUP_DEFINITIONS)?;
-        Ok(BindGroupRef { owner: self, index })
+        let mut groups = self.bind_groups.borrow_mut();
+        if let Some(index) = self.free_bind_group.get() {
+            let slot = &mut groups[index];
+            self.free_bind_group.set(slot.next_free.take());
+            slot.descriptor = Some(Rc::new(desc));
+            return Ok(BindGroupRef {
+                owner: self,
+                index,
+                generation: slot.generation,
+            });
+        }
+        if groups.len() >= MAX_BIND_GROUP_DEFINITIONS {
+            return Err(Error::ResourceLimitExceeded);
+        }
+        groups.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        let index = groups.len();
+        groups.push(BindGroupSlot {
+            descriptor: Some(Rc::new(desc)),
+            generation: 0,
+            next_free: None,
+        });
+        Ok(BindGroupRef {
+            owner: self,
+            index,
+            generation: 0,
+        })
+    }
+    /// Retire a bind-group identity so its bounded slot can be reused safely.
+    /// Previously recorded commands and references using this identity become
+    /// invalid. Shared descriptor snapshots remain valid independently.
+    pub fn release_bind_group(&self, id: BindGroupId) -> Result<()> {
+        self.bind_group_ref(id)?;
+        let mut groups = self.bind_groups.borrow_mut();
+        let slot = &mut groups[id.index];
+        let next_generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or(Error::ResourceLimitExceeded)?;
+        slot.descriptor = None;
+        slot.generation = next_generation;
+        slot.next_free = self.free_bind_group.get();
+        self.free_bind_group.set(Some(id.index));
+        Ok(())
     }
     /// Resolve a persistent bind group identity in its owning table.
     pub fn bind_group_ref(&self, id: BindGroupId) -> Result<BindGroupRef<'_>> {
-        self.validate_id(id.owner, id.index, &self.bind_groups)?;
+        if id.owner != self.id {
+            return Err(Error::ResourceTableMismatch);
+        }
+        if self
+            .bind_groups
+            .borrow()
+            .get(id.index)
+            .is_none_or(|slot| slot.generation != id.generation || slot.descriptor.is_none())
+        {
+            return Err(Error::InvalidDescriptor);
+        }
         Ok(BindGroupRef {
             owner: self,
             index: id.index,
+            generation: id.generation,
         })
     }
     /// Return an owned copy of a validated bind group descriptor.
@@ -923,7 +1085,8 @@ impl ResourceTable {
         self.bind_groups
             .borrow()
             .get(reference.index)
-            .cloned()
+            .filter(|slot| slot.generation == reference.generation)
+            .and_then(|slot| slot.descriptor.clone())
             .ok_or(Error::InvalidDescriptor)
     }
     /// Define an immutable compute pipeline and return its branded reference.
@@ -1040,7 +1203,8 @@ impl ResourceTable {
         self.textures
             .borrow()
             .get(reference.index)
-            .copied()
+            .filter(|slot| slot.generation == reference.generation)
+            .and_then(|slot| slot.descriptor)
             .ok_or(Error::InvalidDescriptor)
     }
     /// Return the validated descriptor for a buffer reference.
@@ -1116,7 +1280,7 @@ impl ResourceTable {
     pub(crate) fn same_texture(&self, left: TextureRef<'_>, right: TextureRef<'_>) -> Result<bool> {
         self.texture(left)?;
         self.texture(right)?;
-        Ok(left.index == right.index)
+        Ok(left.index == right.index && left.generation == right.generation)
     }
 }
 
@@ -1131,6 +1295,7 @@ impl Default for ResourceTable {
 pub struct TextureRef<'r> {
     pub(crate) owner: &'r ResourceTable,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 /// Reference to a buffer retained by one [`ResourceTable`].
 #[derive(Clone, Copy)]
@@ -1157,6 +1322,7 @@ pub struct RenderPipelineRef<'r> {
 pub struct TextureId {
     owner: usize,
     index: usize,
+    generation: u64,
 }
 
 /// Persistent table-qualified identity of a logical buffer.
@@ -1186,7 +1352,7 @@ impl TextureRef<'_> {
     ///
     /// # Returns
     ///
-    /// A stable slot for the lifetime of the resource table.
+    /// A stable slot until this texture is retired.
     pub const fn slot(self) -> usize {
         self.index
     }
@@ -1214,6 +1380,7 @@ impl TextureRef<'_> {
         TextureId {
             owner: self.owner.id,
             index: self.index,
+            generation: self.generation,
         }
     }
 }
@@ -1310,7 +1477,19 @@ macro_rules! impl_resource_ref_traits {
     };
 }
 
-impl_resource_ref_traits!(TextureRef);
+impl fmt::Debug for TextureRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TextureRef(..)")
+    }
+}
+impl PartialEq for TextureRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self.owner, other.owner)
+            && self.index == other.index
+            && self.generation == other.generation
+    }
+}
+impl Eq for TextureRef<'_> {}
 impl_resource_ref_traits!(BufferRef);
 impl_resource_ref_traits!(SamplerRef);
 impl_resource_ref_traits!(RenderPipelineRef);
@@ -1347,15 +1526,17 @@ impl_resource_ref_traits!(ShaderModuleRef);
 pub struct BindGroupRef<'r> {
     pub(crate) owner: &'r ResourceTable,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 /// Persistent table-qualified bind group identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BindGroupId {
     owner: usize,
     index: usize,
+    generation: u64,
 }
 impl BindGroupRef<'_> {
-    /// Return the stable table-local backend slot.
+    /// Return the table-local backend slot for this generation.
     pub const fn slot(self) -> usize {
         self.index
     }
@@ -1364,10 +1545,23 @@ impl BindGroupRef<'_> {
         BindGroupId {
             owner: self.owner.id,
             index: self.index,
+            generation: self.generation,
         }
     }
 }
-impl_resource_ref_traits!(BindGroupRef);
+impl fmt::Debug for BindGroupRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BindGroupRef(..)")
+    }
+}
+impl PartialEq for BindGroupRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self.owner, other.owner)
+            && self.index == other.index
+            && self.generation == other.generation
+    }
+}
+impl Eq for BindGroupRef<'_> {}
 
 /// Borrowed reference to an immutable compute pipeline.
 #[derive(Clone, Copy)]
