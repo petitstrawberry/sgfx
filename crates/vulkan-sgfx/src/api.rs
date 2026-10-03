@@ -3131,6 +3131,11 @@ unsafe extern "system" fn destroy_semaphore(
     }
 }
 
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "scarlet-wsi"),
+    test
+))]
 fn semaphore_refs(d: &Driver, handles: &[vk::Semaphore]) -> VkResult<Vec<Arc<AtomicU8>>> {
     if d.lost.load(Ordering::Acquire) {
         return Err(vk::Result::ERROR_DEVICE_LOST);
@@ -3147,6 +3152,11 @@ fn semaphore_refs(d: &Driver, handles: &[vk::Semaphore]) -> VkResult<Vec<Arc<Ato
         .collect()
 }
 
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "scarlet-wsi"),
+    test
+))]
 fn wait_and_consume_semaphores(d: &Driver, semaphores: &[Arc<AtomicU8>]) -> VkResult<()> {
     for semaphore in semaphores {
         loop {
