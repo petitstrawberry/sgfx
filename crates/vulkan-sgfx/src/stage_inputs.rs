@@ -257,7 +257,7 @@ pub(crate) fn lower(words: Vec<u32>) -> Result<Vec<u32>, vk::Result> {
             // These positions are IDs; the remaining operands are literals.
             8 | 317 | 54 | 56 | 248 | 249 | 250 | 251 | 252 | 253 => &[],
             59 if inst.len() >= 4 => &inst[4..],
-            62 | 63 | 64 if inst.len() >= 3 => &inst[1..3],
+            62..=64 if inst.len() >= 3 => &inst[1..3],
             79 | 82 if inst.len() >= 5 => &inst[3..5],
             81 if inst.len() >= 4 => &inst[3..4],
             12 if inst.len() >= 5 => &inst[5..],

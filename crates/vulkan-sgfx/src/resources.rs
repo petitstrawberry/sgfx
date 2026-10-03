@@ -23,7 +23,6 @@ pub(crate) struct BufferView {
     pub buffer: vk::Buffer,
     pub offset: u64,
     pub range: u64,
-    pub format: vk::Format,
 }
 /// Host allocation with the eight-byte base alignment advertised by the ICD.
 /// The backing words never grow after allocation, preserving every mapped pointer.
@@ -134,35 +133,21 @@ impl DescriptorSet {
     }
 }
 pub(crate) type Specialization = Vec<(u32, Vec<u8>)>;
+type ShaderVariant = (
+    Specialization,
+    Vec<Option<bool>>,
+    Vec<DescriptorBindingMap>,
+    ir::ShaderModuleId,
+);
 pub(crate) struct Shader {
     words: Vec<u32>,
-    variants: Vec<(
-        Specialization,
-        Vec<Option<bool>>,
-        Vec<DescriptorBindingMap>,
-        ir::ShaderModuleId,
-    )>,
+    variants: Vec<ShaderVariant>,
 }
 impl Shader {
-    pub(crate) fn variant(
-        &mut self,
-        table: &ir::ResourceTable,
-        values: &Specialization,
-    ) -> Result<ir::ShaderModuleId, vk::Result> {
-        self.variant_for_subpass(table, values, &[])
-    }
     pub(crate) fn input_bindings(
         &self,
     ) -> Result<Vec<crate::input_attachments::InputBinding>, vk::Result> {
         crate::input_attachments::bindings(&self.words)
-    }
-    pub(crate) fn variant_for_subpass(
-        &mut self,
-        table: &ir::ResourceTable,
-        values: &Specialization,
-        inputs: &[Option<bool>],
-    ) -> Result<ir::ShaderModuleId, vk::Result> {
-        self.variant_for_layout(table, values, inputs, &[])
     }
     pub(crate) fn variant_for_layout(
         &mut self,

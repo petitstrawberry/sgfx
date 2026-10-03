@@ -1585,6 +1585,19 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
     }
 }
 
+pub(crate) fn extended_image_usage(
+    format: vk::Format,
+    flags: vk::ImageCreateFlags,
+) -> vk::ImageUsageFlags {
+    let mut usage = image_usage(format);
+    if flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
+        && format == vk::Format::R8G8B8A8_SRGB
+    {
+        usage |= image_usage(vk::Format::R8G8B8A8_UNORM);
+    }
+    usage
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1812,17 +1825,4 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.topology, ir::PrimitiveTopology::TriangleFan);
     }
-}
-
-pub(crate) fn extended_image_usage(
-    format: vk::Format,
-    flags: vk::ImageCreateFlags,
-) -> vk::ImageUsageFlags {
-    let mut usage = image_usage(format);
-    if flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
-        && format == vk::Format::R8G8B8A8_SRGB
-    {
-        usage |= image_usage(vk::Format::R8G8B8A8_UNORM);
-    }
-    usage
 }

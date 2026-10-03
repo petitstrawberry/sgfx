@@ -331,24 +331,23 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                 signals: packet.binary_signals.clone(),
                 timeline_signals: packet.timeline_signals.clone(),
             };
-            if let Err(error) = d.completion_sender.send(request) {
-                if let CompletionRequest::Observe {
+            if let Err(error) = d.completion_sender.send(request)
+                && let CompletionRequest::Observe {
                     submissions,
                     fence,
                     signals,
                     timeline_signals,
                 } = error.0
-                {
-                    finish_submissions(
-                        &submissions,
-                        fence.as_ref(),
-                        &signals,
-                        &timeline_signals,
-                        &d.in_flight,
-                        &d.pending,
-                        &d.lost,
-                    );
-                }
+            {
+                finish_submissions(
+                    &submissions,
+                    fence.as_ref(),
+                    &signals,
+                    &timeline_signals,
+                    &d.in_flight,
+                    &d.pending,
+                    &d.lost,
+                );
             }
             Ok(())
         })();

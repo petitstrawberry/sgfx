@@ -27,7 +27,6 @@ unsafe extern "system" fn create(
             buffer: i.buffer,
             offset: i.offset,
             range: i.range,
-            format: i.format,
         };
         *out = with_device(device, move |rt| {
             let buffer = rt

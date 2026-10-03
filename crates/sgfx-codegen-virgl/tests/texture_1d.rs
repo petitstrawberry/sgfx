@@ -87,12 +87,11 @@ fn assert_immediate_move(shader: &CompiledShader, destination: &str, encoding: &
         .tgsi
         .lines()
         .filter_map(|line| line.split_once(": ").map(|(_, instruction)| instruction))
-        .filter(|instruction| {
+        .rfind(|instruction| {
             instruction
                 .split_once(' ')
                 .is_some_and(|(_, operands)| operands.starts_with(&format!("{destination}, ")))
-        })
-        .last();
+        });
     assert_eq!(
         last_write,
         Some(format!("MOV {destination}, {immediate}.xxxx").as_str()),

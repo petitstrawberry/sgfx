@@ -122,113 +122,6 @@ impl ImageReadbackRegion {
     }
 }
 
-#[cfg(test)]
-mod readback_tests {
-    use super::*;
-
-    fn region(x: i32, y: i32, width: u32, height: u32) -> vk::BufferImageCopy {
-        vk::BufferImageCopy::default()
-            .image_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .layer_count(1),
-            )
-            .image_offset(vk::Offset3D { x, y, z: 0 })
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })
-    }
-
-    fn buffer_id() -> ir::BufferId {
-        ir::ResourceTable::new()
-            .define_buffer(ir::BufferDesc::new(256, ir::BufferUsage::COPY_DST).unwrap())
-            .unwrap()
-            .id()
-    }
-
-    #[test]
-    fn partial_image_readback_preserves_offset_and_row_padding_for_r_rg_rgba() {
-        for bpp in [1u32, 2, 4] {
-            let extent = vk::Extent3D {
-                width: 4,
-                height: 3,
-                depth: 1,
-            };
-            let copy = region(1, 1, 2, 2)
-                .buffer_offset(u64::from(bpp))
-                .buffer_row_length(4)
-                .buffer_image_height(7);
-            let layout = ImageReadbackRegion::new(extent, bpp, u64::from(12 * bpp), &copy).unwrap();
-            let pixels: Vec<_> = (0..12 * bpp).map(|byte| byte as u8).collect();
-            let writes = layout.writes(&pixels, buffer_id()).unwrap();
-            assert_eq!(writes.len(), 2);
-            let mut output = vec![0xcd; (12 * bpp) as usize];
-            for write in writes {
-                let ir::OwnedCommand::WriteBuffer { offset, data, .. } = write else {
-                    panic!("buffer write expected");
-                };
-                output[offset as usize..offset as usize + data.len()].copy_from_slice(&data);
-            }
-            let mut expected = vec![0xcd; (12 * bpp) as usize];
-            for (dst, src) in [(1 * bpp, 5 * bpp), (5 * bpp, 9 * bpp)] {
-                expected[dst as usize..(dst + 2 * bpp) as usize]
-                    .copy_from_slice(&pixels[src as usize..(src + 2 * bpp) as usize]);
-            }
-            assert_eq!(output, expected);
-        }
-    }
-
-    #[test]
-    fn partial_image_readback_single_pixel_and_contiguous_rows_are_exact() {
-        let extent = vk::Extent3D {
-            width: 3,
-            height: 2,
-            depth: 1,
-        };
-        let pixels: Vec<_> = (0..24).collect();
-        let layout =
-            ImageReadbackRegion::new(extent, 4, 8, &region(2, 1, 1, 1).buffer_offset(4)).unwrap();
-        let writes = layout.writes(&pixels, buffer_id()).unwrap();
-        assert!(
-            matches!(writes.as_slice(), [ir::OwnedCommand::WriteBuffer { offset: 4, data, .. }] if data == &[20,21,22,23])
-        );
-        let layout = ImageReadbackRegion::new(extent, 4, 12, &region(0, 1, 3, 1)).unwrap();
-        let writes = layout.writes(&pixels, buffer_id()).unwrap();
-        assert!(
-            matches!(writes.as_slice(), [ir::OwnedCommand::WriteBuffer { offset: 0, data, .. }] if data == &pixels[12..])
-        );
-    }
-
-    #[test]
-    fn partial_image_readback_rejects_bounds_alignment_overflow_and_short_gpu_data() {
-        let extent = vk::Extent3D {
-            width: 4,
-            height: 3,
-            depth: 1,
-        };
-        for invalid in [
-            region(-1, 0, 1, 1),
-            region(4, 0, 1, 1),
-            region(0, 0, 0, 1),
-            region(0, 2, 1, 2),
-            region(0, 0, 2, 2).buffer_row_length(1),
-            region(0, 0, 2, 2).buffer_image_height(1),
-            region(0, 0, 1, 1).buffer_offset(1),
-            region(0, 0, 1, 1).buffer_offset(u64::MAX - 3),
-        ] {
-            assert!(ImageReadbackRegion::new(extent, 4, u64::MAX, &invalid).is_err());
-        }
-        assert!(ImageReadbackRegion::new(extent, 4, 3, &region(0, 0, 1, 1)).is_err());
-        let layout = ImageReadbackRegion::new(extent, 4, 4, &region(0, 0, 1, 1)).unwrap();
-        assert!(matches!(
-            layout.writes(&[0; 4], buffer_id()),
-            Err(vk::Result::ERROR_DEVICE_LOST)
-        ));
-    }
-}
-
 /// Lower bounded color mip blits, flips and narrow-to-RGBA expansion into IR.
 /// Array layers remain outside this subset.
 pub(crate) fn blit(
@@ -458,4 +351,111 @@ pub(crate) fn upload(
         }
     }
     Ok(ops)
+}
+
+#[cfg(test)]
+mod readback_tests {
+    use super::*;
+
+    fn region(x: i32, y: i32, width: u32, height: u32) -> vk::BufferImageCopy {
+        vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_offset(vk::Offset3D { x, y, z: 0 })
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+    }
+
+    fn buffer_id() -> ir::BufferId {
+        ir::ResourceTable::new()
+            .define_buffer(ir::BufferDesc::new(256, ir::BufferUsage::COPY_DST).unwrap())
+            .unwrap()
+            .id()
+    }
+
+    #[test]
+    fn partial_image_readback_preserves_offset_and_row_padding_for_r_rg_rgba() {
+        for bpp in [1u32, 2, 4] {
+            let extent = vk::Extent3D {
+                width: 4,
+                height: 3,
+                depth: 1,
+            };
+            let copy = region(1, 1, 2, 2)
+                .buffer_offset(u64::from(bpp))
+                .buffer_row_length(4)
+                .buffer_image_height(7);
+            let layout = ImageReadbackRegion::new(extent, bpp, u64::from(12 * bpp), &copy).unwrap();
+            let pixels: Vec<_> = (0..12 * bpp).map(|byte| byte as u8).collect();
+            let writes = layout.writes(&pixels, buffer_id()).unwrap();
+            assert_eq!(writes.len(), 2);
+            let mut output = vec![0xcd; (12 * bpp) as usize];
+            for write in writes {
+                let ir::OwnedCommand::WriteBuffer { offset, data, .. } = write else {
+                    panic!("buffer write expected");
+                };
+                output[offset as usize..offset as usize + data.len()].copy_from_slice(&data);
+            }
+            let mut expected = vec![0xcd; (12 * bpp) as usize];
+            for (dst, src) in [(bpp, 5 * bpp), (5 * bpp, 9 * bpp)] {
+                expected[dst as usize..(dst + 2 * bpp) as usize]
+                    .copy_from_slice(&pixels[src as usize..(src + 2 * bpp) as usize]);
+            }
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn partial_image_readback_single_pixel_and_contiguous_rows_are_exact() {
+        let extent = vk::Extent3D {
+            width: 3,
+            height: 2,
+            depth: 1,
+        };
+        let pixels: Vec<_> = (0..24).collect();
+        let layout =
+            ImageReadbackRegion::new(extent, 4, 8, &region(2, 1, 1, 1).buffer_offset(4)).unwrap();
+        let writes = layout.writes(&pixels, buffer_id()).unwrap();
+        assert!(
+            matches!(writes.as_slice(), [ir::OwnedCommand::WriteBuffer { offset: 4, data, .. }] if data == &[20,21,22,23])
+        );
+        let layout = ImageReadbackRegion::new(extent, 4, 12, &region(0, 1, 3, 1)).unwrap();
+        let writes = layout.writes(&pixels, buffer_id()).unwrap();
+        assert!(
+            matches!(writes.as_slice(), [ir::OwnedCommand::WriteBuffer { offset: 0, data, .. }] if data == &pixels[12..])
+        );
+    }
+
+    #[test]
+    fn partial_image_readback_rejects_bounds_alignment_overflow_and_short_gpu_data() {
+        let extent = vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        };
+        for invalid in [
+            region(-1, 0, 1, 1),
+            region(4, 0, 1, 1),
+            region(0, 0, 0, 1),
+            region(0, 2, 1, 2),
+            region(0, 0, 2, 2).buffer_row_length(1),
+            region(0, 0, 2, 2).buffer_image_height(1),
+            region(0, 0, 1, 1).buffer_offset(1),
+            region(0, 0, 1, 1).buffer_offset(u64::MAX - 3),
+        ] {
+            assert!(ImageReadbackRegion::new(extent, 4, u64::MAX, &invalid).is_err());
+        }
+        assert!(ImageReadbackRegion::new(extent, 4, 3, &region(0, 0, 1, 1)).is_err());
+        let layout = ImageReadbackRegion::new(extent, 4, 4, &region(0, 0, 1, 1)).unwrap();
+        assert!(matches!(
+            layout.writes(&[0; 4], buffer_id()),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        ));
+    }
 }

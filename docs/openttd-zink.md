@@ -33,8 +33,24 @@ hardware and other Vulkan devices have not been tested.
 The publishing copy was checked again on macOS: core/default codegen tests,
 programmable codegen tests (38 passed, one external harness test ignored),
 and Vulkan library tests (76 passed); formatting and diff checks passed.
-Strict Clippy is not green: it reports `collapsible_if` in the existing codegen
-return-guard code. Full GitHub CI/native backend matrix was not rerun.
+The follow-up CI fix removes unused internal wrappers/metadata and addresses
+strict lint findings without reducing the CI check set. Strict portable Clippy,
+programmable/facade/WGPU/Vulkan host tests and native default-feature checks
+for both aarch64-unknown-scarlet and riscv64gc-unknown-scarlet passed locally.
+
+Pinned external GPU dependencies are now compatible with the added RG8 enum:
+
+- Maxwell: `17907c32fd661d45a8de2b5f63eda1899d2172aa` on
+  `petitstrawberry/scarlet-project-switch:fix/sgfx-rg8-compatibility`.
+- Adreno: `aac53af1d7fa1c653103651e72a54f93862fe050` on
+  `petitstrawberry/scarlet-project-chromebook:fix/sgfx-rg8-compatibility`.
+
+Each dependency change preserves its existing supported-format lowering and
+rejects all remaining formats with Unsupported. It neither advertises nor
+implements RG8 on those GPUs. Backend all-target checks and codegen tests
+passed using this branch's core IR. Only correction branches were published;
+external repository default branches were not changed and no extra PRs opened.
+Physical GPU behavior remains untested.
 
 OpenTTD fullscreen remains a known failure: a legal signed viewport extends
 outside the attachment and is rejected by the current IR/backend attachment

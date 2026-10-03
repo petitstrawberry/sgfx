@@ -1378,12 +1378,13 @@ impl<'a> Compiler<'a> {
                     ));
                 }
             }
-            if index + 1 != block.len() && statement_may_return(statement) {
-                if let Some(flag) = &frame.return_flag {
-                    self.instructions.push(format!("UIF {}", flag.src()));
-                    self.instructions.push("ELSE".into());
-                    return_guards += 1;
-                }
+            if index + 1 != block.len()
+                && statement_may_return(statement)
+                && let Some(flag) = &frame.return_flag
+            {
+                self.instructions.push(format!("UIF {}", flag.src()));
+                self.instructions.push("ELSE".into());
+                return_guards += 1;
             }
         }
         for _ in 0..return_guards {

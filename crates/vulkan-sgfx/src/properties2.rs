@@ -267,9 +267,11 @@ mod tests {
     use super::*;
     #[test]
     fn uuid_is_stable_and_does_not_depend_on_instance_handles() {
-        let mut properties = vk::PhysicalDeviceProperties::default();
-        properties.vendor_id = 0x1234;
-        properties.device_id = 7;
+        let mut properties = vk::PhysicalDeviceProperties {
+            vendor_id: 0x1234,
+            device_id: 7,
+            ..Default::default()
+        };
         let uuid = device_uuid(&properties);
         assert_ne!(uuid, [0; vk::UUID_SIZE]);
         assert_eq!(uuid, device_uuid(&properties));

@@ -282,12 +282,13 @@ mod tests {
 
     fn validate(
         module: &naga::Module,
-    ) -> Result<naga::valid::ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
+    ) -> Result<naga::valid::ModuleInfo, Box<naga::WithSpan<naga::valid::ValidationError>>> {
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
         )
         .validate(module)
+        .map_err(Box::new)
     }
 
     fn scalar_read_offset(words: &[u32], input: u32) -> u32 {
