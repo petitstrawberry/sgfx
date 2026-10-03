@@ -62,14 +62,19 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         if words[2] == r.revision {
             return Ok(());
         }
-        let retired = r
+        let (textures, buffers) = r
             .table
-            .abi_retired_buffers(words)
+            .abi_retired_resources(words)
             .map_err(|_| abi::INVALID)?;
-        if !retired.is_empty() && !r.context.is_idle().map_err(handle_error)? {
+        if (!textures.is_empty() || !buffers.is_empty())
+            && !r.context.is_idle().map_err(handle_error)?
+        {
             return Err(abi::BUSY);
         }
-        for id in retired {
+        for id in textures {
+            r.inner.release_texture(id).map_err(error)?;
+        }
+        for id in buffers {
             r.inner.release_buffer(id).map_err(error)?;
         }
         match r.table.sync_abi_snapshot(words) {
@@ -94,6 +99,29 @@ unsafe extern "C" fn release_buffer(p: Object, slot: u32) -> i32 {
             return Err(abi::BUSY);
         }
         r.inner.release_buffer(id).map_err(error)
+    })())
+}
+unsafe extern "C" fn release_texture(p: Object, slot: u32) -> i32 {
+    status((|| {
+        let r = unsafe { object::<Resources>(p) }?;
+        if r.poisoned {
+            return Err(abi::DEVICE_LOST);
+        }
+        let id = r.table.abi_texture(slot).map_err(|_| abi::INVALID)?.id();
+        if !r.context.is_idle().map_err(handle_error)? {
+            return Err(abi::BUSY);
+        }
+        r.inner.release_texture(id).map_err(error)
+    })())
+}
+unsafe extern "C" fn release_bind_group(p: Object, slot: u32) -> i32 {
+    status((|| {
+        let r = unsafe { object::<Resources>(p) }?;
+        if r.poisoned {
+            return Err(abi::DEVICE_LOST);
+        }
+        let id = r.table.abi_bind_group(slot).map_err(|_| abi::INVALID)?.id();
+        r.inner.release_bind_group(id).map_err(error)
     })())
 }
 unsafe extern "C" fn validate(p: Object, kind: u32, slot: u32) -> i32 {
@@ -323,12 +351,12 @@ unsafe extern "C" fn clone_receipt(p: Object) {
     }
 }
 
-/// Negotiate the optional low-level v1 extension after the main entry point.
+/// Negotiate the optional low-level v2 extension after the main entry point.
 /// # Safety
 /// `out` is writable for `size` bytes; all objects subsequently used come from
 /// this DSO's main/extension tables and obey their ownership contracts.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sgfx_backend_get_driver_api_v1(
+pub unsafe extern "C" fn sgfx_backend_get_driver_api_v2(
     version: u32,
     size: usize,
     out: *mut abi::DriverApi,
@@ -358,6 +386,8 @@ pub unsafe extern "C" fn sgfx_backend_get_driver_api_v1(
             submit,
             read_texture,
             clone_receipt,
+            release_texture,
+            release_bind_group,
         });
     }
     abi::OK

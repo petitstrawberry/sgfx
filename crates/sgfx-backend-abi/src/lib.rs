@@ -1,4 +1,4 @@
-//! SGFX backend ABI v1. Only scalars, C records, pointers and function pointers
+//! SGFX backend ABI v2. Only scalars, C records, pointers and function pointers
 //! cross this boundary. No Rust allocator, layout, trait object or unwind ABI is
 //! shared. This is an in-process ABI for 64-bit little-endian targets.
 //!
@@ -14,10 +14,10 @@
 use core::ffi::c_void;
 
 #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
-compile_error!("SGFX backend ABI v1 requires a 64-bit little-endian target");
+compile_error!("SGFX backend ABI v2 requires a 64-bit little-endian target");
 
-pub const VERSION: u32 = 1;
-pub const ENTRY: &[u8] = b"sgfx_backend_get_api_v1\0";
+pub const VERSION: u32 = 2;
+pub const ENTRY: &[u8] = b"sgfx_backend_get_api_v2\0";
 pub const OK: i32 = 0;
 pub const INVALID: i32 = 1;
 pub const UNSUPPORTED: i32 = 2;
@@ -160,7 +160,7 @@ pub struct BackendApi {
     pub drop_receipt: unsafe extern "C" fn(Object),
 }
 
-/// Writes exactly one v1 table only when version and size are compatible.
+/// Writes exactly one v2 table only when version and size are compatible.
 pub type GetApi = unsafe extern "C" fn(u32, usize, *const HostInfo, *mut BackendApi) -> i32;
 
 const _: () = {
@@ -180,10 +180,10 @@ pub const TEXTURE_ARRAYS: u64 = 128;
 pub const DEPTH_SAMPLING: u64 = 256;
 pub const IMAGE_MIPS: u64 = 512;
 
-/// Optional v1 extension for low-level API frontends, including Vulkan. The
+/// Optional v2 extension for low-level API frontends, including Vulkan. The
 /// original mapped-session table remains binary compatible. Resolve once at
 /// load time; all objects below belong to the same loaded backend.
-pub const DRIVER_ENTRY: &[u8] = b"sgfx_backend_get_driver_api_v1\0";
+pub const DRIVER_ENTRY: &[u8] = b"sgfx_backend_get_driver_api_v2\0";
 pub const VALIDATE_SHADER: u32 = 1;
 pub const VALIDATE_RENDER_PIPELINE: u32 = 2;
 pub const VALIDATE_COMPUTE_PIPELINE: u32 = 3;
@@ -210,9 +210,11 @@ pub struct DriverApi {
     pub read_texture: unsafe extern "C" fn(Object, Object, u32, *mut u8, usize) -> i32,
     /// Retain one additional strong receipt owner. Thread-safe; never allocates.
     pub clone_receipt: unsafe extern "C" fn(Object),
+    pub release_texture: unsafe extern "C" fn(Object, u32) -> i32,
+    pub release_bind_group: unsafe extern "C" fn(Object, u32) -> i32,
 }
 pub type GetDriverApi = unsafe extern "C" fn(u32, usize, *mut DriverApi) -> i32;
 const _: () = {
-    assert!(core::mem::size_of::<DriverApi>() == 128);
+    assert!(core::mem::size_of::<DriverApi>() == 144);
     assert!(core::mem::offset_of!(DriverApi, create_resources) == 8);
 };

@@ -24,7 +24,7 @@ Install the library and this adjacent `scarlet-virgl.sgfx-driver` manifest in
 `/system/lib/sgfx`:
 
 ```ini
-abi=1
+abi=2
 name=scarlet-virgl
 gpu_backend=virtio-gpu
 library=libsgfx_scarlet_virgl.so
@@ -44,29 +44,17 @@ explicit recording-mode error: submission does not secretly convert them.
 The usual device/context/session, execute, submit and completion APIs remain
 available. YCbCr import is currently unsupported by this plugin ABI.
 
-During development the workspace patches the coordinated `sgfx-core` Git
-source to the local core with ABI support. A downstream workspace testing this
-unpublished change must apply the same `[patch."https://github.com/petitstrawberry/sgfx"]`
-override to its local `sgfx-core`. Publishing requires advancing the coordinated
-core/backend revisions; a root workspace patch is not inherited by dependents.
+The facade and in-tree backends use the same path dependency on `sgfx-core`.
+The workspace override also unifies external Adreno/Maxwell backends with this
+core. Downstream applications must apply an equivalent source override when
+those backends still reference an older coordinated core revision.
 
-Scarlet's standard desktop bundles install the plugin and manifest for AArch64
-and RISC-V64; the base bundle already supplies `scarlet-ld`. In the Scarlet
-checkout, prepare its isolated Cargo configuration once:
-
-```sh
-python3 tools/sgfx-native-build.py prepare --rust-source /path/to/matching/rust
-```
-
-The checked-in 64-bit projects use the resulting
-`target/sgfx-userspace/cargo.toml` through `userspace.cargo-config`. It patches
-the sibling SGFX checkout for all local and external bundle applications,
-rebuilds std from the matching DSO-safe sources, and chooses the interpreter
-only for executables that actually need the backend loader. Each link is
-checked for the exact allowed imports, interpreter and relocations. The
-installed compiler and sysroot remain untouched. With an updated toolchain
-whose bundled sources already contain the runtime fixes, omit `--rust-source`.
-Direct Cargo builds use `cargo --config target/sgfx-userspace/cargo.toml ...`.
+Scarlet's desktop bundle installs the plugin and manifest for AArch64 and
+RISC-V64. The base bundle supplies `/bin/scarlet-ld`. See Scarlet's
+`docs/graphics/sgfx-dynamic-backends.md` for the standard image build and
+`tools/sgfx-native-build.py` for reproducible driver installation and executable
+linking with the current DSO-safe native toolchain. The installed compiler and
+sysroot remain untouched.
 
 `sgfx-probe` prints `linkage: dynamic` and the loaded library path. A missing
 plugin is an error, never a silent static VirGL fallback. `DT_NEEDED` remains
@@ -114,16 +102,17 @@ there is no per-draw FFI call, loader lock or symbol lookup. AArch64 LSE support
 is detected by the initialized application runtime and handed to the plugin at
 negotiation, since a library's private Rust runtime has no executable auxv.
 
-## ABI v1
+## ABI v2
 
 The C declaration is [`sgfx_backend.h`](../crates/sgfx-backend-abi/include/sgfx_backend.h);
 the matching `no_std` Rust crate has compile-time layout/offset assertions.
 Only 64-bit little-endian processes are supported. The original mapped-session entry point is
-`sgfx_backend_get_api_v1(version, size, host_info, out_table)` (224-byte table).
-The independent `sgfx_backend_get_driver_api_v1(version, size, out_table)`
-extension (128-byte table) supports the low-level resource/queue API used by
-Vulkan. Older mapped-session plugins remain loadable; low-level operations
-require the extension. These are the plugin's only exported symbols.
+`sgfx_backend_get_api_v2(version, size, host_info, out_table)` (224-byte table).
+The independent `sgfx_backend_get_driver_api_v2(version, size, out_table)`
+extension (144-byte table) supports the low-level resource/queue API used by
+Vulkan. The initial v1 draft is rejected: v2 carries generations for textures and
+bind groups and bounded/flipped blit operands. Low-level operations require
+the extension, including explicit texture and bind-group retirement. These are the plugin's only exported symbols.
 
 The low-level extension borrows the same recorded command stream. Readback
 writes directly into caller-owned buffers, and cloning a completion retains the
@@ -136,14 +125,15 @@ agree with the stream; unknown opcodes and malformed lengths are rejected.
 Integer/float/flag/enum values are explicit ABI encodings, independent of Rust
 layout. Pointers occur only in borrowed upload spans; this is an in-process
 protocol, not a disk or IPC format. Buffer references carry slot and generation;
-other immutable resources use slots in the mirrored table.
+texture and bind-group references also carry slot and generation. Other
+immutable resources use slots in the mirrored table.
 
-The v1 schemas are centralized in
+The v2 schemas are centralized in
 [`commands.rs`](../crates/sgfx-core/src/ir/abi/commands.rs),
 [`codec.rs`](../crates/sgfx-core/src/ir/abi/codec.rs), and
 [`resources.rs`](../crates/sgfx-core/src/ir/abi/resources.rs).
 Existing opcodes, enum numbers, field order and meanings are frozen. Changes
-that are not compatible with v1 require a new ABI version/entry point, even if
+that are not compatible with v2 require a new ABI version/entry point, even if
 the ordinary Rust APIs are updated together. Trusted plugins must initialize
 every output on success and satisfy the memory/lifetime contract; loading a
 plugin is not a sandbox boundary.
@@ -263,7 +253,7 @@ performance parity. Native 64-bit VirGL now defaults to the dynamic path;
 `backend-scarlet-virgl-static` retains an explicit comparison build. ELF32 and
 Linux-ABI clients keep the static compatibility transport.
 
-Local evidence is retained under `target/dynamic-backends/aarch64-runtime/`:
+The original implementation reported local evidence under `target/dynamic-backends/aarch64-runtime/`:
 `qemu-scalar-interleaved/result.json` and `serial.log` contain the table above;
 `qemu-interleaved/` and `qemu-hidden-interleaved/` contain the earlier diagnostic
 results. The diagnostic source and exact build command are retained alongside
@@ -274,7 +264,7 @@ pre-migration production-fixture check is in `qemu-final/`. Correctness checks i
 VirGL triangle and upload readbacks, not only successful loading. RISC-V64
 artifacts pass the same ELF audit; GPU execution was tested on AArch64 only.
 
-The default migration's AArch64 smoke result is retained separately in
+The original implementation reported its default migration AArch64 smoke result in
 `target/dynamic-backends/migration-aarch64-final/qemu/result.json`. It also
 checks the standard probe, legacy client and low-level driver extension.
 The standard-build SWS/ScarletUI/Vulkan integration result is in the sibling

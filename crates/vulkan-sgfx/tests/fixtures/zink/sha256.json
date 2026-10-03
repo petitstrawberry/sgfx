@@ -1,0 +1,9 @@
+{
+  "openttd-3textures.frag.spv": "1096c3a4788cd4d1746de0eae93f696fa2f0e8c0602bef980f500279de2bdef3",
+  "openttd-4textures.frag.spv": "b57589fd8a786b2d5614acfe1a56d88000419d3d0a85a8f52256b7d186a0f025",
+  "openttd.vert.spv": "c3be12028b9150a6a6687ef624c97f2f9e2de3735565f73ad0f2a95c1f41b5fe",
+  "texture.frag.spv": "e0ebd3dae909c36b92ba3643a832afafce57d9b7f6a892dd3d1fdc338a22988f",
+  "texture.vert.spv": "f876ba0e79476d34275ba466c9d0dc5842323f129a09cc5d2b2c65a6cc1042f8",
+  "triangle.frag.spv": "95d8acb4cd8d77732be28ad504b665c3b61e614c4b710710fa8de5a0c7c80ca5",
+  "triangle.vert.spv": "3f31c5466be328e7ea08b15ecb10a9067fb5b03a3c389059e5ef6878ff9af2e2"
+}

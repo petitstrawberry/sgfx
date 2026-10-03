@@ -54,13 +54,28 @@ impl From<Failure> for IrSubmitError {
 }
 
 fn native_status(completion: &GpuCompletion) -> Result<bool, Failure> {
-    let info = completion.query().map_err(Failure::Backend)?;
+    let info = completion.query().map_err(|error| {
+        trace_failure("completion query", error);
+        Failure::Backend(error)
+    })?;
     completion_status(info)
         .map(|status| status == CompletionStatus::Complete)
-        .map_err(|error| match error {
-            IrSubmitError::CompletionFailed(reason) => Failure::Completion(reason),
-            _ => Failure::Unavailable,
+        .map_err(|error| {
+            trace_failure("completion status", &error);
+            match error {
+                IrSubmitError::CompletionFailed(reason) => Failure::Completion(reason),
+                _ => Failure::Unavailable,
+            }
         })
+}
+
+fn trace_failure(operation: &str, error: impl core::fmt::Debug) {
+    #[cfg(feature = "std")]
+    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        std::eprintln!("[SGFX native] {operation} failed: {error:?}");
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = (operation, error);
 }
 
 // One coalesced byte is sufficient and cannot fill the pipe. Queue wakeups have
@@ -217,14 +232,20 @@ impl Transport for Native {
                 Ok(completion)
             }
             Err(GpuSubmitError::Busy) => Err(DispatchError::Busy),
-            Err(GpuSubmitError::Rejected(error) | GpuSubmitError::Failed { error, .. }) => {
+            Err(error) => {
+                trace_failure("asynchronous submit", &error);
                 // Acceptance happened at logical enqueue. Any later rejection
                 // or uncertain native acceptance fails the receipt and poisons
                 // the queue, never replays it. Kernel-owned references protect
                 // possibly accepted work after these observation handles drop.
-                Err(DispatchError::Failed(Failure::Backend(error)))
+                let failure = match error {
+                    GpuSubmitError::Rejected(error) | GpuSubmitError::Failed { error, .. } => {
+                        Failure::Backend(error)
+                    }
+                    _ => Failure::Unavailable,
+                };
+                Err(DispatchError::Failed(failure))
             }
-            Err(_) => Err(DispatchError::Failed(Failure::Unavailable)),
         }
     }
 
@@ -265,7 +286,10 @@ impl NativeScheduler {
         queue: Arc<GpuQueue>,
         chunks: Vec<Chunk>,
     ) -> Result<Arc<Signal>, AdmissionError<Failure>> {
-        let signal = Arc::new(Signal::new().map_err(|_| AdmissionError::OutOfMemory)?);
+        let signal = Arc::new(Signal::new().map_err(|error| {
+            trace_failure("logical completion signal allocation", error);
+            AdmissionError::OutOfMemory
+        })?);
         lock(&self.shared.scheduler).enqueue(chunks, queue, Arc::clone(&signal))?;
         self.shared.wake.notify();
         Ok(signal)
@@ -332,11 +356,16 @@ fn run(shared: Arc<Shared>) {
     // One wake handle plus at most sixteen native completion handles.
     let mut handles = Vec::new();
     if handles.try_reserve_exact(17).is_err() {
+        trace_failure(
+            "worker poll storage allocation",
+            HandleError::OutOfResources,
+        );
         lock(&shared.scheduler).fail(&Native, Failure::Backend(HandleError::OutOfResources));
         return;
     }
     loop {
         if let Err(error) = shared.wake.consume() {
+            trace_failure("worker wake read", error);
             lock(&shared.scheduler).fail(&Native, Failure::Backend(error));
             return;
         }
@@ -368,6 +397,7 @@ fn run(shared: Arc<Shared>) {
             100_000_000
         };
         if let Err(error) = poll(&mut handles, timeout) {
+            trace_failure("worker completion poll", error);
             lock(&shared.scheduler)
                 .fail(&Native, Failure::Backend(HandleError::SystemError(error)));
             return;

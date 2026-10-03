@@ -83,7 +83,7 @@ impl Manifest {
         let library = library
             .filter(|s| !s.is_empty() && !s.contains(['/', '\\', '\0']) && *s != "." && *s != "..")
             .ok_or_else(|| Error("library must be a filename alongside its manifest".into()))?;
-        if version != Some("1") {
+        if version != Some("2") {
             return Err(Error("incompatible SGFX driver ABI".into()));
         }
         Ok(Self {
@@ -249,7 +249,7 @@ impl LoadedBackend {
                 "driver rejected SGFX ABI negotiation: {status}"
             )));
         }
-        // The entry-point contract initializes the complete v1 table on success.
+        // The entry-point contract initializes the complete v2 table on success.
         let api = unsafe { table.assume_init() };
         if api.version != abi::VERSION
             || (api.size as usize) < core::mem::size_of::<abi::BackendApi>()
@@ -338,14 +338,14 @@ mod tests {
     fn manifests_are_independent_of_compiled_backend_names() {
         let manifest = Manifest::parse(
             "/drivers/new.sgfx-driver",
-            "abi=1\nname=future-gpu\ngpu_backend=new-gpu\nlibrary=libfuture.so\n",
+            "abi=2\nname=future-gpu\ngpu_backend=new-gpu\nlibrary=libfuture.so\n",
         )
         .unwrap();
         assert_eq!(manifest.library, "/drivers/libfuture.so");
         for source in [
-            "abi=2\nname=x\ngpu_backend=y\nlibrary=x.so",
-            "abi=1\nabi=1\nname=x\ngpu_backend=y\nlibrary=x.so",
-            "abi=1\nname=x\ngpu_backend=y\nlibrary=../x.so",
+            "abi=1\nname=x\ngpu_backend=y\nlibrary=x.so",
+            "abi=2\nabi=2\nname=x\ngpu_backend=y\nlibrary=x.so",
+            "abi=2\nname=x\ngpu_backend=y\nlibrary=../x.so",
         ] {
             assert!(Manifest::parse("/drivers/x.sgfx-driver", source).is_err());
         }
@@ -374,11 +374,11 @@ mod tests {
             .unwrap();
         };
         assert!(discover(&dirs, "future-gpu", None).is_err());
-        install("newer", 2);
-        install("first", 1);
+        install("newer", abi::VERSION + 1);
+        install("first", abi::VERSION);
         assert_eq!(discover(&dirs, "future-gpu", None).unwrap().name, "first");
         assert!(discover(&dirs, "different-gpu", None).is_err());
-        install("second", 1);
+        install("second", abi::VERSION);
         assert!(discover(&dirs, "future-gpu", None).is_err());
         assert_eq!(
             discover(&dirs, "future-gpu", Some("second")).unwrap().name,
@@ -387,7 +387,7 @@ mod tests {
         assert!(discover(&dirs, "future-gpu", Some("missing")).is_err());
         let missing = Manifest::parse(
             directory.0.join("missing.sgfx-driver").to_str().unwrap(),
-            "abi=1\nname=missing\ngpu_backend=future-gpu\nlibrary=libmissing.so",
+            "abi=2\nname=missing\ngpu_backend=future-gpu\nlibrary=libmissing.so",
         )
         .unwrap();
         assert!(LoadedBackend::load(&missing).is_err());

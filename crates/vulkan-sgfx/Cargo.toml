@@ -33,12 +33,16 @@ ash = { version = "0.38", default-features = false, features = ["loaded"] }
 dlmalloc = { version = "0.2.14", features = ["global"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", default-features = false, features = ["std"], optional = true }
+framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, features = ["std"], optional = true }
 sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-scarlet-virgl"] }
 
 [dev-dependencies]
+sgfx-codegen-virgl = { path = "../sgfx-codegen-virgl", features = ["programmable"] }
 png = "0.18"
 naga = { version = "24", features = ["wgsl-in", "spv-out"] }
+
+[build-dependencies]
+cc = "1"
 
 [target.'cfg(not(target_os = "scarlet"))'.dev-dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded"] }

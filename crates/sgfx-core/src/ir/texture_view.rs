@@ -5,6 +5,10 @@ use super::{Error, Result, TextureDesc, TextureFormat};
 /// Coordinate interpretation used by a sampled texture binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureViewDimension {
+    /// One one-dimensional layer.
+    D1,
+    /// An array of one-dimensional layers.
+    D1Array,
     /// One two-dimensional layer.
     D2,
     /// An array of two-dimensional layers.
@@ -49,7 +53,13 @@ impl TextureViewDesc {
 
     /// Validate a view against the allocation being bound.
     pub fn validate(self, texture: TextureDesc) -> Result<()> {
-        if !texture.format().view_compatible(self.format) {
+        if !texture.format().view_compatible(self.format)
+            || texture.dimension_1d()
+                != matches!(
+                    self.dimension,
+                    TextureViewDimension::D1 | TextureViewDimension::D1Array
+                )
+        {
             return Err(Error::InvalidDescriptor);
         }
         if self.mip_level_count == 0
@@ -66,7 +76,7 @@ impl TextureViewDesc {
             return Err(Error::OutOfBounds);
         }
         match self.dimension {
-            TextureViewDimension::D2 if self.array_layer_count != 1 => {
+            TextureViewDimension::D1 | TextureViewDimension::D2 if self.array_layer_count != 1 => {
                 Err(Error::InvalidDescriptor)
             }
             TextureViewDimension::Cube

@@ -367,13 +367,20 @@ fn encode(c: Command<'_, '_>, w: &mut Vec<u64>) {
             source_mip,
             destination,
             destination_mip,
+            source_rect,
+            destination_rect,
             filter,
+            flips,
         } => {
             source.id().put(w);
             source_mip.put(w);
             destination.id().put(w);
             destination_mip.put(w);
+            source_rect.put(w);
+            destination_rect.put(w);
             filter.put(w);
+            flips[0].put(w);
+            flips[1].put(w);
             15
         }
         Command::CopyBufferToBuffer {
@@ -677,7 +684,10 @@ unsafe fn decode_resource_command<'r, 'data>(
                 source_mip: r.value(t)?,
                 destination: t.texture_ref(r.value(t)?)?,
                 destination_mip: r.value(t)?,
+                source_rect: r.value(t)?,
+                destination_rect: r.value(t)?,
                 filter: r.value(t)?,
+                flips: [r.value(t)?, r.value(t)?],
             });
         }
         16 => {

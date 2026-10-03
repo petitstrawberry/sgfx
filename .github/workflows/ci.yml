@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  SCARLET_TOOLCHAIN: github:petitstrawberry/scarlet-rust-nix/2b4ddd555389a8c53806bbc2586440b2662c38dd#scarlet-rust-toolchain
+  SCARLET_TOOLCHAIN: github:petitstrawberry/scarlet-rust-nix/ecd6c50a4760279fa10f7a80e56e33dda46c89e0#scarlet-rust-toolchain
 
 jobs:
   portable:
@@ -124,8 +124,7 @@ jobs:
           cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features
           cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --no-deps -- -D warnings
       - name: Check the dynamic facade and VirGL plugin
-        # The standard target cannot link cdylibs yet. Real ELF staging and
-        # execution use scripts/build-dynamic-backends.py and its isolated spec.
+        # The pinned native toolchain supports cdylibs and DSO-safe std TLS.
         run: cargo-clippy clippy --locked -p sgfx -p sgfx-backend-scarlet-virgl-plugin --target '${{ matrix.target }}' --no-default-features --features sgfx/std,sgfx/backend-dynamic --no-deps -- -D warnings
       - name: Check native public API documentation
         env:

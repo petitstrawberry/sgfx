@@ -238,13 +238,15 @@ pub enum PrimitiveTopology {
     TriangleList,
     /// Assemble connected triangles, alternating the winding of each triangle.
     TriangleStrip,
+    /// Assemble triangles sharing the first vertex, in input order.
+    TriangleFan,
 }
 
 impl PrimitiveTopology {
     pub(crate) const fn accepts_count(self, count: u32) -> bool {
         match self {
             Self::TriangleList => count != 0 && count.is_multiple_of(3),
-            Self::TriangleStrip => count >= 3,
+            Self::TriangleStrip | Self::TriangleFan => count >= 3,
         }
     }
 }

@@ -44,16 +44,16 @@ def source_sysroot(output, rustc, source):
 
 
 def audit(staging, scarlet, arch):
-    source = scarlet / "tools/native-rustc/audit_elf.py"
+    source = scarlet / "tools/elf_audit.py"
     spec = importlib.util.spec_from_file_location("scarlet_elf_audit", source)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     reports = []
     for name, expected_imports, interpreter in (
         ("system/lib/sgfx/libsgfx_scarlet_virgl.so", set(), None),
-        ("bin/sgfx-dynamic-smoke", {"dlopen", "dlsym", "dlerror"}, "/system/bin/scarlet-ld"),
+        ("bin/sgfx-dynamic-smoke", {"dlopen", "dlsym", "dlerror"}, "/bin/scarlet-ld"),
         ("bin/sgfx-static-smoke", set(), None),
-        ("system/bin/scarlet-ld", set(), None),
+        ("bin/scarlet-ld", set(), None),
         ("init", set(), None),
     ):
         elf = module.Elf(staging / name)
@@ -76,7 +76,7 @@ def audit(staging, scarlet, arch):
                 symbol, info, _, section, _, _ = elf.unpack("IBBHQQ", elf.at_vaddr(elf.tag(6) + index * 24, 24))
                 if section and info >> 4 in (1, 2):
                     exports.append(elf.dynstring(symbol))
-            if set(exports) != {"sgfx_backend_get_api_v1", "sgfx_backend_get_driver_api_v1"} or report["entry"] != 0:
+            if set(exports) != {"sgfx_backend_get_api_v2", "sgfx_backend_get_driver_api_v2"} or report["entry"] != 0:
                 raise RuntimeError(f"backend exports executable/Rust internals: {exports}")
             report["exports"] = exports
         report["path"] = name
@@ -161,11 +161,12 @@ def main():
     release = output / "cargo" / target.stem / "release"
 
     def stage(source, destination):
-        data = bytearray(source.read_bytes())
+        data = source.read_bytes()
         machine = 183 if args.arch == "aarch64" else 243
         if data[:7] != b"\x7fELF\x02\x01\x01" or struct.unpack_from("<H", data, 18)[0] != machine:
             raise RuntimeError(f"not the expected ELF64 architecture: {source}")
-        data[7] = 83  # ELFOSABI_SCARLET
+        if data[7] != 83:
+            raise RuntimeError(f"compiler did not mark ELFOSABI_SCARLET: {source}; use a toolchain with native GNU ELF tag support")
         destination.write_bytes(data)
         destination.chmod(0o755)
 
@@ -174,12 +175,12 @@ def main():
          "-C", "link-arg=--exclude-libs=ALL", "-C", "link-arg=--entry=0",
          "-C", "link-arg=-z", "-C", "link-arg=defs"])
     stage(release / "libsgfx_scarlet_virgl.so", drivers / "libsgfx_scarlet_virgl.so")
-    (drivers / "scarlet-virgl.sgfx-driver").write_text("abi=1\nname=scarlet-virgl\ngpu_backend=virtio-gpu\nlibrary=libsgfx_scarlet_virgl.so\n")
+    (drivers / "scarlet-virgl.sgfx-driver").write_text("abi=2\nname=scarlet-virgl\ngpu_backend=virtio-gpu\nlibrary=libsgfx_scarlet_virgl.so\n")
     example = [cargo, "rustc", "-p", "sgfx", "--example", "dynamic_smoke", "--no-default-features"]
     run([*example, "--features", "std,backend-scarlet-virgl-static", *common])
     stage(release / "examples/dynamic_smoke", staging / "bin/sgfx-static-smoke")
     run([*example, "--features", "std,backend-dynamic,backend-scarlet-virgl", *common, "--", "-C", "link-arg=-pie",
-         "-C", "link-arg=--dynamic-linker=/system/bin/scarlet-ld",
+         "-C", "link-arg=--dynamic-linker=/bin/scarlet-ld",
          # LLD needs a shared input to emit imports supplied by the interpreter.
          # --as-needed drops this unreferenced driver: the frontend has no
          # DT_NEEDED backend dependency. The ELF audit below enforces that.
@@ -189,7 +190,7 @@ def main():
     # Rebuild interpreter std from the same sources: all std instances must agree
     # on the native thread layout, including namespaces and cleanup records.
     run([cargo, "build", "--manifest-path", args.scarlet.resolve() / "user/scarlet-ld/Cargo.toml", *common], args.scarlet.resolve())
-    stage(release / "scarlet-ld", staging / "system/bin/scarlet-ld")
+    stage(release / "scarlet-ld", staging / "bin/scarlet-ld")
     # Use the standard bootstrap policy, including devfs, stdio and Environment.
     # A bare /init cannot spawn ordinary children before this transition.
     bootstrap = output / "bootstrap"

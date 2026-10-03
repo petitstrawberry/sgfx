@@ -13,12 +13,15 @@ scarlet-std = ["dep:scarlet-std", "gpu-raw/scarlet-std"]
 programmable = ["sgfx-codegen-virgl/programmable"]
 
 [dependencies]
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", default-features = false, features = ["std"], optional = true }
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", optional = true }
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", default-features = false }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, features = ["std"], optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false }
 sgfx-codegen-virgl = { path = "../sgfx-codegen-virgl" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "5ea41a0dfd6992bb1c0fce06c8e65425dc978140", default-features = false }
+sgfx-core = { path = "../sgfx-core", default-features = false }
 
 [lib]
 name = "sgfx_backend_scarlet_virgl"
 path = "src/lib.rs"
+
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }

@@ -146,6 +146,7 @@ impl From<HandleError> for IrSubmitError {
 /// clone of the same resource table.
 pub struct IrResources {
     resources: Rc<ResourceTable>,
+    context: driver::Context,
     context_id: i32,
     backend: driver::IrResources,
     images: Vec<ImageMapping>,
@@ -196,6 +197,7 @@ impl IrResources {
         }
         Ok(Self {
             resources,
+            context: context.clone(),
             context_id: context.context_id(),
             backend: context.create_ir_resources()?,
             images,
@@ -217,11 +219,22 @@ impl IrResources {
         self.resources.as_ref()
     }
 
+    /// Release an unmapped texture after all submissions using it complete.
+    /// The caller separately retires the logical identity in its table.
+    pub fn release_texture(&mut self, id: TextureId) -> Result<(), IrSubmitError> {
+        let slot = self.resources.texture_ref(id)?.slot();
+        if self.images.iter().any(|mapping| mapping.texture == id) {
+            return Err(ir::Error::InvalidDescriptor.into());
+        }
+        self.backend.release_texture(&self.context, slot)?;
+        Ok(())
+    }
+
     /// Forget a retired logical buffer and its physical VirGL allocation.
     /// Callers must ensure previously submitted work has completed first.
     pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<(), IrSubmitError> {
         let slot = self.resources.buffer_ref(id)?.slot();
-        self.backend.release_buffer(slot);
+        self.backend.release_buffer(&self.context, slot)?;
         // A mirrored table can append and retire a buffer before its first
         // submission has grown these materialization caches.
         if let Some(shadow) = self.buffer_shadows.get_mut(slot) {
@@ -233,6 +246,15 @@ impl IrResources {
         if let Some(revision) = self.canonical_buffer_revisions.get_mut(slot) {
             *revision = None;
         }
+        Ok(())
+    }
+
+    /// Forget materialization of a bind group after its recorded commands have
+    /// been consumed. Native lowering copies all bindings into owned packets,
+    /// so there is no persistent group cache or GPU completion wait here.
+    /// The caller separately retires the identity in the resource table.
+    pub fn release_bind_group(&mut self, id: ir::BindGroupId) -> Result<(), IrSubmitError> {
+        self.resources.bind_group_ref(id)?;
         Ok(())
     }
 
@@ -1247,7 +1269,10 @@ impl ExecutionPlan {
                     source_mip,
                     destination,
                     destination_mip,
+                    source_rect,
+                    destination_rect,
                     filter,
+                    flips,
                 } if active.is_none() => {
                     let source_desc = resources.resources().texture(*source)?;
                     let destination_desc = resources.resources().texture(*destination)?;
@@ -1255,13 +1280,18 @@ impl ExecutionPlan {
                     let destination_extent = destination_desc.mip_extent(*destination_mip)?;
                     if !source_desc.usage().contains(TextureUsage::COPY_SRC)
                         || !destination_desc.usage().contains(TextureUsage::COPY_DST)
-                        || source_desc.format() != destination_desc.format()
+                        || !source_desc
+                            .format()
+                            .blit_compatible(destination_desc.format())
                         || !matches!(
                             source_desc.format(),
                             TextureFormat::Bgra8Unorm
                                 | TextureFormat::Rgba8Unorm
                                 | TextureFormat::R8Unorm
+                                | TextureFormat::Rg8Unorm
                         )
+                        || !source_rect.is_within(source_extent)
+                        || !destination_rect.is_within(destination_extent)
                         || source.id() == destination.id() && source_mip == destination_mip
                     {
                         return Err(ir::Error::InvalidUsage.into());
@@ -1272,17 +1302,17 @@ impl ExecutionPlan {
                     events.push(ExecutionEvent::Copy(driver::IrTextureCopy {
                         source: texture_spec(*source, source_desc)?,
                         source_rect: IrRect {
-                            x: 0,
-                            y: 0,
-                            width: source_extent.width(),
-                            height: source_extent.height(),
+                            x: source_rect.x(),
+                            y: source_rect.y(),
+                            width: source_rect.width(),
+                            height: source_rect.height(),
                         },
                         destination: texture_spec(*destination, destination_desc)?,
                         destination_rect: IrRect {
-                            x: 0,
-                            y: 0,
-                            width: destination_extent.width(),
-                            height: destination_extent.height(),
+                            x: destination_rect.x(),
+                            y: destination_rect.y(),
+                            width: destination_rect.width(),
+                            height: destination_rect.height(),
                         },
                         source_mip: *source_mip,
                         destination_mip: *destination_mip,
@@ -1290,6 +1320,7 @@ impl ExecutionPlan {
                             FilterMode::Nearest => IrFilterMode::Nearest,
                             FilterMode::Linear => IrFilterMode::Linear,
                         }),
+                        flips: *flips,
                     }));
                 }
                 Command::CopyTextureToTexture {
@@ -1325,6 +1356,7 @@ impl ExecutionPlan {
                         source_mip: 0,
                         destination_mip: 0,
                         filter: None,
+                        flips: [false; 2],
                         source: source_spec,
                         source_rect: ir_rect(*source_rect),
                         destination: destination_spec,
@@ -1370,7 +1402,10 @@ impl ExecutionPlan {
                     let descriptor = resources.resources().texture(desc.target())?;
                     if !matches!(
                         descriptor.format(),
-                        TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+                        TextureFormat::Bgra8Unorm
+                            | TextureFormat::Rgba8Unorm
+                            | TextureFormat::R8Unorm
+                            | TextureFormat::Rg8Unorm
                     ) {
                         return Err(IrSubmitError::Unsupported(
                             UnsupportedIrFeature::TargetFormat,
@@ -1401,7 +1436,10 @@ impl ExecutionPlan {
                         let descriptor = resources.resources().texture(attachment.target())?;
                         if !matches!(
                             descriptor.format(),
-                            TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm
+                            TextureFormat::Bgra8Unorm
+                                | TextureFormat::Rgba8Unorm
+                                | TextureFormat::R8Unorm
+                                | TextureFormat::Rg8Unorm
                         ) {
                             return Err(IrSubmitError::Unsupported(
                                 UnsupportedIrFeature::TargetFormat,
@@ -1600,8 +1638,13 @@ impl ExecutionPlan {
                 Command::SetViewport(value) => {
                     let pass = active_pass_mut(&mut active)?;
                     let extent = resources.resources.texture(pass.attachment)?.extent();
-                    let [x, y, width, height, _, _] = value.components();
-                    if x + width > extent.width() as f32 || y + height > extent.height() as f32 {
+                    if !value.is_within(extent) {
+                        #[cfg(feature = "std")]
+                        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                            eprintln!(
+                                "[SGFX VirGL] viewport out of bounds: viewport={value:?} extent={extent:?}"
+                            );
+                        }
                         return Err(ir::Error::OutOfBounds.into());
                     }
                     pass.viewport = Some(*value);
@@ -2888,6 +2931,7 @@ fn convert_texture_upload(
         .and_then(|width| {
             width.checked_mul(match texture.format {
                 IrTextureFormat::R8 => 1,
+                IrTextureFormat::Rg8 => 2,
                 IrTextureFormat::Bgra8 | IrTextureFormat::Rgba8 => 4,
                 IrTextureFormat::Depth32Float => unreachable!(),
             })
@@ -2934,7 +2978,12 @@ fn convert_texture_upload(
             }
             IrTextureFormat::R8 => {
                 for value in source {
-                    pixels.extend_from_slice(&[0, 0, 0, *value]);
+                    pixels.extend_from_slice(&[0, 0, *value, 255]);
+                }
+            }
+            IrTextureFormat::Rg8 => {
+                for pixel in source.chunks_exact(2) {
+                    pixels.extend_from_slice(&[0, pixel[1], pixel[0], 255]);
                 }
             }
             IrTextureFormat::Depth32Float => unreachable!(),
@@ -3074,6 +3123,7 @@ fn texture_spec(
                 ));
             }
             TextureFormat::R8Unorm => IrTextureFormat::R8,
+            TextureFormat::Rg8Unorm => IrTextureFormat::Rg8,
             TextureFormat::Depth32Float => IrTextureFormat::Depth32Float,
         },
     })

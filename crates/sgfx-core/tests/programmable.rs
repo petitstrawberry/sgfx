@@ -364,6 +364,18 @@ fn owned_viewports_validate_values_attachment_bounds_and_pass_scope() {
         )
         .unwrap();
     let valid = Viewport::new(2.0, 1.0, 6.0, 7.0, 0.2, 0.8).unwrap();
+    let inverted = Viewport::new(0.0, 8.0, 8.0, -8.0, 0.0, 1.0).unwrap();
+    assert!(inverted.is_within(Extent2D::new(8, 8).unwrap()));
+    assert!(
+        Viewport::new(0.0, 8.0, 8.0, 0.0, 0.0, 1.0)
+            .unwrap()
+            .is_within(Extent2D::new(8, 8).unwrap())
+    );
+    assert!(
+        !Viewport::new(0.0, 7.0, 8.0, -8.0, 0.0, 1.0)
+            .unwrap()
+            .is_within(Extent2D::new(8, 8).unwrap())
+    );
     let begin = OwnedCommand::BeginRenderPass(OwnedRenderPassDesc {
         target: target.id(),
         area: PixelRect::new(0, 0, 8, 8).unwrap(),
@@ -378,6 +390,13 @@ fn owned_viewports_validate_values_attachment_bounds_and_pass_scope() {
     ]);
     let commands = recording.record(&table).unwrap();
     assert!(matches!(commands.commands()[1], Command::SetViewport(v) if v == valid));
+    OwnedCommandBuffer::new(vec![
+        begin.clone(),
+        OwnedCommand::SetViewport(inverted),
+        OwnedCommand::EndRenderPass,
+    ])
+    .validate(&table)
+    .unwrap();
     let outside = Viewport::new(2.0, 0.0, 7.0, 8.0, 0.0, 1.0).unwrap();
     assert_eq!(
         OwnedCommandBuffer::new(vec![

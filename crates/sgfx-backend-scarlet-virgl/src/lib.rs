@@ -601,8 +601,13 @@ impl MappedTargetSession {
         self.queue.backend.is_idle().map_err(IrSubmitError::Backend)
     }
 
-    /// Retire a logical buffer's private cache after its accepted GPU work has
-    /// completed. Used when synchronizing a dynamic client's resource table.
+    /// Retire an unmapped texture after submissions using it complete.
+    pub fn release_texture(&mut self, id: ir::TextureId) -> Result<(), IrSubmitError> {
+        self.resources.release_texture(id)
+    }
+
+    /// Retire a logical buffer's private cache after its accepted GPU work
+    /// completes. Used when synchronizing a dynamic client's resource table.
     #[cfg(feature = "backend-abi")]
     pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<(), IrSubmitError> {
         self.resources.release_buffer(id)

@@ -43,6 +43,16 @@ impl IrResources {
         self.sync()?;
         status(unsafe { (api(&self.owner.library)?.release_buffer)(self.owner.raw, slot) })
     }
+    pub(crate) fn release_texture(&mut self, id: ir::TextureId) -> Result<()> {
+        let slot = self.table.texture_ref(id).map_err(invalid)?.slot() as u32;
+        self.sync()?;
+        status(unsafe { (api(&self.owner.library)?.release_texture)(self.owner.raw, slot) })
+    }
+    pub(crate) fn release_bind_group(&mut self, id: ir::BindGroupId) -> Result<()> {
+        let slot = self.table.bind_group_ref(id).map_err(invalid)?.slot() as u32;
+        self.sync()?;
+        status(unsafe { (api(&self.owner.library)?.release_bind_group)(self.owner.raw, slot) })
+    }
     pub(crate) fn map_image(
         &mut self,
         id: ir::TextureId,

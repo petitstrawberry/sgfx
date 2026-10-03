@@ -62,9 +62,16 @@ impl ResourceTable {
 
     /// Resolve a texture slot in a backend's mirrored resource table.
     pub fn abi_texture(&self, slot: u32) -> Result<TextureRef<'_>> {
+        let generation = self
+            .textures
+            .borrow()
+            .get(slot as usize)
+            .ok_or(Error::InvalidDescriptor)?
+            .generation;
         self.texture_ref(TextureId {
             owner: self.id,
             index: slot as usize,
+            generation,
         })
     }
 }
@@ -80,6 +87,20 @@ impl ResourceTable {
             .ok_or(Error::InvalidDescriptor)?
             .generation;
         self.buffer_ref(BufferId {
+            owner: self.id,
+            index: slot as usize,
+            generation,
+        })
+    }
+    /// Resolve the current generation of a mirrored bind-group slot.
+    pub fn abi_bind_group(&self, slot: u32) -> Result<BindGroupRef<'_>> {
+        let generation = self
+            .bind_groups
+            .borrow()
+            .get(slot as usize)
+            .ok_or(Error::InvalidDescriptor)?
+            .generation;
+        self.bind_group_ref(BindGroupId {
             owner: self.id,
             index: slot as usize,
             generation,

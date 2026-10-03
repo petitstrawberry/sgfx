@@ -39,7 +39,7 @@ fn plugin_boundary_borrows_the_original_command_storage_and_upload_bytes() {
     let recording = encoder.finish().unwrap();
     let batch = recording.abi_batch().unwrap();
     assert_eq!(batch.count, 1);
-    // v1 WriteBuffer is exactly header, slot, generation, offset, address, length.
+    // v2 WriteBuffer is exactly header, slot, generation, offset, address, length.
     let words = unsafe { batch.words.as_slice() };
     assert_eq!(words.len(), 6);
     assert_eq!(words[0], (6u64 << 32) | 1);
@@ -331,4 +331,167 @@ fn imported_render_pass_preserves_eight_attachments_and_read_only_depth() {
     };
     assert_eq!(pass.color_attachments().count(), 8);
     assert!(pass.depth_attachment().unwrap().read_only());
+}
+
+#[test]
+fn texture_reuse_invalidates_imported_recordings_and_reports_retirement() {
+    let host = ResourceTable::new();
+    host.enable_abi_commands();
+    let desc = TextureDesc::new(
+        TextureFormat::Rg8Unorm,
+        Extent2D::new(2, 2).unwrap(),
+        TextureUsage::COPY_DST | TextureUsage::COPY_SRC,
+    )
+    .unwrap();
+    let old = host.define_texture(desc).unwrap();
+    let payload = [7; 8];
+    let mut encoder = CommandEncoder::new(&host);
+    encoder
+        .write_texture(
+            old,
+            TextureWrite::new(PixelRect::new(0, 0, 2, 2).unwrap(), 4, &payload).unwrap(),
+        )
+        .unwrap();
+    let recording = encoder.finish().unwrap();
+    let mirror = ResourceTable::new();
+    let (identity, _) = mirror
+        .sync_abi_snapshot(&host.abi_snapshot().unwrap())
+        .unwrap();
+    let original = mirror.abi_texture(old.slot() as u32).unwrap().id();
+    host.release_texture(old.id()).unwrap();
+    let retired = mirror
+        .abi_retired_resources(&host.abi_snapshot().unwrap())
+        .unwrap();
+    assert_eq!(retired.0, vec![original]);
+    assert!(retired.1.is_empty());
+    mirror
+        .sync_abi_snapshot(&host.abi_snapshot().unwrap())
+        .unwrap();
+    let replacement = host.define_texture(desc).unwrap();
+    assert_eq!(replacement.slot(), old.slot());
+    mirror
+        .sync_abi_snapshot(&host.abi_snapshot().unwrap())
+        .unwrap();
+    let imported =
+        unsafe { CommandBuffer::from_abi(&mirror, identity, recording.abi_batch().unwrap()) }
+            .unwrap();
+    assert!(imported.iter_commands().next().unwrap().is_err());
+    assert!(mirror.texture_ref(original).is_err());
+    assert_eq!(
+        mirror
+            .texture(mirror.abi_texture(replacement.slot() as u32).unwrap())
+            .unwrap(),
+        desc
+    );
+}
+
+#[test]
+fn bind_group_reuse_invalidates_imported_commands() {
+    let host = ResourceTable::new();
+    host.enable_abi_commands();
+    let layout = BindGroupLayoutDesc::new(vec![]).unwrap();
+    let desc = BindGroupDesc::new(&host, layout.clone(), vec![]).unwrap();
+    let old = host.define_bind_group(desc.clone()).unwrap();
+    let shader = host
+        .define_shader_module(
+            ShaderModuleDesc::wgsl("@compute @workgroup_size(1) fn main() {}".into()).unwrap(),
+        )
+        .unwrap();
+    let pipeline = host
+        .define_compute_pipeline(
+            ComputePipelineDesc::new(
+                ShaderEntryPoint::new(shader, ShaderStage::Compute, "main".into()).unwrap(),
+                PipelineLayoutDesc::new(vec![layout]).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut encoder = CommandEncoder::new(&host);
+    let mut pass = encoder.begin_compute_pass().unwrap();
+    pass.set_pipeline(pipeline).unwrap();
+    pass.set_bind_group(0, old).unwrap();
+    pass.dispatch(1, 1, 1).unwrap();
+    pass.end().unwrap();
+    let recording = encoder.finish().unwrap();
+    let mirror = ResourceTable::new();
+    let (identity, _) = mirror
+        .sync_abi_snapshot(&host.abi_snapshot().unwrap())
+        .unwrap();
+    let original = mirror.abi_bind_group(old.slot() as u32).unwrap().id();
+    host.release_bind_group(old.id()).unwrap();
+    mirror
+        .sync_abi_snapshot(&host.abi_snapshot().unwrap())
+        .unwrap();
+    let replacement = host.define_bind_group(desc).unwrap();
+    assert_eq!(replacement.slot(), old.slot());
+    mirror
+        .sync_abi_snapshot(&host.abi_snapshot().unwrap())
+        .unwrap();
+    let imported =
+        unsafe { CommandBuffer::from_abi(&mirror, identity, recording.abi_batch().unwrap()) }
+            .unwrap();
+    assert!(imported.iter_commands().any(|command| command.is_err()));
+    assert!(mirror.bind_group_ref(original).is_err());
+    assert!(mirror.abi_bind_group(replacement.slot() as u32).is_ok());
+}
+
+#[test]
+fn bounded_flipped_blits_preserve_their_operands_across_the_abi() {
+    let host = ResourceTable::new();
+    host.enable_abi_commands();
+    let source = host
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::Rg8Unorm,
+                Extent2D::new(16, 16).unwrap(),
+                TextureUsage::COPY_SRC,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let destination = host
+        .define_texture(
+            TextureDesc::new(
+                TextureFormat::Rg8Unorm,
+                Extent2D::new(16, 16).unwrap(),
+                TextureUsage::COPY_DST,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let source_rect = PixelRect::new(1, 2, 3, 4).unwrap();
+    let destination_rect = PixelRect::new(2, 3, 6, 8).unwrap();
+    let mut encoder = CommandEncoder::new(&host);
+    encoder
+        .blit_texture_region_flipped(
+            source,
+            0,
+            source_rect,
+            destination,
+            0,
+            destination_rect,
+            FilterMode::Nearest,
+            [true, false],
+        )
+        .unwrap();
+    let recording = encoder.finish().unwrap();
+    let mirror = ResourceTable::new();
+    let (identity, _) = mirror
+        .sync_abi_snapshot(&host.abi_snapshot().unwrap())
+        .unwrap();
+    let imported =
+        unsafe { CommandBuffer::from_abi(&mirror, identity, recording.abi_batch().unwrap()) }
+            .unwrap();
+    let Command::BlitTexture {
+        source_rect: src,
+        destination_rect: dst,
+        flips,
+        ..
+    } = imported.iter_commands().next().unwrap().unwrap()
+    else {
+        panic!("blit");
+    };
+    assert_eq!(src, source_rect);
+    assert_eq!(dst, destination_rect);
+    assert_eq!(flips, [true, false]);
 }

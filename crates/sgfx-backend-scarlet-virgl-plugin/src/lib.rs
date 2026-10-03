@@ -225,15 +225,18 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         if words[2] == s.revision {
             return Ok(());
         }
-        let retired = s
+        let (textures, buffers) = s
             .table
-            .abi_retired_buffers(words)
+            .abi_retired_resources(words)
             .map_err(|_| abi::INVALID)?;
         // Never turn resource retirement into a hidden GPU wait in submit.
-        if !retired.is_empty() && !s.inner.is_idle().map_err(error)? {
+        if (!textures.is_empty() || !buffers.is_empty()) && !s.inner.is_idle().map_err(error)? {
             return Err(abi::BUSY);
         }
-        for id in retired {
+        for id in textures {
+            s.inner.release_texture(id).map_err(error)?;
+        }
+        for id in buffers {
             s.inner.release_buffer(id).map_err(error)?;
         }
         match s.table.sync_abi_snapshot(words) {
@@ -426,7 +429,7 @@ const fn name<const N: usize>(s: &[u8]) -> [u8; N] {
 /// `out` must reference writable storage for `size` bytes when non-null.
 /// `host` must be readable and its feature bits must describe the actual CPU.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sgfx_backend_get_api_v1(
+pub unsafe extern "C" fn sgfx_backend_get_api_v2(
     version: u32,
     size: usize,
     host: *const abi::HostInfo,

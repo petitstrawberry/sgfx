@@ -1,4 +1,4 @@
-//! Frozen v1 scalar/descriptor encoding. Enum numbers here are ABI numbers,
+//! Frozen v2 scalar/descriptor encoding. Enum numbers here are ABI numbers,
 //! independent of Rust discriminants. Existing numbers must never be reordered.
 
 use super::*;
@@ -157,12 +157,12 @@ macro_rules! enumeration {
         }
     };
 }
-enumeration!(TextureFormat {Bgra8Unorm=0,Bgra8UnormSrgb=1,Rgba8Unorm=2,Rgba8UnormSrgb=3,R8Unorm=4,Nv12=5,Depth32Float=6});
+enumeration!(TextureFormat {Bgra8Unorm=0,Bgra8UnormSrgb=1,Rgba8Unorm=2,Rgba8UnormSrgb=3,R8Unorm=4,Nv12=5,Depth32Float=6,Rg8Unorm=7});
 enumeration!(FilterMode {Nearest=0,Linear=1});
 enumeration!(AddressMode {ClampToEdge=0,Repeat=1,MirrorRepeat=2});
 enumeration!(CompareFunction {Never=0,Less=1,Equal=2,LessEqual=3,Greater=4,NotEqual=5,GreaterEqual=6,Always=7});
 enumeration!(VertexFormat {Sint32=0,Uint32=1,Float16x2=2,Float16x4=3,Sint16x4=4,Snorm10_10_10_2=5,Float32x2=6,Float32x3=7,Float32x4=8,Unorm8x4=9});
-enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1});
+enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1,TriangleFan=2});
 enumeration!(IndexFormat {Uint16=0,Uint32=1});
 enumeration!(TextureSampleMode {Rgba=0,RgbIgnoreAlpha=1,AlphaMask=2});
 enumeration!(BlendFactor {Zero=0,One=1,SourceAlpha=2,OneMinusSourceAlpha=3,DestinationAlpha=4,OneMinusDestinationAlpha=5});
@@ -173,7 +173,7 @@ enumeration!(StorageTextureAccess {WriteOnly=0});
 enumeration!(BufferAccess {CopyDestination=0,CopySource=1,Vertex=2,Index=3,Uniform=4,StorageRead=5,StorageReadWrite=6});
 enumeration!(TextureAccess {CopyDestination=0,CopySource=1,Sampled=2,RenderAttachment=3,StorageWrite=4});
 enumeration!(ShaderStage {Vertex=0,Fragment=1,Compute=2});
-enumeration!(TextureViewDimension {D2=0,D2Array=1,Cube=2});
+enumeration!(TextureViewDimension {D2=0,D2Array=1,Cube=2,D1=3,D1Array=4});
 enumeration!(StoreOp {Store=0,DontCare=1});
 
 macro_rules! flags {
@@ -446,17 +446,51 @@ macro_rules! identity {
         }
     };
 }
-identity!(TextureId, texture_ref);
+
 identity!(SamplerId, sampler_ref);
 identity!(RenderPipelineId, render_pipeline_ref);
 identity!(ShaderModuleId, shader_module_ref);
-identity!(BindGroupId, bind_group_ref);
+
 identity!(ComputePipelineId, compute_pipeline_ref);
 identity!(
     ProgrammableRenderPipelineId,
     programmable_render_pipeline_ref
 );
 impl Codec for BufferId {
+    fn put(&self, w: &mut Vec<u64>) {
+        self.index.put(w);
+        self.generation.put(w);
+    }
+    fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
+        let id = Self {
+            owner: t.id,
+            index: r.value(t)?,
+            generation: r.value(t)?,
+        };
+        // Historical immutable bind groups can retain retired identities.
+        // Resolving a command operand (or validating a group for use) checks
+        // the generation, rather than reviving an old slot during import.
+        Ok(id)
+    }
+}
+impl Codec for TextureId {
+    fn put(&self, w: &mut Vec<u64>) {
+        self.index.put(w);
+        self.generation.put(w);
+    }
+    fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
+        let id = Self {
+            owner: t.id,
+            index: r.value(t)?,
+            generation: r.value(t)?,
+        };
+        // Historical immutable bind groups can retain retired identities.
+        // Resolving a command operand (or validating a group for use) checks
+        // the generation, rather than reviving an old slot during import.
+        Ok(id)
+    }
+}
+impl Codec for BindGroupId {
     fn put(&self, w: &mut Vec<u64>) {
         self.index.put(w);
         self.generation.put(w);

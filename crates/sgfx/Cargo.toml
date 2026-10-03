@@ -54,12 +54,12 @@ backend-scarlet-maxwell = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-maxwell"]
 backend-scarlet-adreno = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
 
 [dependencies]
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "5ea41a0dfd6992bb1c0fce06c8e65425dc978140", default-features = false }
+sgfx-core = { path = "../sgfx-core", default-features = false }
 
 [target.'cfg(target_pointer_width = "64")'.dependencies]
 sgfx-backend-abi = { path = "../sgfx-backend-abi", optional = true }
 sgfx-backend-loader = { path = "../sgfx-backend-loader", default-features = false, optional = true }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "5ea41a0dfd6992bb1c0fce06c8e65425dc978140", default-features = false, features = ["backend-abi"] }
+sgfx-core = { path = "../sgfx-core", default-features = false, features = ["backend-abi"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
 pollster = { version = "0.4", optional = true }
@@ -68,15 +68,15 @@ sgfx-backend-wgpu = { path = "../sgfx-backend-wgpu", optional = true }
 wgpu = { version = "24", features = ["spirv"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", default-features = false, optional = true }
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", optional = true }
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", default-features = false, optional = true }
-sgfx-backend-scarlet-maxwell = { git = "https://github.com/petitstrawberry/scarlet-project-switch", rev = "d3b102f823480512309806f252b4e12baf0a39c6", default-features = false, optional = true }
-sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "1ff1075afb4991516290e9cd9143a57daaba98f6", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
+sgfx-backend-scarlet-maxwell = { git = "https://github.com/petitstrawberry/scarlet-project-switch", rev = "17907c32fd661d45a8de2b5f63eda1899d2172aa", default-features = false, optional = true }
+sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "aac53af1d7fa1c653103651e72a54f93862fe050", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
 
 # Scarlet Linux-ABI clients use the native GPU transport on AArch64.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "4ea47edf7e37f50f3c286e2fe51c784f6d282cfe", default-features = false, optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
 
 [lib]
 name = "sgfx"

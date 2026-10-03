@@ -187,3 +187,96 @@ fn sampled_depth_is_valid_but_storage_depth_is_not() {
     );
     assert!(TextureDesc::new(TextureFormat::Depth32Float, size, TextureUsage::STORAGE).is_err());
 }
+
+#[test]
+fn one_dimensional_views_preserve_width_mips_layers_and_reject_2d_aliases() {
+    let texture = TextureDesc::new(
+        TextureFormat::Rg8Unorm,
+        Extent2D::new(8, 1).unwrap(),
+        TextureUsage::SAMPLED | TextureUsage::COPY_DST,
+    )
+    .unwrap()
+    .with_dimension_1d(true)
+    .unwrap()
+    .with_mip_level_count(4)
+    .unwrap()
+    .with_array_layer_count(3)
+    .unwrap();
+    assert_eq!(texture.byte_size().unwrap(), (8 + 4 + 2 + 1) * 2 * 3);
+    assert!(
+        TextureViewDesc::new(
+            texture,
+            texture.format(),
+            TextureViewDimension::D1Array,
+            0,
+            4,
+            0,
+            3
+        )
+        .is_ok()
+    );
+    assert!(
+        TextureViewDesc::new(
+            texture,
+            texture.format(),
+            TextureViewDimension::D1,
+            0,
+            4,
+            1,
+            1
+        )
+        .is_ok()
+    );
+    assert!(
+        TextureViewDesc::new(
+            texture,
+            texture.format(),
+            TextureViewDimension::D1,
+            0,
+            4,
+            0,
+            3
+        )
+        .is_err()
+    );
+    assert!(
+        TextureViewDesc::new(
+            texture,
+            texture.format(),
+            TextureViewDimension::D2Array,
+            0,
+            4,
+            0,
+            3
+        )
+        .is_err()
+    );
+    assert!(
+        texture
+            .with_array_layer_count(6)
+            .unwrap()
+            .with_cube_compatible(true)
+            .is_err()
+    );
+    let invalid = TextureDesc::new(
+        TextureFormat::R8Unorm,
+        Extent2D::new(8, 2).unwrap(),
+        TextureUsage::SAMPLED,
+    )
+    .unwrap();
+    assert!(invalid.with_dimension_1d(true).is_err());
+    assert!(
+        TextureViewDesc::new(
+            invalid,
+            invalid.format(),
+            TextureViewDimension::D1,
+            0,
+            1,
+            0,
+            1
+        )
+        .is_err()
+    );
+    assert!(!TextureFormat::R8Unorm.view_compatible(TextureFormat::Rg8Unorm));
+    assert!(!TextureFormat::Rg8Unorm.view_compatible(TextureFormat::Rgba8Unorm));
+}

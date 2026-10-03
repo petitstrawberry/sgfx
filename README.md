@@ -73,19 +73,18 @@ common backend contract. See the [approved policy](docs/1.0-contract.md#2-coordi
 sgfx = { git = "https://github.com/petitstrawberry/sgfx" }
 ```
 
-The workspace pins coordinated Git dependencies such as Scarlet, Adreno, and
-the shared `sgfx-core` type source to exact commits. Downstream applications
-should also retain their resolved revisions in `Cargo.lock`. This development
-workspace patches `sgfx-core` to the local ABI-enabled source; downstream users
-testing the unpublished dynamic backend need the same override until the
-coordinated Git revisions are advanced.
+The workspace pins external Scarlet and Adreno dependencies to exact commits.
+During coordinated IR development, its root source override resolves external
+backends to the workspace `sgfx-core`, so each binary has one core type source.
+Downstream applications do not inherit that override; a release needs compatible
+immutable revisions and a resolved `Cargo.lock`.
 
 See [dependencies and locked revisions](docs/reference.md#dependencies-and-locked-revisions)
 for the native source set, shared Rust type identity and workspace patch policy.
 
 ## Development
 
-All components that exchange SGFX IR use the same exact `sgfx-core` Git commit.
+All components that exchange SGFX IR must use one `sgfx-core` source identity.
 Use the Scarlet and Adreno revisions declared in the manifests and selected in
 `Cargo.lock`. Update the manifest `rev` and lockfile together when selecting a
 new compatible source set, then run the locked target checks below.

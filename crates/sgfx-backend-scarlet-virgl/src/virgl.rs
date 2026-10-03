@@ -43,6 +43,7 @@ const VIRGL_CCMD_CREATE_OBJECT: u32 = 1;
 // a smaller range; STK places several storage slices in one buffer.
 pub(crate) const MAX_STORAGE_VIEW_BYTES: u64 = 1024 * 1024;
 const VIRGL_CCMD_BIND_OBJECT: u32 = 2;
+const VIRGL_CCMD_DESTROY_OBJECT: u32 = 3;
 const VIRGL_CCMD_SET_VIEWPORT_STATE: u32 = 4;
 const VIRGL_CCMD_SET_FRAMEBUFFER_STATE: u32 = 5;
 const VIRGL_CCMD_SET_VERTEX_BUFFERS: u32 = 6;
@@ -81,6 +82,7 @@ const PIPE_SHADER_FRAGMENT: u32 = 1;
 const VIRGL_SHADER_TOKEN_COUNT_HINT: u32 = 300;
 const PIPE_PRIM_TRIANGLES: u32 = 4;
 const PIPE_PRIM_TRIANGLE_STRIP: u32 = 5;
+const PIPE_PRIM_TRIANGLE_FAN: u32 = 6;
 const PIPE_CLEAR_COLOR0: u32 = 1 << 2;
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
 
@@ -133,6 +135,9 @@ const IR_BUFFER_SLOTS: usize = 1_024;
 const IR_TEXTURE_SLOTS: usize = 1_024;
 const IR_SAMPLER_SLOTS: usize = 256;
 const IR_PIPELINE_SLOTS: usize = 512;
+// Internal transfer draws cannot collide with public IR resource slots.
+const IR_BLIT_PIPELINE_SLOT: usize = IR_PIPELINE_SLOTS;
+const IR_BLIT_SAMPLER_SLOT: usize = IR_SAMPLER_SLOTS;
 const IR_PROGRAMMABLE_PIPELINE_SLOTS: usize = 256;
 
 type SharedScheduler = Rc<RefCell<Option<Arc<NativeScheduler>>>>;
@@ -432,7 +437,8 @@ impl Context {
             GPU_IMAGE_USAGE_RENDER_TARGET
                 | GPU_IMAGE_USAGE_PRESENTABLE
                 | GPU_IMAGE_USAGE_SAMPLED
-                | GPU_IMAGE_USAGE_TRANSFER_SRC,
+                | GPU_IMAGE_USAGE_TRANSFER_SRC
+                | GPU_IMAGE_USAGE_TRANSFER_DST,
         )?;
         let resource_id = resource_id_from_token(self.raw.attach_image(&raw)?)?;
         Ok(Image {
@@ -600,8 +606,18 @@ impl Context {
             spec.mip_levels,
             spec.array_layers,
             spec.cube,
-        )?;
-        let resource_id = resource_id_from_token(self.raw.attach_image(&raw)?)?;
+        ).inspect_err(|_error| {
+            #[cfg(feature = "std")]
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                std::eprintln!("[SGFX native] image allocation failed: slot={} extent={}x{} layers={} mips={} format={format} error={_error:?}", spec.slot, spec.width, spec.height, spec.array_layers, spec.mip_levels);
+            }
+        })?;
+        let resource_id = resource_id_from_token(self.raw.attach_image(&raw).inspect_err(|_error| {
+            #[cfg(feature = "std")]
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                std::eprintln!("[SGFX native] image attachment failed: slot={} extent={}x{} error={_error:?}", spec.slot, spec.width, spec.height);
+            }
+        })?)?;
         Ok(Texture {
             raw,
             resource_id,
@@ -685,7 +701,13 @@ impl Context {
         pixels: &mut [u8],
     ) -> HandleResult<()> {
         if resources.context_handle != self.handle_id()
-            || !matches!(spec.format, IrTextureFormat::Bgra8 | IrTextureFormat::Rgba8)
+            || !matches!(
+                spec.format,
+                IrTextureFormat::Bgra8
+                    | IrTextureFormat::Rgba8
+                    | IrTextureFormat::R8
+                    | IrTextureFormat::Rg8
+            )
             || !self.device.capabilities.supports_image_readback()
         {
             return Err(HandleError::InvalidParameter);
@@ -726,12 +748,44 @@ impl Context {
         Ok(())
     }
 
-    pub(crate) fn release_texture(&self, texture: Texture) -> HandleResult<()> {
+    fn retire_texture(&self, texture: &Texture) -> HandleResult<()> {
         if texture.context_handle != self.handle_id() {
             return Err(HandleError::InvalidParameter);
         }
         wait_scheduled(&self.scheduler)?;
+        let mut commands = Vec::new();
+        push_retirement_unbinds(&mut commands);
+        if texture.sampler_view_initialized.get() {
+            push_destroy_object(
+                &mut commands,
+                VIRGL_OBJECT_SAMPLER_VIEW,
+                texture.sampler_view_handle,
+            );
+            if texture.r8_sampler_view_handle != 0 {
+                push_destroy_object(
+                    &mut commands,
+                    VIRGL_OBJECT_SAMPLER_VIEW,
+                    texture.r8_sampler_view_handle,
+                );
+            }
+        }
+        if texture.ir_surface_initialized.get() {
+            push_destroy_object(
+                &mut commands,
+                VIRGL_OBJECT_SURFACE,
+                texture.ir_surface_handle,
+            );
+        }
+        // Views and surfaces hold renderer references even after resource detach.
+        // Synchronous completion makes it safe to detach and close the owned FD.
+        self.raw.create_queue()?.submit(&commands)?;
+        texture.sampler_view_initialized.set(false);
+        texture.ir_surface_initialized.set(false);
         self.raw.detach_image(&texture.raw)
+    }
+
+    pub(crate) fn release_texture(&self, texture: Texture) -> HandleResult<()> {
+        self.retire_texture(&texture)
     }
 
     pub(crate) fn release_image(&self, image: Image) -> HandleResult<()> {
@@ -809,8 +863,8 @@ impl Context {
             textures: empty_slots(IR_TEXTURE_SLOTS)?,
             depth_sample_copies: empty_slots(IR_TEXTURE_SLOTS)?,
             texture_specs: empty_slots(IR_TEXTURE_SLOTS)?,
-            samplers: empty_slots(IR_SAMPLER_SLOTS)?,
-            pipelines: empty_slots(IR_PIPELINE_SLOTS)?,
+            samplers: empty_slots(IR_SAMPLER_SLOTS + 64)?,
+            pipelines: empty_slots(IR_PIPELINE_SLOTS + 1)?,
             programmable_pipelines: empty_slots(IR_PROGRAMMABLE_PIPELINE_SLOTS)?,
             vertex_shader_handle: self.allocate_object_handle()?,
             solid_fragment_shader_handle: self.allocate_object_handle()?,
@@ -1037,10 +1091,46 @@ pub(crate) struct IrStateSnapshot {
 }
 
 impl IrResources {
-    pub(crate) fn release_buffer(&mut self, slot: usize) {
-        if let Some(buffer) = self.buffers.get_mut(slot) {
-            buffer.take();
+    pub(crate) fn release_texture(&mut self, context: &Context, slot: usize) -> HandleResult<()> {
+        if self.context_handle != context.handle_id() || slot >= self.textures.len() {
+            return Err(HandleError::InvalidParameter);
         }
+        if matches!(self.textures[slot], Some(IrTexture::Mapped(_))) {
+            return Err(HandleError::InvalidParameter);
+        }
+        if let Some(IrTexture::Internal(texture)) = self.textures[slot].as_ref() {
+            context.retire_texture(texture)?;
+            self.textures[slot] = None;
+        }
+        if let Some(texture) = self.depth_sample_copies[slot].as_ref() {
+            context.retire_texture(texture)?;
+            self.depth_sample_copies[slot] = None;
+        }
+        self.texture_specs[slot] = None;
+        Ok(())
+    }
+
+    pub(crate) fn release_buffer(&mut self, context: &Context, slot: usize) -> HandleResult<()> {
+        if self.context_handle != context.handle_id() || slot >= self.buffers.len() {
+            return Err(HandleError::InvalidParameter);
+        }
+        if let Some(buffer) = self.buffers[slot].as_ref() {
+            wait_scheduled(&context.scheduler)?;
+            let mut commands = Vec::new();
+            push_retirement_unbinds(&mut commands);
+            if buffer.sampler_view_initialized.get() {
+                push_destroy_object(
+                    &mut commands,
+                    VIRGL_OBJECT_SAMPLER_VIEW,
+                    buffer.sampler_view_handle,
+                );
+            }
+            context.raw.create_queue()?.submit(&commands)?;
+            buffer.sampler_view_initialized.set(false);
+            context.raw.detach_buffer(&buffer._raw)?;
+            self.buffers[slot] = None;
+        }
+        Ok(())
     }
 
     pub(crate) fn unmap_ir_image(
@@ -1656,6 +1746,25 @@ impl Queue {
         {
             return Err(HandleError::InvalidParameter);
         }
+        if copy.filter.is_some()
+            && matches!(
+                copy.source.format,
+                IrTextureFormat::R8 | IrTextureFormat::Rg8
+            )
+            && matches!(
+                copy.destination.format,
+                IrTextureFormat::Rgba8 | IrTextureFormat::Bgra8
+            )
+        {
+            let submission = narrow_color_blit_submission(copy)?;
+            return self.submit_ir_internal(
+                context,
+                resources,
+                copy.destination,
+                &submission,
+                mode,
+            );
+        }
         let source = ir_texture(context, resources, copy.source)?;
         let source_id = source.resource_id();
         let destination = ir_texture(context, resources, copy.destination)?;
@@ -1674,6 +1783,7 @@ impl Queue {
                 copy.source_mip,
                 copy.source_rect,
                 filter,
+                copy.flips,
             );
         } else {
             push_resource_copy(
@@ -1790,7 +1900,13 @@ impl Queue {
             let spec = color.texture;
             if !spec.render_attachment
                 || spec.present
-                || !matches!(spec.format, IrTextureFormat::Bgra8 | IrTextureFormat::Rgba8)
+                || !matches!(
+                    spec.format,
+                    IrTextureFormat::Bgra8
+                        | IrTextureFormat::Rgba8
+                        | IrTextureFormat::R8
+                        | IrTextureFormat::Rg8
+                )
                 || spec.width != target.width
                 || spec.height != target.height
                 || color
@@ -2215,7 +2331,15 @@ impl Queue {
                     .get(sampler.slot)
                     .and_then(Option::as_ref)
                     .ok_or(HandleError::InvalidParameter)?;
-                let sampler_view = texture.sampler_view_handle();
+                let sampler_view = if matches!(
+                    draw.pipeline.fragment,
+                    IrFragmentProgram::TextureAlphaMask
+                        | IrFragmentProgram::TextureVertexColorAlphaMask
+                ) {
+                    texture.sampler_view_handle()
+                } else {
+                    texture.programmable_sampler_view_handle()
+                };
                 if bound_sampler_view != Some(sampler_view) {
                     push_sampler_view_binding(&mut commands, sampler_view);
                     bound_sampler_view = Some(sampler_view);
@@ -2665,6 +2789,120 @@ fn ir_texture<'resources>(
     Ok(texture)
 }
 
+fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmission> {
+    let filter = copy.filter.ok_or(HandleError::InvalidParameter)?;
+    if copy.destination_mip != 0
+        || copy.source_mip >= 32
+        || copy.source.array_layers != 1
+        || copy.destination.array_layers != 1
+        || !copy.source.sampled
+        || !copy.destination.render_attachment
+    {
+        return Err(HandleError::InvalidParameter);
+    }
+    let source_width = (copy.source.width >> copy.source_mip).max(1) as f32;
+    let source_height = (copy.source.height >> copy.source_mip).max(1) as f32;
+    let src = copy.source_rect;
+    let dst = copy.destination_rect;
+    let mut u = [
+        src.x as f32 / source_width,
+        (src.x + src.width) as f32 / source_width,
+    ];
+    let mut v = [
+        src.y as f32 / source_height,
+        (src.y + src.height) as f32 / source_height,
+    ];
+    if copy.flips[0] {
+        u.swap(0, 1);
+    }
+    if copy.flips[1] {
+        v.swap(0, 1);
+    }
+    let x = [
+        2.0 * dst.x as f32 / copy.destination.width as f32 - 1.0,
+        2.0 * (dst.x + dst.width) as f32 / copy.destination.width as f32 - 1.0,
+    ];
+    let y = [
+        1.0 - 2.0 * dst.y as f32 / copy.destination.height as f32,
+        1.0 - 2.0 * (dst.y + dst.height) as f32 / copy.destination.height as f32,
+    ];
+    let mut vertices = Vec::new();
+    vertices
+        .try_reserve_exact(6)
+        .map_err(|_| HandleError::OutOfResources)?;
+    for (i, j) in [(0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1)] {
+        vertices.push(IrVertex {
+            position: [x[i], y[j], 0.0, 1.0],
+            secondary: [1.0; 4],
+            tertiary: [u[i], v[j]],
+        });
+    }
+    let replace = crate::driver::IrBlendComponent {
+        source_factor: IrBlendFactor::One,
+        destination_factor: IrBlendFactor::Zero,
+        operation: IrBlendOp::Add,
+    };
+    let mut draws = Vec::new();
+    draws
+        .try_reserve_exact(1)
+        .map_err(|_| HandleError::OutOfResources)?;
+    draws.push(IrDraw {
+        programmable: None,
+        start_vertex: 0,
+        instance_count: 1,
+        first_instance: 0,
+        vertex_buffers: [None; 8],
+        vertex_count: 6,
+        vertex_buffer: None,
+        pipeline: IrPipelineState {
+            slot: IR_BLIT_PIPELINE_SLOT,
+            fragment: IrFragmentProgram::TextureRgba,
+            blend: IrBlendState {
+                color: replace,
+                alpha: replace,
+            },
+            color_write_mask: 0xf,
+            additional_color_blends: [None; 7],
+            cull_mode: IrCullMode::None,
+            front_face: IrFrontFace::CounterClockwise,
+            depth: None,
+        },
+        texture: Some(copy.source),
+        sampler: Some(IrSamplerState {
+            slot: IR_BLIT_SAMPLER_SLOT
+                + copy.source_mip as usize * 2
+                + usize::from(matches!(filter, IrFilterMode::Linear)),
+            min_filter: filter,
+            mag_filter: filter,
+            address_u: IrAddressMode::ClampToEdge,
+            address_v: IrAddressMode::ClampToEdge,
+            mip_filter: IrFilterMode::Nearest,
+            min_lod: copy.source_mip as f32,
+            max_lod: copy.source_mip as f32,
+            compare: None,
+        }),
+        uniforms: IrUniforms {
+            transform: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            color: [1.0; 4],
+        },
+        scissor: dst,
+        viewport: None,
+    });
+    Ok(IrSubmission {
+        clear_color: None,
+        additional_colors: Vec::new(),
+        depth_attachment: None,
+        depth_read_only: false,
+        clear_depth: None,
+        render_area: dst,
+        vertices,
+        draws,
+        texture_uploads: Vec::new(),
+    })
+}
+
 fn ir_sampler<'resources>(
     context: &Context,
     resources: &'resources mut IrResources,
@@ -2966,7 +3204,8 @@ fn validate_ir_draw(
     if let Some([x, y, width, height, min_depth, max_depth]) = draw.viewport {
         if crate::ir::Viewport::new(x, y, width, height, min_depth, max_depth).is_err()
             || x + width > target_width as f32
-            || y + height > target_height as f32
+            || y.min(y + height) < 0.0
+            || y.max(y + height) > target_height as f32
         {
             return Err(HandleError::InvalidParameter);
         }
@@ -3400,21 +3639,38 @@ fn push_sampler_mip_view(commands: &mut Vec<u8>, handle: u32, resource_id: u32, 
 }
 
 fn push_ir_sampler_views(commands: &mut Vec<u8>, texture: &IrTexture, spec: IrTextureSpec) {
-    push_ir_sampler_view(
-        commands,
-        texture.sampler_view_handle(),
-        texture.resource_id(),
-        spec,
-    );
     if spec.format == IrTextureFormat::R8 {
-        // R8 storage uses BGRA alpha for the fixed alpha-mask path. Expose the
-        // Vulkan/IR value (r, 0, 0, 1) through a distinct programmable view.
+        // Keep the fixed alpha-mask sampler contract while storing the logical
+        // red channel in physical red, matching render-target writes and clears.
+        push_ir_sampler_view_swizzled(
+            commands,
+            texture.sampler_view_handle(),
+            texture.resource_id(),
+            spec,
+            (4 << 3) | (4 << 6) | (PIPE_SWIZZLE_X << 9),
+        );
+        // Programmable R8 sampling returns (r, 0, 0, 1).
         push_ir_sampler_view_swizzled(
             commands,
             texture.programmable_sampler_view_handle(),
             texture.resource_id(),
             spec,
-            PIPE_SWIZZLE_W | (4 << 3) | (4 << 6) | (5 << 9),
+            PIPE_SWIZZLE_X | (4 << 3) | (4 << 6) | (5 << 9),
+        );
+    } else if spec.format == IrTextureFormat::Rg8 {
+        push_ir_sampler_view_swizzled(
+            commands,
+            texture.sampler_view_handle(),
+            texture.resource_id(),
+            spec,
+            PIPE_SWIZZLE_X | (PIPE_SWIZZLE_Y << 3) | (4 << 6) | (5 << 9),
+        );
+    } else {
+        push_ir_sampler_view(
+            commands,
+            texture.sampler_view_handle(),
+            texture.resource_id(),
+            spec,
         );
     }
 }
@@ -3463,6 +3719,44 @@ fn push_ir_sampler_view_swizzled(
     push_dword(commands, (spec.array_layers - 1) << 16);
     push_dword(commands, (spec.mip_levels - 1) << 8);
     push_dword(commands, swizzle);
+}
+
+fn push_destroy_object(commands: &mut Vec<u8>, object: u32, handle: u32) {
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_DESTROY_OBJECT, object, 1),
+    );
+    push_dword(commands, handle);
+}
+
+// Lowering caches bindings within one submission only. Clearing all persistent
+// resource bindings here is safe: the next submission explicitly rebinds them.
+fn push_retirement_unbinds(commands: &mut Vec<u8>) {
+    for stage in [PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT] {
+        push_dword(
+            commands,
+            command_header(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 34),
+        );
+        push_dword(commands, stage);
+        push_dword(commands, 0);
+        for _ in 0..32 {
+            push_dword(commands, 0);
+        }
+    }
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 2),
+    );
+    push_dword(commands, 0);
+    push_dword(commands, 0);
+    push_dword(
+        commands,
+        command_header(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 24),
+    );
+    for _ in 0..24 {
+        push_dword(commands, 0);
+    }
+    push_index_buffer(commands, 0, 0, 0);
 }
 
 fn push_sampler_view_binding(commands: &mut Vec<u8>, handle: u32) {
@@ -3543,6 +3837,7 @@ fn push_mip_blit(
     source_level: u32,
     source: crate::driver::IrRect,
     filter: IrFilterMode,
+    flips: [bool; 2],
 ) {
     push_dword(commands, command_header(VIRGL_CCMD_BLIT, 0, 21));
     // PIPE_MASK_RGBA (not PIPE_CLEAR_COLOR0), image filter, no scissor.
@@ -3562,11 +3857,19 @@ fn push_mip_blit(
         source_resource,
         source_level,
         VIRGL_FORMAT_B8G8R8A8_UNORM,
-        source.x,
-        source.y,
+        source.x + if flips[0] { source.width } else { 0 },
+        source.y + if flips[1] { source.height } else { 0 },
         0,
-        source.width,
-        source.height,
+        if flips[0] {
+            0u32.wrapping_sub(source.width)
+        } else {
+            source.width
+        },
+        if flips[1] {
+            0u32.wrapping_sub(source.height)
+        } else {
+            source.height
+        },
         1,
     ] {
         push_dword(commands, word);
@@ -4944,6 +5247,7 @@ fn push_instanced_draw_parameters(
         crate::ir::PrimitiveTopology::TriangleStrip if vertex_count >= 3 => {
             PIPE_PRIM_TRIANGLE_STRIP
         }
+        crate::ir::PrimitiveTopology::TriangleFan if vertex_count >= 3 => PIPE_PRIM_TRIANGLE_FAN,
         _ => return Err(HandleError::InvalidParameter),
     };
     push_dword(commands, command_header(VIRGL_CCMD_DRAW_VBO, 0, 12));
@@ -5098,6 +5402,57 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_unbinds_renderer_resource_references_before_destroying_views() {
+        let mut commands = Vec::new();
+        push_retirement_unbinds(&mut commands);
+        push_destroy_object(&mut commands, VIRGL_OBJECT_SAMPLER_VIEW, 123);
+        push_destroy_object(&mut commands, VIRGL_OBJECT_SURFACE, 124);
+        let words = dwords(&commands);
+        let mut packets = Vec::new();
+        let mut offset = 0;
+        while offset < words.len() {
+            let header = words[offset];
+            let length = (header >> 16) as usize;
+            packets.push((
+                header & 255,
+                (header >> 8) & 255,
+                &words[offset + 1..offset + 1 + length],
+            ));
+            offset += length + 1;
+        }
+        assert_eq!(offset, words.len());
+        for (index, stage) in [PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT]
+            .into_iter()
+            .enumerate()
+        {
+            let (command, _, payload) = packets[index];
+            assert_eq!(command, VIRGL_CCMD_SET_SAMPLER_VIEWS);
+            assert_eq!(&payload[..2], &[stage, 0]);
+            assert_eq!(payload.len(), 34);
+            assert!(payload[2..].iter().all(|handle| *handle == 0));
+        }
+        assert_eq!(
+            packets[2],
+            (VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, &[0, 0][..])
+        );
+        assert_eq!(packets[3].0, VIRGL_CCMD_SET_VERTEX_BUFFERS);
+        assert!(packets[3].2.iter().all(|word| *word == 0));
+        assert_eq!(packets[4], (VIRGL_CCMD_SET_INDEX_BUFFER, 0, &[0, 0, 0][..]));
+        assert_eq!(
+            packets[5],
+            (
+                VIRGL_CCMD_DESTROY_OBJECT,
+                VIRGL_OBJECT_SAMPLER_VIEW,
+                &[123][..]
+            )
+        );
+        assert_eq!(
+            packets[6],
+            (VIRGL_CCMD_DESTROY_OBJECT, VIRGL_OBJECT_SURFACE, &[124][..])
+        );
+    }
     use crate::driver::{IrBlendComponent, IrDepthState};
 
     #[test]
@@ -5160,6 +5515,77 @@ mod tests {
     }
 
     #[test]
+    fn narrow_color_blit_draw_preserves_regions_flips_lod_and_private_slots() {
+        let source = IrTextureSpec {
+            slot: 3,
+            width: 16,
+            height: 8,
+            mip_levels: 3,
+            array_layers: 1,
+            cube: false,
+            sampled: true,
+            render_attachment: false,
+            copy_destination: true,
+            present: false,
+            format: IrTextureFormat::R8,
+        };
+        let destination = IrTextureSpec {
+            slot: 4,
+            width: 16,
+            height: 16,
+            mip_levels: 1,
+            render_attachment: true,
+            format: IrTextureFormat::Rgba8,
+            ..source
+        };
+        let copy = IrTextureCopy {
+            source,
+            destination,
+            source_mip: 1,
+            destination_mip: 0,
+            source_rect: crate::driver::IrRect {
+                x: 2,
+                y: 1,
+                width: 4,
+                height: 2,
+            },
+            destination_rect: crate::driver::IrRect {
+                x: 4,
+                y: 8,
+                width: 8,
+                height: 4,
+            },
+            filter: Some(IrFilterMode::Linear),
+            flips: [true, false],
+        };
+        let submission = narrow_color_blit_submission(copy).unwrap();
+        assert_eq!(submission.vertices.len(), 6);
+        assert_eq!(submission.vertices[0].position, [-0.5, 0.0, 0.0, 1.0]);
+        assert_eq!(submission.vertices[5].position, [0.5, -0.5, 0.0, 1.0]);
+        assert_eq!(submission.vertices[0].tertiary, [0.75, 0.25]);
+        assert_eq!(submission.vertices[5].tertiary, [0.25, 0.75]);
+        let draw = &submission.draws[0];
+        assert_eq!(draw.pipeline.slot, IR_PIPELINE_SLOTS);
+        assert_eq!(draw.pipeline.color_write_mask, 0xf);
+        let sampler = draw.sampler.unwrap();
+        assert_eq!(sampler.slot, IR_SAMPLER_SLOTS + 3);
+        assert_eq!(sampler.min_lod, 1.0);
+        assert_eq!(sampler.max_lod, 1.0);
+        assert!(matches!(
+            draw.pipeline.fragment,
+            IrFragmentProgram::TextureRgba
+        ));
+        assert!(submission.clear_color.is_none());
+        assert!(
+            narrow_color_blit_submission(IrTextureCopy {
+                destination_mip: 1,
+                ..copy
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn mip_blit_preserves_levels_extents_and_color_mask() {
         let mut commands = Vec::new();
         let rect = |width, height| crate::driver::IrRect {
@@ -5177,6 +5603,7 @@ mod tests {
             1,
             rect(7, 3),
             IrFilterMode::Linear,
+            [false; 2],
         );
         let words = dwords(&commands);
         assert_eq!(
@@ -5246,6 +5673,42 @@ mod tests {
             Err(HandleError::InvalidParameter)
         );
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn triangle_fan_draw_uses_native_fan_for_indexed_and_nonindexed_vertices() {
+        for indexed in [false, true] {
+            let mut commands = Vec::new();
+            push_draw_topology_parameters(
+                &mut commands,
+                2,
+                5,
+                indexed,
+                -3,
+                crate::ir::PrimitiveTopology::TriangleFan,
+            )
+            .unwrap();
+            let words = dwords(&commands);
+            // VirGL PIPE_PRIM_TRIANGLE_FAN is 6; fan connectivity cannot be
+            // replaced by strip connectivity for this five-vertex draw.
+            assert_eq!(
+                &words[1..7],
+                &[2, 5, 6, u32::from(indexed), 1, (-3i32) as u32]
+            );
+            commands.clear();
+            assert_eq!(
+                push_draw_topology_parameters(
+                    &mut commands,
+                    0,
+                    2,
+                    indexed,
+                    0,
+                    crate::ir::PrimitiveTopology::TriangleFan,
+                ),
+                Err(HandleError::InvalidParameter)
+            );
+            assert!(commands.is_empty());
+        }
     }
 
     #[test]

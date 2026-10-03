@@ -670,6 +670,25 @@ enum ResourcesBackend {
 }
 
 impl Resources {
+    /// Release backend materialization for a retired logical texture.
+    /// The caller must first wait for submissions using it to complete.
+    pub fn release_texture(&mut self, id: ir::TextureId) -> Result<()> {
+        match &mut self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            ResourcesBackend::Wgpu(resources) => resources.release_texture(id).map_err(Error::Wgpu),
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+            ))]
+            ResourcesBackend::ScarletVirgl(resources) => {
+                resources.release_texture(id).map_err(Error::from)
+            }
+        }
+    }
+
     /// Release backend materialization for a retired logical buffer.
     /// The caller must first wait for submissions using it to complete.
     pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<()> {
@@ -685,6 +704,28 @@ impl Resources {
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 resources.release_buffer(id).map_err(Error::from)
+            }
+        }
+    }
+
+    /// Release cached materialization after recorded commands using this bind
+    /// group have been consumed. Submitted work retains its own resources, so
+    /// no GPU completion wait is required. Retire the table identity afterward.
+    pub fn release_bind_group(&mut self, id: ir::BindGroupId) -> Result<()> {
+        match &mut self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            ResourcesBackend::Wgpu(resources) => {
+                resources.release_bind_group(id).map_err(Error::Wgpu)
+            }
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+            ))]
+            ResourcesBackend::ScarletVirgl(resources) => {
+                resources.release_bind_group(id).map_err(Error::from)
             }
         }
     }

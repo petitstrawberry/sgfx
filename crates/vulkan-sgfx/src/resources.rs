@@ -18,6 +18,12 @@ pub(crate) struct Buffer {
     pub usage: vk::BufferUsageFlags,
     pub bound: Option<(vk::DeviceMemory, u64)>,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct BufferView {
+    pub buffer: vk::Buffer,
+    pub offset: u64,
+    pub range: u64,
+}
 /// Host allocation with the eight-byte base alignment advertised by the ICD.
 /// The backing words never grow after allocation, preserving every mapped pointer.
 pub(crate) struct AlignedBytes {
@@ -82,44 +88,87 @@ pub(crate) struct DescriptorSet {
     pub pool: vk::DescriptorPool,
     pub layout: ir::BindGroupLayoutDesc,
     pub types: BTreeMap<u32, vk::DescriptorType>,
+    pub stages: BTreeMap<u32, vk::ShaderStageFlags>,
     pub bindings: HashMap<u32, DescriptorBinding>,
     pub cached_group: Option<ir::BindGroupId>,
     pub invalid: bool,
 }
+/// Vulkan binding numbers are labels, not indices into SGFX's bounded slots.
+/// Each logical descriptor reserves an even resource slot and an adjacent
+/// sampler slot. Preserve the existing low-number ABI and pack sparse labels
+/// into unused pairs, with the same map used by layouts, shaders and updates.
+pub(crate) type DescriptorBindingMap = BTreeMap<u32, u32>;
+fn descriptor_binding_map(
+    types: &BTreeMap<u32, vk::DescriptorType>,
+) -> Result<DescriptorBindingMap, vk::Result> {
+    let pairs = ir::MAX_BINDINGS_PER_GROUP as u32 / 2;
+    if types.len() > pairs as usize {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    let mut map = types
+        .keys()
+        .filter(|&&b| b < pairs)
+        .map(|&b| (b, b * 2))
+        .collect::<BTreeMap<_, _>>();
+    for &binding in types.keys().filter(|&&b| b >= pairs) {
+        let slot = (0..pairs)
+            .map(|slot| slot * 2)
+            .find(|slot| !map.values().any(|used| used == slot))
+            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        map.insert(binding, slot);
+    }
+    Ok(map)
+}
+impl DescriptorSet {
+    pub(crate) fn binding_map(&self) -> DescriptorBindingMap {
+        descriptor_binding_map(&self.types).expect("validated descriptor layout")
+    }
+    pub(crate) fn source_to_ir(&self, binding: u32) -> Option<u32> {
+        self.binding_map().get(&binding).copied()
+    }
+    fn ir_to_source(&self, slot: u32) -> Option<u32> {
+        self.binding_map()
+            .into_iter()
+            .find_map(|(binding, base)| (base == slot / 2 * 2).then_some(binding))
+    }
+}
 pub(crate) type Specialization = Vec<(u32, Vec<u8>)>;
+type ShaderVariant = (
+    Specialization,
+    Vec<Option<bool>>,
+    Vec<DescriptorBindingMap>,
+    ir::ShaderModuleId,
+);
 pub(crate) struct Shader {
     words: Vec<u32>,
-    variants: Vec<(Specialization, Vec<Option<bool>>, ir::ShaderModuleId)>,
+    variants: Vec<ShaderVariant>,
 }
 impl Shader {
-    pub(crate) fn variant(
-        &mut self,
-        table: &ir::ResourceTable,
-        values: &Specialization,
-    ) -> Result<ir::ShaderModuleId, vk::Result> {
-        self.variant_for_subpass(table, values, &[])
-    }
     pub(crate) fn input_bindings(
         &self,
     ) -> Result<Vec<crate::input_attachments::InputBinding>, vk::Result> {
         crate::input_attachments::bindings(&self.words)
     }
-    pub(crate) fn variant_for_subpass(
+    pub(crate) fn variant_for_layout(
         &mut self,
         table: &ir::ResourceTable,
         values: &Specialization,
         inputs: &[Option<bool>],
+        bindings: &[DescriptorBindingMap],
     ) -> Result<ir::ShaderModuleId, vk::Result> {
-        if let Some((_, _, id)) = self
-            .variants
-            .iter()
-            .find(|(key, input_key, _)| key == values && input_key == inputs)
+        if let Some((_, _, _, id)) =
+            self.variants
+                .iter()
+                .find(|(key, input_key, binding_key, _)| {
+                    key == values && input_key == inputs && binding_key == bindings
+                })
         {
             return Ok(*id);
         }
-        let desc = normalize_spirv_specialized(self.words.clone(), values, inputs)?;
+        let desc = normalize_spirv_specialized(self.words.clone(), values, inputs, bindings)?;
         let id = table.define_shader_module(desc).map_err(failure)?.id();
-        self.variants.push((values.clone(), inputs.to_vec(), id));
+        self.variants
+            .push((values.clone(), inputs.to_vec(), bindings.to_vec(), id));
         Ok(id)
     }
 }
@@ -149,18 +198,27 @@ pub(crate) unsafe fn specialization(
 
 #[derive(Default)]
 pub(crate) struct Resources {
+    pub image_view_formats: HashMap<vk::Image, Vec<vk::Format>>,
+    pub descriptor_templates:
+        HashMap<vk::DescriptorUpdateTemplate, crate::api::descriptor_template::Template>,
     pub buffers: HashMap<vk::Buffer, Buffer>,
+    pub buffer_views: HashMap<vk::BufferView, BufferView>,
     pub memories: HashMap<vk::DeviceMemory, Memory>,
     /// Buffers whose unmapped host allocation has already been staged to SGFX.
     pub uploaded_unmapped_buffers: HashSet<vk::Buffer>,
     pub shaders: HashMap<vk::ShaderModule, Shader>,
     pub set_layouts: HashMap<vk::DescriptorSetLayout, ir::BindGroupLayoutDesc>,
     pub set_layout_types: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::DescriptorType>>,
+    pub set_layout_stages: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::ShaderStageFlags>>,
     pub samplers: HashMap<vk::Sampler, ir::SamplerId>,
     pub pipeline_layouts: HashMap<vk::PipelineLayout, ir::PipelineLayoutDesc>,
+    pub pipeline_binding_maps: HashMap<vk::PipelineLayout, Vec<DescriptorBindingMap>>,
+    pub pipeline_binding_stages:
+        HashMap<vk::PipelineLayout, Vec<BTreeMap<u32, vk::ShaderStageFlags>>>,
     pub descriptor_pools: HashMap<vk::DescriptorPool, DescriptorPool>,
     pub descriptor_sets: HashMap<vk::DescriptorSet, DescriptorSet>,
     bind_group_cache: Vec<(ir::BindGroupDesc, ir::BindGroupId)>,
+    pub pipeline_caches: HashMap<vk::PipelineCache, Vec<u8>>,
     pub pipelines: HashMap<vk::Pipeline, Pipeline>,
     graphics_swizzles:
         HashMap<(vk::Pipeline, crate::spirv::TextureSwizzles), ir::ProgrammableRenderPipelineId>,
@@ -299,8 +357,9 @@ impl Resources {
                     .get(&(group as u32))
                     .and_then(|set| self.descriptor_sets.get(set))
                     .ok_or(invalid)?;
-                let Some(DescriptorBinding::Image { view, .. }) =
-                    set.bindings.get(&(entry.binding() / 2))
+                let Some(DescriptorBinding::Image { view, .. }) = set
+                    .bindings
+                    .get(&set.ir_to_source(entry.binding()).ok_or(invalid)?)
                 else {
                     return Err(invalid);
                 };
@@ -346,6 +405,34 @@ impl Resources {
         for set in self.descriptor_sets.values_mut() {
             set.cached_group = None;
         }
+    }
+
+    /// Retire descriptor snapshots after every recording in a queue packet has
+    /// been encoded. Vulkan command recordings retain set handles, not these
+    /// transient IR identities; submitted backend commands own their bindings.
+    /// Keep the single shared empty group used to clear inactive layout slots.
+    pub(crate) fn release_descriptor_groups(
+        &mut self,
+        table: &ir::ResourceTable,
+        mut release_backend: impl FnMut(ir::BindGroupId) -> Result<(), vk::Result>,
+    ) -> Result<(), vk::Result> {
+        for set in self.descriptor_sets.values_mut() {
+            set.cached_group = None;
+        }
+        let mut result = Ok(());
+        for (desc, id) in std::mem::take(&mut self.bind_group_cache) {
+            if desc.layout().entries().is_empty() {
+                self.bind_group_cache.push((desc, id));
+            } else if let Err(error) =
+                release_backend(id).and_then(|()| table.release_bind_group(id).map_err(failure))
+            {
+                // Preserve failed retirements for diagnosis or a retry, while
+                // still releasing the rest of this packet's snapshots.
+                self.bind_group_cache.push((desc, id));
+                result = Err(error);
+            }
+        }
+        result
     }
 
     pub(crate) fn empty_bind_group(
@@ -427,7 +514,7 @@ impl Resources {
         // Only statically used descriptors need resources. Vulkan's layout
         // itself does not contain image dimensionality or sampler comparison.
         for entry in layout.entries() {
-            let binding = entry.binding() / 2;
+            let binding = set.ir_to_source(entry.binding()).ok_or(invalid)?;
             let resource = *set.bindings.get(&binding).ok_or(invalid)?;
             let resource = match resource {
                 DescriptorBinding::Buffer {
@@ -640,6 +727,9 @@ pub(crate) fn backend_failure(error: crate::runtime::BackendError) -> vk::Result
     crate::runtime::backend_failure(error)
 }
 pub(crate) fn failure(error: ir::Error) -> vk::Result {
+    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        eprintln!("[SGFX Vulkan] IR failure: {error:?}");
+    }
     match error {
         ir::Error::OutOfMemory => vk::Result::ERROR_OUT_OF_HOST_MEMORY,
         ir::Error::ResourceLimitExceeded => vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
@@ -727,7 +817,10 @@ unsafe extern "system" fn create_buffer(
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::UNIFORM_BUFFER
-            | vk::BufferUsageFlags::STORAGE_BUFFER;
+            | vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+            | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
+            | vk::BufferUsageFlags::INDIRECT_BUFFER;
         if !i.p_next.is_null()
             || !i.flags.is_empty()
             || i.size == 0
@@ -736,6 +829,10 @@ unsafe extern "system" fn create_buffer(
             || !allowed.contains(i.usage)
             || i.sharing_mode != vk::SharingMode::EXCLUSIVE
         {
+            eprintln!(
+                "SGFX Vulkan: unsupported buffer size={} usage={:?} flags={:?} sharing={:?} pnext={:?}",
+                i.size, i.usage, i.flags, i.sharing_mode, i.p_next
+            );
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let size = i.size;
@@ -743,6 +840,9 @@ unsafe extern "system" fn create_buffer(
         // buffer for backends that upload in four-byte units.
         let backing_size = size.next_multiple_of(4);
         let usage = i.usage;
+        // Usage flags authorize future operations; reserving the byte storage
+        // does not execute them. Texel views and indirect draws remain rejected
+        // at their typed entry points until the backend supports those commands.
         let mut ir_usage = ir::BufferUsage::COPY_SRC | ir::BufferUsage::COPY_DST;
         for (vk_flag, ir_flag) in [
             (vk::BufferUsageFlags::VERTEX_BUFFER, ir::BufferUsage::VERTEX),
@@ -792,13 +892,20 @@ unsafe extern "system" fn destroy_buffer(
 ) {
     let _ = crate::api::with_device(device, move |r| {
         if let Some(id) = r.resources.buffers.get(&buffer).map(|buffer| buffer.id) {
+            let shared = r
+                .resources
+                .buffers
+                .iter()
+                .any(|(handle, other)| *handle != buffer && other.id == id);
             // The backend cache owns the physical allocation for this slot.
             // Complete submitted work before dropping it or recycling the ID.
-            r.in_flight.wait();
-            r.cache
-                .release_buffer(id)
-                .map_err(crate::runtime::backend_failure)?;
-            r.table.release_buffer(id).map_err(failure)?;
+            if !shared {
+                r.in_flight.wait();
+                r.cache
+                    .release_buffer(id)
+                    .map_err(crate::runtime::backend_failure)?;
+                r.table.release_buffer(id).map_err(failure)?;
+            }
             r.resources.buffers.remove(&buffer);
             r.resources.uploaded_unmapped_buffers.remove(&buffer);
         }
@@ -910,6 +1017,41 @@ unsafe extern "system" fn bind_buffer_memory(
 ) -> vk::Result {
     ffi(|| {
         crate::api::with_device(device, move |r| {
+            let current = r
+                .resources
+                .buffers
+                .get(&buffer)
+                .ok_or(vk::Result::ERROR_UNKNOWN)?;
+            // Equal byte ranges share one physical GPU identity. Partial buffer
+            // aliases and image aliases still require backend memory views.
+            let alias = r.resources.buffers.iter().find_map(|(handle, other)| {
+                (*handle != buffer
+                    && other.bound == Some((memory, offset))
+                    && other.size == current.size)
+                    .then_some(other.id)
+            });
+            if let Some(alias_id) = alias {
+                let current_desc = r
+                    .table
+                    .buffer(r.table.buffer_ref(current.id).map_err(failure)?)
+                    .map_err(failure)?;
+                let alias_desc = r
+                    .table
+                    .buffer(r.table.buffer_ref(alias_id).map_err(failure)?)
+                    .map_err(failure)?;
+                if current.bound.is_some()
+                    || !offset.is_multiple_of(256)
+                    || !alias_desc.usage().contains(current_desc.usage())
+                {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                let unused_id = current.id;
+                r.table.release_buffer(unused_id).map_err(failure)?;
+                let current = r.resources.buffers.get_mut(&buffer).unwrap();
+                current.id = alias_id;
+                current.bound = Some((memory, offset));
+                return Ok(());
+            }
             if !memory_available(
                 &r.resources,
                 memory,
@@ -920,6 +1062,13 @@ unsafe extern "system" fn bind_buffer_memory(
                     .ok_or(vk::Result::ERROR_UNKNOWN)?
                     .size,
             ) {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] buffer memory overlap/range: buffer={buffer:?} memory={memory:?} offset={offset} size={:?} allocation={:?}",
+                        r.resources.buffers.get(&buffer).map(|b| b.size),
+                        r.resources.memories.get(&memory).map(|m| m.bytes.len())
+                    );
+                }
                 return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
             }
             let mem = r
@@ -938,6 +1087,14 @@ unsafe extern "system" fn bind_buffer_memory(
                     .checked_add(buf.size)
                     .is_none_or(|end| end > mem.bytes.len() as u64)
             {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] buffer bind: buffer={buffer:?} offset={offset} size={} bound={:?} allocation={}",
+                        buf.size,
+                        buf.bound,
+                        mem.bytes.len()
+                    );
+                }
                 return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
             }
             buf.bound = Some((memory, offset));
@@ -1052,17 +1209,27 @@ unsafe extern "system" fn memory_commitment(
 /// Normalize Vulkan clip-space Y to SGFX's shader convention once, retaining entry-point names.
 #[cfg(test)]
 pub(crate) fn normalize_spirv(words: Vec<u32>) -> Result<ir::ShaderModuleDesc, vk::Result> {
-    normalize_spirv_specialized(words, &Vec::new(), &[])
+    normalize_spirv_specialized(words, &Vec::new(), &[], &[])
+}
+#[cfg(test)]
+pub(crate) fn normalize_spirv_for_layout(
+    words: Vec<u32>,
+    bindings: &[DescriptorBindingMap],
+) -> Result<ir::ShaderModuleDesc, vk::Result> {
+    normalize_spirv_specialized(words, &Vec::new(), &[], bindings)
 }
 fn normalize_spirv_specialized(
     words: Vec<u32>,
     values: &Specialization,
     inputs: &[Option<bool>],
+    bindings: &[DescriptorBindingMap],
 ) -> Result<ir::ShaderModuleDesc, vk::Result> {
     ir::ShaderModuleDesc::spirv(words.clone()).map_err(failure)?;
     let words = crate::specialization::freeze(words, values)?;
     let words = crate::input_attachments::lower(words, inputs)?;
     let words = crate::spirv::separate_combined_samplers(words)?;
+    let words = crate::uniform_arrays::lower(words)?;
+    let words = crate::stage_inputs::lower(words)?;
     let options = naga::front::spv::Options {
         adjust_coordinate_space: true,
         strict_capabilities: true,
@@ -1070,7 +1237,12 @@ fn normalize_spirv_specialized(
     };
     let mut module = naga::front::spv::Frontend::new(words.into_iter(), &options)
         .parse()
-        .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        .map_err(|e| {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!("[SGFX Vulkan] SPIR-V parse: {e:?}");
+            }
+            vk::Result::ERROR_FEATURE_NOT_PRESENT
+        })?;
     crate::shader_functions::specialize(&mut module)?;
     crate::shader_functions::resolve_sampler_types(&mut module)?;
     crate::shader_functions::widen_fragment_outputs(&mut module)?;
@@ -1088,14 +1260,23 @@ fn normalize_spirv_specialized(
         .collect::<Vec<_>>();
     for (_, global) in module.global_variables.iter_mut() {
         if let Some(binding) = global.binding.as_mut() {
-            if binding.binding >= 16 {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
             let combined_sampler = matches!(
                 module.types[global.ty].inner,
                 naga::TypeInner::Sampler { .. }
             ) && images.iter().any(|image| image == binding);
-            binding.binding = binding.binding * 2 + u32::from(combined_sampler);
+            let base = if bindings.is_empty() {
+                binding
+                    .binding
+                    .checked_mul(2)
+                    .filter(|slot| *slot < ir::MAX_BINDINGS_PER_GROUP as u32)
+            } else {
+                bindings
+                    .get(binding.group as usize)
+                    .and_then(|map| map.get(&binding.binding))
+                    .copied()
+            }
+            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+            binding.binding = base + u32::from(combined_sampler);
         }
     }
     let info = naga::valid::Validator::new(
@@ -1103,7 +1284,12 @@ fn normalize_spirv_specialized(
         naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(&module)
-    .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    .map_err(|e| {
+        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            eprintln!("[SGFX Vulkan] shader validation: {e:?}");
+        }
+        vk::Result::ERROR_FEATURE_NOT_PRESENT
+    })?;
     let mut output = naga::back::spv::Options {
         lang_version: (1, 0),
         ..Default::default()
@@ -1200,8 +1386,26 @@ unsafe extern "system" fn create_descriptor_set_layout(
         if i.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        if !i.p_next.is_null() || !i.flags.is_empty() {
+        if !i.flags.is_empty() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
+        if !i.p_next.is_null() {
+            let flags = &*i
+                .p_next
+                .cast::<vk::DescriptorSetLayoutBindingFlagsCreateInfo<'_>>();
+            if flags.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
+                || !flags.p_next.is_null()
+                || (flags.binding_count != 0 && flags.binding_count != i.binding_count)
+                || copied(
+                    flags.p_binding_flags,
+                    flags.binding_count as usize,
+                    ir::MAX_BINDINGS_PER_GROUP,
+                )?
+                .iter()
+                .any(|flag| !flag.is_empty())
+            {
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
         }
         let bindings = copied(
             i.p_bindings,
@@ -1210,16 +1414,29 @@ unsafe extern "system" fn create_descriptor_set_layout(
         )?;
         let mut entries = Vec::with_capacity(bindings.len());
         let mut types = BTreeMap::new();
-        for binding in bindings {
+        let mut original_stages = BTreeMap::new();
+        for binding in &bindings {
             if binding.descriptor_count != 1
                 || !binding.p_immutable_samplers.is_null()
-                || binding.binding >= 16
                 || types
                     .insert(binding.binding, binding.descriptor_type)
                     .is_some()
             {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] descriptor layout binding={} count={} type={:?} stages={:?}",
+                        binding.binding,
+                        binding.descriptor_count,
+                        binding.descriptor_type,
+                        binding.stage_flags
+                    );
+                }
                 return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
             }
+            original_stages.insert(binding.binding, binding.stage_flags);
+        }
+        let binding_map = descriptor_binding_map(&types)?;
+        for binding in bindings {
             let ty = match binding.descriptor_type {
                 vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
                     ir::BindingType::UniformBuffer
@@ -1237,15 +1454,28 @@ unsafe extern "system" fn create_descriptor_set_layout(
                 },
                 _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
             };
+            let supported = binding.stage_flags
+                & (vk::ShaderStageFlags::VERTEX
+                    | vk::ShaderStageFlags::FRAGMENT
+                    | vk::ShaderStageFlags::COMPUTE);
+            let visibility = if binding.stage_flags == vk::ShaderStageFlags::ALL
+                || binding.stage_flags == vk::ShaderStageFlags::ALL_GRAPHICS
+            {
+                stages(binding.stage_flags)?
+            } else if supported.is_empty() {
+                continue;
+            } else {
+                stages(supported)?
+            };
             entries.push(ir::BindGroupLayoutEntry::new(
-                binding.binding * 2,
-                stages(binding.stage_flags)?,
+                binding_map[&binding.binding],
+                visibility,
                 ty,
             ));
             if binding.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
                 entries.push(ir::BindGroupLayoutEntry::new(
-                    binding.binding * 2 + 1,
-                    stages(binding.stage_flags)?,
+                    binding_map[&binding.binding] + 1,
+                    visibility,
                     ir::BindingType::Sampler,
                 ));
             }
@@ -1258,6 +1488,9 @@ unsafe extern "system" fn create_descriptor_set_layout(
             let handle = vk::DescriptorSetLayout::from_raw(crate::api::next_id());
             r.resources.set_layouts.insert(handle, desc);
             r.resources.set_layout_types.insert(handle, types);
+            r.resources
+                .set_layout_stages
+                .insert(handle, original_stages);
             Ok(handle)
         })?;
         out.write(handle);
@@ -1272,6 +1505,7 @@ unsafe extern "system" fn destroy_descriptor_set_layout(
     let _ = crate::api::with_device(device, move |r| {
         r.resources.set_layouts.remove(&handle);
         r.resources.set_layout_types.remove(&handle);
+        r.resources.set_layout_stages.remove(&handle);
         Ok(())
     });
 }
@@ -1316,6 +1550,27 @@ unsafe extern "system" fn create_pipeline_layout(
             if r.resources.pipeline_layouts.len() >= LIMIT {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
+            let binding_maps = handles
+                .iter()
+                .map(|h| {
+                    descriptor_binding_map(
+                        r.resources
+                            .set_layout_types
+                            .get(h)
+                            .ok_or(vk::Result::ERROR_UNKNOWN)?,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let binding_stages = handles
+                .iter()
+                .map(|h| {
+                    r.resources
+                        .set_layout_stages
+                        .get(h)
+                        .cloned()
+                        .ok_or(vk::Result::ERROR_UNKNOWN)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let groups = handles
                 .into_iter()
                 .map(|h| {
@@ -1337,6 +1592,12 @@ unsafe extern "system" fn create_pipeline_layout(
                 .map_err(failure)?;
             let handle = vk::PipelineLayout::from_raw(crate::api::next_id());
             r.resources.pipeline_layouts.insert(handle, desc.clone());
+            r.resources
+                .pipeline_binding_maps
+                .insert(handle, binding_maps);
+            r.resources
+                .pipeline_binding_stages
+                .insert(handle, binding_stages);
             Ok((handle, desc))
         })?;
         crate::api::set_pipeline_layout_metadata(device, handle, Some(metadata))?;
@@ -1351,6 +1612,8 @@ unsafe extern "system" fn destroy_pipeline_layout(
 ) {
     let _ = crate::api::with_device(device, move |r| {
         r.resources.pipeline_layouts.remove(&handle);
+        r.resources.pipeline_binding_maps.remove(&handle);
+        r.resources.pipeline_binding_stages.remove(&handle);
         Ok(())
     });
     let _ = crate::api::set_pipeline_layout_metadata(device, handle, None);
@@ -1498,6 +1761,11 @@ unsafe extern "system" fn allocate_descriptor_sets(
                             .get(&h)
                             .cloned()
                             .ok_or(vk::Result::ERROR_UNKNOWN)?,
+                        r.resources
+                            .set_layout_stages
+                            .get(&h)
+                            .cloned()
+                            .ok_or(vk::Result::ERROR_UNKNOWN)?,
                     ))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1516,7 +1784,7 @@ unsafe extern "system" fn allocate_descriptor_sets(
                 return Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY);
             }
             let mut remaining = pool.remaining.clone();
-            for (_, types) in &layouts {
+            for (_, types, _) in &layouts {
                 for ty in types.values() {
                     let slot = remaining.entry(*ty).or_default();
                     *slot = slot
@@ -1526,7 +1794,7 @@ unsafe extern "system" fn allocate_descriptor_sets(
             }
             pool.remaining = remaining;
             let mut result = Vec::with_capacity(layouts.len());
-            for (layout, types) in layouts {
+            for (layout, types, stages) in layouts {
                 let handle = vk::DescriptorSet::from_raw(crate::api::next_id());
                 r.resources.descriptor_sets.insert(
                     handle,
@@ -1534,6 +1802,7 @@ unsafe extern "system" fn allocate_descriptor_sets(
                         pool: pool_handle,
                         layout,
                         types,
+                        stages,
                         bindings: HashMap::new(),
                         cached_group: None,
                         invalid: false,
@@ -1613,23 +1882,12 @@ fn descriptor_write_binding(
     if set.types.get(&first) != Some(&ty) {
         return None;
     }
-    let visibility = set
-        .layout
-        .entries()
-        .iter()
-        .find(|entry| entry.binding() == first * 2)?
-        .visibility();
+    // Vulkan visibility remains relevant to consecutive-binding updates even
+    // when an unsupported (unused) stage has no lowered SGFX entry.
+    let visibility = set.stages.get(&first)?;
     let mut target = None;
     for (&binding, actual) in set.types.range(first..).take(element as usize + 1) {
-        if *actual != ty
-            || set
-                .layout
-                .entries()
-                .iter()
-                .find(|entry| entry.binding() == binding * 2)?
-                .visibility()
-                != visibility
-        {
+        if *actual != ty || set.stages.get(&binding)? != visibility {
             return None;
         }
         target = Some(binding);
@@ -1641,7 +1899,7 @@ fn descriptor_write_binding(
     }
 }
 
-unsafe extern "system" fn update_descriptor_sets(
+pub(crate) unsafe extern "system" fn update_descriptor_sets(
     device: vk::Device,
     write_count: u32,
     writes: *const vk::WriteDescriptorSet<'_>,
@@ -1828,6 +2086,12 @@ unsafe extern "system" fn update_descriptor_sets(
                     if let (true, Some(binding), Some(value)) = (valid, binding, write.value) {
                         set.bindings.insert(binding, value);
                     } else {
+                        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                            eprintln!(
+                                "[SGFX Vulkan] invalid descriptor write: set={:?} binding={} element={} type={:?} value={:?} valid_resource={valid} resolved_binding={binding:?}",
+                                write.set, write.binding, write.element, write.ty, write.value
+                            );
+                        }
                         set.invalid = true;
                     }
                 }
@@ -1863,6 +2127,11 @@ unsafe extern "system" fn update_descriptor_sets(
     if result != vk::Result::SUCCESS {
         // This Vulkan entry point cannot return an error. Never silently preserve
         // stale bindings after a batch that exceeds the documented subset limits.
+        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            eprintln!(
+                "[SGFX Vulkan] descriptor update batch failed; marking device lost: writes={write_count} copies={copy_count} result={result:?}"
+            );
+        }
         let _ = crate::api::with_device(device, |r| {
             r.lost = true;
             Ok(())
@@ -1884,7 +2153,7 @@ unsafe extern "system" fn create_compute_pipelines(
         for index in 0..count as usize {
             out.add(index).write(vk::Pipeline::null());
         }
-        if !allocator.is_null() || cache != vk::PipelineCache::null() {
+        if !allocator.is_null() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let infos = copied(infos, count as usize, LIMIT)?;
@@ -1917,6 +2186,7 @@ unsafe extern "system" fn create_compute_pipelines(
             ));
         }
         let handles = crate::api::with_device(device, move |r| {
+            crate::api::bootstrap::validate_cache(&r.resources, cache)?;
             if r.resources
                 .pipelines
                 .len()
@@ -1927,12 +2197,18 @@ unsafe extern "system" fn create_compute_pipelines(
             }
             let mut descriptors = Vec::with_capacity(requests.len());
             for (module, name, layout, values) in requests {
+                let bindings = r
+                    .resources
+                    .pipeline_binding_maps
+                    .get(&layout)
+                    .cloned()
+                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
                 let module = r
                     .resources
                     .shaders
                     .get_mut(&module)
                     .ok_or(vk::Result::ERROR_UNKNOWN)?
-                    .variant(&r.table, &values)?;
+                    .variant_for_layout(&r.table, &values, &[], &bindings)?;
                 let shader = ir::ShaderEntryPoint::new(
                     r.table.shader_module_ref(module).map_err(failure)?,
                     ir::ShaderStage::Compute,
@@ -2011,7 +2287,8 @@ unsafe extern "system" fn create_sampler(
             || i.unnormalized_coordinates != vk::FALSE
             || i.mip_lod_bias != 0.0
             || !i.max_lod.is_finite()
-            || i.max_lod < 0.0
+            || !i.min_lod.is_finite()
+            || i.max_lod < i.min_lod
             || !matches!(
                 i.mipmap_mode,
                 vk::SamplerMipmapMode::NEAREST | vk::SamplerMipmapMode::LINEAR
@@ -2027,6 +2304,7 @@ unsafe extern "system" fn create_sampler(
         let address = |v| match v {
             vk::SamplerAddressMode::REPEAT => Ok(ir::AddressMode::Repeat),
             vk::SamplerAddressMode::CLAMP_TO_EDGE => Ok(ir::AddressMode::ClampToEdge),
+            vk::SamplerAddressMode::MIRRORED_REPEAT => Ok(ir::AddressMode::MirrorRepeat),
             _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
         };
         let desc = ir::SamplerDesc::new(
@@ -2134,6 +2412,156 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_descriptor_labels_use_distinct_bounded_slots() {
+        let types = BTreeMap::from([
+            (0, vk::DescriptorType::UNIFORM_BUFFER),
+            (4, vk::DescriptorType::UNIFORM_BUFFER),
+            (128, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+            (u32::MAX, vk::DescriptorType::STORAGE_BUFFER),
+        ]);
+        assert_eq!(
+            descriptor_binding_map(&types).unwrap(),
+            BTreeMap::from([(0, 0), (4, 8), (128, 2), (u32::MAX, 4),])
+        );
+        let full = (128..144)
+            .map(|b| (b, vk::DescriptorType::UNIFORM_BUFFER))
+            .collect();
+        let map = descriptor_binding_map(&full).unwrap();
+        assert_eq!(
+            map.values().copied().collect::<Vec<_>>(),
+            (0..32).step_by(2).collect::<Vec<_>>()
+        );
+        let excess = (128..145)
+            .map(|b| (b, vk::DescriptorType::UNIFORM_BUFFER))
+            .collect();
+        assert_eq!(
+            descriptor_binding_map(&excess),
+            Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+        );
+    }
+
+    #[test]
+    fn descriptor_writes_preserve_declared_stage_visibility() {
+        let set = DescriptorSet {
+            pool: vk::DescriptorPool::null(),
+            layout: ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+            types: [1, 3, 128]
+                .into_iter()
+                .map(|b| (b, vk::DescriptorType::UNIFORM_BUFFER))
+                .collect(),
+            stages: BTreeMap::from([
+                (1, vk::ShaderStageFlags::GEOMETRY),
+                (3, vk::ShaderStageFlags::GEOMETRY),
+                (128, vk::ShaderStageFlags::FRAGMENT),
+            ]),
+            bindings: HashMap::new(),
+            cached_group: None,
+            invalid: false,
+        };
+        // Declared but unused stages still accept updates. Consecutive writes
+        // may cross holes only while the ORIGINAL Vulkan visibility matches.
+        assert_eq!(
+            descriptor_write_binding(&set, 1, 0, vk::DescriptorType::UNIFORM_BUFFER),
+            Some(1)
+        );
+        assert_eq!(
+            descriptor_write_binding(&set, 1, 1, vk::DescriptorType::UNIFORM_BUFFER),
+            Some(3)
+        );
+        assert_eq!(
+            descriptor_write_binding(&set, 1, 2, vk::DescriptorType::UNIFORM_BUFFER),
+            None
+        );
+        assert_eq!(
+            descriptor_write_binding(&set, 2, 0, vk::DescriptorType::UNIFORM_BUFFER),
+            None
+        );
+        assert_eq!(
+            descriptor_write_binding(&set, 1, 0, vk::DescriptorType::STORAGE_BUFFER),
+            None
+        );
+    }
+
+    #[test]
+    fn sparse_combined_sampler_shader_uses_layout_mapping_and_cache_key() {
+        let module = naga::front::wgsl::parse_str(
+            "@group(0) @binding(128) var image: texture_2d<f32>;\n\
+             @group(0) @binding(129) var smp: sampler;\n\
+             @fragment fn main() -> @location(0) vec4<f32> { return textureSample(image, smp, vec2<f32>(0.5)); }"
+        ).unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+        let mut words =
+            naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
+                .unwrap();
+        // Represent the pair emitted by combined-sampler separation: both
+        // globals retain one Vulkan binding before SGFX normalization.
+        let mut cursor = 5;
+        while cursor < words.len() {
+            let count = (words[cursor] >> 16) as usize;
+            if words[cursor] & 0xffff == 71
+                && count == 4
+                && words[cursor + 2] == 33
+                && words[cursor + 3] == 129
+            {
+                words[cursor + 3] = 128;
+            }
+            cursor += count;
+        }
+        let table = ir::ResourceTable::new();
+        let mut shader = Shader {
+            words,
+            variants: Vec::new(),
+        };
+        let first_map = [BTreeMap::from([(128, 0)])];
+        let second_map = [BTreeMap::from([(128, 2)])];
+        let first = shader
+            .variant_for_layout(&table, &vec![], &[], &first_map)
+            .unwrap();
+        assert_eq!(
+            first,
+            shader
+                .variant_for_layout(&table, &vec![], &[], &first_map)
+                .unwrap()
+        );
+        let second = shader
+            .variant_for_layout(&table, &vec![], &[], &second_map)
+            .unwrap();
+        assert_ne!(first, second);
+        for (id, expected) in [(first, vec![0, 1]), (second, vec![2, 3])] {
+            let desc = table
+                .shader_module(table.shader_module_ref(id).unwrap())
+                .unwrap();
+            let ir::ShaderSource::SpirV(words) = desc.source() else {
+                panic!()
+            };
+            let normalized = naga::front::spv::Frontend::new(
+                words.iter().copied(),
+                &naga::front::spv::Options::default(),
+            )
+            .parse()
+            .unwrap();
+            let mut slots = normalized
+                .global_variables
+                .iter()
+                .filter_map(|(_, g)| g.binding.as_ref().map(|b| b.binding))
+                .collect::<Vec<_>>();
+            slots.sort_unstable();
+            assert_eq!(slots, expected);
+            sgfx_codegen_virgl::programmable::compile_shader(
+                &desc,
+                ir::ShaderStage::Fragment,
+                "main",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn dynamic_descriptor_offsets_select_checked_distinct_buffer_ranges() {
         let table = ir::ResourceTable::new();
         let mut resources = Resources::new();
@@ -2164,6 +2592,7 @@ mod tests {
                 pool: vk::DescriptorPool::null(),
                 layout,
                 types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
+                stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
                 bindings: HashMap::from([(
                     0,
                     DescriptorBinding::Buffer {
@@ -2334,6 +2763,176 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_retirement_error_preserves_failed_groups_and_releases_others() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(64, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let groups = [0, 16].map(|offset| {
+            let desc = ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap();
+            let id = table.define_bind_group(desc.clone()).unwrap().id();
+            resources.bind_group_cache.push((desc, id));
+            id
+        });
+        let empty = resources.empty_bind_group(&table).unwrap();
+        let mut attempted = Vec::new();
+        assert_eq!(
+            resources.release_descriptor_groups(&table, |id| {
+                attempted.push(id);
+                if id == groups[0] {
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert_eq!(attempted, groups);
+        assert!(table.bind_group_ref(groups[0]).is_ok());
+        assert!(table.bind_group_ref(groups[1]).is_err());
+        assert_eq!(resources.bind_group_cache.len(), 2);
+        assert_eq!(resources.empty_bind_group(&table).unwrap(), empty);
+        resources
+            .release_descriptor_groups(&table, |_| Ok(()))
+            .unwrap();
+        assert!(table.bind_group_ref(groups[0]).is_err());
+        assert_eq!(resources.bind_group_cache.len(), 1);
+    }
+
+    #[test]
+    fn submitted_descriptor_snapshots_recycle_slots_without_aliasing_uniform_ranges() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let packet_count = ir::MAX_BIND_GROUP_DEFINITIONS * 2 + 4;
+        let buffer_size = packet_count as u64 * 128;
+        let buffer_handle = vk::Buffer::from_raw(1);
+        let set_handle = vk::DescriptorSet::from_raw(2);
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(buffer_size, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        resources.buffers.insert(
+            buffer_handle,
+            Buffer {
+                id: buffer,
+                size: buffer_size,
+                usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+                bound: Some((vk::DeviceMemory::from_raw(3), 0)),
+            },
+        );
+        let layout = ir::BindGroupLayoutDesc::new(vec![
+            ir::BindGroupLayoutEntry::new(
+                0,
+                ir::ShaderStages::VERTEX,
+                ir::BindingType::UniformBuffer,
+            ),
+            ir::BindGroupLayoutEntry::new(
+                8,
+                ir::ShaderStages::FRAGMENT,
+                ir::BindingType::UniformBuffer,
+            ),
+        ])
+        .unwrap();
+        resources.descriptor_sets.insert(
+            set_handle,
+            DescriptorSet {
+                pool: vk::DescriptorPool::null(),
+                layout,
+                types: BTreeMap::from([
+                    (0, vk::DescriptorType::UNIFORM_BUFFER),
+                    (4, vk::DescriptorType::UNIFORM_BUFFER),
+                ]),
+                stages: BTreeMap::from([
+                    (0, vk::ShaderStageFlags::VERTEX),
+                    (4, vk::ShaderStageFlags::FRAGMENT),
+                ]),
+                bindings: HashMap::new(),
+                cached_group: None,
+                invalid: false,
+            },
+        );
+        let empty = resources.empty_bind_group(&table).unwrap();
+        let mut previous = None;
+        for packet in 0..packet_count {
+            let offset = packet as u64 * 128;
+            let set = resources.descriptor_sets.get_mut(&set_handle).unwrap();
+            set.cached_group = None;
+            set.bindings = HashMap::from([
+                (
+                    0,
+                    DescriptorBinding::Buffer {
+                        buffer: buffer_handle,
+                        offset,
+                        range: 24,
+                    },
+                ),
+                (
+                    4,
+                    DescriptorBinding::Buffer {
+                        buffer: buffer_handle,
+                        offset: offset + 64,
+                        range: 12,
+                    },
+                ),
+            ]);
+            let group = resources.descriptor_group(&table, set_handle, &[]).unwrap();
+            assert_ne!(Some(group), previous);
+            assert_eq!(
+                resources.descriptor_group(&table, set_handle, &[]).unwrap(),
+                group
+            );
+            let snapshot = table
+                .bind_group_shared(table.bind_group_ref(group).unwrap())
+                .unwrap();
+            assert!(matches!(snapshot.entries()[0].resource(),
+                ir::BindingResource::Buffer { offset: actual, size: 24, .. } if actual == offset));
+            assert!(matches!(snapshot.entries()[1].resource(),
+                ir::BindingResource::Buffer { offset: actual, size: 12, .. } if actual == offset + 64));
+            let mut released = Vec::new();
+            resources
+                .release_descriptor_groups(&table, |id| {
+                    released.push(id);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(released, vec![group]);
+            assert!(table.bind_group_ref(group).is_err());
+            assert!(
+                resources.descriptor_sets[&set_handle]
+                    .cached_group
+                    .is_none()
+            );
+            assert_eq!(resources.bind_group_cache.len(), 1);
+            assert_eq!(resources.empty_bind_group(&table).unwrap(), empty);
+            // Already materialized native metadata remains immutable after its
+            // logical slot is retired; later packets cannot overwrite it.
+            assert!(matches!(snapshot.entries()[0].resource(),
+                ir::BindingResource::Buffer { offset: actual, .. } if actual == offset));
+            previous = Some(group);
+        }
+    }
+
+    #[test]
     fn epoch_cache_clear_cannot_reuse_an_old_table_identity() {
         let old_table = ir::ResourceTable::new();
         let new_table = ir::ResourceTable::new();
@@ -2344,6 +2943,7 @@ mod tests {
             DescriptorSet {
                 pool: vk::DescriptorPool::null(),
                 types: BTreeMap::new(),
+                stages: BTreeMap::new(),
                 layout: ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
                 bindings: HashMap::new(),
                 cached_group: None,
@@ -2581,7 +3181,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             commands[0],
-            ir::OwnedCommand::BlitTexture {
+            ir::OwnedCommand::BlitTextureRegion {
                 source_mip: 0,
                 destination_mip: 1,
                 filter: ir::FilterMode::Linear,
@@ -2599,7 +3199,18 @@ mod tests {
         let mut same_level = region;
         same_level.dst_subresource = region.src_subresource;
         same_level.dst_offsets = region.src_offsets;
-        for invalid in [partial, flip, layer, nonexistent, same_level] {
+        let partial_commands = lower(
+            partial,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::Filter::LINEAR,
+        )
+        .unwrap();
+        assert!(
+            matches!(&partial_commands[0], ir::OwnedCommand::BlitTextureRegion { destination_rect, .. } if destination_rect.width() == 1)
+        );
+        let mut outside = region;
+        outside.src_offsets[1].x = 5;
+        for invalid in [outside, flip, layer, nonexistent, same_level] {
             assert!(
                 lower(
                     invalid,
@@ -2696,6 +3307,7 @@ mod tests {
             DescriptorSet {
                 pool: vk::DescriptorPool::null(),
                 types: BTreeMap::from([(0, vk::DescriptorType::STORAGE_BUFFER)]),
+                stages: BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
                 layout,
                 bindings: HashMap::from([(
                     0,
@@ -2743,6 +3355,7 @@ mod tests {
             DescriptorSet {
                 pool: vk::DescriptorPool::null(),
                 types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                stages: BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
                 layout,
                 bindings: HashMap::new(),
                 cached_group: None,
