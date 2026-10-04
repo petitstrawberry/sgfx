@@ -18,9 +18,9 @@ Default features already enable `backend-dynamic`. Existing applications can
 keep `backend-scarlet-virgl`, which enables native runtime discovery. Legacy
 native64 processes can use `legacy-scarlet-std`. Dynamic clients omit driver
 implementations and shader compilers; default features still include compiled
-Adreno. `backend-scarlet-virgl-static` explicitly selects the static comparison
-backend, including in mixed builds with dynamic discovery. The static feature
-alone does not enable the loader. This C ABI requires native 64-bit support.
+Adreno. Native 64-bit VirGL clients always use the dynamic path. RV32 retains
+the compatibility backend through `backend-scarlet-virgl`, as do existing
+AArch64 Linux-ABI clients. This C ABI requires native 64-bit support.
 
 Driver distributions install their library and an adjacent manifest such as
 `example-renderer.sgfx-driver` in `/system/lib/sgfx`:
@@ -193,7 +193,7 @@ python3 scripts/run-dynamic-smoke.py --arch aarch64 \
 Omit `--rust-source` with an updated installed toolchain. `--offline` is
 available after dependencies are cached. The script generates an isolated PIC
 target/sysroot view, builds `std` and the interpreter consistently with ThinLTO
-and one codegen unit (also applied to the static comparison), and never
+and one codegen unit, and never
 modifies the installed compiler/sysroot. Rust implementation symbols use hidden
 visibility before optimization, leaving the C entry exported; link-time hiding
 alone cannot provide LLVM the same locality information. `--arch riscv64` selects the other
@@ -229,23 +229,19 @@ RELR, symbol versions and text relocations fail the audit. Each guest result
 records QEMU and initramfs hashes and retains `input-build.json` when its
 artifact hashes match the supplied staging tree.
 
-The smoke fixture runs identical static and dynamic scenes in one guest and
+The smoke fixture runs dynamic scenes in one guest and
 checks triangle pixels, a 4 MiB upload, synchronous/asynchronous execution,
 completion and object lifetimes, low-level queues, shared images, readback and
 buffer retirement. When staged, the standard probe and legacy fixture also
-verify dynamic loading and rejection of a missing driver. Both modes execute as fresh sibling processes
-in four rounds, alternating their order. Each records medians over 80 samples
-after 30 warmups for recording, submission, their combined elapsed time
-(`total_ns`), and completion of 1-draw and 200-draw frames. `frame_ns` starts
-before recording and ends after completion; older results without `total_ns`
-started their frame timer at submission. AArch64 reads the architectural counter without a clock syscall per
-sample; the clock source and measurement overhead are reported. These measure
-elapsed time including preemption, not thread CPU time. `result.json` preserves
-each round and computes paired dynamic/static ratios. Guest
-correctness `PASS` is distinct from a performance guarantee: compare the
-reported timings, retain `result.json`/`serial.log`, and account for host/QEMU
-scheduling noise. Additional hardware and application workloads remain needed
-to establish the broader performance impact of the native 64-bit default.
+verify dynamic loading and rejection of a missing driver. The fixture records
+dynamic execution timings in `result.json`; it no longer builds a static
+comparison binary. Guest correctness `PASS` is distinct from a performance
+guarantee: retain `result.json`/`serial.log` and account for host/QEMU scheduling
+noise. Additional hardware and application workloads remain needed to
+establish the broader performance impact of dynamic execution.
+
+The comparisons below are historical measurements collected before removal
+of the native 64-bit static facade feature.
 
 An additional AArch64 HVF diagnostic alternated static, static-with-canonical-IR,
 and dynamic sessions **per frame in the same process**, with 30 warmups and
@@ -285,8 +281,8 @@ The earlier comparison of 20 versus 72 microseconds used asymmetric process
 lifetimes and a syscall-based timer. Repeated symmetric comparisons did not
 reproduce a fixed 3.6x submission penalty, so that result must not be presented
 as the cost of dynamic linking. Nor do the corrected comparisons prove exact
-performance parity. Native 64-bit VirGL now defaults to the dynamic path;
-`backend-scarlet-virgl-static` retains an explicit comparison build.
+performance parity. Native 64-bit VirGL now uses the dynamic path exclusively;
+the historical static comparison build is no longer a facade feature.
 
 The original implementation reported local evidence under `target/dynamic-backends/aarch64-runtime/`:
 `qemu-scalar-interleaved/result.json` and `serial.log` contain the table above;

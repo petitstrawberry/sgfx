@@ -8,7 +8,6 @@ fn main() {
         std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("scarlet"),
         std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64"),
         std::env::var_os("CARGO_FEATURE_BACKEND_DYNAMIC").is_some(),
-        std::env::var_os("CARGO_FEATURE_BACKEND_SCARLET_VIRGL_STATIC").is_some(),
     );
     for (enabled, name) in [
         (policy.dynamic, "sgfx_dynamic"),

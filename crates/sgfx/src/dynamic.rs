@@ -206,11 +206,7 @@ impl Device {
 }
 fn backend_kind(name: &str) -> BackendKind {
     match name {
-        #[cfg(any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        ))]
+        #[cfg(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl))]
         "scarlet-virgl" => BackendKind::ScarletVirgl,
         #[cfg(feature = "backend-scarlet-adreno")]
         "scarlet-adreno" => BackendKind::ScarletAdreno,
@@ -516,11 +512,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )))]
+    #[cfg(not(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)))]
     #[test]
     fn uncompiled_backends_use_the_manifest_name() {
         assert_eq!(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and stage the native SGFX plugin and identical static/dynamic GPU probes.
+"""Build and stage the native SGFX plugin and dynamic GPU probe.
 
 Only an isolated generated target is changed. No installed sysroot or toolchain
 is edited. The resulting /init needs Scarlet's resident scarlet-ld interpreter.
@@ -53,7 +53,6 @@ def audit(staging, scarlet, arch):
                  for path in sorted((staging / "system/lib/sgfx").glob("*.so"))]
     for name, expected_imports, interpreter in [*libraries,
         ("bin/sgfx-dynamic-smoke", {"dlopen", "dlsym", "dlerror"}, "/bin/scarlet-ld"),
-        ("bin/sgfx-static-smoke", set(), None),
         ("bin/scarlet-ld", set(), None),
         ("init", set(), None),
     ]:
@@ -180,8 +179,6 @@ def main():
     stage(release / "libsgfx_scarlet_virgl.so", drivers / "libsgfx_scarlet_virgl.so")
     (drivers / "scarlet-virgl.sgfx-driver").write_text("abi=2\nname=scarlet-virgl\ngpu_backend=virtio-gpu\nlibrary=libsgfx_scarlet_virgl.so\n")
     example = [cargo, "rustc", "-p", "sgfx", "--example", "dynamic_smoke", "--no-default-features"]
-    run([*example, "--features", "std,backend-scarlet-virgl-static", *common])
-    stage(release / "examples/dynamic_smoke", staging / "bin/sgfx-static-smoke")
     run([*example, "--features", "std,backend-dynamic,backend-scarlet-virgl", *common, "--", "-C", "link-arg=-pie",
          "-C", "link-arg=--dynamic-linker=/bin/scarlet-ld",
          # LLD needs a shared input to emit imports supplied by the interpreter.

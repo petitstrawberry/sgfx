@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the SGFX dynamic/static comparison in a disposable Scarlet QEMU guest."""
+"""Run the SGFX dynamic backend probe in a disposable Scarlet QEMU guest."""
 import argparse
 import hashlib
 import importlib.util

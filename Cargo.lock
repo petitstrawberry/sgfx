@@ -1691,7 +1691,6 @@ dependencies = [
  "sgfx-backend-abi",
  "sgfx-backend-loader",
  "sgfx-backend-scarlet-adreno",
- "sgfx-backend-scarlet-virgl",
  "sgfx-backend-scarlet-virgl-compat",
  "sgfx-backend-wgpu",
  "sgfx-core",
