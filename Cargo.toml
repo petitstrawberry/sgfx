@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/sgfx-backend-loader",
     "crates/sgfx-backend-scarlet-virgl-plugin",
-    "crates/sgfx-backend-scarlet-maxwell-compat",
     "crates/sgfx-backend-abi",
     "crates/sgfx",
     "crates/sgfx-core",

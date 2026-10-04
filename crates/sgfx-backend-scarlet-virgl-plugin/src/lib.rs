@@ -27,6 +27,19 @@ struct Session {
     poisoned: bool,
 }
 
+// Core retains its pinned wire-ABI source identity. Reconstruct its record
+// without accessing the borrowed command words or changing their lifetime.
+fn core_batch(batch: abi::Batch) -> ir::abi::Batch {
+    ir::abi::Batch {
+        table: batch.table,
+        words: ir::abi::Span {
+            data: batch.words.data,
+            len: batch.words.len,
+        },
+        count: batch.count,
+    }
+}
+
 fn error(e: virgl::IrSubmitError) -> i32 {
     use virgl::IrSubmitError as E;
     match e {
@@ -117,6 +130,30 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
             }
             | if c.supports_image_mips() {
                 abi::IMAGE_MIPS
+            } else {
+                0
+            }
+            | if c.supports_programmable_graphics() {
+                abi::READ_ONLY_STORAGE_BUFFERS
+                    | abi::SRGB_TEXTURE_VIEWS
+                    | abi::EXTENDED_VERTEX_FORMATS
+                    | abi::PUSH_CONSTANTS_128
+                    | abi::COLOR_ATTACHMENTS_8
+            } else {
+                0
+            }
+            | if c.supports_texture_arrays() && c.supports_depth_sampling() {
+                abi::TYPED_TEXTURE_VIEWS
+            } else {
+                0
+            }
+            | if c.supports_rendering() {
+                abi::RGBA8_COLOR_ATTACHMENT
+            } else {
+                0
+            }
+            | if c.supports_image_mips() {
+                abi::IMAGE_BLITS
             } else {
                 0
             };
@@ -328,8 +365,9 @@ unsafe extern "C" fn execute(p: Object, batch: *const abi::Batch) -> i32 {
             return Err(abi::DEVICE_LOST);
         }
         let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
-        let commands = unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, *batch) }
-            .map_err(|_| abi::INVALID)?;
+        let commands =
+            unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, core_batch(*batch)) }
+                .map_err(|_| abi::INVALID)?;
         s.inner.executor().execute(&commands).map_err(error)
     })())
 }
@@ -346,8 +384,9 @@ unsafe extern "C" fn submit(p: Object, batch: *const abi::Batch, out: *mut abi::
             return Err(abi::DEVICE_LOST);
         }
         let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
-        let commands = unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, *batch) }
-            .map_err(|_| abi::INVALID)?;
+        let commands =
+            unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, core_batch(*batch)) }
+                .map_err(|_| abi::INVALID)?;
         let (disposition, error, receipt) = match s.inner.executor().submit(&commands) {
             Ok(receipt) => (abi::ACCEPTED, abi::OK, receipt),
             Err(SubmitError::Busy) => return Err(abi::BUSY),

@@ -82,9 +82,8 @@ jobs:
           cargo test --locked -p sgfx --no-default-features
           cargo test --locked -p sgfx --no-default-features --features backend-wgpu
           cargo test --locked -p sgfx --no-default-features --features std,backend-dynamic,backend-wgpu
-          cargo test --locked -p sgfx --no-default-features --features std,backend-scarlet-maxwell
-          cargo test --locked -p sgfx --no-default-features --features std,backend-scarlet-maxwell-static
-          cargo test --locked -p sgfx --no-default-features --features std,backend-scarlet-virgl-static
+          cargo test --locked -p sgfx --no-default-features --features std,backend-dynamic
+          cargo test --locked -p sgfx --no-default-features --features std,backend-scarlet-virgl
           cargo-clippy clippy --locked -p sgfx --no-default-features --all-targets --no-deps -- -D warnings
           cargo-clippy clippy --locked -p sgfx --no-default-features --features backend-wgpu --all-targets --no-deps -- -D warnings
       - name: Check public API documentation
@@ -120,20 +119,32 @@ jobs:
         run: cargo tree --locked -p sgfx --target '${{ matrix.target }}' --invert sgfx-core
       - name: Check std-enabled Scarlet target
         run: cargo check --locked -p sgfx --target '${{ matrix.target }}'
-      - name: Check Maxwell dynamic and static feature boundaries
+      - name: Check generic discovery and VirGL feature boundaries
         run: |
-          cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-maxwell
-          cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-maxwell-static
-          cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-virgl-static
-          cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-maxwell,backend-scarlet-virgl-static
-          cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-maxwell --prefix none > "$CARGO_TARGET_DIR/maxwell-dynamic-tree.txt"
-          cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-virgl-static --prefix none > "$CARGO_TARGET_DIR/virgl-static-tree.txt"
+          cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-dynamic
+          cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-virgl
+          cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-dynamic,backend-scarlet-virgl
+          cargo tree --locked -p sgfx --target '${{ matrix.target }}' --prefix none > "$CARGO_TARGET_DIR/default-tree.txt"
+          cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-dynamic --prefix none > "$CARGO_TARGET_DIR/dynamic-tree.txt"
+          cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-dynamic --edges normal --depth 1 --prefix none > "$CARGO_TARGET_DIR/dynamic-direct-tree.txt"
+          cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-virgl --prefix none > "$CARGO_TARGET_DIR/virgl-tree.txt"
           python3 - <<'PY'
           import os
           from pathlib import Path
           target = Path(os.environ['CARGO_TARGET_DIR'])
-          assert 'sgfx-backend-scarlet-maxwell v' not in (target / 'maxwell-dynamic-tree.txt').read_text()
-          assert 'sgfx-backend-loader v' not in (target / 'virgl-static-tree.txt').read_text()
+          for name in ('default-tree.txt', 'dynamic-tree.txt', 'virgl-tree.txt'):
+              tree = (target / name).read_text()
+              assert 'sgfx-backend-loader v' in tree, name
+              assert 'sgfx-backend-scarlet-virgl v' not in tree, name
+          direct_dependencies = {
+              line.split()[0]
+              for line in (target / 'dynamic-direct-tree.txt').read_text().splitlines()
+              if line.strip()
+          }
+          assert direct_dependencies == {
+              'sgfx', 'sgfx-core', 'sgfx-backend-abi', 'sgfx-backend-loader',
+              'gpu-raw', 'scarlet-os',
+          }, direct_dependencies
           PY
       - name: Lint std-enabled Scarlet target
         run: cargo-clippy clippy --locked -p sgfx --target '${{ matrix.target }}' --no-deps -- -D warnings

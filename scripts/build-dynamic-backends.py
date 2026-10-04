@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and stage the native SGFX plugin and identical static/dynamic GPU probes.
+"""Build and stage the native SGFX plugin and dynamic GPU probe.
 
 Only an isolated generated target is changed. No installed sysroot or toolchain
 is edited. The resulting /init needs Scarlet's resident scarlet-ld interpreter.
@@ -53,7 +53,6 @@ def audit(staging, scarlet, arch):
                  for path in sorted((staging / "system/lib/sgfx").glob("*.so"))]
     for name, expected_imports, interpreter in [*libraries,
         ("bin/sgfx-dynamic-smoke", {"dlopen", "dlsym", "dlerror"}, "/bin/scarlet-ld"),
-        ("bin/sgfx-static-smoke", set(), None),
         ("bin/scarlet-ld", set(), None),
         ("init", set(), None),
     ]:
@@ -77,10 +76,9 @@ def audit(staging, scarlet, arch):
                 symbol, info, _, section, _, _ = elf.unpack("IBBHQQ", elf.at_vaddr(elf.tag(6) + index * 24, 24))
                 if section and info >> 4 in (1, 2):
                     exports.append(elf.dynstring(symbol))
-            expected_exports = {"sgfx_backend_get_api_v2", "sgfx_backend_get_driver_api_v2"}
-            if name.endswith("libsgfx_scarlet_maxwell.so"):
-                expected_exports.add("sgfx_backend_get_ycbcr_api_v2")
-            if set(exports) != expected_exports or report["entry"] != 0:
+            required_exports = {"sgfx_backend_get_api_v2", "sgfx_backend_get_driver_api_v2"}
+            allowed_exports = required_exports | {"sgfx_backend_get_ycbcr_api_v2"}
+            if not required_exports <= set(exports) <= allowed_exports or report["entry"] != 0:
                 raise RuntimeError(f"backend exports executable/Rust internals: {exports}")
             report["exports"] = exports
         report["path"] = name
@@ -94,12 +92,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scarlet", type=Path, default=Path(__file__).resolve().parents[2] / "Scarlet")
     parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--maxwell", type=Path,
-                        help="also build/stage the Maxwell plugin from this Switch checkout (VirGL smoke still runs on VirtIO)")
     parser.add_argument("--rust-source", type=Path, help="matching Rust source tree with Scarlet's DSO-safe std TLS runtime")
     args = parser.parse_args()
-    if args.maxwell and args.arch != "aarch64":
-        parser.error("the Switch Maxwell plugin requires --arch aarch64")
     repo = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -184,18 +178,7 @@ def main():
          "-C", "link-arg=-z", "-C", "link-arg=defs"])
     stage(release / "libsgfx_scarlet_virgl.so", drivers / "libsgfx_scarlet_virgl.so")
     (drivers / "scarlet-virgl.sgfx-driver").write_text("abi=2\nname=scarlet-virgl\ngpu_backend=virtio-gpu\nlibrary=libsgfx_scarlet_virgl.so\n")
-    if args.maxwell:
-        manifest = args.maxwell.resolve() / "userspace/sgfx-backend-scarlet-maxwell-plugin/Cargo.toml"
-        run([cargo, "rustc", "--manifest-path", manifest, "--lib", *common,
-             "--", "-C", "link-arg=-soname", "-C", "link-arg=libsgfx_scarlet_maxwell.so",
-             "-C", "link-arg=--exclude-libs=ALL", "-C", "link-arg=--entry=0",
-             "-C", "link-arg=-z", "-C", "link-arg=defs"], args.maxwell.resolve())
-        stage(release / "libsgfx_scarlet_maxwell.so", drivers / "libsgfx_scarlet_maxwell.so")
-        (drivers / "scarlet-maxwell.sgfx-driver").write_text(
-            "abi=2\nname=scarlet-maxwell\ngpu_backend=nvidia-gm20b\nlibrary=libsgfx_scarlet_maxwell.so\n")
     example = [cargo, "rustc", "-p", "sgfx", "--example", "dynamic_smoke", "--no-default-features"]
-    run([*example, "--features", "std,backend-scarlet-virgl-static", *common])
-    stage(release / "examples/dynamic_smoke", staging / "bin/sgfx-static-smoke")
     run([*example, "--features", "std,backend-dynamic,backend-scarlet-virgl", *common, "--", "-C", "link-arg=-pie",
          "-C", "link-arg=--dynamic-linker=/bin/scarlet-ld",
          # LLD needs a shared input to emit imports supplied by the interpreter.

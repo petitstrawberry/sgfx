@@ -895,19 +895,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "maxwell-shader-pack"
-version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9#5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9"
-
-[[package]]
-name = "maxwell-submit-wire"
-version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9#5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9"
-dependencies = [
- "maxwell-shader-pack",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1704,9 +1691,6 @@ dependencies = [
  "sgfx-backend-abi",
  "sgfx-backend-loader",
  "sgfx-backend-scarlet-adreno",
- "sgfx-backend-scarlet-maxwell",
- "sgfx-backend-scarlet-maxwell-compat",
- "sgfx-backend-scarlet-virgl",
  "sgfx-backend-scarlet-virgl-compat",
  "sgfx-backend-wgpu",
  "sgfx-core",
@@ -1737,26 +1721,6 @@ dependencies = [
  "scarlet-std",
  "sgfx-codegen-adreno-a6xx",
  "sgfx-core",
-]
-
-[[package]]
-name = "sgfx-backend-scarlet-maxwell"
-version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9#5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9"
-dependencies = [
- "gpu-raw",
- "maxwell-submit-wire",
- "scarlet-os",
- "scarlet-std",
- "sgfx-codegen-maxwell",
- "sgfx-core",
-]
-
-[[package]]
-name = "sgfx-backend-scarlet-maxwell-compat"
-version = "1.0.0"
-dependencies = [
- "sgfx-backend-scarlet-maxwell",
 ]
 
 [[package]]
@@ -1807,16 +1771,6 @@ dependencies = [
  "adreno-a6xx-layout",
  "adreno-a6xx-pm4",
  "adreno-a6xx-shader-pack",
- "sgfx-core",
-]
-
-[[package]]
-name = "sgfx-codegen-maxwell"
-version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9#5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9"
-dependencies = [
- "maxwell-shader-pack",
- "maxwell-submit-wire",
  "sgfx-core",
 ]
 

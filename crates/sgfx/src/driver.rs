@@ -24,11 +24,7 @@ use crate::dynamic::{PresentationImage as VirglImage, driver::Submission as Virg
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 use crate::virgl::{Image as VirglImage, Submission as VirglSubmission};
 
@@ -262,11 +258,7 @@ impl Adapter {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             AdapterBackend::ScarletVirgl(adapter) => create_virgl_device(adapter),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -284,11 +276,7 @@ enum AdapterBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirgl(ScarletAdapter),
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -329,10 +317,7 @@ impl Instance {
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            any(
-                feature = "backend-scarlet-virgl",
-                feature = "backend-scarlet-virgl-static"
-            )
+            feature = "backend-scarlet-virgl"
         ))]
         if matches!(
             preference,
@@ -373,11 +358,7 @@ enum DeviceBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirgl(Rc<crate::virgl::Context>),
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -405,11 +386,7 @@ impl Device {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             DeviceBackend::ScarletVirgl(context) => context
                 .create_ir_resources(table)
@@ -442,11 +419,7 @@ impl Device {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             DeviceBackend::ScarletVirgl(context) => context
                 .create_queue()
@@ -474,17 +447,14 @@ impl Device {
 
     /// Create a presentable image on this device.
     #[cfg(any(
+        sgfx_dynamic,
         all(target_os = "macos", feature = "backend-wgpu"),
         all(
             any(
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            any(
-                feature = "backend-scarlet-virgl",
-                feature = "backend-scarlet-virgl-static",
-                sgfx_dynamic_virgl
-            )
+            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
         )
     ))]
     pub fn create_presentation_image(
@@ -515,11 +485,7 @@ impl Device {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             DeviceBackend::ScarletVirgl(context) => {
                 if format != ir::TextureFormat::Bgra8Unorm {
@@ -585,17 +551,14 @@ impl Device {
 
 /// Device-local image used by a platform presentation context.
 #[cfg(any(
+    sgfx_dynamic,
     all(target_os = "macos", feature = "backend-wgpu"),
     all(
         any(
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     )
 ))]
 pub struct PresentationImage {
@@ -604,17 +567,14 @@ pub struct PresentationImage {
 }
 
 #[cfg(any(
+    sgfx_dynamic,
     all(target_os = "macos", feature = "backend-wgpu"),
     all(
         any(
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     )
 ))]
 enum PresentationImageBackend {
@@ -625,11 +585,7 @@ enum PresentationImageBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirgl(Rc<VirglImage>),
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -637,17 +593,14 @@ enum PresentationImageBackend {
 }
 
 #[cfg(any(
+    sgfx_dynamic,
     all(target_os = "macos", feature = "backend-wgpu"),
     all(
         any(
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     )
 ))]
 impl PresentationImage {
@@ -660,11 +613,7 @@ impl PresentationImage {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             PresentationImageBackend::ScarletVirgl(image) => image.width(),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -681,11 +630,7 @@ impl PresentationImage {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             PresentationImageBackend::ScarletVirgl(image) => image.height(),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -702,11 +647,7 @@ impl PresentationImage {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             PresentationImageBackend::ScarletVirgl(_) => ir::TextureFormat::Bgra8Unorm,
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -720,14 +661,11 @@ impl PresentationImage {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic)
     ))]
     pub fn duplicate_shared_handle(&self) -> Result<crate::Handle> {
         match &self.backend {
+            #[cfg(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl))]
             PresentationImageBackend::ScarletVirgl(image) => {
                 image.shared_handle().duplicate().map_err(Error::from)
             }
@@ -771,12 +709,6 @@ pub struct Resources {
     backend: ResourcesBackend,
 }
 
-// The explicit static comparison retains the native cache inline. Production
-// dynamic builds store only the small opaque resource owner.
-#[cfg_attr(
-    all(sgfx_dynamic, not(sgfx_dynamic_virgl)),
-    allow(clippy::large_enum_variant)
-)]
 enum ResourcesBackend {
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     Wgpu(sgfx_backend_wgpu::Resources),
@@ -785,11 +717,7 @@ enum ResourcesBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirgl(crate::virgl::IrResources),
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -808,11 +736,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 resources.release_texture(id).map_err(Error::from)
@@ -835,11 +759,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 resources.release_buffer(id).map_err(Error::from)
@@ -865,11 +785,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 resources.release_bind_group(id).map_err(Error::from)
@@ -883,17 +799,14 @@ impl Resources {
 
     /// Map a logical render target to a device-local shareable image.
     #[cfg(any(
+        sgfx_dynamic,
         all(target_os = "macos", feature = "backend-wgpu"),
         all(
             any(
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            any(
-                feature = "backend-scarlet-virgl",
-                feature = "backend-scarlet-virgl-static",
-                sgfx_dynamic_virgl
-            )
+            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
         )
     ))]
     pub fn map_presentation_image(
@@ -920,11 +833,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             (
                 ResourcesBackend::ScarletVirgl(resources),
@@ -944,17 +853,14 @@ impl Resources {
 
     /// Remove a logical PRESENT texture mapping.
     #[cfg(any(
+        sgfx_dynamic,
         all(target_os = "macos", feature = "backend-wgpu"),
         all(
             any(
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            any(
-                feature = "backend-scarlet-virgl",
-                feature = "backend-scarlet-virgl-static",
-                sgfx_dynamic_virgl
-            )
+            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
         )
     ))]
     pub fn unmap_presentation_image(&mut self, texture: ir::TextureId) {
@@ -971,11 +877,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 let _ = resources.unmap_image(texture);
@@ -998,11 +900,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 resources.validate_shader_module(id).map_err(Error::from)
@@ -1028,11 +926,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => resources
                 .validate_programmable_render_pipeline(id)
@@ -1055,11 +949,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 resources.validate_compute_pipeline(id).map_err(Error::from)
@@ -1083,11 +973,7 @@ impl Resources {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             ResourcesBackend::ScarletVirgl(resources) => {
                 resources.read_buffer(id, offset, size).map_err(Error::from)
@@ -1114,11 +1000,7 @@ enum QueueBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirgl {
         queue: crate::virgl::Queue,
@@ -1159,11 +1041,7 @@ impl Queue {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             (
                 QueueBackend::ScarletVirgl { queue, context },
@@ -1221,11 +1099,7 @@ impl Queue {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             (
                 QueueBackend::ScarletVirgl { context, .. },
@@ -1263,11 +1137,7 @@ enum SubmissionBackend {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirgl(VirglSubmission),
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -1284,11 +1154,7 @@ impl fmt::Debug for Submission {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             SubmissionBackend::ScarletVirgl(receipt) => receipt.fmt(formatter),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -1309,11 +1175,7 @@ impl Completion for Submission {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             SubmissionBackend::ScarletVirgl(receipt) => receipt.poll().map_err(Error::from),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -1330,11 +1192,7 @@ impl Completion for Submission {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             SubmissionBackend::ScarletVirgl(receipt) => receipt.wait(timeout).map_err(Error::from),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
@@ -1513,11 +1371,7 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 #[derive(Clone)]
 struct ScarletAdapter {
@@ -1535,11 +1389,7 @@ struct ScarletAdapter {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 fn discover_virgl_adapters() -> Vec<Adapter> {
     use alloc::format;
@@ -1648,11 +1498,7 @@ fn discover_virgl_adapters() -> Vec<Adapter> {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 fn create_virgl_device(adapter: &ScarletAdapter) -> Result<Device> {
     #[cfg(sgfx_dynamic_virgl)]
@@ -1682,7 +1528,6 @@ fn preference_kind(preference: BackendPreference) -> Option<BackendKind> {
         BackendPreference::Metal => Some(BackendKind::Metal),
         BackendPreference::ScarletVirgl => Some(BackendKind::ScarletVirgl),
         BackendPreference::ScarletAdreno => Some(BackendKind::ScarletAdreno),
-        BackendPreference::ScarletMaxwell => Some(BackendKind::ScarletMaxwell),
         #[cfg(feature = "backend-dynamic")]
         BackendPreference::Other(name) => Some(BackendKind::Other(name)),
     }
@@ -1706,20 +1551,10 @@ fn discover_dynamic_adapters(preference: BackendPreference) -> Vec<Adapter> {
     let Some(selection) = dynamic_selection(preference) else {
         return adapters;
     };
-    // The static comparison feature explicitly owns VirGL selection. Other
-    // devices still use manifests and never fall back to a static backend.
-    #[cfg(not(sgfx_dynamic_virgl))]
-    if !dynamic_owns_device(preference, true, false) {
-        return adapters;
-    }
     for index in 0..16 {
         let path = format!("/dev/gpu{index}");
         let Ok(gpu) = Gpu::open(&path) else { continue };
         let Ok(raw) = gpu.query_info() else { continue };
-        #[cfg(not(sgfx_dynamic_virgl))]
-        if !dynamic_owns_device(preference, true, crate::virgl::Device::supports(&raw)) {
-            continue;
-        }
         let backend_id = raw.backend_id_bytes().to_vec();
         drop(gpu);
         let Ok(device) = crate::dynamic::Device::open_with_backend(
@@ -1735,8 +1570,7 @@ fn discover_dynamic_adapters(preference: BackendPreference) -> Vec<Adapter> {
         }
         let backend = device.backend();
         let backend_name = String::from(device.backend_name());
-        let capabilities =
-            dynamic_capabilities(backend, DynamicFeatures::from(device.capabilities()));
+        let capabilities = dynamic_capabilities(DynamicFeatures::from(device.capabilities()));
         let adapter = ScarletAdapter {
             path,
             backend_id,
@@ -1749,13 +1583,7 @@ fn discover_dynamic_adapters(preference: BackendPreference) -> Vec<Adapter> {
                 name: format!("Scarlet {} GPU {index}", device.backend_name()),
                 vendor_id: 0,
                 device_id: 0,
-                device_type: match backend {
-                    BackendKind::ScarletVirgl => DeviceType::Virtual,
-                    BackendKind::ScarletMaxwell | BackendKind::ScarletAdreno => {
-                        DeviceType::Integrated
-                    }
-                    _ => DeviceType::Other,
-                },
+                device_type: DeviceType::Other,
                 backend,
             },
             capabilities,
@@ -1796,17 +1624,6 @@ fn create_dynamic_device(adapter: &ScarletAdapter) -> Result<Device> {
     })
 }
 
-#[cfg(any(all(sgfx_dynamic, not(sgfx_dynamic_virgl)), test))]
-fn dynamic_owns_device(
-    preference: BackendPreference,
-    static_virgl: bool,
-    virgl_compatible: bool,
-) -> bool {
-    !(static_virgl
-        && (matches!(preference, BackendPreference::ScarletVirgl)
-            || preference == BackendPreference::Auto && virgl_compatible))
-}
-
 #[cfg(any(sgfx_dynamic, test))]
 #[derive(Clone, Copy, Default)]
 struct DynamicFeatures {
@@ -1818,6 +1635,14 @@ struct DynamicFeatures {
     depth_sampling: bool,
     mips: bool,
     depth: bool,
+    read_only_storage: bool,
+    typed_views: bool,
+    srgb_views: bool,
+    extended_vertex_formats: bool,
+    rgba8_attachments: bool,
+    blits: bool,
+    push_constants_128: bool,
+    color_attachments_8: bool,
 }
 
 #[cfg(sgfx_dynamic)]
@@ -1832,16 +1657,24 @@ impl From<crate::dynamic::Capabilities> for DynamicFeatures {
             depth_sampling: capabilities.supports_depth_sampling(),
             mips: capabilities.supports_image_mips(),
             depth: capabilities.supports_depth(),
+            read_only_storage: capabilities.supports_read_only_storage_buffers(),
+            typed_views: capabilities.supports_typed_texture_views(),
+            srgb_views: capabilities.supports_srgb_texture_views(),
+            extended_vertex_formats: capabilities.supports_extended_vertex_formats(),
+            rgba8_attachments: capabilities.supports_rgba8_color_attachment(),
+            blits: capabilities.supports_image_blits(),
+            push_constants_128: capabilities.supports_push_constants_128(),
+            color_attachments_8: capabilities.supports_color_attachments_8(),
         }
     }
 }
 
 #[cfg(any(sgfx_dynamic, test))]
-fn dynamic_capabilities(backend: BackendKind, features: DynamicFeatures) -> Capabilities {
+fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
     let programmable = features.rendering && features.programmable;
-    // These implementation properties are not represented by generic ABI
-    // flags. Only VirGL currently guarantees them.
-    let virgl = backend == BackendKind::ScarletVirgl;
+    // Optional properties come exclusively from the negotiated ABI flags.
+    // A manifest name never grants execution features or resource limits.
+    let read_only_storage = programmable && features.read_only_storage;
     Capabilities {
         graphics: features.rendering,
         compute: false,
@@ -1850,34 +1683,38 @@ fn dynamic_capabilities(backend: BackendKind, features: DynamicFeatures) -> Capa
         vertex_buffers: programmable,
         index_buffers: programmable,
         uniform_buffers: programmable,
-        storage_buffers: programmable && virgl,
+        storage_buffers: read_only_storage,
         storage_images: false,
-        typed_texture_views: features.arrays && features.depth_sampling && virgl,
-        srgb_texture_views: programmable && virgl,
+        typed_texture_views: features.typed_views && features.arrays && features.depth_sampling,
+        srgb_texture_views: programmable && features.srgb_views,
         srgb_color_attachments: false,
-        extended_vertex_formats: programmable && virgl,
-        rgba8_color_attachment: features.rendering && virgl,
+        extended_vertex_formats: programmable && features.extended_vertex_formats,
+        rgba8_color_attachment: features.rendering && features.rgba8_attachments,
         bgra8_color_attachment: features.rendering,
         depth32_attachment: features.depth,
         image_readback: features.readback,
-        image_blits: features.mips && virgl,
+        image_blits: features.blits,
         limits: Limits {
-            max_push_constants_size: if programmable && virgl { 128 } else { 0 },
+            max_push_constants_size: if programmable && features.push_constants_128 {
+                128
+            } else {
+                0
+            },
             max_image_dimension_2d: 4096,
             max_image_mip_levels: if features.mips { 13 } else { 1 },
             max_image_array_layers: if features.arrays { 2048 } else { 1 },
             max_uniform_buffer_range: if programmable { 16 * 1024 } else { 0 },
-            max_storage_buffer_range: if programmable && virgl { 256 * 1024 } else { 0 },
+            max_storage_buffer_range: if read_only_storage { 256 * 1024 } else { 0 },
             max_bound_descriptor_sets: if programmable { 4 } else { 0 },
             max_uniform_buffers_per_stage: if programmable { 12 } else { 0 },
-            max_storage_buffers_per_stage: if programmable && virgl { 4 } else { 0 },
+            max_storage_buffers_per_stage: if read_only_storage { 4 } else { 0 },
             max_storage_images_per_stage: 0,
             max_vertex_attributes: if programmable { 16 } else { 0 },
             max_vertex_buffers: if programmable { 8 } else { 0 },
             max_vertex_buffer_stride: if programmable { 2048 } else { 0 },
             max_inter_stage_components: if programmable { 60 } else { 0 },
-            max_color_attachments: if programmable && virgl {
-                ir::MAX_COLOR_ATTACHMENTS as u32
+            max_color_attachments: if programmable && features.color_attachments_8 {
+                8
             } else if features.rendering {
                 1
             } else {
@@ -1899,36 +1736,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn static_virgl_comparison_owns_only_its_selected_devices() {
-        assert!(!dynamic_owns_device(BackendPreference::Auto, true, true));
-        assert!(dynamic_owns_device(BackendPreference::Auto, true, false));
-        assert!(!dynamic_owns_device(
-            BackendPreference::ScarletVirgl,
-            true,
-            false
-        ));
-        assert!(dynamic_owns_device(BackendPreference::Auto, false, true));
-        assert!(dynamic_owns_device(
-            BackendPreference::ScarletVirgl,
-            false,
-            true
-        ));
-        for preference in [
-            BackendPreference::ScarletMaxwell,
-            BackendPreference::ScarletAdreno,
-        ] {
-            assert!(dynamic_owns_device(preference, true, true));
-        }
-        #[cfg(feature = "backend-dynamic")]
-        assert!(dynamic_owns_device(
-            BackendPreference::parse("third-party-gpu").unwrap(),
-            true,
-            true
-        ));
-    }
-
-    #[test]
-    fn generic_flags_do_not_grant_virgl_specific_execution_features() {
+    fn legacy_flags_do_not_grant_optional_execution_features() {
         let features = DynamicFeatures {
             rendering: true,
             programmable: true,
@@ -1938,24 +1746,17 @@ mod tests {
             depth_sampling: true,
             mips: true,
             depth: true,
+            ..Default::default()
         };
-        #[allow(unused_mut)]
-        let mut backends = alloc::vec![BackendKind::ScarletMaxwell];
-        #[cfg(feature = "backend-dynamic")]
-        backends.push(BackendKind::Other(
-            crate::BackendName::new("third-party-gpu").unwrap(),
-        ));
-        for backend in backends {
-            let capabilities = dynamic_capabilities(backend, features);
-            assert!(!capabilities.supports_storage_buffers());
-            assert!(!capabilities.supports_typed_texture_views());
-            assert!(!capabilities.supports_srgb_texture_views());
-            assert!(!capabilities.supports_extended_vertex_formats());
-            assert!(!capabilities.supports_rgba8_color_attachment());
-            assert!(!capabilities.supports_image_blits());
-            assert_eq!(capabilities.limits().max_push_constants_size, 0);
-            assert_eq!(capabilities.limits().max_color_attachments, 1);
-        }
+        let capabilities = dynamic_capabilities(features);
+        assert!(!capabilities.supports_storage_buffers());
+        assert!(!capabilities.supports_typed_texture_views());
+        assert!(!capabilities.supports_srgb_texture_views());
+        assert!(!capabilities.supports_extended_vertex_formats());
+        assert!(!capabilities.supports_rgba8_color_attachment());
+        assert!(!capabilities.supports_image_blits());
+        assert_eq!(capabilities.limits().max_push_constants_size, 0);
+        assert_eq!(capabilities.limits().max_color_attachments, 1);
     }
 
     #[test]
@@ -1966,10 +1767,6 @@ mod tests {
         for (preference, backend) in [
             (BackendPreference::ScarletVirgl, BackendKind::ScarletVirgl),
             (BackendPreference::ScarletAdreno, BackendKind::ScarletAdreno),
-            (
-                BackendPreference::ScarletMaxwell,
-                BackendKind::ScarletMaxwell,
-            ),
         ] {
             assert_eq!(dynamic_selection(preference), Some(Some(backend)));
         }
@@ -1987,16 +1784,13 @@ mod tests {
     }
 
     #[test]
-    fn maxwell_rendering_flags_do_not_claim_programmability() {
-        let capabilities = dynamic_capabilities(
-            BackendKind::ScarletMaxwell,
-            DynamicFeatures {
-                rendering: true,
-                upload: true,
-                readback: true,
-                ..Default::default()
-            },
-        );
+    fn rendering_flags_do_not_claim_programmability() {
+        let capabilities = dynamic_capabilities(DynamicFeatures {
+            rendering: true,
+            upload: true,
+            readback: true,
+            ..Default::default()
+        });
         assert!(capabilities.supports_graphics());
         assert!(capabilities.supports_transfer());
         assert!(capabilities.supports_bgra8_color_attachment());
@@ -2018,7 +1812,7 @@ mod tests {
 
     #[test]
     fn dynamic_capabilities_require_each_optional_flag() {
-        let empty = dynamic_capabilities(BackendKind::ScarletVirgl, DynamicFeatures::default());
+        let empty = dynamic_capabilities(DynamicFeatures::default());
         assert!(!empty.supports_graphics());
         assert!(!empty.supports_transfer());
         assert!(!empty.supports_image_readback());
@@ -2026,30 +1820,51 @@ mod tests {
         let features = DynamicFeatures {
             programmable: true,
             arrays: true,
+            read_only_storage: true,
+            typed_views: true,
+            srgb_views: true,
+            extended_vertex_formats: true,
+            rgba8_attachments: true,
+            push_constants_128: true,
+            color_attachments_8: true,
             ..Default::default()
         };
-        let incomplete = dynamic_capabilities(BackendKind::ScarletVirgl, features);
+        let incomplete = dynamic_capabilities(features);
         assert!(!incomplete.supports_programmable_graphics());
         assert!(!incomplete.supports_typed_texture_views());
-        let virgl = dynamic_capabilities(
-            BackendKind::ScarletVirgl,
-            DynamicFeatures {
-                rendering: true,
-                programmable: true,
-                arrays: true,
-                depth_sampling: true,
-                mips: true,
-                depth: true,
-                ..Default::default()
-            },
-        );
-        assert!(virgl.supports_programmable_graphics());
-        assert!(virgl.supports_storage_buffers());
-        assert!(virgl.supports_typed_texture_views());
-        assert!(virgl.supports_extended_vertex_formats());
-        assert!(virgl.supports_image_blits());
+        assert!(!incomplete.supports_storage_buffers());
+        assert!(!incomplete.supports_srgb_texture_views());
+        assert!(!incomplete.supports_extended_vertex_formats());
+        assert!(!incomplete.supports_rgba8_color_attachment());
+        assert_eq!(incomplete.limits().max_storage_buffer_range, 0);
+        assert_eq!(incomplete.limits().max_push_constants_size, 0);
+        let capabilities = dynamic_capabilities(DynamicFeatures {
+            rendering: true,
+            programmable: true,
+            arrays: true,
+            depth_sampling: true,
+            mips: true,
+            depth: true,
+            read_only_storage: true,
+            typed_views: true,
+            srgb_views: true,
+            extended_vertex_formats: true,
+            rgba8_attachments: true,
+            blits: true,
+            push_constants_128: true,
+            color_attachments_8: true,
+            ..Default::default()
+        });
+        assert!(capabilities.supports_programmable_graphics());
+        assert!(capabilities.supports_storage_buffers());
+        assert!(capabilities.supports_typed_texture_views());
+        assert!(capabilities.supports_srgb_texture_views());
+        assert!(capabilities.supports_extended_vertex_formats());
+        assert!(capabilities.supports_rgba8_color_attachment());
+        assert!(capabilities.supports_image_blits());
+        assert_eq!(capabilities.limits().max_push_constants_size, 128);
         assert_eq!(
-            virgl.limits().max_color_attachments,
+            capabilities.limits().max_color_attachments,
             ir::MAX_COLOR_ATTACHMENTS as u32
         );
     }

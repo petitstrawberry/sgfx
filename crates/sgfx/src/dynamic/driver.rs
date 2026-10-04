@@ -237,6 +237,7 @@ impl Queue {
             resources.sync()?;
             commands
                 .abi_batch()
+                .map(driver_batch)
                 .ok_or(Error::Dynamic(DynamicError::RecordingMode))
         };
         let batch = prepare().map_err(|e| match e {

@@ -38,6 +38,19 @@ fn invalid(_: ir::Error) -> Error {
     Error::Dynamic(DynamicError::Status(abi::INVALID))
 }
 
+// Core can use an older source revision of the same wire ABI. Copy the record
+// fields into this driver's ABI types without reading or changing its span.
+fn driver_batch(batch: ir::abi::Batch) -> abi::Batch {
+    abi::Batch {
+        table: batch.table,
+        words: abi::Span {
+            data: batch.words.data,
+            len: batch.words.len,
+        },
+        count: batch.count,
+    }
+}
+
 struct Owner {
     library: Arc<LoadedBackend>,
     raw: abi::Object,
@@ -70,6 +83,30 @@ impl Drop for Owner {
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities(u64);
 impl Capabilities {
+    pub fn supports_read_only_storage_buffers(self) -> bool {
+        self.0 & abi::READ_ONLY_STORAGE_BUFFERS != 0
+    }
+    pub fn supports_typed_texture_views(self) -> bool {
+        self.0 & abi::TYPED_TEXTURE_VIEWS != 0
+    }
+    pub fn supports_srgb_texture_views(self) -> bool {
+        self.0 & abi::SRGB_TEXTURE_VIEWS != 0
+    }
+    pub fn supports_extended_vertex_formats(self) -> bool {
+        self.0 & abi::EXTENDED_VERTEX_FORMATS != 0
+    }
+    pub fn supports_rgba8_color_attachment(self) -> bool {
+        self.0 & abi::RGBA8_COLOR_ATTACHMENT != 0
+    }
+    pub fn supports_image_blits(self) -> bool {
+        self.0 & abi::IMAGE_BLITS != 0
+    }
+    pub fn supports_push_constants_128(self) -> bool {
+        self.0 & abi::PUSH_CONSTANTS_128 != 0
+    }
+    pub fn supports_color_attachments_8(self) -> bool {
+        self.0 & abi::COLOR_ATTACHMENTS_8 != 0
+    }
     pub fn supports_programmable_graphics(self) -> bool {
         self.0 & abi::PROGRAMMABLE_GRAPHICS != 0
     }
@@ -99,15 +136,13 @@ impl Capabilities {
         self.0 & abi::DEPTH != 0
     }
 }
-pub const BACKEND_ID: &[u8] = b"virtio-gpu";
 pub struct Device {
     owner: Owner,
     capabilities: Capabilities,
 }
 impl Device {
     pub fn supports(info: &gpu_raw::GpuQueryInfo) -> bool {
-        info.backend_id_bytes() == BACKEND_ID
-            && info.device_state == gpu_raw::GPU_DEVICE_STATE_READY
+        info.device_state == gpu_raw::GPU_DEVICE_STATE_READY
             && info.execution_support
                 & (gpu_raw::GPU_EXECUTION_SUPPORT_QUEUE | gpu_raw::GPU_EXECUTION_SUPPORT_MEMORY)
                 == gpu_raw::GPU_EXECUTION_SUPPORT_QUEUE | gpu_raw::GPU_EXECUTION_SUPPORT_MEMORY
@@ -122,6 +157,9 @@ impl Device {
         let info = gpu
             .query_info()
             .map_err(|_| Error::Dynamic(DynamicError::Status(abi::INITIALIZATION_FAILED)))?;
+        if !Self::supports(&info) {
+            return Err(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)));
+        }
         let id = core::str::from_utf8(info.backend_id_bytes())
             .map_err(|_| Error::Dynamic(DynamicError::Status(abi::INVALID)))?;
         let manifest = discover(&driver_directories(), id, preference)
@@ -140,14 +178,7 @@ impl Device {
         })
     }
     pub fn backend(&self) -> BackendKind {
-        match self.backend_name() {
-            "scarlet-virgl" => BackendKind::ScarletVirgl,
-            "scarlet-adreno" => BackendKind::ScarletAdreno,
-            "scarlet-maxwell" => BackendKind::ScarletMaxwell,
-            name => {
-                BackendKind::Other(crate::BackendName::new(name).expect("validated driver name"))
-            }
-        }
+        backend_kind(self.backend_name())
     }
     pub fn backend_name(&self) -> &str {
         &self.owner.library.name
@@ -173,6 +204,16 @@ impl Device {
         })
     }
 }
+fn backend_kind(name: &str) -> BackendKind {
+    match name {
+        #[cfg(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl))]
+        "scarlet-virgl" => BackendKind::ScarletVirgl,
+        #[cfg(feature = "backend-scarlet-adreno")]
+        "scarlet-adreno" => BackendKind::ScarletAdreno,
+        name => BackendKind::Other(crate::BackendName::new(name).expect("validated driver name")),
+    }
+}
+
 pub struct Context {
     owner: Owner,
 }
@@ -279,7 +320,7 @@ impl MappedTargetSession {
             .abi_batch()
             .ok_or(Error::Dynamic(DynamicError::RecordingMode))?;
         self.sync()?;
-        Ok(batch)
+        Ok(driver_batch(batch))
     }
     pub fn image(&self, target: ir::TextureId) -> Result<ImageRef<'_>> {
         self.images
@@ -458,3 +499,25 @@ impl Completion for Submission {
 
 pub(crate) mod driver;
 pub(crate) use driver::{IrResources, PresentationImage, Queue};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn installed_driver_names_do_not_require_compiled_backend_variants() {
+        for name in ["example-driver", "another-vendor-driver"] {
+            assert_eq!(
+                super::backend_kind(name),
+                crate::BackendKind::Other(crate::BackendName::new(name).unwrap())
+            );
+        }
+    }
+
+    #[cfg(not(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)))]
+    #[test]
+    fn uncompiled_backends_use_the_manifest_name() {
+        assert_eq!(
+            super::backend_kind("scarlet-virgl"),
+            crate::BackendKind::Other(crate::BackendName::new("scarlet-virgl").unwrap())
+        );
+    }
+}

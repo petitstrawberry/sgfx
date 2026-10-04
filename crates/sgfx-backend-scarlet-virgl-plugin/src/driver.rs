@@ -294,8 +294,9 @@ unsafe extern "C" fn submit(
             return Err(abi::DEVICE_LOST);
         }
         let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
-        let commands = unsafe { ir::CommandBuffer::from_abi(&r.table, r.source, *batch) }
-            .map_err(|_| abi::INVALID)?;
+        let commands =
+            unsafe { ir::CommandBuffer::from_abi(&r.table, r.source, core_batch(*batch)) }
+                .map_err(|_| abi::INVALID)?;
         let (disposition, error, receipt) =
             match q.inner.submit_ir_async(&q.context, &mut r.inner, &commands) {
                 Ok(receipt) => (abi::ACCEPTED, abi::OK, receipt),

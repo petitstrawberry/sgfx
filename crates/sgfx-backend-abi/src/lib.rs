@@ -179,6 +179,24 @@ pub const PROGRAMMABLE_GRAPHICS: u64 = 64;
 pub const TEXTURE_ARRAYS: u64 = 128;
 pub const DEPTH_SAMPLING: u64 = 256;
 pub const IMAGE_MIPS: u64 = 512;
+/// Read-only storage buffers: four bindings per stage, up to 256 KiB each.
+/// This does not advertise storage writes or compute support.
+pub const READ_ONLY_STORAGE_BUFFERS: u64 = 1024;
+/// Typed sampled views, including array, cube and depth views. The applicable
+/// texture-array and depth-sampling flags must also be advertised.
+pub const TYPED_TEXTURE_VIEWS: u64 = 2048;
+/// Sampled sRGB views with correct decoding; no sRGB attachment guarantee.
+pub const SRGB_TEXTURE_VIEWS: u64 = 4096;
+/// All portable SGFX vertex formats, including narrow and packed formats.
+pub const EXTENDED_VERTEX_FORMATS: u64 = 8192;
+/// RGBA8 UNORM color attachments.
+pub const RGBA8_COLOR_ATTACHMENT: u64 = 16384;
+/// Color image blits with the portable filtering and subresource rules.
+pub const IMAGE_BLITS: u64 = 32768;
+/// Up to 128 bytes of push constants for programmable graphics.
+pub const PUSH_CONSTANTS_128: u64 = 65536;
+/// Up to eight simultaneous programmable color attachments.
+pub const COLOR_ATTACHMENTS_8: u64 = 131072;
 
 /// Optional v2 extension for low-level API frontends, including Vulkan. The
 /// original mapped-session table remains binary compatible. Resolve once at
