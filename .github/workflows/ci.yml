@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  SCARLET_TOOLCHAIN: github:petitstrawberry/scarlet-rust-nix/ecd6c50a4760279fa10f7a80e56e33dda46c89e0#scarlet-rust-toolchain
+  SCARLET_TOOLCHAIN: github:petitstrawberry/scarlet-rust-nix/074b722ac3c0d69daa8d4560996e23474c373d7c#scarlet-rust-toolchain
 
 jobs:
   portable:
@@ -126,6 +126,23 @@ jobs:
       - name: Check the dynamic facade and VirGL plugin
         # The pinned native toolchain supports cdylibs and DSO-safe std TLS.
         run: cargo-clippy clippy --locked -p sgfx -p sgfx-backend-scarlet-virgl-plugin --target '${{ matrix.target }}' --no-default-features --features sgfx/std,sgfx/backend-dynamic --no-deps -- -D warnings
+      - name: Link the native VirGL plugin and verify its Scarlet OSABI
+        env:
+          RUSTFLAGS: -Zdefault-visibility=hidden
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+        run: |
+          cargo rustc --locked --release -p sgfx-backend-scarlet-virgl-plugin --lib --target '${{ matrix.target }}' -- \
+            -C link-arg=--hash-style=both -C link-arg=--entry=0 -C link-arg=--exclude-libs=ALL \
+            -C link-arg=-soname -C link-arg=libsgfx_scarlet_virgl.so -C link-arg=-z -C link-arg=defs
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path(os.environ['CARGO_TARGET_DIR']) / '${{ matrix.target }}' / 'release/libsgfx_scarlet_virgl.so'
+          header = path.read_bytes()[:20]
+          assert header[:8] == b'\x7fELF\x02\x01\x01\x53', header
+          assert int.from_bytes(header[16:18], 'little') == 3, header
+          PY
       - name: Check native public API documentation
         env:
           RUSTDOCFLAGS: -D warnings
