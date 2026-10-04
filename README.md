@@ -58,8 +58,10 @@ must select a compatible revision/lockfile set and rebuild its components.
 The intended application-facing graphics boundary is the Vulkan C ABI. The
 experimental `vulkan-sgfx` frontend depends only on the SGFX execution facade;
 the product build links that facade and core into the ICD/library. The host
-build embeds WGPU. Native 64-bit Scarlet loads VirGL through a versioned C ABI
-from the installed `libsgfx_scarlet_virgl.so`; commands and uploads cross its boundary without copying. See
+build embeds WGPU. Native 64-bit Scarlet loads VirGL and Maxwell through a
+versioned C ABI from installed `libsgfx_scarlet_virgl.so` and
+`libsgfx_scarlet_maxwell.so` drivers; commands and uploads cross the boundary
+without copying. See
 [dynamic backends](docs/dynamic-backends.md) for installation, ownership,
 toolchain requirements and the native comparison fixture. Vulkan conformance
 remains future work.

@@ -218,3 +218,146 @@ const _: () = {
     assert!(core::mem::size_of::<DriverApi>() == 144);
     assert!(core::mem::offset_of!(DriverApi, create_resources) == 8);
 };
+
+/// Optional v2 extension for importing YCbCr images into a mapped session.
+/// The original backend and low-level driver tables remain binary compatible.
+pub const YCBCR_ENTRY: &[u8] = b"sgfx_backend_get_ycbcr_api_v2\0";
+pub const YCBCR_MATRIX_BT601: u32 = 1;
+pub const YCBCR_MATRIX_BT709: u32 = 2;
+pub const YCBCR_RANGE_LIMITED: u32 = 1;
+pub const YCBCR_RANGE_FULL: u32 = 2;
+pub const YCBCR_CHROMA_COSITED: u32 = 1;
+pub const YCBCR_CHROMA_MIDPOINT: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YcbcrConversion {
+    pub size: u32,
+    pub reserved: u32,
+    pub matrix: u32,
+    pub range: u32,
+    pub chroma_x: u32,
+    pub chroma_y: u32,
+}
+
+impl YcbcrConversion {
+    pub const fn is_valid(self) -> bool {
+        self.size as usize == core::mem::size_of::<Self>()
+            && self.reserved == 0
+            && matches!(self.matrix, YCBCR_MATRIX_BT601 | YCBCR_MATRIX_BT709)
+            && matches!(self.range, YCBCR_RANGE_LIMITED | YCBCR_RANGE_FULL)
+            && matches!(self.chroma_x, YCBCR_CHROMA_COSITED | YCBCR_CHROMA_MIDPOINT)
+            && matches!(self.chroma_y, YCBCR_CHROMA_COSITED | YCBCR_CHROMA_MIDPOINT)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct YcbcrApi {
+    pub version: u32,
+    pub size: u32,
+    /// Imports into a session from the same backend. Consumes the owned Scarlet
+    /// handle on every return path, including invalid conversion or session.
+    pub import_ycbcr: unsafe extern "C" fn(Object, u32, i32, YcbcrConversion) -> i32,
+}
+
+/// Writes the complete extension table only when version and size are compatible.
+pub type GetYcbcrApi = unsafe extern "C" fn(u32, usize, *mut YcbcrApi) -> i32;
+
+const _: () = {
+    assert!(core::mem::size_of::<YcbcrConversion>() == 24);
+    assert!(core::mem::offset_of!(YcbcrConversion, matrix) == 8);
+    assert!(core::mem::offset_of!(YcbcrConversion, chroma_y) == 20);
+    assert!(core::mem::size_of::<YcbcrApi>() == 16);
+    assert!(core::mem::offset_of!(YcbcrApi, import_ycbcr) == 8);
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ycbcr_extension_preserves_existing_table_layouts() {
+        assert_eq!(core::mem::size_of::<BackendApi>(), 224);
+        assert_eq!(core::mem::size_of::<DriverApi>(), 144);
+        assert_eq!(core::mem::size_of::<YcbcrConversion>(), 24);
+        assert_eq!(core::mem::align_of::<YcbcrConversion>(), 4);
+        assert_eq!(core::mem::size_of::<YcbcrApi>(), 16);
+        assert_eq!(core::mem::align_of::<YcbcrApi>(), 8);
+    }
+
+    #[test]
+    fn ycbcr_conversion_accepts_all_known_combinations() {
+        for matrix in [YCBCR_MATRIX_BT601, YCBCR_MATRIX_BT709] {
+            for range in [YCBCR_RANGE_LIMITED, YCBCR_RANGE_FULL] {
+                for chroma_x in [YCBCR_CHROMA_COSITED, YCBCR_CHROMA_MIDPOINT] {
+                    for chroma_y in [YCBCR_CHROMA_COSITED, YCBCR_CHROMA_MIDPOINT] {
+                        assert!(
+                            YcbcrConversion {
+                                size: 24,
+                                reserved: 0,
+                                matrix,
+                                range,
+                                chroma_x,
+                                chroma_y,
+                            }
+                            .is_valid()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ycbcr_conversion_rejects_invalid_fields() {
+        let conversion = YcbcrConversion {
+            size: 24,
+            reserved: 0,
+            matrix: YCBCR_MATRIX_BT709,
+            range: YCBCR_RANGE_LIMITED,
+            chroma_x: YCBCR_CHROMA_COSITED,
+            chroma_y: YCBCR_CHROMA_MIDPOINT,
+        };
+        for size in [0, 23, 25, u32::MAX] {
+            assert!(!YcbcrConversion { size, ..conversion }.is_valid());
+        }
+        assert!(
+            !YcbcrConversion {
+                reserved: 1,
+                ..conversion
+            }
+            .is_valid()
+        );
+        for invalid in [0, 3, u32::MAX] {
+            assert!(
+                !YcbcrConversion {
+                    matrix: invalid,
+                    ..conversion
+                }
+                .is_valid()
+            );
+            assert!(
+                !YcbcrConversion {
+                    range: invalid,
+                    ..conversion
+                }
+                .is_valid()
+            );
+            assert!(
+                !YcbcrConversion {
+                    chroma_x: invalid,
+                    ..conversion
+                }
+                .is_valid()
+            );
+            assert!(
+                !YcbcrConversion {
+                    chroma_y: invalid,
+                    ..conversion
+                }
+                .is_valid()
+            );
+        }
+    }
+}

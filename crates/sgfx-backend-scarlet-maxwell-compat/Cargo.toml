@@ -1,0 +1,16 @@
+[package]
+name = "sgfx-backend-scarlet-maxwell-compat"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+default = ["std"]
+std = ["sgfx-backend-scarlet-maxwell/std"]
+scarlet-std = ["sgfx-backend-scarlet-maxwell/scarlet-std"]
+
+[target.'cfg(all(target_os = "scarlet", target_pointer_width = "32"))'.dependencies]
+sgfx-backend-scarlet-maxwell = { git = "https://github.com/petitstrawberry/scarlet-project-switch", rev = "5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9", default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
