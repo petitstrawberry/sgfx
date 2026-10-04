@@ -27,6 +27,19 @@ struct Session {
     poisoned: bool,
 }
 
+// Core retains its pinned wire-ABI source identity. Reconstruct its record
+// without accessing the borrowed command words or changing their lifetime.
+fn core_batch(batch: abi::Batch) -> ir::abi::Batch {
+    ir::abi::Batch {
+        table: batch.table,
+        words: ir::abi::Span {
+            data: batch.words.data,
+            len: batch.words.len,
+        },
+        count: batch.count,
+    }
+}
+
 fn error(e: virgl::IrSubmitError) -> i32 {
     use virgl::IrSubmitError as E;
     match e {
@@ -352,8 +365,9 @@ unsafe extern "C" fn execute(p: Object, batch: *const abi::Batch) -> i32 {
             return Err(abi::DEVICE_LOST);
         }
         let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
-        let commands = unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, *batch) }
-            .map_err(|_| abi::INVALID)?;
+        let commands =
+            unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, core_batch(*batch)) }
+                .map_err(|_| abi::INVALID)?;
         s.inner.executor().execute(&commands).map_err(error)
     })())
 }
@@ -370,8 +384,9 @@ unsafe extern "C" fn submit(p: Object, batch: *const abi::Batch, out: *mut abi::
             return Err(abi::DEVICE_LOST);
         }
         let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
-        let commands = unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, *batch) }
-            .map_err(|_| abi::INVALID)?;
+        let commands =
+            unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, core_batch(*batch)) }
+                .map_err(|_| abi::INVALID)?;
         let (disposition, error, receipt) = match s.inner.executor().submit(&commands) {
             Ok(receipt) => (abi::ACCEPTED, abi::OK, receipt),
             Err(SubmitError::Busy) => return Err(abi::BUSY),

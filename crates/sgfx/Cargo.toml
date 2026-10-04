@@ -54,7 +54,7 @@ backend-scarlet-adreno = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
 sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", default-features = false }
 
 [target.'cfg(target_pointer_width = "64")'.dependencies]
-sgfx-backend-abi = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", optional = true }
+sgfx-backend-abi = { path = "../sgfx-backend-abi", optional = true }
 sgfx-backend-loader = { path = "../sgfx-backend-loader", default-features = false, optional = true }
 sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", default-features = false, features = ["backend-abi"] }
 

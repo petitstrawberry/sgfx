@@ -38,6 +38,19 @@ fn invalid(_: ir::Error) -> Error {
     Error::Dynamic(DynamicError::Status(abi::INVALID))
 }
 
+// Core can use an older source revision of the same wire ABI. Copy the record
+// fields into this driver's ABI types without reading or changing its span.
+fn driver_batch(batch: ir::abi::Batch) -> abi::Batch {
+    abi::Batch {
+        table: batch.table,
+        words: abi::Span {
+            data: batch.words.data,
+            len: batch.words.len,
+        },
+        count: batch.count,
+    }
+}
+
 struct Owner {
     library: Arc<LoadedBackend>,
     raw: abi::Object,
@@ -311,7 +324,7 @@ impl MappedTargetSession {
             .abi_batch()
             .ok_or(Error::Dynamic(DynamicError::RecordingMode))?;
         self.sync()?;
-        Ok(batch)
+        Ok(driver_batch(batch))
     }
     pub fn image(&self, target: ir::TextureId) -> Result<ImageRef<'_>> {
         self.images
