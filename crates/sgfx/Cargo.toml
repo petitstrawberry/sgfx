@@ -12,7 +12,7 @@ default = [
     "backend-wgpu",
     "backend-scarlet-virgl",
     "backend-scarlet-adreno",
-    "backend-scarlet-maxwell",
+    "backend-dynamic",
 ]
 std = [
     "sgfx-core/std",
@@ -20,8 +20,6 @@ std = [
     "scarlet-os?/std",
     "gpu-raw?/std",
     "sgfx-backend-scarlet-adreno?/std",
-    "sgfx-backend-scarlet-maxwell?/std",
-    "sgfx-backend-scarlet-maxwell-compat?/std",
     "sgfx-backend-scarlet-virgl?/std",
     "sgfx-backend-scarlet-virgl-compat?/std",
 ]
@@ -29,13 +27,11 @@ legacy-scarlet-std = [
     "backend-wgpu",
     "backend-scarlet-virgl",
     "backend-scarlet-adreno",
-    "backend-scarlet-maxwell",
+    "backend-dynamic",
     "dep:scarlet-std",
     "sgfx-backend-loader?/legacy-scarlet-std",
     "gpu-raw?/scarlet-std",
     "sgfx-backend-scarlet-adreno?/scarlet-std",
-    "sgfx-backend-scarlet-maxwell?/scarlet-std",
-    "sgfx-backend-scarlet-maxwell-compat?/scarlet-std",
     "sgfx-backend-scarlet-virgl?/scarlet-std",
     "sgfx-backend-scarlet-virgl-compat?/scarlet-std",
 ]
@@ -52,9 +48,6 @@ scarlet-native-api = ["std", "backend-scarlet-virgl"]
 backend-scarlet-virgl = ["backend-dynamic", "dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl-compat"]
 # Explicit comparison/compatibility build; native 64-bit production uses the DSO.
 backend-scarlet-virgl-static = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl", "dep:sgfx-backend-scarlet-virgl-compat"]
-# Native ELF64 loads the installed Maxwell DSO; ELF32 keeps its static backend.
-backend-scarlet-maxwell = ["backend-dynamic", "dep:gpu-raw", "dep:sgfx-backend-scarlet-maxwell-compat"]
-backend-scarlet-maxwell-static = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-maxwell", "dep:sgfx-backend-scarlet-maxwell-compat"]
 backend-scarlet-adreno = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
 
 [dependencies]
@@ -93,7 +86,6 @@ required-features = ["backend-wgpu"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
 
 [target.'cfg(all(target_os = "scarlet", target_pointer_width = "64"))'.dependencies]
-sgfx-backend-scarlet-maxwell = { git = "https://github.com/petitstrawberry/scarlet-project-switch", rev = "5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9", default-features = false, optional = true }
 sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-features = false, optional = true }
 
 # ELF32 and Linux-ABI clients retain their explicit compatibility backend.
@@ -103,8 +95,3 @@ sgfx-backend-scarlet-virgl-compat = { path = "../sgfx-backend-scarlet-virgl-comp
 [[example]]
 name = "legacy_dynamic_smoke"
 required-features = ["legacy-scarlet-std"]
-
-# Separate dependency names prevent the ELF32 compatibility feature from
-# activating the native ELF64 static implementation.
-[target.'cfg(all(target_os = "scarlet", target_pointer_width = "32"))'.dependencies]
-sgfx-backend-scarlet-maxwell-compat = { path = "../sgfx-backend-scarlet-maxwell-compat", default-features = false, optional = true }

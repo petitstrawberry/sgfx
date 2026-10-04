@@ -60,13 +60,13 @@ Updating one Git dependency can also re-resolve its transitive dependencies.
 
 Keep one `sgfx-core` and backend ABI source identity in each binary. The shared
 core/ABI release is pinned to `040dbb5cf42b75489504e1765183d37f6131f54c`.
-Facade, WGPU and VirGL packages depend on that immutable release, as do external
-Adreno and Maxwell backends. Downstream renderers must use the same core pin;
+Facade, WGPU and VirGL packages depend on that immutable release, as does the
+external Adreno backend. Downstream renderers must use the same core pin;
 updating the facade alone does not change the core source identity.
 
 Native runtime/GPU crates use Scarlet revision
 `b3d2a55740a3d2ca49daad0ec7baba233f706f7a`. The facade selects the compatible
-Adreno and Maxwell revisions in its manifest; commit the consuming workspace's
+Adreno revision in its manifest; commit the consuming workspace's
 Cargo lockfile alongside dependency updates. The SGFX workspace overrides core
 and ABI with local paths for development. Downstream applications do not inherit
 workspace overrides.
@@ -89,11 +89,11 @@ See the [facade manifest](../crates/sgfx/Cargo.toml) for the feature definitions
 | Build configuration | Available facade |
 | --- | --- |
 | Defaults on a host target | Rust std and WGPU window/session execution. |
-| Defaults on `riscv64gc-unknown-scarlet` or `aarch64-unknown-scarlet` | Rust std, runtime-loaded VirGL/Maxwell and compiled Adreno; the opened GPU determines automatic selection. |
+| Defaults on `riscv64gc-unknown-scarlet` or `aarch64-unknown-scarlet` | Rust std, runtime discovery of installed drivers and compiled Adreno; the opened GPU determines automatic selection. |
 | `default-features = false`, no features | IR/trait reexports and selection types, but no executor or usable backend. |
 | No defaults, `backend-wgpu` | Host WGPU integration without SGFX environment lookup. WGPU itself still requires std. |
 | No defaults, `std` | Rust std support; select an execution backend separately. |
-| No defaults, `std, backend-dynamic` | Scarlet runtime discovery of installed complete backends through the C ABI. VirGL and Maxwell are supplied as plugins. |
+| No defaults, `std, backend-dynamic` | Scarlet runtime discovery of installed complete backends through the C ABI, without driver implementations in the application dependency graph. |
 | No defaults, `legacy-scarlet-std` | Older Scarlet userspace runtime configuration; `scarlet-std` is its compatibility alias. Not the normal std targets. |
 
 Use `Instance::new()` to read `SGFX_BACKEND`, or
@@ -105,7 +105,6 @@ Use `Instance::new()` to read `SGFX_BACKEND`, or
 | `wgpu` | Host WGPU. WGPU using Metal is still `wgpu`. |
 | `scarlet-virgl` or `virgl` | Scarlet VirGL. |
 | `scarlet-adreno` or `adreno` | Scarlet Adreno. |
-| `scarlet-maxwell` or `maxwell` | Scarlet Maxwell; native64 loads its installed driver. |
 | Other valid driver names with `backend-dynamic` | Require the installed manifest with that exact name. |
 | `metal` | Reserved direct Metal backend; currently unavailable. |
 

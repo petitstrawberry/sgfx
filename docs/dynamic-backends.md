@@ -1,56 +1,40 @@
 # Dynamic Scarlet backends
 
-On native 64-bit Scarlet, VirGL and Maxwell load at runtime through `scarlet-ld`.
-The existing `backend-scarlet-virgl` and `backend-scarlet-maxwell` features select
-installed `libsgfx_scarlet_virgl.so` and `libsgfx_scarlet_maxwell.so` drivers,
-including for default features and legacy `no_std` applications. Adreno and host
-WGPU retain their existing implementations. ELF32 and Linux-ABI clients retain
-their static compatibility transport until their loaders support this ABI.
+On native 64-bit Scarlet, SGFX discovers installed drivers from manifests and
+loads them through `scarlet-ld`. Driver names, GPU backend IDs and library names
+come from those manifests, so external driver distributions do not require
+hardware-specific code or Cargo dependencies in this repository. The built-in
+Adreno and host WGPU implementations remain available.
 
 ## Application and installation
 
-Existing applications can keep their `backend-scarlet-virgl` selection. For a
-VirGL-only standard-Rust client use `default-features = false,
-features = ["std", "backend-scarlet-virgl"]`. Legacy processes use
-`legacy-scarlet-std`. The `backend-dynamic` feature also exposes manifest-based
-selection of other installed drivers and needs an explicit runtime feature.
+Use the generic loader for a standard-Rust client:
 
-For Maxwell-only clients use `default-features = false,
-features = ["std", "backend-scarlet-maxwell"]`. Native production clients omit
-the static VirGL/Maxwell implementations and their shader compilers; default
-features still include compiled Adreno. `backend-scarlet-virgl-static` and
-`backend-scarlet-maxwell-static` explicitly select the corresponding static
-comparison backend, including in mixed builds with other dynamic drivers.
-A standalone static feature does not enable the loader. ELF32 Maxwell retains
-its static compatibility backend through a separate wrapper pinned to the
-legacy revision; this compatibility path does not include the new standard-Rust
-programmable shader compiler. Legacy native64 clients can load the standard-Rust
-Maxwell plugin through the C ABI without linking that compiler into their
-`no_std` process.
+```toml
+sgfx = { git = "https://github.com/petitstrawberry/sgfx", default-features = false, features = ["std", "backend-dynamic"] }
+```
 
-Install the library and this adjacent `scarlet-virgl.sgfx-driver` manifest in
-`/system/lib/sgfx`:
+Default features already enable `backend-dynamic`. Existing applications can
+keep `backend-scarlet-virgl`, which enables native runtime discovery. Legacy
+native64 processes can use `legacy-scarlet-std`. Dynamic clients omit driver
+implementations and shader compilers; default features still include compiled
+Adreno. `backend-scarlet-virgl-static` explicitly selects the static comparison
+backend, including in mixed builds with dynamic discovery. The static feature
+alone does not enable the loader. This C ABI requires native 64-bit support.
+
+Driver distributions install their library and an adjacent manifest such as
+`example-renderer.sgfx-driver` in `/system/lib/sgfx`:
 
 ```ini
 abi=2
-name=scarlet-virgl
-gpu_backend=virtio-gpu
-library=libsgfx_scarlet_virgl.so
+name=example-renderer
+gpu_backend=example-gpu-service
+library=libsgfx_example_renderer.so
 ```
 
-For Switch GM20B, install `libsgfx_scarlet_maxwell.so` alongside
-`scarlet-maxwell.sgfx-driver`:
-
-```ini
-abi=2
-name=scarlet-maxwell
-gpu_backend=nvidia-gm20b
-library=libsgfx_scarlet_maxwell.so
-```
-
-Automatic GM20B selection and `SGFX_BACKEND=scarlet-maxwell` (or `maxwell`)
-request this same manifest. A missing or incompatible Maxwell driver fails
-creation; it does not select a static implementation.
+`gpu_backend` must match the ID reported by the platform GPU service. Auto
+selection uses that match; `SGFX_BACKEND=example-renderer` explicitly requests
+the manifest name. SGFX does not interpret the hardware-specific ID.
 
 `SGFX_DRIVER_PATH` replaces the search directories with a colon-separated list.
 `SGFX_BACKEND` selects an installed manifest name. Auto selection matches the
@@ -64,9 +48,9 @@ recording on its `ResourceTable`. Alternatively call `enable_abi_commands()`
 before creating encoders. Pre-existing native Rust recordings return an
 explicit recording-mode error: submission does not secretly convert them.
 The usual device/context/session, execute, submit and completion APIs remain
-available. Maxwell also exports the optional YCbCr import extension, preserving
-shared NV12 sampling conversions. Drivers without that extension, including
-VirGL, return `Unsupported` for YCbCr import. The low-level `sgfx::driver`
+available. Drivers may export the optional YCbCr import extension for shared
+NV12 sampling conversions. Drivers without that extension return `Unsupported`
+for YCbCr import. The low-level `sgfx::driver`
 facade requires the separately negotiated `DriverApi`; an installed driver
 without that optional API remains usable by the mapped-session facade.
 
@@ -139,7 +123,9 @@ The independent `sgfx_backend_get_driver_api_v2(version, size, out_table)`
 extension (144-byte table) supports the low-level resource/queue API used by
 Vulkan. The initial v1 draft is rejected: v2 carries generations for textures and
 bind groups and bounded/flipped blit operands. Low-level operations require
-the extension, including explicit texture and bind-group retirement. These are the plugin's only exported symbols.
+the extension, including explicit texture and bind-group retirement. Plugins
+export only negotiated C entry points; the optional YCbCr extension adds a
+separate entry point without changing either table.
 
 The low-level extension borrows the same recorded command stream. Readback
 writes directly into caller-owned buffers, and cloning a completion retains the
@@ -186,9 +172,9 @@ TLS namespace fix and executable-only CRT split, a sibling Scarlet checkout cont
 loader-smoke/ELF-audit tools, and QEMU with VirGL support. All Rust runtimes in
 the interpreter, application and plugin must agree on the thread/TLS layout.
 The build script refuses the old per-DSO colliding TLS-key implementation.
-Add `--maxwell ../scarlet-project-switch` to also build, stage and ELF-audit the
-Switch driver using its checked-in coordinated dependency pins. The smoke scene still runs
-on VirtIO/VirGL; staging and ELF audits do not verify GM20B GPU execution.
+The script builds the in-tree VirGL plugin and runs its smoke scene on VirtIO.
+External distributions build, stage and validate their drivers in their own
+repositories against this ABI.
 The compiler also needs the GNU ELF OSABI fix (`petitstrawberry/rust`
 commit `71dd0425890` or newer): retained AArch64 constructors can make LLD
 emit OSABI 3, which the native compiler must accept before marking its output
@@ -234,8 +220,9 @@ application activation. It does not replace the installed QEMU. `-display none`
 is not a substitute for an OpenGL display backend when testing VirGL.
 
 `build.json` records compiler identity, target specification, commands, runtime source hash, artifact
-sizes/hashes and ELF audits. VirGL exports its two C entry points; Maxwell also exports
-`sgfx_backend_get_ycbcr_api_v2`. All other dynamic exports are rejected;
+sizes/hashes and ELF audits. VirGL exports its two C entry points. The audit also
+permits the optional `sgfx_backend_get_ycbcr_api_v2` entry point and rejects
+unrecognized dynamic exports;
 the application must import exactly `dlopen`, `dlsym`, `dlerror` from the
 interpreter and have **no `DT_NEEDED` backend dependency**. Unsupported ELF TLS,
 RELR, symbol versions and text relocations fail the audit. Each guest result
@@ -299,8 +286,7 @@ lifetimes and a syscall-based timer. Repeated symmetric comparisons did not
 reproduce a fixed 3.6x submission penalty, so that result must not be presented
 as the cost of dynamic linking. Nor do the corrected comparisons prove exact
 performance parity. Native 64-bit VirGL now defaults to the dynamic path;
-`backend-scarlet-virgl-static` retains an explicit comparison build. ELF32 and
-Linux-ABI clients keep the static compatibility transport.
+`backend-scarlet-virgl-static` retains an explicit comparison build.
 
 The original implementation reported local evidence under `target/dynamic-backends/aarch64-runtime/`:
 `qemu-scalar-interleaved/result.json` and `serial.log` contain the table above;

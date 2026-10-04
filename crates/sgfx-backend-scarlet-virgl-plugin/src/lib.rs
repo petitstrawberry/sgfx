@@ -119,6 +119,30 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
                 abi::IMAGE_MIPS
             } else {
                 0
+            }
+            | if c.supports_programmable_graphics() {
+                abi::READ_ONLY_STORAGE_BUFFERS
+                    | abi::SRGB_TEXTURE_VIEWS
+                    | abi::EXTENDED_VERTEX_FORMATS
+                    | abi::PUSH_CONSTANTS_128
+                    | abi::COLOR_ATTACHMENTS_8
+            } else {
+                0
+            }
+            | if c.supports_texture_arrays() && c.supports_depth_sampling() {
+                abi::TYPED_TEXTURE_VIEWS
+            } else {
+                0
+            }
+            | if c.supports_rendering() {
+                abi::RGBA8_COLOR_ATTACHMENT
+            } else {
+                0
+            }
+            | if c.supports_image_mips() {
+                abi::IMAGE_BLITS
+            } else {
+                0
             };
         unsafe {
             caps.write(flags);

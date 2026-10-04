@@ -58,13 +58,14 @@ must select a compatible revision/lockfile set and rebuild its components.
 The intended application-facing graphics boundary is the Vulkan C ABI. The
 experimental `vulkan-sgfx` frontend depends only on the SGFX execution facade;
 the product build links that facade and core into the ICD/library. The host
-build embeds WGPU. Native 64-bit Scarlet loads VirGL and Maxwell through a
-versioned C ABI from installed `libsgfx_scarlet_virgl.so` and
-`libsgfx_scarlet_maxwell.so` drivers; commands and uploads cross the boundary
-without copying. See
+build embeds WGPU. Native 64-bit Scarlet discovers installed drivers from
+manifests and loads them through a versioned C ABI; commands and uploads cross
+the boundary without copying. See
 [dynamic backends](docs/dynamic-backends.md) for installation, ownership,
 toolchain requirements and the native comparison fixture. Vulkan conformance
 remains future work.
+Driver distributions provide their libraries and manifests independently; the
+facade does not need hardware-specific features or dependencies to select them.
 Resource ownership, ordering, completion and failure semantics still form the
 common backend contract. See the [approved policy](docs/1.0-contract.md#2-coordinated-rust-implementation-policy).
 
@@ -118,7 +119,7 @@ CARGO_TARGET_DIR=target/upstream-host rustup run nightly-2025-12-31 cargo test -
 ```
 
 Scarlet provides `std` for both of its userspace targets. With the Scarlet
-Rust toolchain active, check the facade and both compiled backends with:
+Rust toolchain active, check the facade and its selected dependencies with:
 
 ```bash
 cargo check --locked -p sgfx --target riscv64gc-unknown-scarlet
