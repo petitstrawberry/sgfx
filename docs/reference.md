@@ -89,11 +89,11 @@ See the [facade manifest](../crates/sgfx/Cargo.toml) for the feature definitions
 | Build configuration | Available facade |
 | --- | --- |
 | Defaults on a host target | Rust std and WGPU window/session execution. |
-| Defaults on `riscv64gc-unknown-scarlet` or `aarch64-unknown-scarlet` | Rust std, runtime-loaded VirGL, and compiled Adreno/Maxwell; the opened GPU determines automatic selection. |
+| Defaults on `riscv64gc-unknown-scarlet` or `aarch64-unknown-scarlet` | Rust std, runtime-loaded VirGL/Maxwell and compiled Adreno; the opened GPU determines automatic selection. |
 | `default-features = false`, no features | IR/trait reexports and selection types, but no executor or usable backend. |
 | No defaults, `backend-wgpu` | Host WGPU integration without SGFX environment lookup. WGPU itself still requires std. |
 | No defaults, `std` | Rust std support; select an execution backend separately. |
-| No defaults, `std, backend-dynamic` | Scarlet runtime discovery of installed complete backends through the C ABI. VirGL is currently supplied as a plugin. |
+| No defaults, `std, backend-dynamic` | Scarlet runtime discovery of installed complete backends through the C ABI. VirGL and Maxwell are supplied as plugins. |
 | No defaults, `legacy-scarlet-std` | Older Scarlet userspace runtime configuration; `scarlet-std` is its compatibility alias. Not the normal std targets. |
 
 Use `Instance::new()` to read `SGFX_BACKEND`, or
@@ -101,17 +101,19 @@ Use `Instance::new()` to read `SGFX_BACKEND`, or
 
 | `SGFX_BACKEND` | Preference |
 | --- | --- |
-| Unset or `auto` | Automatic selection among compiled backends. |
+| Unset or `auto` | Automatic selection from GPU identity and installed drivers; explicit static comparison features retain their selected backend. |
 | `wgpu` | Host WGPU. WGPU using Metal is still `wgpu`. |
 | `scarlet-virgl` or `virgl` | Scarlet VirGL. |
 | `scarlet-adreno` or `adreno` | Scarlet Adreno. |
+| `scarlet-maxwell` or `maxwell` | Scarlet Maxwell; native64 loads its installed driver. |
+| Other valid driver names with `backend-dynamic` | Require the installed manifest with that exact name. |
 | `metal` | Reserved direct Metal backend; currently unavailable. |
 
 Parsing is case-sensitive and does not trim whitespace. An invalid name returns
 `InvalidBackendPreference`; an unavailable explicit backend returns
 `BackendUnavailable`. There is no silent fallback for an explicit choice.
 Without a runtime supporting environment lookup, the preference is `Auto`.
-On Scarlet, `Instance::backend()` under `Auto` is only the compiled default;
+On Scarlet, `Instance::backend()` under `Auto` is a selection hint;
 `Device::backend()` reports the backend selected after opening the GPU.
 
 ## Platform setup

@@ -1705,6 +1705,7 @@ dependencies = [
  "sgfx-backend-loader",
  "sgfx-backend-scarlet-adreno",
  "sgfx-backend-scarlet-maxwell",
+ "sgfx-backend-scarlet-maxwell-compat",
  "sgfx-backend-scarlet-virgl",
  "sgfx-backend-scarlet-virgl-compat",
  "sgfx-backend-wgpu",
@@ -1749,6 +1750,13 @@ dependencies = [
  "scarlet-std",
  "sgfx-codegen-maxwell",
  "sgfx-core",
+]
+
+[[package]]
+name = "sgfx-backend-scarlet-maxwell-compat"
+version = "1.0.0"
+dependencies = [
+ "sgfx-backend-scarlet-maxwell",
 ]
 
 [[package]]

@@ -156,6 +156,7 @@ pub fn discover(
 pub struct LoadedBackend {
     pub api: abi::BackendApi,
     pub driver: Option<abi::DriverApi>,
+    pub ycbcr: Option<abi::YcbcrApi>,
     pub name: String,
     pub gpu_backend: String,
     /// Absolute path passed to the loader for this driver.
@@ -182,6 +183,44 @@ fn dynamic_error() -> Error {
                 .to_string_lossy()
                 .into_owned(),
         )
+    }
+}
+
+#[cfg(any(unix, target_os = "scarlet"))]
+fn negotiate_ycbcr(get: abi::GetYcbcrApi) -> Result<abi::YcbcrApi, Error> {
+    let mut table = core::mem::MaybeUninit::<abi::YcbcrApi>::uninit();
+    let status = unsafe {
+        get(
+            abi::VERSION,
+            core::mem::size_of::<abi::YcbcrApi>(),
+            table.as_mut_ptr(),
+        )
+    };
+    if status != abi::OK {
+        return Err(Error(format!(
+            "driver rejected YCbCr ABI negotiation: {status}"
+        )));
+    }
+    // A successful entry point initializes the complete extension table.
+    let table = unsafe { table.assume_init() };
+    if table.version != abi::VERSION
+        || (table.size as usize) < core::mem::size_of::<abi::YcbcrApi>()
+    {
+        return Err(Error("incompatible YCbCr driver table".into()));
+    }
+    Ok(table)
+}
+
+#[cfg(any(unix, target_os = "scarlet"))]
+unsafe fn load_ycbcr(library: *mut c_void) -> Result<Option<abi::YcbcrApi>, Error> {
+    let address = unsafe { dlsym(library, abi::YCBCR_ENTRY.as_ptr().cast()) };
+    if address.is_null() {
+        // Optional absence must not leave a stale dynamic loader error.
+        let _ = unsafe { dlerror() };
+        Ok(None)
+    } else {
+        let get: abi::GetYcbcrApi = unsafe { core::mem::transmute(address) };
+        negotiate_ycbcr(get).map(Some)
     }
 }
 
@@ -299,9 +338,11 @@ impl LoadedBackend {
             }
             Some(table)
         };
+        let ycbcr = unsafe { load_ycbcr(library) }?;
         Ok(Self {
             api,
             driver,
+            ycbcr,
             name,
             gpu_backend,
             library: library_path,
@@ -334,6 +375,77 @@ pub fn driver_directories() -> Vec<String> {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    unsafe extern "C" fn import_ycbcr(
+        _session: abi::Object,
+        _image: u32,
+        _handle: i32,
+        _conversion: abi::YcbcrConversion,
+    ) -> i32 {
+        abi::UNSUPPORTED
+    }
+
+    unsafe extern "C" fn ycbcr_table<const VERSION: u32, const SIZE: u32>(
+        version: u32,
+        size: usize,
+        out: *mut abi::YcbcrApi,
+    ) -> i32 {
+        if version != abi::VERSION || size != core::mem::size_of::<abi::YcbcrApi>() {
+            return abi::ABI_MISMATCH;
+        }
+        unsafe {
+            out.write(abi::YcbcrApi {
+                version: VERSION,
+                size: SIZE,
+                import_ycbcr,
+            });
+        }
+        abi::OK
+    }
+
+    #[cfg(any(unix, target_os = "scarlet"))]
+    #[test]
+    fn absent_ycbcr_extension_is_optional_and_clears_loader_error() {
+        let process = unsafe { dlopen(core::ptr::null(), 2) };
+        assert!(!process.is_null());
+        assert!(unsafe { load_ycbcr(process) }.unwrap().is_none());
+        assert!(unsafe { dlerror() }.is_null());
+    }
+
+    #[cfg(any(unix, target_os = "scarlet"))]
+    #[test]
+    fn ycbcr_negotiation_accepts_compatible_table() {
+        let table = negotiate_ycbcr(ycbcr_table::<2, 16>).unwrap();
+        assert_eq!(table.version, abi::VERSION);
+        assert_eq!(table.size, core::mem::size_of::<abi::YcbcrApi>() as u32);
+    }
+
+    #[cfg(any(unix, target_os = "scarlet"))]
+    #[test]
+    fn ycbcr_negotiation_rejects_invalid_version_or_size() {
+        for get in [
+            ycbcr_table::<1, 16> as abi::GetYcbcrApi,
+            ycbcr_table::<2, 15> as abi::GetYcbcrApi,
+        ] {
+            assert_eq!(
+                negotiate_ycbcr(get).err().unwrap().0,
+                "incompatible YCbCr driver table"
+            );
+        }
+    }
+
+    #[cfg(any(unix, target_os = "scarlet"))]
+    #[test]
+    fn ycbcr_negotiation_rejection_does_not_read_uninitialized_table() {
+        unsafe extern "C" fn reject(_version: u32, _size: usize, _out: *mut abi::YcbcrApi) -> i32 {
+            abi::ABI_MISMATCH
+        }
+        assert_eq!(
+            negotiate_ycbcr(reject).err().unwrap().0,
+            "driver rejected YCbCr ABI negotiation: 7"
+        );
+    }
+
     #[test]
     fn manifests_are_independent_of_compiled_backend_names() {
         let manifest = Manifest::parse(

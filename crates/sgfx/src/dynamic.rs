@@ -159,6 +159,10 @@ impl Device {
     pub fn capabilities(&self) -> Capabilities {
         self.capabilities
     }
+    /// Whether this plugin provides the optional low-level queue/resource API.
+    pub(crate) fn supports_driver_api(&self) -> bool {
+        self.owner.library.driver.is_some()
+    }
     pub fn create_context(&self) -> Result<Context> {
         let library = self.owner.library.clone();
         let mut raw = core::ptr::null_mut();
@@ -321,11 +325,43 @@ impl MappedTargetSession {
     }
     pub fn import_ycbcr_texture(
         &mut self,
-        _texture: ir::TextureId,
-        _handle: Handle,
-        _conversion: ir::YcbcrConversion,
+        texture: ir::TextureId,
+        handle: Handle,
+        conversion: ir::YcbcrConversion,
     ) -> Result<()> {
-        Err(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))
+        let import = self
+            .owner
+            .library
+            .ycbcr
+            .as_ref()
+            .map(|api| api.import_ycbcr)
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        let slot = self.resources.texture_ref(texture).map_err(invalid)?.slot() as u32;
+        self.sync()?;
+        let conversion = abi::YcbcrConversion {
+            size: core::mem::size_of::<abi::YcbcrConversion>() as u32,
+            reserved: 0,
+            matrix: match conversion.matrix {
+                ir::YcbcrMatrix::Bt601 => abi::YCBCR_MATRIX_BT601,
+                ir::YcbcrMatrix::Bt709 => abi::YCBCR_MATRIX_BT709,
+            },
+            range: match conversion.range {
+                ir::YcbcrRange::Limited => abi::YCBCR_RANGE_LIMITED,
+                ir::YcbcrRange::Full => abi::YCBCR_RANGE_FULL,
+            },
+            chroma_x: match conversion.chroma_x {
+                ir::ChromaLocation::Cosited => abi::YCBCR_CHROMA_COSITED,
+                ir::ChromaLocation::Midpoint => abi::YCBCR_CHROMA_MIDPOINT,
+            },
+            chroma_y: match conversion.chroma_y {
+                ir::ChromaLocation::Cosited => abi::YCBCR_CHROMA_COSITED,
+                ir::ChromaLocation::Midpoint => abi::YCBCR_CHROMA_MIDPOINT,
+            },
+        };
+        let raw = handle.as_raw();
+        core::mem::forget(handle);
+        // The plugin consumes the transferred handle even when it rejects the import.
+        status(unsafe { import(self.owner.raw, slot, raw, conversion) })
     }
     pub fn release_imported_texture(&mut self, texture: ir::TextureId) -> Result<()> {
         let slot = self.resources.texture_ref(texture).map_err(invalid)?.slot() as u32;
