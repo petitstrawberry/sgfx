@@ -24,3 +24,4 @@ default-members = [
 # The facade and every backend must use the core being developed in this tree.
 [patch."https://github.com/petitstrawberry/sgfx"]
 sgfx-core = { path = "crates/sgfx-core" }
+sgfx-backend-abi = { path = "crates/sgfx-backend-abi" }

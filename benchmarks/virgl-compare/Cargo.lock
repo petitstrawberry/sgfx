@@ -60,7 +60,7 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 [[package]]
 name = "gpu-raw"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4ea47edf7e37f50f3c286e2fe51c784f6d282cfe#4ea47edf7e37f50f3c286e2fe51c784f6d282cfe"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
 dependencies = [
  "scarlet-abi",
  "scarlet-os",
@@ -166,12 +166,12 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4ea47edf7e37f50f3c286e2fe51c784f6d282cfe#4ea47edf7e37f50f3c286e2fe51c784f6d282cfe"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
 
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4ea47edf7e37f50f3c286e2fe51c784f6d282cfe#4ea47edf7e37f50f3c286e2fe51c784f6d282cfe"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
 dependencies = [
  "scarlet-abi",
  "scarlet-sys",
@@ -180,7 +180,7 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=4ea47edf7e37f50f3c286e2fe51c784f6d282cfe#4ea47edf7e37f50f3c286e2fe51c784f6d282cfe"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49daad0ec7baba233f706f7a#b3d2a55740a3d2ca49daad0ec7baba233f706f7a"
 dependencies = [
  "scarlet-abi",
 ]
@@ -206,7 +206,7 @@ dependencies = [
 [[package]]
 name = "sgfx-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/sgfx?rev=5ea41a0dfd6992bb1c0fce06c8e65425dc978140#5ea41a0dfd6992bb1c0fce06c8e65425dc978140"
+source = "git+https://github.com/petitstrawberry/sgfx?rev=040dbb5cf42b75489504e1765183d37f6131f54c#040dbb5cf42b75489504e1765183d37f6131f54c"
 
 [[package]]
 name = "sgfx-virgl-compare"

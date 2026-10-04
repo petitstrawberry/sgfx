@@ -75,9 +75,12 @@ sgfx = { git = "https://github.com/petitstrawberry/sgfx" }
 
 The workspace pins external Scarlet and Adreno dependencies to exact commits.
 During coordinated IR development, its root source override resolves external
-backends to the workspace `sgfx-core`, so each binary has one core type source.
+backends to the workspace `sgfx-core` and backend ABI, so each binary has one
+core and ABI type source.
 Downstream applications do not inherit that override; a release needs compatible
-immutable revisions and a resolved `Cargo.lock`.
+immutable revisions and a resolved `Cargo.lock`. The facade, native backends
+and downstream renderers pin the shared core/ABI release separately from facade
+changes to avoid circular Git revisions between SGFX and external backends.
 
 See [dependencies and locked revisions](docs/reference.md#dependencies-and-locked-revisions)
 for the native source set, shared Rust type identity and workspace patch policy.

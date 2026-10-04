@@ -58,26 +58,19 @@ Git dependencies; a Scarlet bundle's `scarlet.lock` does not replace it.
 Generate dependency changes with Cargo, not by editing lockfile entries.
 Updating one Git dependency can also re-resolve its transitive dependencies.
 
-Keep one `sgfx-core` source identity in each binary. Use the same Git URL and
-selector throughout its dependency graph: mixing a bare Git source with a
-`branch`, `tag` or `rev` selector can create separate copies of Rust types even
-when the selected commits are equal. In particular, the external Adreno backend
-imports the core from the bare SGFX Git URL. Do not add a selector to only one
-edge of that graph.
+Keep one `sgfx-core` and backend ABI source identity in each binary. The shared
+core/ABI release is pinned to `040dbb5cf42b75489504e1765183d37f6131f54c`.
+Facade, WGPU and VirGL packages depend on that immutable release, as do external
+Adreno and Maxwell backends. Downstream renderers must use the same core pin;
+updating the facade alone does not change the core source identity.
 
-The source identities used by the current native integration are:
+Native runtime/GPU crates use Scarlet revision
+`b3d2a55740a3d2ca49daad0ec7baba233f706f7a`. The facade selects the compatible
+Adreno and Maxwell revisions in its manifest; commit the consuming workspace's
+Cargo lockfile alongside dependency updates. The SGFX workspace overrides core
+and ABI with local paths for development. Downstream applications do not inherit
+workspace overrides.
 
-| Components | Manifest source | Package versions |
-| --- | --- | --- |
-| SGFX facade, core, WGPU, VirGL and VirGL codegen | `https://github.com/petitstrawberry/sgfx`, no selector | `1.0.0` |
-| Scarlet native runtime/GPU crates | `https://github.com/petitstrawberry/Scarlet`, `branch = "dev"` | `1.0.0` in the selected lock |
-| Adreno backend/codegen | `https://github.com/petitstrawberry/scarlet-project-chromebook.git`, no selector | `0.1.0` |
-
-The SGFX workspace's [Cargo.lock](../Cargo.lock) selects Scarlet revision
-`d8a199815249c784a04c9dec60b6efedbb79d84e` and Adreno revision
-`debc765f80ac7a582150b397bc8dd9cb52b4be89` for this source set. These are lockfile
-resolutions, not changes to the manifest selectors above. The Chromebook
-project and its userspace drivers do not need to share SGFX's version number.
 
 Release inputs must not require sibling checkouts or developer-local path
 patches. The patch in this repository's [workspace manifest](../Cargo.toml)

@@ -9,8 +9,8 @@ name = "sgfx_scarlet_virgl"
 crate-type = ["cdylib"]
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-sgfx-backend-abi = { path = "../sgfx-backend-abi" }
-sgfx-core = { path = "../sgfx-core", features = ["backend-abi"] }
+sgfx-backend-abi = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c" }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", features = ["backend-abi"] }
 sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", features = ["backend-abi"] }
 
 [lints.rust]

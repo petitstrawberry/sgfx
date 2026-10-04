@@ -27,22 +27,22 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "adreno-a6xx-layout"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=aac53af1d7fa1c653103651e72a54f93862fe050#aac53af1d7fa1c653103651e72a54f93862fe050"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=ed98fe5c73d476cde26d057e677acbfaa4defd77#ed98fe5c73d476cde26d057e677acbfaa4defd77"
 
 [[package]]
 name = "adreno-a6xx-pm4"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=aac53af1d7fa1c653103651e72a54f93862fe050#aac53af1d7fa1c653103651e72a54f93862fe050"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=ed98fe5c73d476cde26d057e677acbfaa4defd77#ed98fe5c73d476cde26d057e677acbfaa4defd77"
 
 [[package]]
 name = "adreno-a6xx-shader-pack"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=aac53af1d7fa1c653103651e72a54f93862fe050#aac53af1d7fa1c653103651e72a54f93862fe050"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=ed98fe5c73d476cde26d057e677acbfaa4defd77#ed98fe5c73d476cde26d057e677acbfaa4defd77"
 
 [[package]]
 name = "adreno-a6xx-submit-wire"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=aac53af1d7fa1c653103651e72a54f93862fe050#aac53af1d7fa1c653103651e72a54f93862fe050"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=ed98fe5c73d476cde26d057e677acbfaa4defd77#ed98fe5c73d476cde26d057e677acbfaa4defd77"
 dependencies = [
  "adreno-a6xx-shader-pack",
 ]
@@ -897,12 +897,12 @@ dependencies = [
 [[package]]
 name = "maxwell-shader-pack"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=17907c32fd661d45a8de2b5f63eda1899d2172aa#17907c32fd661d45a8de2b5f63eda1899d2172aa"
+source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9#5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9"
 
 [[package]]
 name = "maxwell-submit-wire"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=17907c32fd661d45a8de2b5f63eda1899d2172aa#17907c32fd661d45a8de2b5f63eda1899d2172aa"
+source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9#5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9"
 dependencies = [
  "maxwell-shader-pack",
 ]
@@ -1727,7 +1727,7 @@ dependencies = [
 [[package]]
 name = "sgfx-backend-scarlet-adreno"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=aac53af1d7fa1c653103651e72a54f93862fe050#aac53af1d7fa1c653103651e72a54f93862fe050"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=ed98fe5c73d476cde26d057e677acbfaa4defd77#ed98fe5c73d476cde26d057e677acbfaa4defd77"
 dependencies = [
  "adreno-a6xx-layout",
  "adreno-a6xx-submit-wire",
@@ -1741,7 +1741,7 @@ dependencies = [
 [[package]]
 name = "sgfx-backend-scarlet-maxwell"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=17907c32fd661d45a8de2b5f63eda1899d2172aa#17907c32fd661d45a8de2b5f63eda1899d2172aa"
+source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9#5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9"
 dependencies = [
  "gpu-raw",
  "maxwell-submit-wire",
@@ -1794,7 +1794,7 @@ dependencies = [
 [[package]]
 name = "sgfx-codegen-adreno-a6xx"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=aac53af1d7fa1c653103651e72a54f93862fe050#aac53af1d7fa1c653103651e72a54f93862fe050"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=ed98fe5c73d476cde26d057e677acbfaa4defd77#ed98fe5c73d476cde26d057e677acbfaa4defd77"
 dependencies = [
  "adreno-a6xx-layout",
  "adreno-a6xx-pm4",
@@ -1805,7 +1805,7 @@ dependencies = [
 [[package]]
 name = "sgfx-codegen-maxwell"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=17907c32fd661d45a8de2b5f63eda1899d2172aa#17907c32fd661d45a8de2b5f63eda1899d2172aa"
+source = "git+https://github.com/petitstrawberry/scarlet-project-switch?rev=5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9#5a3516bebcd2cafd1e37acc4f0d2f8a8561f79c9"
 dependencies = [
  "maxwell-shader-pack",
  "maxwell-submit-wire",

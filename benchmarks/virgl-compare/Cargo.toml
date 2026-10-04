@@ -8,5 +8,5 @@ publish = false
 [workspace]
 
 [dependencies]
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "5ea41a0dfd6992bb1c0fce06c8e65425dc978140" }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c" }
 sgfx-backend-scarlet-virgl = { path = "../../crates/sgfx-backend-scarlet-virgl" }

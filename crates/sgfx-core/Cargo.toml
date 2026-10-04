@@ -11,7 +11,7 @@ std = []
 backend-abi = ["dep:sgfx-backend-abi"]
 
 [dependencies]
-sgfx-backend-abi = { path = "../sgfx-backend-abi", optional = true }
+sgfx-backend-abi = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", optional = true }
 
 [lib]
 name = "sgfx_core"
