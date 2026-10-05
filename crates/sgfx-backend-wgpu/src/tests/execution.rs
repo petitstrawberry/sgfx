@@ -450,3 +450,157 @@ fn image_creation_and_ir_textures_reject_excessive_dimensions() {
         .create_image(1, 1, TextureFormat::Bgra8Unorm)
         .expect("valid image after rejected dimensions");
 }
+
+#[test]
+fn pooled_uniforms_keep_draws_and_queued_submissions_distinct() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().expect("lock WGPU tests");
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let table = Rc::new(ResourceTable::new());
+    let images: Vec<_> = (0..2)
+        .map(|_| {
+            context
+                .create_image(8, 4, TextureFormat::Bgra8Unorm)
+                .unwrap()
+        })
+        .collect();
+    let targets: Vec<_> = (0..2)
+        .map(|_| {
+            table
+                .define_texture(
+                    TextureDesc::new(
+                        TextureFormat::Bgra8Unorm,
+                        Extent2D::new(8, 4).unwrap(),
+                        TextureUsage::RENDER_ATTACHMENT
+                            | TextureUsage::COPY_SRC
+                            | TextureUsage::PRESENT,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id()
+        })
+        .collect();
+    let vertices: [[f32; 8]; 6] = [
+        [-1., -1., 0., 1., 1., 1., 1., 1.],
+        [1., -1., 0., 1., 1., 1., 1., 1.],
+        [1., 1., 0., 1., 1., 1., 1., 1.],
+        [-1., -1., 0., 1., 1., 1., 1., 1.],
+        [1., 1., 0., 1., 1., 1., 1., 1.],
+        [-1., 1., 0., 1., 1., 1., 1., 1.],
+    ];
+    let buffer = table
+        .define_buffer(
+            BufferDesc::new(
+                core::mem::size_of_val(&vertices) as u64,
+                BufferUsage::VERTEX | BufferUsage::COPY_DST,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .id();
+    let pipeline = table
+        .define_render_pipeline(
+            RenderPipelineDesc::new(
+                TextureFormat::Bgra8Unorm,
+                PrimitiveTopology::TriangleList,
+                VertexBufferLayout::new(
+                    32,
+                    vec![
+                        VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                        VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+                    ],
+                )
+                .unwrap(),
+                FragmentProgram::VertexColor,
+                BlendState::SOURCE_OVER_STRAIGHT_ALPHA,
+                RasterState::new(ir::CullMode::None, ir::FrontFace::CounterClockwise),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .id();
+    let mut cache = context.create_resources(Rc::clone(&table));
+    for (target, image) in targets.iter().zip(&images) {
+        cache.map_image(*target, Arc::clone(image)).unwrap();
+    }
+    let queue = context.create_queue();
+    for frame in 0..100 {
+        let slot = frame % 2;
+        let colors = if slot == 0 {
+            [[1., 0., 0., 1.], [0., 0., 1., 1.]]
+        } else {
+            [[0., 1., 0., 1.], [1., 1., 1., 1.]]
+        };
+        let mut encoder = CommandEncoder::new(&table);
+        encoder
+            .write_buffer(
+                table.buffer_ref(buffer).unwrap(),
+                0,
+                bytemuck::cast_slice(&vertices),
+            )
+            .unwrap();
+        let mut pass = encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    &table,
+                    table.texture_ref(targets[slot]).unwrap(),
+                    PixelRect::new(0, 0, 8, 4).unwrap(),
+                    LoadOp::Clear(Color::rgba(0., 0., 0., 1.).unwrap()),
+                    StoreOp::Store,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        pass.set_pipeline(table.render_pipeline_ref(pipeline).unwrap())
+            .unwrap();
+        pass.set_vertex_buffer(table.buffer_ref(buffer).unwrap(), 0)
+            .unwrap();
+        for (side, color) in colors.iter().enumerate() {
+            pass.set_uniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(color[0], color[1], color[2], color[3]).unwrap(),
+            ))
+            .unwrap();
+            pass.set_scissor(Some(PixelRect::new(side as u32 * 4, 0, 4, 4).unwrap()))
+                .unwrap();
+            pass.draw(6, 0).unwrap();
+        }
+        pass.end().unwrap();
+        queue
+            .submit(&mut cache, &encoder.finish().unwrap())
+            .unwrap();
+        assert_eq!(
+            cache.uniform_buffers.borrow().len(),
+            2,
+            "repeat frames must reuse two GPU uniform slots"
+        );
+    }
+    for (slot, image) in images.iter().enumerate() {
+        let pixels = readback_pixels(&device, image);
+        for y in 0..4 {
+            for x in 0..8 {
+                let expected = if slot == 0 {
+                    if x < 4 {
+                        [0, 0, 255, 255]
+                    } else {
+                        [255, 0, 0, 255]
+                    }
+                } else {
+                    if x < 4 {
+                        [0, 255, 0, 255]
+                    } else {
+                        [255, 255, 255, 255]
+                    }
+                };
+                assert_eq!(
+                    pixels[y * 8 + x],
+                    expected,
+                    "each draw/submission must retain its own uniform value"
+                );
+            }
+        }
+    }
+}

@@ -10,7 +10,10 @@
 extern crate alloc;
 
 use alloc::{borrow::Cow, format, rc::Rc, string::String, sync::Arc, vec::Vec};
-use core::fmt;
+use core::{
+    cell::{Cell, RefCell},
+    fmt,
+};
 
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -303,6 +306,8 @@ impl Context {
     /// An empty WGPU materialization cache.
     pub fn create_resources(&self, resources: Rc<ResourceTable>) -> Resources {
         Resources {
+            uniform_buffers: RefCell::new(Vec::new()),
+            uniform_cursor: Cell::new(0),
             context: self.clone(),
             resources,
             textures: Vec::new(),
@@ -788,6 +793,10 @@ impl Image {
 
 /// Persistent logical-resource materialization cache for one WGPU context.
 pub struct Resources {
+    // Slots are distinct within one submission and reused only by later
+    // submissions on the same queue, whose writes follow prior GPU reads.
+    uniform_buffers: RefCell<Vec<Arc<raw::Buffer>>>,
+    uniform_cursor: Cell<usize>,
     context: Context,
     resources: Rc<ResourceTable>,
     textures: Vec<(TextureId, Arc<GpuTexture>)>,
@@ -806,6 +815,26 @@ pub struct Resources {
 }
 
 impl Resources {
+    fn draw_uniform_buffer(&self) -> Result<Arc<raw::Buffer>> {
+        let index = self.uniform_cursor.get();
+        if index >= ir::MAX_COMMANDS {
+            return Err(Error::InvalidState);
+        }
+        let mut buffers = self.uniform_buffers.borrow_mut();
+        if index == buffers.len() {
+            buffers.push(Arc::new(self.context.raw_device().create_buffer(
+                &raw::BufferDescriptor {
+                    label: Some("sgfx wgpu pooled draw uniforms"),
+                    size: core::mem::size_of::<Uniforms>() as u64,
+                    usage: raw::BufferUsages::UNIFORM | raw::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            )));
+        }
+        self.uniform_cursor.set(index + 1);
+        Ok(Arc::clone(&buffers[index]))
+    }
+
     /// Return the logical resource table retained by this cache.
     ///
     /// # Returns
@@ -1274,6 +1303,7 @@ impl Queue {
         commands: &CommandBuffer<'r, 'data>,
         marker: Option<&raw::Buffer>,
     ) -> Result<raw::CommandBuffer> {
+        resources.uniform_cursor.set(0);
         let mut encoder = self.context.device.raw_device().create_command_encoder(
             &raw::CommandEncoderDescriptor {
                 label: Some("sgfx wgpu command encoder"),
@@ -1685,7 +1715,14 @@ impl Queue {
                     vertex_count,
                     first_vertex,
                 } => {
-                    self.encode_draw(&mut render_pass, &state, *vertex_count, *first_vertex, 0..1)?;
+                    self.encode_draw(
+                        resources,
+                        &mut render_pass,
+                        &state,
+                        *vertex_count,
+                        *first_vertex,
+                        0..1,
+                    )?;
                 }
                 Command::DrawIndexed {
                     index_count,
@@ -1693,6 +1730,7 @@ impl Queue {
                     base_vertex,
                 } => {
                     self.encode_indexed_draw(
+                        resources,
                         &mut render_pass,
                         &state,
                         *index_count,
@@ -1708,6 +1746,7 @@ impl Queue {
                     first_instance,
                 } => {
                     self.encode_draw(
+                        resources,
                         &mut render_pass,
                         &state,
                         *vertex_count,
@@ -1723,6 +1762,7 @@ impl Queue {
                     first_instance,
                 } => {
                     self.encode_indexed_draw(
+                        resources,
                         &mut render_pass,
                         &state,
                         *index_count,
@@ -1784,6 +1824,7 @@ impl Queue {
 
     fn encode_draw(
         &self,
+        resources: &Resources,
         render_pass: &mut raw::RenderPass<'_>,
         state: &PassState,
         vertex_count: u32,
@@ -1800,7 +1841,7 @@ impl Queue {
             .as_ref()
             .ok_or(Error::InvalidState)?;
         let uniforms = state.uniforms.ok_or(Error::InvalidState)?;
-        let bind_group = self.create_bind_group(pipeline, uniforms, state)?;
+        let bind_group = self.create_bind_group(resources, pipeline, uniforms, state)?;
         render_pass.set_bind_group(0, &bind_group, &[]);
         render_pass.set_vertex_buffer(0, vertex_buffer.buffer.slice(*offset..));
         render_pass.draw(first_vertex..first_vertex + vertex_count, 0..1);
@@ -1809,6 +1850,7 @@ impl Queue {
 
     fn encode_indexed_draw(
         &self,
+        resources: &Resources,
         render_pass: &mut raw::RenderPass<'_>,
         state: &PassState,
         index_count: u32,
@@ -1838,7 +1880,7 @@ impl Queue {
         let (index_buffer, index_offset, index_kind) =
             state.index_buffer.as_ref().ok_or(Error::InvalidState)?;
         let uniforms = state.uniforms.ok_or(Error::InvalidState)?;
-        let bind_group = self.create_bind_group(pipeline, uniforms, state)?;
+        let bind_group = self.create_bind_group(resources, pipeline, uniforms, state)?;
         render_pass.set_bind_group(0, &bind_group, &[]);
         render_pass.set_vertex_buffer(0, vertex_buffer.buffer.slice(*vertex_offset..));
         render_pass.set_index_buffer(
@@ -1876,6 +1918,7 @@ impl Queue {
 
     fn create_bind_group(
         &self,
+        resources: &Resources,
         pipeline: &GpuPipeline,
         uniforms: DrawUniforms,
         state: &PassState,
@@ -1892,16 +1935,7 @@ impl Queue {
         } else {
             None
         };
-        let uniform_buffer =
-            self.context
-                .device
-                .raw_device()
-                .create_buffer(&raw::BufferDescriptor {
-                    label: Some("sgfx wgpu draw uniforms"),
-                    size: core::mem::size_of::<Uniforms>() as u64,
-                    usage: raw::BufferUsages::UNIFORM | raw::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+        let uniform_buffer = resources.draw_uniform_buffer()?;
         let bytes = Uniforms::from(uniforms);
         self.context.device.raw_queue().write_buffer(
             &uniform_buffer,
