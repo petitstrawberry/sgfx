@@ -466,6 +466,9 @@ pub(crate) unsafe extern "system" fn create_device(
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let thread = match std::thread::Builder::new()
         .name("sgfx-vulkan-device".into())
+        // Command resolution and shader lowering need more than Scarlet
+        // native std's 64 KiB default stack, including calls into backend DSOs.
+        .stack_size(2 * 1024 * 1024)
         .spawn(move || {
             let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 Runtime::new(adapter, worker_recordings, worker_in_flight, worker_lost)
