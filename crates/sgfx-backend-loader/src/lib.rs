@@ -357,6 +357,14 @@ impl LoadedBackend {
     }
 }
 
+fn default_driver_directory(linux: bool) -> &'static str {
+    if linux {
+        "/usr/lib/sgfx"
+    } else {
+        "/lib/sgfx"
+    }
+}
+
 pub fn driver_directories() -> Vec<String> {
     #[cfg(feature = "std")]
     let value = std::env::var("SGFX_DRIVER_PATH").ok();
@@ -368,17 +376,21 @@ pub fn driver_directories() -> Vec<String> {
             .filter(|p| !p.is_empty())
             .map(String::from)
             .collect(),
-        None => vec![String::from(if cfg!(target_os = "linux") {
-            "/usr/lib/sgfx"
-        } else {
-            "/system/lib/sgfx"
-        })],
+        None => vec![String::from(default_driver_directory(cfg!(
+            target_os = "linux"
+        )))],
     }
 }
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_and_linux_driver_locations_are_distinct() {
+        assert_eq!(default_driver_directory(false), "/lib/sgfx");
+        assert_eq!(default_driver_directory(true), "/usr/lib/sgfx");
+    }
 
     unsafe extern "C" fn import_ycbcr(
         _session: abi::Object,
