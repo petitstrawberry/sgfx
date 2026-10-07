@@ -1,11 +1,15 @@
 //! Dynamically loaded VirGL backend. This crate alone owns all Rust objects on
 //! the driver side. The exported table uses the versioned SGFX C ABI.
-#![cfg(target_os = "scarlet")]
+#![cfg(any(
+    target_os = "scarlet",
+    all(target_os = "linux", target_arch = "aarch64")
+))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 // ThinLTO merges std into this object's code, so --exclude-libs alone cannot
 // hide std's native startup exports. They must remain private to this runtime;
 // scarlet-ld resolves the SGFX entry only and must not interpose another std.
+#[cfg(target_os = "scarlet")]
 core::arch::global_asm!(".hidden __scarlet_getauxval", ".hidden __scarlet_start");
 
 use abi::{Object, Span};

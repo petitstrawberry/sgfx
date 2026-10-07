@@ -72,6 +72,41 @@ plugin is an error, never a silent static fallback. `DT_NEEDED` remains
 empty because driver discovery uses `dlopen`; `PT_INTERP`, loader imports and
 the probe's runtime path provide independent evidence of the linkage.
 
+## Linux-ABI Vulkan ICD
+
+AArch64 Linux clients using `scarlet-native-api` also use generic dynamic driver
+selection. `vulkan-sgfx --no-default-features --features scarlet-wsi` enables this
+path for both Maxwell and VirGL. Host WGPU builds do not acquire Scarlet
+native GPU transport merely by targeting Linux.
+
+Linux drivers are built for `aarch64-unknown-linux-gnu` and installed inside the
+Linux root at `/usr/lib/sgfx`, with their `.sgfx-driver` manifests. They use Linux
+libc and `dlopen`, while GPU operations explicitly use Scarlet's native syscall
+namespace. Native `/system/lib/sgfx` ELFOSABI_SCARLET drivers remain separate;
+they must not be copied into the Linux plugin directory. `SGFX_DRIVER_PATH` can
+override either target's default directory.
+
+`scripts/build-linux-icd.py` builds and stages the ICD, VirGL plugin and optionally
+an external Switch Maxwell plugin. `--maxwell-source` selects the Switch source
+checkout. The build uses the ICD's exact ABI/core sources for both drivers;
+Maxwell's path-override lockfile is resolved only in a generated source copy.
+The caller must supply Linux `libsws_client_c.so` with `--sws-library` and make
+it available on the linker/runtime path. Run this script in AArch64 Linux with
+Wayland development tools, the system Vulkan loader, and Rust nightly installed.
+Scarlet's `tools/graphics/build-linux-vulkan.sh` provides the Docker build recipe:
+
+```sh
+tools/graphics/build-linux-vulkan.sh ../sgfx --maxwell-source ../scarlet-project-switch --stage-only
+```
+
+The output has `rootfs/` and a checksum-bearing `build.json`. `--test` runs ABI,
+loader and ICD tests, opens both installed plugins with `dlopen`, negotiates
+the programmable ABI v2, and creates an ICD instance through the system Vulkan
+loader. These checks do not execute GPU commands or prove rendering on Switch.
+The Linux root must supply the glibc, libgcc and Wayland dependencies listed in
+the ELF report. New unpublished source changes require explicit source selection;
+existing immutable release pins are not silently advanced.
+
 ## Zero-copy boundary and ownership
 
 The recording itself is a canonical `Vec<u64>`, written once by the encoder.

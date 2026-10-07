@@ -70,6 +70,7 @@ pub mod dynamic;
 #[cfg(sgfx_dynamic_virgl)]
 use dynamic as virgl;
 #[cfg(all(
+    not(sgfx_dynamic_virgl),
     any(
         all(target_os = "scarlet", target_pointer_width = "32"),
         all(target_os = "linux", feature = "scarlet-native-api")
