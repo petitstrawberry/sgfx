@@ -23,7 +23,7 @@ the compatibility backend through `backend-scarlet-virgl`, as do existing
 AArch64 Linux-ABI clients. This C ABI requires native 64-bit support.
 
 Driver distributions install their library and an adjacent manifest such as
-`example-renderer.sgfx-driver` in `/system/lib/sgfx`:
+`example-renderer.sgfx-driver` in `/lib/sgfx`:
 
 ```ini
 abi=2
@@ -82,7 +82,7 @@ native GPU transport merely by targeting Linux.
 Linux drivers are built for `aarch64-unknown-linux-gnu` and installed inside the
 Linux root at `/usr/lib/sgfx`, with their `.sgfx-driver` manifests. They use Linux
 libc and `dlopen`, while GPU operations explicitly use Scarlet's native syscall
-namespace. Native `/system/lib/sgfx` ELFOSABI_SCARLET drivers remain separate;
+namespace. Native `/lib/sgfx` ELFOSABI_SCARLET drivers remain separate;
 they must not be copied into the Linux plugin directory. `SGFX_DRIVER_PATH` can
 override either target's default directory.
 
