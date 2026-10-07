@@ -368,7 +368,11 @@ pub fn driver_directories() -> Vec<String> {
             .filter(|p| !p.is_empty())
             .map(String::from)
             .collect(),
-        None => vec![String::from("/system/lib/sgfx")],
+        None => vec![String::from(if cfg!(target_os = "linux") {
+            "/usr/lib/sgfx"
+        } else {
+            "/system/lib/sgfx"
+        })],
     }
 }
 

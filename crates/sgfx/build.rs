@@ -4,10 +4,12 @@ fn main() {
     for name in ["sgfx_dynamic", "sgfx_dynamic_virgl"] {
         println!("cargo:rustc-check-cfg=cfg({name})");
     }
-    let policy = build_policy::Policy::new(
-        std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("scarlet"),
-        std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64"),
+    let policy = build_policy::Policy::for_target(
+        &std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default(),
+        &std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default(),
+        &std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default(),
         std::env::var_os("CARGO_FEATURE_BACKEND_DYNAMIC").is_some(),
+        std::env::var_os("CARGO_FEATURE_SCARLET_NATIVE_API").is_some(),
         std::env::var_os("CARGO_FEATURE_BACKEND_SCARLET_VIRGL_STATIC").is_some(),
     );
     for (enabled, name) in [

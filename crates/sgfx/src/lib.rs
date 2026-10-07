@@ -83,6 +83,7 @@ use dynamic as virgl;
 ))]
 use sgfx_backend_scarlet_virgl as virgl;
 #[cfg(all(
+    not(sgfx_dynamic_virgl),
     any(
         all(target_os = "scarlet", target_pointer_width = "32"),
         all(target_os = "linux", feature = "scarlet-native-api")

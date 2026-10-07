@@ -73,6 +73,7 @@ sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarle
 # Scarlet Linux-ABI clients use the native GPU transport on AArch64.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
 
 [lib]
 name = "sgfx"
@@ -88,7 +89,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet
 [target.'cfg(all(target_os = "scarlet", target_pointer_width = "64"))'.dependencies]
 sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-features = false, optional = true }
 
-# ELF32 and Linux-ABI clients retain their explicit compatibility backend.
+# ELF32 and explicitly static Linux-ABI builds retain the compatibility backend.
 [target.'cfg(any(all(target_os = "scarlet", target_pointer_width = "32"), all(target_os = "linux", target_arch = "aarch64")))'.dependencies]
 sgfx-backend-scarlet-virgl-compat = { path = "../sgfx-backend-scarlet-virgl-compat", default-features = false, optional = true }
 
