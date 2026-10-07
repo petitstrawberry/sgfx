@@ -358,11 +358,7 @@ impl LoadedBackend {
 }
 
 fn default_driver_directory(linux: bool) -> &'static str {
-    if linux {
-        "/usr/lib/sgfx"
-    } else {
-        "/lib/sgfx"
-    }
+    if linux { "/usr/lib/sgfx" } else { "/lib/sgfx" }
 }
 
 pub fn driver_directories() -> Vec<String> {
