@@ -61,15 +61,15 @@ sgfx-backend-wgpu = { path = "../sgfx-backend-wgpu", optional = true }
 wgpu = { version = "24", features = ["spirv"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", optional = true }
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
-sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "ed98fe5c73d476cde26d057e677acbfaa4defd77", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, optional = true }
+sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
 
 # Scarlet Linux-ABI clients use the native GPU transport on AArch64.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, optional = true }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, optional = true }
 
 [lib]
 name = "sgfx"
