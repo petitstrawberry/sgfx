@@ -20,7 +20,6 @@ std = [
     "scarlet-os?/std",
     "gpu-raw?/std",
     "sgfx-backend-scarlet-adreno?/std",
-    "sgfx-backend-scarlet-virgl?/std",
     "sgfx-backend-scarlet-virgl-compat?/std",
 ]
 legacy-scarlet-std = [
@@ -32,7 +31,6 @@ legacy-scarlet-std = [
     "sgfx-backend-loader?/legacy-scarlet-std",
     "gpu-raw?/scarlet-std",
     "sgfx-backend-scarlet-adreno?/scarlet-std",
-    "sgfx-backend-scarlet-virgl?/scarlet-std",
     "sgfx-backend-scarlet-virgl-compat?/scarlet-std",
 ]
 # Compatibility alias for consumers that previously selected Scarlet's
@@ -46,8 +44,6 @@ backend-wgpu = [
 ]
 scarlet-native-api = ["std", "backend-scarlet-virgl"]
 backend-scarlet-virgl = ["backend-dynamic", "dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl-compat"]
-# Explicit comparison/compatibility build; native 64-bit production uses the DSO.
-backend-scarlet-virgl-static = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl", "dep:sgfx-backend-scarlet-virgl-compat"]
 backend-scarlet-adreno = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
 
 [dependencies]
@@ -86,10 +82,7 @@ required-features = ["backend-wgpu"]
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
 
-[target.'cfg(all(target_os = "scarlet", target_pointer_width = "64"))'.dependencies]
-sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", default-features = false, optional = true }
-
-# ELF32 and explicitly static Linux-ABI builds retain the compatibility backend.
+# ELF32 and Linux-ABI clients retain their explicit compatibility backend.
 [target.'cfg(any(all(target_os = "scarlet", target_pointer_width = "32"), all(target_os = "linux", target_arch = "aarch64")))'.dependencies]
 sgfx-backend-scarlet-virgl-compat = { path = "../sgfx-backend-scarlet-virgl-compat", default-features = false, optional = true }
 

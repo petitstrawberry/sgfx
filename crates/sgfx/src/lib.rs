@@ -34,11 +34,7 @@ pub use virgl::Handle;
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     )
 ))]
 pub mod driver;
@@ -49,7 +45,6 @@ mod host;
     target_os = "scarlet",
     any(
         feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
         feature = "backend-scarlet-adreno",
         sgfx_dynamic
     )
@@ -62,7 +57,6 @@ pub use host::{Executor, MappedTargetSession, Submission, WindowContext};
     target_os = "scarlet",
     any(
         feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
         feature = "backend-scarlet-adreno",
         sgfx_dynamic
     )
@@ -77,22 +71,11 @@ pub mod dynamic;
 use dynamic as virgl;
 #[cfg(all(
     not(sgfx_dynamic_virgl),
-    target_os = "scarlet",
-    target_pointer_width = "64",
-    feature = "backend-scarlet-virgl-static"
-))]
-use sgfx_backend_scarlet_virgl as virgl;
-#[cfg(all(
-    not(sgfx_dynamic_virgl),
     any(
         all(target_os = "scarlet", target_pointer_width = "32"),
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 use sgfx_backend_scarlet_virgl_compat as virgl;
 
@@ -253,11 +236,7 @@ pub enum Error {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     ScarletVirglHandle(virgl::HandleError),
     /// A Scarlet/VirGL IR materialization or execution operation failed.
@@ -266,11 +245,7 @@ pub enum Error {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     #[cfg(not(sgfx_dynamic_virgl))]
     ScarletVirglIr(virgl::IrSubmitError),
@@ -282,7 +257,6 @@ pub enum Error {
         ),
         any(
             feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
             feature = "backend-scarlet-adreno",
             sgfx_dynamic
         )
@@ -297,7 +271,6 @@ pub enum Error {
         ),
         any(
             feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
             feature = "backend-scarlet-adreno",
             sgfx_dynamic
         )
@@ -312,7 +285,6 @@ pub enum Error {
         ),
         any(
             feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
             feature = "backend-scarlet-adreno",
             sgfx_dynamic
         )
@@ -389,11 +361,7 @@ impl Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             Self::ScarletVirglHandle(error) => virgl_handle_error_kind(*error),
             #[cfg(all(
@@ -401,11 +369,7 @@ impl Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             #[cfg(not(sgfx_dynamic_virgl))]
             Self::ScarletVirglIr(error) => {
@@ -435,7 +399,6 @@ impl Error {
                 ),
                 any(
                     feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
                     feature = "backend-scarlet-adreno",
                     sgfx_dynamic
                 )
@@ -449,7 +412,6 @@ impl Error {
                 ),
                 any(
                     feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
                     feature = "backend-scarlet-adreno",
                     sgfx_dynamic
                 )
@@ -518,11 +480,7 @@ impl Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             #[cfg(not(sgfx_dynamic_virgl))]
             Self::ScarletVirglIr(error) => {
@@ -582,11 +540,7 @@ impl Error {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ),
     all(target_os = "scarlet", feature = "backend-scarlet-adreno")
 ))]
@@ -606,11 +560,7 @@ fn ir_error_kind(error: ir::Error) -> ErrorKind {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 fn virgl_handle_error_kind(error: virgl::HandleError) -> ErrorKind {
     use virgl::HandleError as E;
@@ -656,11 +606,7 @@ impl fmt::Display for Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             Self::ScarletVirglHandle(error) => {
                 write!(formatter, "SGFX Scarlet/VirGL device failed: {error:?}")
@@ -670,11 +616,7 @@ impl fmt::Display for Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
-                    sgfx_dynamic_virgl
-                )
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
             ))]
             #[cfg(not(sgfx_dynamic_virgl))]
             Self::ScarletVirglIr(error) => {
@@ -687,7 +629,6 @@ impl fmt::Display for Error {
                 ),
                 any(
                     feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
                     feature = "backend-scarlet-adreno",
                     sgfx_dynamic
                 )
@@ -701,7 +642,6 @@ impl fmt::Display for Error {
                 ),
                 any(
                     feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
                     feature = "backend-scarlet-adreno",
                     sgfx_dynamic
                 )
@@ -720,7 +660,6 @@ impl fmt::Display for Error {
                 ),
                 any(
                     feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-virgl-static",
                     feature = "backend-scarlet-adreno",
                     sgfx_dynamic
                 )
@@ -824,22 +763,14 @@ fn default_backend() -> Result<BackendKind> {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     {
         return Ok(BackendKind::ScarletVirgl);
     }
     #[cfg(all(
         target_os = "scarlet",
-        not(any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )),
+        not(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)),
         feature = "backend-scarlet-adreno"
     ))]
     {
@@ -856,11 +787,7 @@ fn default_backend() -> Result<BackendKind> {
 const fn default_backend_kind() -> BackendKind {
     if cfg!(all(
         target_os = "scarlet",
-        not(any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )),
+        not(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)),
         feature = "backend-scarlet-adreno"
     )) {
         BackendKind::ScarletAdreno
@@ -885,11 +812,7 @@ fn require_backend(backend: BackendKind) -> Result<BackendKind> {
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-native-api")
             ),
-            any(
-                feature = "backend-scarlet-virgl",
-                feature = "backend-scarlet-virgl-static",
-                sgfx_dynamic_virgl
-            )
+            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
         )),
         BackendKind::ScarletAdreno => cfg!(all(
             target_os = "scarlet",
@@ -959,11 +882,7 @@ mod tests {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-virgl-static",
-            sgfx_dynamic_virgl
-        )
+        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ))]
     #[cfg(not(sgfx_dynamic_virgl))]
     #[test]
@@ -1073,11 +992,7 @@ mod tests {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 impl From<virgl::HandleError> for Error {
     fn from(error: virgl::HandleError) -> Self {
@@ -1090,11 +1005,7 @@ impl From<virgl::HandleError> for Error {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-virgl-static",
-        sgfx_dynamic_virgl
-    )
+    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
 ))]
 impl From<virgl::IrSubmitError> for Error {
     fn from(error: virgl::IrSubmitError) -> Self {

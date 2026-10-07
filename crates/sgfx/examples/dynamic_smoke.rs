@@ -198,8 +198,8 @@ mod native {
     pub fn run() {
         low_level();
         let mode = if cfg!(all(
-            feature = "backend-dynamic",
-            not(feature = "backend-scarlet-virgl-static")
+            target_pointer_width = "64",
+            feature = "backend-dynamic"
         )) {
             "dynamic"
         } else {
@@ -430,10 +430,7 @@ fn main() {
             println!("SGFX_PANIC {info}\nSGFX_PANIC_END")
         }));
         println!("SGFX_MAIN");
-        #[cfg(all(
-            feature = "backend-dynamic",
-            not(feature = "backend-scarlet-virgl-static")
-        ))]
+        #[cfg(all(target_pointer_width = "64", feature = "backend-dynamic"))]
         if !std::env::args().any(|arg| arg == "--child") {
             for program in ["/bin/sgfx-probe", "/bin/sgfx-legacy-smoke"] {
                 if std::path::Path::new(program).is_file() {
