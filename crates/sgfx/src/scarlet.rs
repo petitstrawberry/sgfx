@@ -87,7 +87,7 @@ pub enum Device {
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
     Dynamic(crate::dynamic::Device),
     /// Native Qualcomm Adreno execution through Scarlet's GPU ABI.
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     Adreno(sgfx_backend_scarlet_adreno::Device),
 }
 
@@ -135,7 +135,7 @@ impl Device {
                     BackendKind::ScarletVirgl
                 }
             }
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(_) => BackendKind::ScarletAdreno,
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Self::Dynamic(device) => device.backend(),
@@ -171,7 +171,7 @@ impl Device {
                     depth: capabilities.supports_depth(),
                 }
             }
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(device) => {
                 let capabilities = device.capabilities();
                 Capabilities {
@@ -202,7 +202,7 @@ impl Device {
                 .create_context()
                 .map(Context::Dynamic)
                 .map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(device) => device
                 .create_context()
                 .map(Context::Adreno)
@@ -282,7 +282,7 @@ fn select_auto_backend(info: &gpu_raw::GpuQueryInfo) -> Result<BackendKind> {
     if crate::virgl::Device::supports(info) {
         return Ok(BackendKind::ScarletVirgl);
     }
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     if sgfx_backend_scarlet_adreno::Device::supports(info) {
         return Ok(BackendKind::ScarletAdreno);
     }
@@ -339,7 +339,7 @@ fn open_virgl(path: &str, gpu: Gpu, info: gpu_raw::GpuQueryInfo) -> Result<Devic
 }
 
 fn open_adreno(path: &str, gpu: Gpu, info: gpu_raw::GpuQueryInfo) -> Result<Device> {
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     {
         let _ = path;
         if !sgfx_backend_scarlet_adreno::Device::supports(&info) {
@@ -349,7 +349,7 @@ fn open_adreno(path: &str, gpu: Gpu, info: gpu_raw::GpuQueryInfo) -> Result<Devi
             .map(Device::Adreno)
             .map_err(Error::ScarletAdrenoHandle)
     }
-    #[cfg(all(not(feature = "backend-scarlet-adreno"), sgfx_dynamic))]
+    #[cfg(sgfx_dynamic)]
     {
         if !supports_gpu(&info, b"qcom-adreno") {
             return Err(Error::BackendDeviceMismatch(BackendKind::ScarletAdreno));
@@ -372,7 +372,7 @@ pub enum Context {
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
     Dynamic(crate::dynamic::Context),
     /// A native Adreno rendering context.
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     Adreno(sgfx_backend_scarlet_adreno::Context),
 }
 
@@ -403,7 +403,7 @@ impl Context {
                 .create_mapped_target_session(resources, targets)
                 .map(MappedTargetSession::Dynamic)
                 .map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(context) => context
                 .create_mapped_target_session(resources, targets)
                 .map(MappedTargetSession::Adreno)
@@ -421,7 +421,7 @@ pub enum MappedTargetSession {
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
     Dynamic(crate::dynamic::MappedTargetSession),
     /// A native Adreno mapped-target session.
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     Adreno(sgfx_backend_scarlet_adreno::MappedTargetSession),
 }
 
@@ -441,7 +441,7 @@ impl MappedTargetSession {
             Self::Dynamic(session) => session
                 .import_shared_bgra_texture(texture, handle)
                 .map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(session) => session
                 .import_shared_bgra_texture(texture, handle)
                 .map_err(Error::ScarletAdrenoIr),
@@ -479,7 +479,7 @@ impl MappedTargetSession {
             Self::Dynamic(session) => session
                 .release_imported_texture(texture)
                 .map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(session) => session
                 .release_imported_texture(texture)
                 .map_err(Error::ScarletAdrenoIr),
@@ -511,7 +511,7 @@ impl MappedTargetSession {
                     backend: Image::Dynamic(image),
                 })
                 .map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(session) => session
                 .image(target)
                 .map(|image| ImageRef {
@@ -550,7 +550,7 @@ impl MappedTargetSession {
             Self::Dynamic(session) => session
                 .readback_bgra(target, destination, destination_stride, rect)
                 .map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(session) => session
                 .readback_bgra(target, destination, destination_stride, rect)
                 .map_err(Error::ScarletAdrenoIr),
@@ -568,7 +568,7 @@ impl MappedTargetSession {
             Self::Virgl(session) => Executor::Virgl(session.executor()),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Self::Dynamic(session) => Executor::Dynamic(session.executor()),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(session) => Executor::Adreno(session.executor()),
         }
     }
@@ -582,7 +582,7 @@ enum Image<'a> {
     Virgl(crate::dynamic::ImageRef<'a>),
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
     Dynamic(crate::dynamic::ImageRef<'a>),
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     Adreno(&'a sgfx_backend_scarlet_adreno::Image),
 }
 
@@ -603,7 +603,7 @@ impl ImageRef<'_> {
             Image::Virgl(image) => image.width(),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Image::Dynamic(image) => image.width(),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Image::Adreno(image) => image.width(),
         }
     }
@@ -619,7 +619,7 @@ impl ImageRef<'_> {
             Image::Virgl(image) => image.height(),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Image::Dynamic(image) => image.height(),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Image::Adreno(image) => image.height(),
         }
     }
@@ -635,7 +635,7 @@ impl ImageRef<'_> {
             Image::Virgl(image) => image.shared_handle(),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Image::Dynamic(image) => image.shared_handle(),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Image::Adreno(image) => image.shared_handle(),
         }
     }
@@ -649,7 +649,7 @@ pub enum Executor<'a> {
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
     Dynamic(crate::dynamic::Executor<'a>),
     /// A native Adreno command executor.
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     Adreno(sgfx_backend_scarlet_adreno::Executor<'a>),
 }
 
@@ -662,7 +662,7 @@ impl CommandExecutor for Executor<'_> {
             Self::Virgl(executor) => executor.execute(commands).map_err(Error::from),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Self::Dynamic(executor) => executor.execute(commands).map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(executor) => executor.execute(commands).map_err(Error::ScarletAdrenoIr),
         }
     }
@@ -681,7 +681,7 @@ pub enum Submission {
     #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
     Dynamic(crate::dynamic::Submission),
     /// Completion of every Adreno chunk and its ordered queue prefix.
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     Adreno(sgfx_backend_scarlet_adreno::Submission),
 }
 
@@ -699,7 +699,7 @@ impl Completion for Submission {
             Self::Virgl(ref receipt) => receipt.poll().map_err(Error::from),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Self::Dynamic(ref receipt) => receipt.poll().map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(ref receipt) => receipt.poll().map_err(Error::ScarletAdrenoIr),
         }
     }
@@ -726,7 +726,7 @@ impl Completion for Submission {
             Self::Virgl(ref receipt) => receipt.wait(timeout).map_err(Error::from),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Self::Dynamic(ref receipt) => receipt.wait(timeout).map_err(Error::from),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(ref receipt) => receipt.wait(timeout).map_err(Error::ScarletAdrenoIr),
         }
     }
@@ -741,7 +741,7 @@ impl CommandSubmitter for Executor<'_> {
             Self::Virgl(executor) => executor.supports_async_submission(),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             Self::Dynamic(executor) => executor.supports_async_submission(),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(executor) => executor.supports_async_submission(),
         }
     }
@@ -780,7 +780,7 @@ impl CommandSubmitter for Executor<'_> {
                 .submit(commands)
                 .map(Submission::Dynamic)
                 .map_err(|error| error.map(Error::from, Submission::Dynamic)),
-            #[cfg(feature = "backend-scarlet-adreno")]
+            #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
             Self::Adreno(executor) => executor
                 .submit(commands)
                 .map(Submission::Adreno)
@@ -846,7 +846,7 @@ mod tests {
         assert!(!crate::dynamic::Device::supports(&no_memory));
     }
 
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     #[test]
     fn auto_selects_adreno_for_the_qcom_adreno_id() {
         let info = ready_info(sgfx_backend_scarlet_adreno::BACKEND_ID);

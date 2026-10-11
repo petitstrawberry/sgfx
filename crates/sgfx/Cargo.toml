@@ -44,7 +44,7 @@ backend-wgpu = [
 ]
 scarlet-native-api = ["std", "backend-scarlet-virgl"]
 backend-scarlet-virgl = ["backend-dynamic", "dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl-compat"]
-backend-scarlet-adreno = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
+backend-scarlet-adreno = ["backend-dynamic", "dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
 
 [dependencies]
 sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", default-features = false }
@@ -64,7 +64,6 @@ wgpu = { version = "24", features = ["spirv"], optional = true }
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, optional = true }
 scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", optional = true }
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, optional = true }
-sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
 
 # Scarlet Linux-ABI clients use the native GPU transport on AArch64.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
@@ -89,3 +88,7 @@ sgfx-backend-scarlet-virgl-compat = { path = "../sgfx-backend-scarlet-virgl-comp
 [[example]]
 name = "legacy_dynamic_smoke"
 required-features = ["legacy-scarlet-std"]
+
+# Native ELF64 discovers Adreno through its published ABI v2 driver bundle.
+[target.'cfg(all(target_os = "scarlet", target_pointer_width = "32"))'.dependencies]
+sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }

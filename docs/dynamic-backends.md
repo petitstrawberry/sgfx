@@ -352,3 +352,17 @@ records, metadata revisions/generations, discovery failures and ABI layout.
 The boundary test counts allocations and checks original storage/payload
 pointer identity over repeated imports and iteration. Native CI checks both
 Scarlet architectures; actual `.so` linking/loading uses the script above.
+
+## Adreno on native ELF64
+
+`backend-scarlet-adreno` enables dynamic backend discovery on native 64-bit
+Scarlet. Both automatic selection and the `adreno` / `scarlet-adreno` aliases
+load the installed `scarlet-adreno.sgfx-driver`; the facade does not embed the
+Adreno Rust backend in ELF64 clients. The compatibility implementation remains
+available for ELF32.
+
+The AArch64 driver is distributed by the Chromebook project's
+[`bundles/sgfx-adreno`](https://github.com/petitstrawberry/scarlet-project-chromebook/tree/feat/native-adreno-bundle/bundles/sgfx-adreno).
+Include that bundle after Scarlet's native SGFX runtime bundle when composing
+the image with cargo-scarlet. A missing or incompatible driver reports a loader
+error; it does not silently fall back to the static backend.

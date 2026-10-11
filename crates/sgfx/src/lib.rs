@@ -292,10 +292,18 @@ pub enum Error {
     ScarletBackendUnsupported,
 
     /// A Scarlet/Adreno device or context operation failed.
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+    #[cfg(all(
+        not(sgfx_dynamic),
+        target_os = "scarlet",
+        feature = "backend-scarlet-adreno"
+    ))]
     ScarletAdrenoHandle(sgfx_backend_scarlet_adreno::HandleError),
     /// A Scarlet/Adreno IR materialization or execution operation failed.
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+    #[cfg(all(
+        not(sgfx_dynamic),
+        target_os = "scarlet",
+        feature = "backend-scarlet-adreno"
+    ))]
     ScarletAdrenoIr(sgfx_backend_scarlet_adreno::IrSubmitError),
 }
 
@@ -418,9 +426,17 @@ impl Error {
             ))]
             Self::ScarletBackendUnsupported => ErrorKind::Unsupported,
 
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+            #[cfg(all(
+                not(sgfx_dynamic),
+                target_os = "scarlet",
+                feature = "backend-scarlet-adreno"
+            ))]
             Self::ScarletAdrenoHandle(error) => adreno_handle_error_kind(*error),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+            #[cfg(all(
+                not(sgfx_dynamic),
+                target_os = "scarlet",
+                feature = "backend-scarlet-adreno"
+            ))]
             Self::ScarletAdrenoIr(error) => {
                 use sgfx_backend_scarlet_adreno::IrSubmitError as E;
                 match error {
@@ -505,7 +521,11 @@ impl Error {
                         )
                 )
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+            #[cfg(all(
+                not(sgfx_dynamic),
+                target_os = "scarlet",
+                feature = "backend-scarlet-adreno"
+            ))]
             Self::ScarletAdrenoIr(error) => {
                 use sgfx_backend_scarlet_adreno::{HandleError, IrSubmitError as E};
                 matches!(
@@ -542,7 +562,11 @@ impl Error {
         ),
         any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ),
-    all(target_os = "scarlet", feature = "backend-scarlet-adreno")
+    all(
+        not(sgfx_dynamic),
+        target_os = "scarlet",
+        feature = "backend-scarlet-adreno"
+    )
 ))]
 #[allow(dead_code)]
 fn ir_error_kind(error: ir::Error) -> ErrorKind {
@@ -573,7 +597,11 @@ fn virgl_handle_error_kind(error: virgl::HandleError) -> ErrorKind {
     }
 }
 
-#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+#[cfg(all(
+    not(sgfx_dynamic),
+    target_os = "scarlet",
+    feature = "backend-scarlet-adreno"
+))]
 fn adreno_handle_error_kind(error: sgfx_backend_scarlet_adreno::HandleError) -> ErrorKind {
     use sgfx_backend_scarlet_adreno::HandleError as E;
     match error {
@@ -668,11 +696,19 @@ impl fmt::Display for Error {
                 formatter.write_str("no SGFX Scarlet backend supports the opened GPU")
             }
 
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+            #[cfg(all(
+                not(sgfx_dynamic),
+                target_os = "scarlet",
+                feature = "backend-scarlet-adreno"
+            ))]
             Self::ScarletAdrenoHandle(error) => {
                 write!(formatter, "SGFX Scarlet/Adreno device failed: {error:?}")
             }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
+            #[cfg(all(
+                not(sgfx_dynamic),
+                target_os = "scarlet",
+                feature = "backend-scarlet-adreno"
+            ))]
             Self::ScarletAdrenoIr(error) => {
                 write!(formatter, "SGFX Scarlet/Adreno execution failed: {error:?}")
             }
