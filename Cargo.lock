@@ -27,7 +27,17 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "adreno-a6xx-layout"
 version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399#e8e72900ae8760fb0ccc7eddfd47bd206d4ec399"
+
+[[package]]
+name = "adreno-a6xx-layout"
+version = "0.1.0"
 source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb#fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb"
+
+[[package]]
+name = "adreno-a6xx-pm4"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399#e8e72900ae8760fb0ccc7eddfd47bd206d4ec399"
 
 [[package]]
 name = "adreno-a6xx-pm4"
@@ -37,14 +47,27 @@ source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?
 [[package]]
 name = "adreno-a6xx-shader-pack"
 version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399#e8e72900ae8760fb0ccc7eddfd47bd206d4ec399"
+
+[[package]]
+name = "adreno-a6xx-shader-pack"
+version = "0.1.0"
 source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb#fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb"
+
+[[package]]
+name = "adreno-a6xx-submit-wire"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399#e8e72900ae8760fb0ccc7eddfd47bd206d4ec399"
+dependencies = [
+ "adreno-a6xx-shader-pack 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399)",
+]
 
 [[package]]
 name = "adreno-a6xx-submit-wire"
 version = "0.1.0"
 source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb#fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb"
 dependencies = [
- "adreno-a6xx-shader-pack",
+ "adreno-a6xx-shader-pack 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb)",
 ]
 
 [[package]]
@@ -1690,7 +1713,8 @@ dependencies = [
  "scarlet-std",
  "sgfx-backend-abi",
  "sgfx-backend-loader",
- "sgfx-backend-scarlet-adreno",
+ "sgfx-backend-scarlet-adreno 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399)",
+ "sgfx-backend-scarlet-adreno 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb)",
  "sgfx-backend-scarlet-virgl-compat",
  "sgfx-backend-wgpu",
  "sgfx-core",
@@ -1712,14 +1736,28 @@ dependencies = [
 [[package]]
 name = "sgfx-backend-scarlet-adreno"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb#fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399#e8e72900ae8760fb0ccc7eddfd47bd206d4ec399"
 dependencies = [
- "adreno-a6xx-layout",
- "adreno-a6xx-submit-wire",
+ "adreno-a6xx-layout 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399)",
+ "adreno-a6xx-submit-wire 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399)",
  "gpu-raw",
  "scarlet-os",
  "scarlet-std",
- "sgfx-codegen-adreno-a6xx",
+ "sgfx-codegen-adreno-a6xx 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399)",
+ "sgfx-core",
+]
+
+[[package]]
+name = "sgfx-backend-scarlet-adreno"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb#fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb"
+dependencies = [
+ "adreno-a6xx-layout 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb)",
+ "adreno-a6xx-submit-wire 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb)",
+ "gpu-raw",
+ "scarlet-os",
+ "scarlet-std",
+ "sgfx-codegen-adreno-a6xx 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb)",
  "sgfx-core",
 ]
 
@@ -1766,11 +1804,22 @@ dependencies = [
 [[package]]
 name = "sgfx-codegen-adreno-a6xx"
 version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399#e8e72900ae8760fb0ccc7eddfd47bd206d4ec399"
+dependencies = [
+ "adreno-a6xx-layout 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399)",
+ "adreno-a6xx-pm4 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399)",
+ "adreno-a6xx-shader-pack 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=e8e72900ae8760fb0ccc7eddfd47bd206d4ec399)",
+ "sgfx-core",
+]
+
+[[package]]
+name = "sgfx-codegen-adreno-a6xx"
+version = "0.1.0"
 source = "git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb#fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb"
 dependencies = [
- "adreno-a6xx-layout",
- "adreno-a6xx-pm4",
- "adreno-a6xx-shader-pack",
+ "adreno-a6xx-layout 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb)",
+ "adreno-a6xx-pm4 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb)",
+ "adreno-a6xx-shader-pack 0.1.0 (git+https://github.com/petitstrawberry/scarlet-project-chromebook.git?rev=fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb)",
  "sgfx-core",
 ]
 

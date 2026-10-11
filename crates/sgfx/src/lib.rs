@@ -22,6 +22,13 @@ use core::fmt;
 
 pub use sgfx_core::{backend, ir};
 
+#[cfg(all(
+    target_os = "scarlet",
+    target_pointer_width = "64",
+    feature = "backend-scarlet-adreno-static"
+))]
+use sgfx_backend_scarlet_adreno_static as sgfx_backend_scarlet_adreno;
+
 #[cfg(all(target_os = "linux", feature = "scarlet-native-api"))]
 pub use virgl::Handle;
 
@@ -293,14 +300,14 @@ pub enum Error {
 
     /// A Scarlet/Adreno device or context operation failed.
     #[cfg(all(
-        not(sgfx_dynamic),
+        any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
         target_os = "scarlet",
         feature = "backend-scarlet-adreno"
     ))]
     ScarletAdrenoHandle(sgfx_backend_scarlet_adreno::HandleError),
     /// A Scarlet/Adreno IR materialization or execution operation failed.
     #[cfg(all(
-        not(sgfx_dynamic),
+        any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
         target_os = "scarlet",
         feature = "backend-scarlet-adreno"
     ))]
@@ -427,13 +434,13 @@ impl Error {
             Self::ScarletBackendUnsupported => ErrorKind::Unsupported,
 
             #[cfg(all(
-                not(sgfx_dynamic),
+                any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
                 target_os = "scarlet",
                 feature = "backend-scarlet-adreno"
             ))]
             Self::ScarletAdrenoHandle(error) => adreno_handle_error_kind(*error),
             #[cfg(all(
-                not(sgfx_dynamic),
+                any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
                 target_os = "scarlet",
                 feature = "backend-scarlet-adreno"
             ))]
@@ -522,7 +529,7 @@ impl Error {
                 )
             }
             #[cfg(all(
-                not(sgfx_dynamic),
+                any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
                 target_os = "scarlet",
                 feature = "backend-scarlet-adreno"
             ))]
@@ -563,7 +570,7 @@ impl Error {
         any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
     ),
     all(
-        not(sgfx_dynamic),
+        any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
         target_os = "scarlet",
         feature = "backend-scarlet-adreno"
     )
@@ -598,7 +605,7 @@ fn virgl_handle_error_kind(error: virgl::HandleError) -> ErrorKind {
 }
 
 #[cfg(all(
-    not(sgfx_dynamic),
+    any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
     target_os = "scarlet",
     feature = "backend-scarlet-adreno"
 ))]
@@ -697,7 +704,7 @@ impl fmt::Display for Error {
             }
 
             #[cfg(all(
-                not(sgfx_dynamic),
+                any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
                 target_os = "scarlet",
                 feature = "backend-scarlet-adreno"
             ))]
@@ -705,7 +712,7 @@ impl fmt::Display for Error {
                 write!(formatter, "SGFX Scarlet/Adreno device failed: {error:?}")
             }
             #[cfg(all(
-                not(sgfx_dynamic),
+                any(not(sgfx_dynamic), feature = "backend-scarlet-adreno-static"),
                 target_os = "scarlet",
                 feature = "backend-scarlet-adreno"
             ))]

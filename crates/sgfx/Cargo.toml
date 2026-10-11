@@ -20,6 +20,7 @@ std = [
     "scarlet-os?/std",
     "gpu-raw?/std",
     "sgfx-backend-scarlet-adreno?/std",
+    "sgfx-backend-scarlet-adreno-static?/std",
     "sgfx-backend-scarlet-virgl-compat?/std",
 ]
 legacy-scarlet-std = [
@@ -31,6 +32,7 @@ legacy-scarlet-std = [
     "sgfx-backend-loader?/legacy-scarlet-std",
     "gpu-raw?/scarlet-std",
     "sgfx-backend-scarlet-adreno?/scarlet-std",
+    "sgfx-backend-scarlet-adreno-static?/scarlet-std",
     "sgfx-backend-scarlet-virgl-compat?/scarlet-std",
 ]
 # Compatibility alias for consumers that previously selected Scarlet's
@@ -45,6 +47,9 @@ backend-wgpu = [
 scarlet-native-api = ["std", "backend-scarlet-virgl"]
 backend-scarlet-virgl = ["backend-dynamic", "dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl-compat"]
 backend-scarlet-adreno = ["backend-dynamic", "dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
+# Explicit comparison mode for native Adreno. Other installed backends retain
+# dynamic discovery, including VirGL on native ELF64.
+backend-scarlet-adreno-static = ["backend-scarlet-adreno", "dep:sgfx-backend-scarlet-adreno-static"]
 
 [dependencies]
 sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", default-features = false }
@@ -89,6 +94,10 @@ sgfx-backend-scarlet-virgl-compat = { path = "../sgfx-backend-scarlet-virgl-comp
 name = "legacy_dynamic_smoke"
 required-features = ["legacy-scarlet-std"]
 
-# Native ELF64 discovers Adreno through its published ABI v2 driver bundle.
+# ELF32 retains its compatibility backend. ELF64 normally discovers the
+# published ABI v2 driver bundle; comparison mode uses its current native crate.
 [target.'cfg(all(target_os = "scarlet", target_pointer_width = "32"))'.dependencies]
 sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "fa3b967ffb3d79b3f80a4d3d4c6348b1b15ecedb", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
+
+[target.'cfg(all(target_os = "scarlet", target_pointer_width = "64"))'.dependencies]
+sgfx-backend-scarlet-adreno-static = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "e8e72900ae8760fb0ccc7eddfd47bd206d4ec399", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
