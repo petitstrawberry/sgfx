@@ -1,6 +1,12 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("scarlet") {
+        for argument in ["--hash-style=both", "-z", "now", "--entry=0", "--exclude-libs=ALL", "-soname", "libvulkan_sgfx.so", "--unresolved-symbols=ignore-all"] {
+            println!("cargo::rustc-link-arg-cdylib={argument}");
+        }
+    }
+
     println!("cargo:rerun-if-changed=protocol/scarlet-sgfx.xml");
     println!("cargo:rerun-if-changed=src/wayland_client.c");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
