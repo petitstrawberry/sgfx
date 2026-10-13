@@ -8,7 +8,10 @@ mode, project, destination = sys.argv[1:]
 project, destination = Path(project), Path(destination)
 manifest = tomllib.loads((project / "scarlet.toml").read_text())
 config = tomllib.loads((project / manifest["bsp"]["path"] / ".cargo/config.toml").read_text())
-arch = Path(config["build"]["target"]).name.split("-")[0]
+name = Path(config["build"]["target"]).name
+arch = next((arch for arch in ("aarch64", "riscv64", "riscv32") if name.startswith(arch)), None)
+if arch is None:
+    raise SystemExit(f"unsupported native SGFX target: {name}")
 target = {"aarch64": "aarch64-unknown-scarlet", "riscv64": "riscv64gc-unknown-scarlet", "riscv32": "riscv32gc-unknown-scarlet"}[arch]
 flags = ["--cfg", 'getrandom_backend="custom"']
 if arch != "riscv32":
