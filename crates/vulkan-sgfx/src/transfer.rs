@@ -122,6 +122,149 @@ impl ImageReadbackRegion {
     }
 }
 
+/// Exact same-format color copies. Unlike blits, this uses the canonical
+/// CopyTextureToTexture operation: no sampling, gamma conversion or blending.
+/// The existing IR copy contract addresses only mip zero and a single layer.
+pub(crate) fn copy_image(
+    resources: &Resources,
+    source: vk::Image,
+    source_layout: vk::ImageLayout,
+    destination: vk::Image,
+    destination_layout: vk::ImageLayout,
+    regions: &[vk::ImageCopy],
+) -> Result<Vec<ir::OwnedCommand>, vk::Result> {
+    let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
+    let unsupported = vk::Result::ERROR_FEATURE_NOT_PRESENT;
+    if !matches!(
+        source_layout,
+        vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+    ) || !matches!(
+        destination_layout,
+        vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_DST_OPTIMAL
+    ) {
+        return Err(invalid);
+    }
+    let src = resources.images.get(&source).ok_or(invalid)?;
+    let dst = resources.images.get(&destination).ok_or(invalid)?;
+    if !src.usable()
+        || !dst.usable()
+        || !src.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+        || !dst.usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
+        || regions.is_empty()
+    {
+        return Err(invalid);
+    }
+    if src.format != dst.format
+        || !matches!(
+            src.format,
+            vk::Format::B8G8R8A8_UNORM
+                | vk::Format::R8G8B8A8_UNORM
+                | vk::Format::A8B8G8R8_UNORM_PACK32
+                | vk::Format::B8G8R8A8_SRGB
+                | vk::Format::R8G8B8A8_SRGB
+                | vk::Format::A8B8G8R8_SRGB_PACK32
+                | vk::Format::R8_UNORM
+                | vk::Format::R8G8_UNORM
+        )
+        || src.array_layers != 1
+        || dst.array_layers != 1
+    {
+        return Err(unsupported);
+    }
+    let rect = |image: &crate::images::Image,
+                subresource: vk::ImageSubresourceLayers,
+                offset: vk::Offset3D,
+                extent: vk::Extent3D| {
+        let image_extent = image.mip_extent(subresource.mip_level)?;
+        if subresource.aspect_mask != vk::ImageAspectFlags::COLOR
+            || subresource.mip_level != 0
+            || subresource.base_array_layer != 0
+            || subresource.layer_count != 1
+            || offset.z != 0
+            || extent.depth != 1
+        {
+            return Err(unsupported);
+        }
+        let x = u32::try_from(offset.x).map_err(|_| invalid)?;
+        let y = u32::try_from(offset.y).map_err(|_| invalid)?;
+        let area = ir::PixelRect::new(x, y, extent.width, extent.height).map_err(|_| invalid)?;
+        if !area.is_within(
+            ir::Extent2D::new(image_extent.width, image_extent.height).map_err(|_| invalid)?,
+        ) {
+            return Err(invalid);
+        }
+        Ok(area)
+    };
+    let rectangles = regions
+        .iter()
+        .map(|region| {
+            Ok((
+                rect(
+                    src,
+                    region.src_subresource,
+                    region.src_offset,
+                    region.extent,
+                )?,
+                rect(
+                    dst,
+                    region.dst_subresource,
+                    region.dst_offset,
+                    region.extent,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>, vk::Result>>()?;
+    let overlap = |a: ir::PixelRect, b: ir::PixelRect| {
+        a.x() < b.x() + b.width()
+            && b.x() < a.x() + a.width()
+            && a.y() < b.y() + b.height()
+            && b.y() < a.y() + a.height()
+    };
+    // Vulkan prohibits destination overlap and any source/destination overlap
+    // across the complete region list, not merely within each individual pair.
+    for (i, &(_, destination)) in rectangles.iter().enumerate() {
+        if rectangles[..i]
+            .iter()
+            .any(|&(_, other)| overlap(destination, other))
+        {
+            return Err(invalid);
+        }
+    }
+    if source == destination {
+        if source_layout != vk::ImageLayout::GENERAL
+            || destination_layout != vk::ImageLayout::GENERAL
+            || rectangles
+                .iter()
+                .any(|&(a, _)| rectangles.iter().any(|&(_, b)| overlap(a, b)))
+        {
+            return Err(invalid);
+        }
+        // GENERAL read/write barriers cannot currently express both access
+        // roles on one canonical texture. Do not silently ignore that contract.
+        return Err(unsupported);
+    }
+    if let (Some((a, offset_a)), Some((b, offset_b))) = (src.bound, dst.bound) {
+        if a == b
+            && offset_a < offset_b.saturating_add(dst.byte_size())
+            && offset_b < offset_a.saturating_add(src.byte_size())
+        {
+            // Distinct aliased images do not yet share physical SGFX storage.
+            return Err(unsupported);
+        }
+    }
+    Ok(rectangles
+        .into_iter()
+        .map(
+            |(source_rect, destination_rect)| ir::OwnedCommand::CopyTextureToTexture {
+                source: src.id,
+                source_rect,
+                destination: dst.id,
+                destination_rect,
+            },
+        )
+        .collect())
+}
+
 /// Lower bounded color mip blits, flips and narrow-to-RGBA expansion into IR.
 /// Array layers remain outside this subset.
 pub(crate) fn blit(
@@ -456,6 +599,192 @@ mod readback_tests {
         assert!(matches!(
             layout.writes(&[0; 4], buffer_id()),
             Err(vk::Result::ERROR_DEVICE_LOST)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod copy_image_tests {
+    use super::*;
+    use ash::vk::Handle;
+    fn src_handle() -> vk::Image {
+        vk::Image::from_raw(101)
+    }
+    fn dst_handle() -> vk::Image {
+        vk::Image::from_raw(102)
+    }
+    fn resources() -> Resources {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        for (handle, memory) in [(src_handle(), 201), (dst_handle(), 202)] {
+            let id = table
+                .define_texture(
+                    ir::TextureDesc::new(
+                        ir::TextureFormat::Bgra8Unorm,
+                        ir::Extent2D::new(8, 8).unwrap(),
+                        ir::TextureUsage::COPY_SRC | ir::TextureUsage::COPY_DST,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id();
+            resources.images.insert(
+                handle,
+                crate::images::Image {
+                    id,
+                    format: vk::Format::B8G8R8A8_UNORM,
+                    extent: vk::Extent3D {
+                        width: 8,
+                        height: 8,
+                        depth: 1,
+                    },
+                    mip_levels: 1,
+                    array_layers: 1,
+                    flags: vk::ImageCreateFlags::empty(),
+                    usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+                    bound: Some((vk::DeviceMemory::from_raw(memory), 0)),
+                    swapchain: None,
+                    #[cfg(target_os = "scarlet")]
+                    shared: None,
+                },
+            );
+        }
+        resources
+    }
+    fn region(sx: i32, sy: i32, dx: i32, dy: i32, width: u32, height: u32) -> vk::ImageCopy {
+        let sub = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        vk::ImageCopy::default()
+            .src_subresource(sub)
+            .dst_subresource(sub)
+            .src_offset(vk::Offset3D { x: sx, y: sy, z: 0 })
+            .dst_offset(vk::Offset3D { x: dx, y: dy, z: 0 })
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+    }
+    fn copy(
+        resources: &Resources,
+        regions: &[vk::ImageCopy],
+    ) -> Result<Vec<ir::OwnedCommand>, vk::Result> {
+        copy_image(
+            resources,
+            src_handle(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            dst_handle(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            regions,
+        )
+    }
+    #[test]
+    fn image_copy_emits_exact_rectangles_without_sampling_or_blending() {
+        let resources = resources();
+        let ops = copy(
+            &resources,
+            &[region(1, 2, 4, 3, 3, 2), region(0, 0, 0, 0, 1, 1)],
+        )
+        .unwrap();
+        assert_eq!(ops.len(), 2);
+        match &ops[0] {
+            ir::OwnedCommand::CopyTextureToTexture {
+                source,
+                source_rect,
+                destination,
+                destination_rect,
+            } => {
+                assert_eq!(*source, resources.images[&src_handle()].id);
+                assert_eq!(*destination, resources.images[&dst_handle()].id);
+                assert_eq!(*source_rect, ir::PixelRect::new(1, 2, 3, 2).unwrap());
+                assert_eq!(*destination_rect, ir::PixelRect::new(4, 3, 3, 2).unwrap());
+            }
+            _ => panic!("image copy must not use a blit/draw/upload"),
+        }
+    }
+    #[test]
+    fn image_copy_rejects_invalid_regions_usage_and_overlapping_destinations() {
+        let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
+        assert!(
+            matches!(copy_image(&resources(), src_handle(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            dst_handle(), vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region(0,0,0,0,1,1)]), Err(e) if e==invalid)
+        );
+        assert!(
+            copy_image(
+                &resources(),
+                src_handle(),
+                vk::ImageLayout::GENERAL,
+                dst_handle(),
+                vk::ImageLayout::GENERAL,
+                &[region(0, 0, 0, 0, 1, 1)]
+            )
+            .is_ok()
+        );
+        for region in [
+            region(-1, 0, 0, 0, 1, 1),
+            region(0, -1, 0, 0, 1, 1),
+            region(0, 0, -1, 0, 1, 1),
+            region(0, 0, 0, 0, 0, 1),
+            region(0, 0, 0, 0, 1, 0),
+            region(7, 0, 0, 0, 2, 1),
+            region(0, 0, 7, 0, 2, 1),
+            region(0, 0, 1, 0, u32::MAX, 1),
+        ] {
+            assert!(matches!(copy(&resources(),&[region]),Err(e) if e==invalid));
+        }
+        assert!(matches!(copy(&resources(),&[]),Err(e) if e==invalid));
+        assert!(
+            matches!(copy(&resources(),&[region(0,0,2,2,2,2),region(4,4,3,3,2,2)]),Err(e) if e==invalid)
+        );
+        let mut resources = resources();
+        resources.images.get_mut(&src_handle()).unwrap().usage = vk::ImageUsageFlags::TRANSFER_DST;
+        assert!(matches!(copy(&resources,&[region(0,0,0,0,1,1)]),Err(e) if e==invalid));
+    }
+    #[test]
+    fn image_copy_reports_unknown_subresources_formats_aliases_and_self_access() {
+        let unsupported = vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        let sub = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        for region in [
+            region(0, 0, 0, 0, 1, 1).src_subresource(sub.base_array_layer(1)),
+            region(0, 0, 0, 0, 1, 1).dst_subresource(sub.layer_count(2)),
+            region(0, 0, 0, 0, 1, 1).src_subresource(sub.aspect_mask(vk::ImageAspectFlags::DEPTH)),
+            region(0, 0, 0, 0, 1, 1).extent(vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 2,
+            }),
+        ] {
+            assert!(matches!(copy(&resources(),&[region]),Err(e) if e==unsupported));
+        }
+        let mut resources = resources();
+        resources.images.get_mut(&src_handle()).unwrap().mip_levels = 2;
+        assert!(
+            matches!(copy(&resources,&[region(0,0,0,0,1,1).src_subresource(sub.mip_level(1))]),Err(e) if e==unsupported)
+        );
+        resources.images.get_mut(&dst_handle()).unwrap().format = vk::Format::R8G8B8A8_UNORM;
+        assert!(matches!(copy(&resources,&[region(0,0,0,0,1,1)]),Err(e) if e==unsupported));
+        resources.images.get_mut(&dst_handle()).unwrap().format = vk::Format::B8G8R8A8_UNORM;
+        resources.images.get_mut(&dst_handle()).unwrap().bound =
+            resources.images[&src_handle()].bound;
+        assert!(matches!(copy(&resources,&[region(0,0,0,0,1,1)]),Err(e) if e==unsupported));
+        assert!(
+            matches!(copy_image(&resources,src_handle(),vk::ImageLayout::GENERAL,src_handle(),vk::ImageLayout::GENERAL,&[region(0,0,4,0,2,2)]),Err(e) if e==unsupported)
+        );
+        // Source of the second region overlaps the first destination: cross-
+        // region hazard must be rejected, not accepted as two disjoint pairs.
+        assert!(matches!(
+            copy_image(
+                &resources,
+                src_handle(),
+                vk::ImageLayout::GENERAL,
+                src_handle(),
+                vk::ImageLayout::GENERAL,
+                &[region(0, 0, 4, 0, 2, 2), region(4, 0, 0, 4, 2, 2)]
+            ),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
         ));
     }
 }

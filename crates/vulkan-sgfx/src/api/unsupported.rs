@@ -27,19 +27,6 @@ unsafe extern "system" fn unsupported_cmd_clear_depth_stencil_image(
     record_error(command_buffer, ash::vk::Result::ERROR_FEATURE_NOT_PRESENT);
 }
 #[allow(unused_variables)]
-unsafe extern "system" fn unsupported_cmd_copy_image(
-    command_buffer: CommandBuffer,
-    src_image: Image,
-    src_image_layout: ImageLayout,
-    dst_image: Image,
-    dst_image_layout: ImageLayout,
-    region_count: u32,
-    p_regions: *const ImageCopy,
-) {
-    eprintln!("SGFX Vulkan: vkCmdCopyImage is not supported by this backend subset");
-    record_error(command_buffer, ash::vk::Result::ERROR_FEATURE_NOT_PRESENT);
-}
-#[allow(unused_variables)]
 unsafe extern "system" fn unsupported_cmd_copy_query_pool_results(
     command_buffer: CommandBuffer,
     query_pool: QueryPool,
@@ -345,7 +332,6 @@ pub(super) fn lookup(name: &CStr) -> PFN_vkVoidFunction {
             unsupported_cmd_clear_depth_stencil_image,
             PFN_vkCmdClearDepthStencilImage
         ),
-        b"vkCmdCopyImage" => entry!(unsupported_cmd_copy_image, PFN_vkCmdCopyImage),
         b"vkCmdCopyQueryPoolResults" => entry!(
             unsupported_cmd_copy_query_pool_results,
             PFN_vkCmdCopyQueryPoolResults

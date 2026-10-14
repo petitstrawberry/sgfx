@@ -807,6 +807,13 @@ pub(crate) fn set_pipeline_layout_metadata(
 #[derive(Clone)]
 enum RecordedCommand {
     InertDynamicState,
+    CopyImage {
+        source: vk::Image,
+        source_layout: vk::ImageLayout,
+        destination: vk::Image,
+        destination_layout: vk::ImageLayout,
+        regions: Vec<vk::ImageCopy>,
+    },
     BlitImage {
         source: vk::Image,
         source_layout: vk::ImageLayout,
@@ -1029,6 +1036,7 @@ impl Recording {
             RecordedCommand::CopyImageToBuffer { .. }
             | RecordedCommand::ClearColorImage { .. }
             | RecordedCommand::BlitImage { .. }
+            | RecordedCommand::CopyImage { .. }
             | RecordedCommand::CopyBuffer { .. }
             | RecordedCommand::CopyBufferToImage { .. }
             | RecordedCommand::UpdateBuffer { .. }
@@ -1083,6 +1091,26 @@ impl RecordedCommand {
     fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
         match self {
             Self::InertDynamicState => (),
+            Self::CopyImage {
+                source,
+                source_layout,
+                destination,
+                destination_layout,
+                regions,
+            } => {
+                if rec.render.is_some() {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                rec.ops.extend(crate::transfer::copy_image(
+                    &rt.resources,
+                    *source,
+                    *source_layout,
+                    *destination,
+                    *destination_layout,
+                    regions,
+                )?);
+                rec.used_images.extend([*source, *destination]);
+            }
             Self::BlitImage {
                 source,
                 source_layout,
@@ -1465,6 +1493,10 @@ impl RecordedCommand {
                         image_data.format,
                         vk::Format::R8G8B8A8_UNORM
                             | vk::Format::B8G8R8A8_UNORM
+                            | vk::Format::A8B8G8R8_UNORM_PACK32
+                            | vk::Format::R8G8B8A8_SRGB
+                            | vk::Format::B8G8R8A8_SRGB
+                            | vk::Format::A8B8G8R8_SRGB_PACK32
                             | vk::Format::R8_UNORM
                             | vk::Format::R8G8_UNORM
                     )
@@ -1768,6 +1800,27 @@ fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedR
                     std::mem::discriminant(command)
                 );
                 match command {
+                    RecordedCommand::CopyImage {
+                        source,
+                        source_layout,
+                        destination,
+                        destination_layout,
+                        regions,
+                    } => eprintln!(
+                        "[SGFX Vulkan] raw image copy: {source:?}/{source_layout:?} {:?} -> {destination:?}/{destination_layout:?} {:?} regions={regions:?}",
+                        rt.resources.images.get(source).map(|i| (
+                            i.format,
+                            i.extent,
+                            i.mip_levels,
+                            i.array_layers
+                        )),
+                        rt.resources.images.get(destination).map(|i| (
+                            i.format,
+                            i.extent,
+                            i.mip_levels,
+                            i.array_layers
+                        ))
+                    ),
                     RecordedCommand::BlitImage {
                         source,
                         destination,
@@ -2811,6 +2864,38 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
             source,
             image,
             layout,
+            regions,
+        },
+    );
+}
+
+unsafe extern "system" fn cmd_copy_image(
+    command: vk::CommandBuffer,
+    source: vk::Image,
+    source_layout: vk::ImageLayout,
+    destination: vk::Image,
+    destination_layout: vk::ImageLayout,
+    count: u32,
+    regions: *const vk::ImageCopy,
+) {
+    if count == 0 || count > 4000 {
+        record_error(command, vk::Result::ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    let regions = match slice(regions, count) {
+        Ok(regions) => regions.to_vec(),
+        Err(error) => {
+            record_error(command, error);
+            return;
+        }
+    };
+    record(
+        command,
+        RecordedCommand::CopyImage {
+            source,
+            source_layout,
+            destination,
+            destination_layout,
             regions,
         },
     );
@@ -3860,6 +3945,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdBindDescriptorSets" => entry!(cmd_bind_descriptor_sets),
         b"vkCmdPushConstants" => entry!(cmd_push_constants),
         b"vkCmdBlitImage" => entry!(cmd_blit_image),
+        b"vkCmdCopyImage" => entry!(cmd_copy_image),
         b"vkCmdDispatch" => entry!(cmd_dispatch),
         b"vkCmdDraw" => entry!(cmd_draw),
         b"vkCmdDrawIndexed" => entry!(cmd_draw_indexed),
@@ -3987,6 +4073,24 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_image_is_a_transfer_and_cannot_be_recorded_inside_render_pass() {
+        let mut recording = Recording::new(0);
+        recording.state = RecordingState::Recording;
+        recording.render_active = true;
+        assert_eq!(
+            recording.push(RecordedCommand::CopyImage {
+                source: vk::Image::null(),
+                source_layout: vk::ImageLayout::GENERAL,
+                destination: vk::Image::null(),
+                destination_layout: vk::ImageLayout::GENERAL,
+                regions: Vec::new(),
+            }),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        assert!(recording.commands.is_empty());
+    }
 
     #[test]
     fn clear_attachments_requires_recording_inside_render_pass() {
