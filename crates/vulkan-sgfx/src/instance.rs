@@ -1159,6 +1159,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
             vk::Format::R32_SINT
                 | vk::Format::R32_UINT
                 | vk::Format::R16G16_SFLOAT
+                | vk::Format::R16G16_UINT
                 | vk::Format::R16G16B16A16_SFLOAT
                 | vk::Format::R16G16B16A16_SINT
                 | vk::Format::A2B10G10R10_SNORM_PACK32
