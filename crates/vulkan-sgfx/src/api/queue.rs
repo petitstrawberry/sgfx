@@ -352,9 +352,7 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
             Ok(())
         })();
         if let Err(error) = result {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!("[SGFX Vulkan] queue packet {index} failed: {error:?}");
-            }
+            eprintln!("[SGFX Vulkan] queue packet {index} failed: {error:?}");
             d.lost.store(true, Ordering::Release);
             cancel(&packets[index..]);
             if let Some(s) = &fence {
