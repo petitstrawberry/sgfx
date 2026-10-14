@@ -782,6 +782,7 @@ impl<'a> Compiler<'a> {
                         (IoScalar::Uint, 1) => VertexFormat::Uint32,
                         (IoScalar::Uint, 2) => VertexFormat::Uint16x2,
                         (IoScalar::Sint, 4) => VertexFormat::Sint16x4,
+                        (IoScalar::Float, 1) => VertexFormat::Float32,
                         (IoScalar::Float, 2) => VertexFormat::Float32x2,
                         (IoScalar::Float, 3) => VertexFormat::Float32x3,
                         (IoScalar::Float, 4) => VertexFormat::Float32x4,

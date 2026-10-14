@@ -270,7 +270,14 @@ fn compile_pipeline(
         let scalar = match attribute.format() {
             VertexFormat::Sint32 | VertexFormat::Sint16x4 => IoScalar::Sint,
             VertexFormat::Uint32 | VertexFormat::Uint16x2 => IoScalar::Uint,
-            _ => IoScalar::Float,
+            VertexFormat::Float32
+            | VertexFormat::Float32x2
+            | VertexFormat::Float32x3
+            | VertexFormat::Float32x4
+            | VertexFormat::Float16x2
+            | VertexFormat::Float16x4
+            | VertexFormat::Unorm8x4
+            | VertexFormat::Snorm10_10_10_2 => IoScalar::Float,
         };
         // Vertex fetch supplies a four-component value independently of the
         // shader's vector width. VirGL retains the attribute's actual format,
@@ -1122,16 +1129,19 @@ pub(super) fn decode_draw(
             .map(|a| u64::from(a.offset()) + u64::from(a.format().byte_size()))
             .max()
             .unwrap_or(0);
-        let maximum = maximum_vertex;
-        let end = offset
-            .checked_add(u64::from(maximum) * u64::from(layout.stride()))
-            .and_then(|start| start.checked_add(attribute_end))
-            .ok_or(ir::Error::Overflow)?;
+        let (end, binding_offset) = vertex_fetch_range(
+            layout,
+            offset,
+            maximum_vertex,
+            first_instance,
+            instance_count,
+            attribute_end,
+        )?;
         if end > bytes.as_slice().len() as u64 {
             #[cfg(feature = "std")]
             if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                 eprintln!(
-                    "[SGFX VirGL] vertex shadow out of bounds: slot={slot} offset={offset} maximum={maximum} stride={} attribute_end={attribute_end} end={end} available={}",
+                    "[SGFX VirGL] vertex shadow out of bounds: slot={slot} offset={offset} maximum_vertex={maximum_vertex} first_instance={first_instance} instance_count={instance_count} stride={} attribute_end={attribute_end} end={end} available={}",
                     layout.stride(),
                     bytes.as_slice().len(),
                 );
@@ -1140,7 +1150,7 @@ pub(super) fn decode_draw(
         }
         vertex_buffers[slot] = Some(IrVertexBufferBinding {
             buffer: buffer_spec(resources, pending, buffer)?,
-            offset: u32::try_from(offset).map_err(|_| ir::Error::Overflow)?,
+            offset: u32::try_from(binding_offset).map_err(|_| ir::Error::Overflow)?,
         });
     }
     let vertex_buffer = vertex_buffers[0];
@@ -1231,6 +1241,38 @@ fn draw_with_index(
         textures: Rc::clone(&state.textures),
         storage_buffers: Rc::clone(&state.storage_buffers),
     })
+}
+
+#[cfg(feature = "programmable")]
+fn vertex_fetch_range(
+    layout: &ir::VertexBufferLayout,
+    offset: u64,
+    maximum_vertex: u32,
+    first_instance: u32,
+    instance_count: u32,
+    attribute_end: u64,
+) -> Result<(u64, u64), IrSubmitError> {
+    let (maximum, base) = match layout.step_mode() {
+        ir::VertexStepMode::Vertex => (maximum_vertex, 0),
+        ir::VertexStepMode::Instance => (
+            first_instance
+                .checked_add(instance_count)
+                .and_then(|end| end.checked_sub(1))
+                .ok_or(ir::Error::Overflow)?,
+            first_instance,
+        ),
+    };
+    let end = offset
+        .checked_add(u64::from(maximum) * u64::from(layout.stride()))
+        .and_then(|start| start.checked_add(attribute_end))
+        .ok_or(ir::Error::Overflow)?;
+    // Host VirGL draw packets use base_instance=0. The existing TGSI constant
+    // supplies Vulkan's firstInstance to the shader builtin; advance only the
+    // per-instance buffer here so its hardware divisor-one fetch matches it.
+    let binding_offset = offset
+        .checked_add(u64::from(base) * u64::from(layout.stride()))
+        .ok_or(ir::Error::Overflow)?;
+    Ok((end, binding_offset))
 }
 
 #[cfg(not(feature = "programmable"))]
@@ -1834,12 +1876,37 @@ mod tests {
     }
 
     #[test]
+    fn instance_fetch_offsets_and_bounds_use_first_instance_not_vertex_index() {
+        let vertex = ir::VertexBufferLayout::new(
+            12,
+            vec![ir::VertexAttribute::new(0, VertexFormat::Float32x3, 0)],
+        )
+        .unwrap();
+        let instance = vertex.clone().with_step_mode(ir::VertexStepMode::Instance);
+        assert_eq!(
+            vertex_fetch_range(&vertex, 16, 5, 2, 2, 12).unwrap(),
+            (88, 16)
+        );
+        assert_eq!(
+            vertex_fetch_range(&instance, 16, 5, 2, 2, 12).unwrap(),
+            (64, 40)
+        );
+        assert_eq!(
+            vertex_fetch_range(&instance, 0, 1000, 2, 2, 12).unwrap(),
+            (48, 24)
+        );
+        assert!(vertex_fetch_range(&instance, 0, 0, u32::MAX, 2, 12).is_err());
+        assert!(vertex_fetch_range(&instance, u64::MAX - 4, 0, 2, 2, 12).is_err());
+    }
+
+    #[test]
     fn permits_vertex_fetch_component_defaults_and_unused_components() {
         let vec4_source = SHADER
             .replace("position: vec3<f32>", "position: vec4<f32>")
             .replace("vec4<f32>(position, 1.0)", "position");
         for (source, shader_components) in [(SHADER, 3), (vec4_source.as_str(), 4)] {
             for format in [
+                VertexFormat::Float32,
                 VertexFormat::Float32x2,
                 VertexFormat::Float32x3,
                 VertexFormat::Float32x4,

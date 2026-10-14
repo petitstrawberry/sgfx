@@ -878,6 +878,10 @@ enum RecordedCommand {
         buffer: vk::Buffer,
         regions: Vec<vk::BufferImageCopy>,
     },
+    ClearAttachments {
+        attachments: Vec<vk::ClearAttachment>,
+        rects: Vec<vk::ClearRect>,
+    },
     ClearColorImage {
         image: vk::Image,
         layout: vk::ImageLayout,
@@ -1008,7 +1012,9 @@ impl Recording {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
             RecordedCommand::EndRenderPass => self.render_active = false,
-            RecordedCommand::Draw { .. } | RecordedCommand::DrawIndexed { .. }
+            RecordedCommand::Draw { .. }
+            | RecordedCommand::DrawIndexed { .. }
+            | RecordedCommand::ClearAttachments { .. }
                 if !self.render_active =>
             {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -1286,6 +1292,9 @@ impl RecordedCommand {
                 )?;
             }
             Self::NextSubpass => render_passes::next(rec)?,
+            Self::ClearAttachments { attachments, rects } => {
+                render_passes::clear_attachments(rec, attachments, rects)?;
+            }
             Self::ClearColorImage {
                 image,
                 layout,
@@ -2340,6 +2349,28 @@ unsafe extern "system" fn cmd_next_subpass(
         return;
     }
     record(command, RecordedCommand::NextSubpass)
+}
+
+unsafe extern "system" fn cmd_clear_attachments(
+    command: vk::CommandBuffer,
+    attachment_count: u32,
+    attachments: *const vk::ClearAttachment,
+    rect_count: u32,
+    rects: *const vk::ClearRect,
+) {
+    let result = (|| {
+        if attachment_count > 16 || rect_count > 1024 {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        Ok(RecordedCommand::ClearAttachments {
+            attachments: slice(attachments, attachment_count)?.to_vec(),
+            rects: slice(rects, rect_count)?.to_vec(),
+        })
+    })();
+    match result {
+        Ok(command_data) => record(command, command_data),
+        Err(error) => record_error(command, error),
+    }
 }
 
 unsafe extern "system" fn cmd_clear_color_image(
@@ -3839,6 +3870,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdEndRenderPass" => entry!(cmd_end_render_pass),
         b"vkCmdCopyImageToBuffer" => entry!(cmd_copy_image_to_buffer),
         b"vkCmdClearColorImage" => entry!(cmd_clear_color_image),
+        b"vkCmdClearAttachments" => entry!(cmd_clear_attachments),
         b"vkCmdCopyBuffer" => entry!(cmd_copy_buffer),
         b"vkCmdCopyBufferToImage" => entry!(cmd_copy_buffer_to_image),
         b"vkCmdSetViewport" => entry!(cmd_set_viewport),
@@ -3955,6 +3987,28 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_attachments_requires_recording_inside_render_pass() {
+        let clear = || RecordedCommand::ClearAttachments {
+            attachments: Vec::new(),
+            rects: Vec::new(),
+        };
+        let mut outside = Recording::new(0);
+        outside.state = RecordingState::Recording;
+        assert_eq!(
+            outside.push(clear()),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        assert!(outside.commands.is_empty());
+        let mut inside = Recording::new(0);
+        inside.state = RecordingState::Recording;
+        inside.render_active = true;
+        inside.push(clear()).unwrap();
+        assert_eq!(inside.commands.len(), 1);
+        assert!(inside.render_active);
+        assert!(inside.error.is_none());
+    }
 
     #[test]
     fn barriers_accept_explicit_same_family_without_ownership_transfer() {

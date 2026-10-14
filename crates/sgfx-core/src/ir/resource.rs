@@ -503,6 +503,8 @@ pub enum AddressMode {
     Repeat,
     /// Repeat while mirroring every other copy.
     MirrorRepeat,
+    /// Clamp to a transparent black border, including zero alpha.
+    ClampToBorder,
 }
 
 /// Portable logical sampler descriptor.

@@ -15,17 +15,6 @@ unsafe extern "system" fn unsupported_cmd_begin_query(
     record_error(command_buffer, ash::vk::Result::ERROR_FEATURE_NOT_PRESENT);
 }
 #[allow(unused_variables)]
-unsafe extern "system" fn unsupported_cmd_clear_attachments(
-    command_buffer: CommandBuffer,
-    attachment_count: u32,
-    p_attachments: *const ClearAttachment,
-    rect_count: u32,
-    p_rects: *const ClearRect,
-) {
-    eprintln!("SGFX Vulkan: vkCmdClearAttachments is not supported by this backend subset");
-    record_error(command_buffer, ash::vk::Result::ERROR_FEATURE_NOT_PRESENT);
-}
-#[allow(unused_variables)]
 unsafe extern "system" fn unsupported_cmd_clear_depth_stencil_image(
     command_buffer: CommandBuffer,
     image: Image,
@@ -352,9 +341,6 @@ pub(super) fn lookup(name: &CStr) -> PFN_vkVoidFunction {
     }
     match name.to_bytes() {
         b"vkCmdBeginQuery" => entry!(unsupported_cmd_begin_query, PFN_vkCmdBeginQuery),
-        b"vkCmdClearAttachments" => {
-            entry!(unsupported_cmd_clear_attachments, PFN_vkCmdClearAttachments)
-        }
         b"vkCmdClearDepthStencilImage" => entry!(
             unsupported_cmd_clear_depth_stencil_image,
             PFN_vkCmdClearDepthStencilImage

@@ -9,6 +9,12 @@
 use ash::{Entry, vk};
 use std::path::PathBuf;
 
+#[path = "contracts/scalar_vertex.rs"]
+mod scalar_vertex;
+
+#[path = "contracts/clear_attachments.rs"]
+mod clear_attachments;
+
 #[path = "contracts/render_area.rs"]
 mod render_area;
 

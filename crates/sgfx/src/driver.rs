@@ -1336,7 +1336,8 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
     required_limits.max_compute_workgroup_storage_size = adapter_limits
         .max_compute_workgroup_storage_size
         .min(16 * 1024);
-    let required_features = adapter.features() & wgpu::Features::PUSH_CONSTANTS;
+    let required_features = adapter.features()
+        & (wgpu::Features::PUSH_CONSTANTS | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
     required_limits.max_push_constant_size =
         if required_features.contains(wgpu::Features::PUSH_CONSTANTS) {
             adapter_limits

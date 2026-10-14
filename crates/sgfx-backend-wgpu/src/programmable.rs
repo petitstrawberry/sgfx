@@ -349,7 +349,10 @@ impl Resources {
             .zip(&attributes)
             .map(|(layout, attributes)| raw::VertexBufferLayout {
                 array_stride: u64::from(layout.stride()),
-                step_mode: raw::VertexStepMode::Vertex,
+                step_mode: match layout.step_mode() {
+                    ir::VertexStepMode::Vertex => raw::VertexStepMode::Vertex,
+                    ir::VertexStepMode::Instance => raw::VertexStepMode::Instance,
+                },
                 attributes,
             })
             .collect::<Vec<_>>();

@@ -2278,13 +2278,82 @@ unsafe extern "system" fn destroy_pipeline(
     });
 }
 
+fn sampler_descriptor(
+    i: &vk::SamplerCreateInfo<'_>,
+    custom_allocator: bool,
+) -> Result<ir::SamplerDesc, vk::Result> {
+    if custom_allocator
+        || i.s_type != vk::StructureType::SAMPLER_CREATE_INFO
+        || !i.p_next.is_null()
+        || !i.flags.is_empty()
+        || i.anisotropy_enable != vk::FALSE
+        || i.unnormalized_coordinates != vk::FALSE
+        || !matches!(i.compare_enable, vk::FALSE | vk::TRUE)
+        || i.mip_lod_bias != 0.0
+        || !i.max_lod.is_finite()
+        || !i.min_lod.is_finite()
+        || i.max_lod < i.min_lod
+        || !matches!(
+            i.mipmap_mode,
+            vk::SamplerMipmapMode::NEAREST | vk::SamplerMipmapMode::LINEAR
+        )
+    {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    let border = [i.address_mode_u, i.address_mode_v, i.address_mode_w]
+        .contains(&vk::SamplerAddressMode::CLAMP_TO_BORDER);
+    if border
+        && !matches!(
+            i.border_color,
+            vk::BorderColor::FLOAT_TRANSPARENT_BLACK | vk::BorderColor::INT_TRANSPARENT_BLACK
+        )
+    {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    let filter = |v| match v {
+        vk::Filter::NEAREST => Ok(ir::FilterMode::Nearest),
+        vk::Filter::LINEAR => Ok(ir::FilterMode::Linear),
+        _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+    };
+    let address = |v| match v {
+        vk::SamplerAddressMode::REPEAT => Ok(ir::AddressMode::Repeat),
+        vk::SamplerAddressMode::CLAMP_TO_EDGE => Ok(ir::AddressMode::ClampToEdge),
+        vk::SamplerAddressMode::MIRRORED_REPEAT => Ok(ir::AddressMode::MirrorRepeat),
+        vk::SamplerAddressMode::CLAMP_TO_BORDER => Ok(ir::AddressMode::ClampToBorder),
+        _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+    };
+    // SGFX supports 1D/2D, array and cube textures; no 3D textures. W is
+    // unused for those images, but reject modes outside the enabled contract.
+    address(i.address_mode_w)?;
+    Ok(ir::SamplerDesc::new(
+        filter(i.min_filter)?,
+        filter(i.mag_filter)?,
+        address(i.address_mode_u)?,
+        address(i.address_mode_v)?,
+    )
+    .with_mip_filter(
+        match i.mipmap_mode {
+            vk::SamplerMipmapMode::LINEAR => ir::FilterMode::Linear,
+            _ => ir::FilterMode::Nearest,
+        },
+        i.min_lod,
+        i.max_lod,
+    )
+    .map_err(failure)?
+    .with_compare(if i.compare_enable != vk::FALSE {
+        Some(crate::images::compare(i.compare_op)?)
+    } else {
+        None
+    }))
+}
+
 unsafe extern "system" fn create_sampler(
     device: vk::Device,
     info: *const vk::SamplerCreateInfo<'_>,
     allocator: *const vk::AllocationCallbacks<'_>,
     out: *mut vk::Sampler,
 ) -> vk::Result {
-    ffi(|| {
+    let result = ffi(|| {
         if out.is_null() {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
@@ -2292,54 +2361,7 @@ unsafe extern "system" fn create_sampler(
         let i = info
             .as_ref()
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if !allocator.is_null()
-            || i.s_type != vk::StructureType::SAMPLER_CREATE_INFO
-            || !i.p_next.is_null()
-            || !i.flags.is_empty()
-            || i.anisotropy_enable != vk::FALSE
-            || i.unnormalized_coordinates != vk::FALSE
-            || i.mip_lod_bias != 0.0
-            || !i.max_lod.is_finite()
-            || !i.min_lod.is_finite()
-            || i.max_lod < i.min_lod
-            || !matches!(
-                i.mipmap_mode,
-                vk::SamplerMipmapMode::NEAREST | vk::SamplerMipmapMode::LINEAR
-            )
-        {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        let filter = |v| match v {
-            vk::Filter::NEAREST => Ok(ir::FilterMode::Nearest),
-            vk::Filter::LINEAR => Ok(ir::FilterMode::Linear),
-            _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-        };
-        let address = |v| match v {
-            vk::SamplerAddressMode::REPEAT => Ok(ir::AddressMode::Repeat),
-            vk::SamplerAddressMode::CLAMP_TO_EDGE => Ok(ir::AddressMode::ClampToEdge),
-            vk::SamplerAddressMode::MIRRORED_REPEAT => Ok(ir::AddressMode::MirrorRepeat),
-            _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-        };
-        let desc = ir::SamplerDesc::new(
-            filter(i.min_filter)?,
-            filter(i.mag_filter)?,
-            address(i.address_mode_u)?,
-            address(i.address_mode_v)?,
-        )
-        .with_mip_filter(
-            match i.mipmap_mode {
-                vk::SamplerMipmapMode::LINEAR => ir::FilterMode::Linear,
-                _ => ir::FilterMode::Nearest,
-            },
-            i.min_lod,
-            i.max_lod,
-        )
-        .map_err(failure)?
-        .with_compare(if i.compare_enable != vk::FALSE {
-            Some(crate::images::compare(i.compare_op)?)
-        } else {
-            None
-        });
+        let desc = sampler_descriptor(i, !allocator.is_null())?;
         let handle = crate::api::with_device(device, move |r| {
             let id = r.table.define_sampler(desc).map_err(failure)?.id();
             let handle = vk::Sampler::from_raw(crate::api::next_id());
@@ -2348,7 +2370,15 @@ unsafe extern "system" fn create_sampler(
         })?;
         out.write(handle);
         Ok(())
-    })
+    });
+    if result != vk::Result::SUCCESS {
+        eprintln!(
+            "[SGFX Vulkan] CreateSampler failure={result:?} custom_allocator={} info={:?}",
+            !allocator.is_null(),
+            info.as_ref(),
+        );
+    }
+    result
 }
 unsafe extern "system" fn destroy_sampler(
     device: vk::Device,
@@ -2423,6 +2453,89 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decal_sampler() -> vk::SamplerCreateInfo<'static> {
+        vk::SamplerCreateInfo::default()
+            .min_filter(vk::Filter::LINEAR)
+            .mag_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK)
+            .min_lod(0.0)
+            .max_lod(1000.0)
+    }
+
+    #[test]
+    fn skia_decal_sampler_retains_transparent_border_and_lod() {
+        let desc = sampler_descriptor(&decal_sampler(), false).unwrap();
+        assert_eq!(desc.address_u(), ir::AddressMode::ClampToBorder);
+        assert_eq!(desc.address_v(), ir::AddressMode::ClampToBorder);
+        assert_eq!(desc.min_filter(), ir::FilterMode::Linear);
+        assert_eq!(desc.mag_filter(), ir::FilterMode::Linear);
+        assert_eq!(desc.max_lod(), 1000.0);
+        assert!(
+            sampler_descriptor(
+                &decal_sampler().border_color(vk::BorderColor::INT_TRANSPARENT_BLACK),
+                false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn nonzero_border_and_unimplemented_sampler_controls_are_rejected() {
+        for color in [
+            vk::BorderColor::FLOAT_OPAQUE_BLACK,
+            vk::BorderColor::INT_OPAQUE_BLACK,
+            vk::BorderColor::FLOAT_OPAQUE_WHITE,
+            vk::BorderColor::INT_OPAQUE_WHITE,
+        ] {
+            assert_eq!(
+                sampler_descriptor(&decal_sampler().border_color(color), false),
+                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+            );
+        }
+        for info in [
+            decal_sampler().anisotropy_enable(true).max_anisotropy(2.0),
+            decal_sampler().mip_lod_bias(0.5),
+            decal_sampler().unnormalized_coordinates(true),
+            decal_sampler().address_mode_w(vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE),
+        ] {
+            assert_eq!(
+                sampler_descriptor(&info, false),
+                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+            );
+        }
+        // Border color is ignored by Vulkan when no axis clamps to the border.
+        assert!(
+            sampler_descriptor(
+                &decal_sampler()
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE),
+                false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn sampler_failure_reports_info_and_clears_the_output_handle() {
+        let mut out = vk::Sampler::from_raw(123);
+        let result = unsafe {
+            create_sampler(
+                vk::Device::null(),
+                &decal_sampler().border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE),
+                ptr::null(),
+                &mut out,
+            )
+        };
+        assert_eq!(result, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        assert_eq!(out, vk::Sampler::null());
+    }
 
     #[test]
     fn sparse_descriptor_labels_use_distinct_bounded_slots() {

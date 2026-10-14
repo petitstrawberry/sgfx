@@ -72,6 +72,8 @@ const VIRGL_OBJECT_SURFACE: u32 = 8;
 const VIRGL_FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const VIRGL_FORMAT_Z32_FLOAT: u32 = 18;
 const VIRGL_FORMAT_R32G32B32A32_FLOAT: u32 = 31;
+#[cfg(feature = "programmable")]
+const VIRGL_FORMAT_R32_FLOAT: u32 = 28;
 const VIRGL_FORMAT_R32G32_FLOAT: u32 = 29;
 #[cfg(feature = "programmable")]
 const VIRGL_FORMAT_R32G32B32_FLOAT: u32 = 30;
@@ -122,6 +124,7 @@ const PIPE_BLEND_SUBTRACT: u32 = 1;
 const PIPE_BLEND_REVERSE_SUBTRACT: u32 = 2;
 const PIPE_TEX_WRAP_REPEAT: u32 = 0;
 const PIPE_TEX_WRAP_CLAMP_TO_EDGE: u32 = 2;
+const PIPE_TEX_WRAP_CLAMP_TO_BORDER: u32 = 3;
 const PIPE_TEX_WRAP_MIRROR_REPEAT: u32 = 4;
 const PIPE_TEX_FILTER_NEAREST: u32 = 0;
 const PIPE_TEX_FILTER_LINEAR: u32 = 1;
@@ -4163,17 +4166,21 @@ fn push_programmable_vertex_elements(
     for location in 0..count {
         // Shader IN numbers correspond to locations, independently of the
         // application's attribute order. Fill unused holes with a valid fetch.
-        let (slot, _layout, attribute) = attributes
+        let (slot, layout, attribute) = attributes
             .iter()
             .find(|(_, _, attribute)| attribute.location() == location)
             .or_else(|| attributes.first())
             .ok_or(HandleError::InvalidParameter)?;
         push_dword(commands, attribute.offset());
-        push_dword(commands, 0);
+        push_dword(
+            commands,
+            u32::from(layout.step_mode() == crate::ir::VertexStepMode::Instance),
+        );
         push_dword(commands, *slot as u32);
         push_dword(
             commands,
             match attribute.format() {
+                crate::ir::VertexFormat::Float32 => VIRGL_FORMAT_R32_FLOAT,
                 crate::ir::VertexFormat::Float32x2 => VIRGL_FORMAT_R32G32_FLOAT,
                 crate::ir::VertexFormat::Float32x3 => VIRGL_FORMAT_R32G32B32_FLOAT,
                 crate::ir::VertexFormat::Float32x4 => VIRGL_FORMAT_R32G32B32A32_FLOAT,
@@ -4636,6 +4643,8 @@ fn push_ir_sampler(commands: &mut Vec<u8>, sampler: &IrSampler) {
     push_float(commands, 0.0);
     push_float(commands, state.min_lod);
     push_float(commands, state.max_lod);
+    // The portable ClampToBorder mode means transparent black. VirGL's
+    // four border-color words are the IEEE float/integer zero components.
     for _ in 0..4 {
         push_dword(commands, 0);
     }
@@ -5060,6 +5069,7 @@ fn ir_address_mode(address: IrAddressMode) -> u32 {
         IrAddressMode::ClampToEdge => PIPE_TEX_WRAP_CLAMP_TO_EDGE,
         IrAddressMode::Repeat => PIPE_TEX_WRAP_REPEAT,
         IrAddressMode::MirrorRepeat => PIPE_TEX_WRAP_MIRROR_REPEAT,
+        IrAddressMode::ClampToBorder => PIPE_TEX_WRAP_CLAMP_TO_BORDER,
     }
 }
 
@@ -5481,6 +5491,37 @@ mod tests {
             ir_buffer_upload_range(Some(8), 9, 4096, None).unwrap(),
             0..4096
         );
+    }
+
+    #[test]
+    fn transparent_border_sampler_uses_native_wrap_and_zero_rgba() {
+        let sampler = IrSampler {
+            handle: 23,
+            initialized: Cell::new(false),
+            state: IrSamplerState {
+                slot: 0,
+                min_filter: IrFilterMode::Linear,
+                mag_filter: IrFilterMode::Linear,
+                mip_filter: IrFilterMode::Nearest,
+                address_u: IrAddressMode::ClampToBorder,
+                address_v: IrAddressMode::ClampToBorder,
+                min_lod: 0.0,
+                max_lod: 1000.0,
+                compare: None,
+            },
+        };
+        let mut bytes = Vec::new();
+        push_ir_sampler(&mut bytes, &sampler);
+        let words = dwords(&bytes);
+        assert_eq!(words.len(), 10);
+        assert_eq!(
+            words[0],
+            command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_STATE, 9)
+        );
+        assert_eq!(words[2] & 7, 3); // Gallium PIPE_TEX_WRAP_CLAMP_TO_BORDER.
+        assert_eq!((words[2] >> 3) & 7, 3);
+        assert_eq!(&words[6..10], &[0, 0, 0, 0]);
+        assert_eq!(f32::from_bits(words[5]), 1000.0);
     }
 
     fn dwords(bytes: &[u8]) -> Vec<u32> {
@@ -6455,6 +6496,49 @@ mod tests {
             )),
             Err(HandleError::InvalidParameter)
         );
+    }
+
+    #[test]
+    fn instance_vertex_elements_use_divisor_one_only_for_instance_bindings() {
+        use crate::ir::{VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
+        let layouts = [
+            VertexBufferLayout::new(
+                8,
+                alloc::vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+            )
+            .unwrap(),
+            VertexBufferLayout::new(
+                12,
+                alloc::vec![
+                    VertexAttribute::new(1, VertexFormat::Float32x2, 0),
+                    VertexAttribute::new(2, VertexFormat::Float32, 8)
+                ],
+            )
+            .unwrap()
+            .with_step_mode(VertexStepMode::Instance),
+        ];
+        let mut commands = Vec::new();
+        push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
+        assert_eq!(
+            &dwords(&commands)[2..],
+            &[0, 0, 0, 29, 0, 1, 1, 29, 8, 1, 1, 28]
+        );
+    }
+
+    #[test]
+    fn programmable_scalar_coverage_keeps_r32_fetch_at_offset_eight() {
+        use crate::ir::{VertexAttribute, VertexBufferLayout, VertexFormat};
+        let layout = VertexBufferLayout::new(
+            12,
+            alloc::vec![
+                VertexAttribute::new(0, VertexFormat::Float32x2, 0),
+                VertexAttribute::new(1, VertexFormat::Float32, 8),
+            ],
+        )
+        .unwrap();
+        let mut commands = Vec::new();
+        push_programmable_vertex_elements(&mut commands, 9, &[layout]).unwrap();
+        assert_eq!(&dwords(&commands)[2..], &[0, 0, 0, 29, 8, 0, 0, 28]);
     }
 
     #[test]

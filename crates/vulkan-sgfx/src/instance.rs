@@ -1171,7 +1171,8 @@ pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
     if capabilities.supports_vertex_buffers()
         && matches!(
             format,
-            vk::Format::R32G32_SFLOAT
+            vk::Format::R32_SFLOAT
+                | vk::Format::R32G32_SFLOAT
                 | vk::Format::R32G32B32_SFLOAT
                 | vk::Format::R32G32B32A32_SFLOAT
                 | vk::Format::R8G8B8A8_UNORM
@@ -1594,6 +1595,13 @@ mod tests {
                 vk::FormatFeatureFlags::VERTEX_BUFFER
             );
             assert!(formats.optimal_tiling_features.is_empty());
+            get_physical_device_format_properties(physical, vk::Format::R32_SFLOAT, &mut formats);
+            assert_eq!(
+                formats.buffer_features,
+                vk::FormatFeatureFlags::VERTEX_BUFFER
+            );
+            assert!(formats.optimal_tiling_features.is_empty());
+
             count = 10;
             assert_eq!(
                 enumerate_device_extension_properties(

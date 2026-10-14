@@ -107,6 +107,8 @@ pub enum VertexFormat {
     Unorm8x4,
     /// Two 16-bit unsigned integers, widened during vertex fetch.
     Uint16x2,
+    /// One 32-bit floating-point component.
+    Float32,
 }
 
 impl VertexFormat {
@@ -120,7 +122,8 @@ impl VertexFormat {
             Self::Float32x2 => 8,
             Self::Float32x3 => 12,
             Self::Float32x4 => 16,
-            Self::Unorm8x4
+            Self::Float32
+            | Self::Unorm8x4
             | Self::Sint32
             | Self::Uint32
             | Self::Float16x2
@@ -180,11 +183,21 @@ impl VertexAttribute {
     }
 }
 
+/// Advance an interleaved attribute record by vertex or by instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexStepMode {
+    /// Fetch using the draw's vertex index.
+    Vertex,
+    /// Fetch using the draw's instance index, with divisor one.
+    Instance,
+}
+
 /// Owned validated description of one interleaved vertex buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexBufferLayout {
     stride: u32,
     attributes: Vec<VertexAttribute>,
+    step_mode: VertexStepMode,
 }
 
 impl VertexBufferLayout {
@@ -215,7 +228,22 @@ impl VertexBufferLayout {
                 return Err(Error::InvalidDescriptor);
             }
         }
-        Ok(Self { stride, attributes })
+        Ok(Self {
+            stride,
+            attributes,
+            step_mode: VertexStepMode::Vertex,
+        })
+    }
+
+    /// Select per-vertex or per-instance fetch. Instance stepping uses divisor one.
+    pub fn with_step_mode(mut self, step_mode: VertexStepMode) -> Self {
+        self.step_mode = step_mode;
+        self
+    }
+
+    /// Return the index used to advance records in this binding.
+    pub const fn step_mode(&self) -> VertexStepMode {
+        self.step_mode
     }
 
     /// Return the interleaved byte stride.
@@ -579,7 +607,9 @@ impl RenderPipelineDesc {
         blend: BlendState,
         raster: RasterState,
     ) -> Result<Self> {
-        if target_format == TextureFormat::Depth32Float {
+        if target_format == TextureFormat::Depth32Float
+            || vertex_buffer.step_mode() != VertexStepMode::Vertex
+        {
             return Err(Error::InvalidDescriptor);
         }
         let position = vertex_buffer

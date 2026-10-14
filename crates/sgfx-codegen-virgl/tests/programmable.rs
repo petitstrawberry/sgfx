@@ -1202,3 +1202,29 @@ fn push_constant_reads_require_root_members_but_not_explicit_unused_padding() {
         }
     }
 }
+
+#[test]
+fn scalar_float_vertex_input_keeps_one_lane_and_float_reflection() {
+    use sgfx_codegen_virgl::programmable::IoScalar;
+    use sgfx_core::ir::VertexFormat;
+    let source = r#"
+    struct Output { @builtin(position) position: vec4<f32>, @location(0) coverage: f32 };
+    @vertex fn vs(@location(0) position: vec2<f32>, @location(1) coverage: f32) -> Output {
+        return Output(vec4<f32>(position, 0.0, 1.0), coverage);
+    }
+    @fragment fn fs(@location(0) coverage: f32) -> @location(0) vec4<f32> {
+        return vec4<f32>(coverage, 0.0, 0.0, 1.0);
+    }
+    "#;
+    for module in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&module, ShaderStage::Vertex, "vs").unwrap();
+        assert_eq!(
+            shader.vertex_inputs,
+            [(0, VertexFormat::Float32x2), (1, VertexFormat::Float32)]
+        );
+        let input = shader.inputs.iter().find(|i| i.location == 1).unwrap();
+        assert_eq!(input.components, 1);
+        assert_eq!(input.scalar, IoScalar::Float);
+        assert!(shader.tgsi.contains("DCL IN[1]"));
+    }
+}

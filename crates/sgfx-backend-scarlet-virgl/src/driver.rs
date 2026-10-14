@@ -625,6 +625,7 @@ pub(crate) enum IrAddressMode {
     ClampToEdge,
     Repeat,
     MirrorRepeat,
+    ClampToBorder,
 }
 
 /// Persistent sampler slot and its immutable portable state.

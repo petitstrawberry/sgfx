@@ -1030,11 +1030,17 @@ unsafe fn vertex_layout(
         vertex.vertex_binding_description_count as usize,
     ) {
         if binding.binding >= ir::MAX_VERTEX_BUFFERS as u32
-            || binding.input_rate != vk::VertexInputRate::VERTEX
+            || !matches!(
+                binding.input_rate,
+                vk::VertexInputRate::VERTEX | vk::VertexInputRate::INSTANCE
+            )
             || binding.stride > 2048
             || !binding.stride.is_multiple_of(4)
             || buffers
-                .insert(binding.binding, (binding.stride, Vec::new()))
+                .insert(
+                    binding.binding,
+                    (binding.stride, binding.input_rate, Vec::new()),
+                )
                 .is_some()
         {
             return Err(UNSUPPORTED);
@@ -1051,6 +1057,7 @@ unsafe fn vertex_layout(
             return Err(UNSUPPORTED);
         }
         let format = match attribute.format {
+            vk::Format::R32_SFLOAT => ir::VertexFormat::Float32,
             vk::Format::R32G32_SFLOAT => ir::VertexFormat::Float32x2,
             vk::Format::R32G32B32_SFLOAT => ir::VertexFormat::Float32x3,
             vk::Format::R32G32B32A32_SFLOAT => ir::VertexFormat::Float32x4,
@@ -1067,7 +1074,7 @@ unsafe fn vertex_layout(
             _ => return Err(UNSUPPORTED),
         };
 
-        let (_, attributes) = buffers.get_mut(&attribute.binding).ok_or(UNSUPPORTED)?;
+        let (_, _, attributes) = buffers.get_mut(&attribute.binding).ok_or(UNSUPPORTED)?;
         attributes.push(ir::VertexAttribute::new(
             attribute.location,
             format,
@@ -1077,11 +1084,19 @@ unsafe fn vertex_layout(
     buffers
         .into_iter()
         .enumerate()
-        .map(|(index, (slot, (stride, attributes)))| {
+        .map(|(index, (slot, (stride, rate, attributes)))| {
             if slot != index as u32 {
                 return Err(UNSUPPORTED);
             }
-            ir::VertexBufferLayout::new(stride, attributes).map_err(|_| UNSUPPORTED)
+            ir::VertexBufferLayout::new(stride, attributes)
+                .map(|layout| {
+                    layout.with_step_mode(match rate {
+                        vk::VertexInputRate::VERTEX => ir::VertexStepMode::Vertex,
+                        vk::VertexInputRate::INSTANCE => ir::VertexStepMode::Instance,
+                        _ => unreachable!("input rates are validated above"),
+                    })
+                })
+                .map_err(|_| UNSUPPORTED)
         })
         .collect()
 }
@@ -1641,6 +1656,94 @@ mod tests {
     }
 
     #[test]
+    fn skia_instance_layout_keeps_distinct_rates_and_all_packed_attributes() {
+        let bindings = [
+            vk::VertexInputBindingDescription {
+                binding: 0,
+                stride: 48,
+                input_rate: vk::VertexInputRate::VERTEX,
+            },
+            vk::VertexInputBindingDescription {
+                binding: 1,
+                stride: 60,
+                input_rate: vk::VertexInputRate::INSTANCE,
+            },
+        ];
+        let attributes = (0..8)
+            .map(|location| vk::VertexInputAttributeDescription {
+                location,
+                binding: u32::from(location >= 3),
+                format: match location {
+                    6 => vk::Format::R32G32_SFLOAT,
+                    7 => vk::Format::R8G8B8A8_UNORM,
+                    _ => vk::Format::R32G32B32A32_SFLOAT,
+                },
+                offset: match location {
+                    0..=2 => location * 16,
+                    3..=5 => (location - 3) * 16,
+                    6 => 48,
+                    _ => 56,
+                },
+            })
+            .collect::<Vec<_>>();
+        let info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        let layouts = unsafe { vertex_layout(&info) }.unwrap();
+        assert_eq!(layouts[0].step_mode(), ir::VertexStepMode::Vertex);
+        assert_eq!(layouts[1].step_mode(), ir::VertexStepMode::Instance);
+        assert_eq!(layouts[0].stride(), 48);
+        assert_eq!(layouts[1].stride(), 60);
+        assert_eq!(layouts[0].attributes().len(), 3);
+        assert_eq!(layouts[1].attributes().len(), 5);
+        assert_eq!(
+            layouts[1].attributes()[4],
+            ir::VertexAttribute::new(7, ir::VertexFormat::Unorm8x4, 56)
+        );
+    }
+
+    #[test]
+    fn skia_xy_plus_scalar_coverage_preserves_the_twelve_byte_stride() {
+        let bindings = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: 12,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }];
+        let mut attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32_SFLOAT,
+                offset: 8,
+            },
+        ];
+        let info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        let parsed = unsafe { vertex_layout(&info) }.unwrap().remove(0);
+        assert_eq!(parsed.stride(), 12);
+        assert_eq!(
+            parsed.attributes()[0],
+            ir::VertexAttribute::new(0, ir::VertexFormat::Float32x2, 0)
+        );
+        assert_eq!(
+            parsed.attributes()[1],
+            ir::VertexAttribute::new(1, ir::VertexFormat::Float32, 8)
+        );
+        attributes[1].offset = 12;
+        let info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        assert_eq!(unsafe { vertex_layout(&info) }, Err(UNSUPPORTED));
+    }
+
+    #[test]
     fn interleaved_vertex_layout_is_bounded_and_formats_are_preserved() {
         let bindings = [vk::VertexInputBindingDescription {
             binding: 0,
@@ -1680,7 +1783,7 @@ mod tests {
             .vertex_attribute_descriptions(&attributes);
         assert_eq!(unsafe { vertex_layout(&overflow) }, Err(UNSUPPORTED));
         let bindings = [vk::VertexInputBindingDescription {
-            input_rate: vk::VertexInputRate::INSTANCE,
+            input_rate: vk::VertexInputRate::from_raw(99),
             ..bindings[0]
         }];
         let instanced = vk::PipelineVertexInputStateCreateInfo::default()

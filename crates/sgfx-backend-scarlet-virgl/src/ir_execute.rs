@@ -2659,11 +2659,13 @@ fn sampler_state(descriptor: SamplerDesc, slot: usize) -> IrSamplerState {
             AddressMode::ClampToEdge => IrAddressMode::ClampToEdge,
             AddressMode::Repeat => IrAddressMode::Repeat,
             AddressMode::MirrorRepeat => IrAddressMode::MirrorRepeat,
+            AddressMode::ClampToBorder => IrAddressMode::ClampToBorder,
         },
         address_v: match descriptor.address_v() {
             AddressMode::ClampToEdge => IrAddressMode::ClampToEdge,
             AddressMode::Repeat => IrAddressMode::Repeat,
             AddressMode::MirrorRepeat => IrAddressMode::MirrorRepeat,
+            AddressMode::ClampToBorder => IrAddressMode::ClampToBorder,
         },
     }
 }
