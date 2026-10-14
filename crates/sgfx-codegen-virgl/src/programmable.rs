@@ -58,7 +58,10 @@ pub struct StorageBufferBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushConstantBinding {
     pub first_register: u32,
+    /// Rounded declaration span used for constant-register allocation.
     pub size: u32,
+    /// Declared members end here; trailing structure alignment is not data.
+    pub required_size: u32,
 }
 
 /// The number of mip levels in a bound image, supplied by the resource
@@ -997,9 +1000,18 @@ impl<'a> Compiler<'a> {
                 .checked_add(size.div_ceil(16))
                 .filter(|&register| register <= 1024)
                 .ok_or_else(|| unsupported("more than 1024 inline constant registers"))?;
+            let required_size = match &self.module.types[ty].inner {
+                T::Struct { members, .. } => members
+                    .iter()
+                    .map(|member| member.offset + layouter[member.ty].size)
+                    .max()
+                    .unwrap_or(0),
+                _ => size,
+            };
             self.push_constants = Some(PushConstantBinding {
                 first_register,
                 size,
+                required_size,
             });
             self.globals[handle.index()] = Some(self.uniform_value(ty, first_register * 16)?);
         }
@@ -1893,6 +1905,53 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
+            E::Derivative { axis, ctrl, expr } => {
+                if self.stage != ShaderStage::Fragment || ctrl != naga::DerivativeControl::None {
+                    return Err(unsupported(
+                        "non-default derivative control or non-fragment derivative",
+                    ));
+                }
+                let input = self.expression(frame, expr)?;
+                if input.shape.kind()? != K::Float {
+                    return Err(unsupported("non-floating derivative"));
+                }
+                let result = self.allocate(shape.clone(), false)?;
+                match axis {
+                    naga::DerivativeAxis::X | naga::DerivativeAxis::Y => {
+                        let opcode = if axis == naga::DerivativeAxis::X {
+                            "DDX"
+                        } else {
+                            "DDY"
+                        };
+                        let minus_one = self.immediate(Literal::F32(-1.0))?;
+                        for (dst, src) in result.lanes.iter().zip(&input.lanes) {
+                            self.instruction(opcode, dst, &[src])?;
+                            // SGFX fragment coordinates increase downwards, unlike
+                            // the host GL window-space Y derivative.
+                            if axis == naga::DerivativeAxis::Y {
+                                self.instruction("MUL", dst, &[dst, &minus_one.lanes[0]])?;
+                            }
+                        }
+                    }
+                    naga::DerivativeAxis::Width => {
+                        let dx = self.allocate(shape.clone(), false)?;
+                        let dy = self.allocate(shape, false)?;
+                        for ((dst, src), (x, y)) in result
+                            .lanes
+                            .iter()
+                            .zip(&input.lanes)
+                            .zip(dx.lanes.iter().zip(&dy.lanes))
+                        {
+                            self.instruction("DDX", x, &[src])?;
+                            self.instruction("DDY", y, &[src])?;
+                            self.instruction("ABS", x, &[x])?;
+                            self.instruction("ABS", y, &[y])?;
+                            self.instruction("ADD", dst, &[x, y])?;
+                        }
+                    }
+                }
+                result
+            }
             E::Relational { fun, argument } => {
                 let argument = self.expression(frame, argument)?;
                 let opcode = match fun {
@@ -1923,10 +1982,10 @@ impl<'a> Compiler<'a> {
                 let c = arg2.map(|h| self.expression(frame, h)).transpose()?;
                 self.math(fun, a, b, c, shape)?
             }
-            _ => {
-                return Err(unsupported(
-                    "expression (texture, derivative, atomic, override and subgroup operations are not supported)",
-                ));
+            rejected => {
+                return Err(ShaderCompileError(format!(
+                    "unsupported TGSI expression: {rejected:?}"
+                )));
             }
         };
         frame.expressions[handle.index()] = Some(value.clone());

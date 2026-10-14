@@ -328,8 +328,8 @@ fn compile_pipeline(
         };
         if let Some(push) = &shader.push_constants {
             let ranges = pipeline.layout().push_constant_ranges();
-            // Require the declared source block within the bounded stage layout.
-            for byte in 0..push.size {
+            // Require declared members, excluding unused trailing structure alignment.
+            for byte in 0..push.required_size {
                 if !ranges.iter().any(|range| {
                     range.stages().contains(visibility)
                         && byte >= range.offset()
@@ -1236,6 +1236,74 @@ mod tests {
             var output: Output; output.position = transform.mvp * vec4<f32>(position, 1.0); output.color = color; return output;
         }
         @fragment fn fs(input: Output) -> @location(0) vec4<f32> { return vec4<f32>(input.color, 1.0); }";
+
+    #[test]
+    fn fragment_derivatives_lower_scalar_vector_and_antialias_width() {
+        let table = ResourceTable::new();
+        let id = pipeline_source(&table, VertexFormat::Float32x3, ir::BindingType::UniformBuffer,
+            "@vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(p, 1); }
+            @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+                let dx = dpdx(p.xy); let dy = dpdy(p.xy); let aa = fwidth(p.x + p.y);
+                return vec4<f32>(dx.x, dy.y, aa, 1);
+            }");
+        let compiled = compile_pipeline(&table, id).unwrap();
+        assert!(compiled.fragment.tgsi.contains("DDX "));
+        assert!(compiled.fragment.tgsi.contains("DDY "));
+        assert!(compiled.fragment.tgsi.contains("ABS "));
+    }
+
+    #[test]
+    fn push_constant_range_covers_members_without_trailing_struct_alignment() {
+        let table = ResourceTable::new();
+        let module = table.define_shader_module(ir::ShaderModuleDesc::wgsl(
+            "struct Push { adjust: vec4<f32>, atlas: vec2<f32> }; var<push_constant> pc: Push;
+            @vertex fn vs(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(p * pc.atlas + pc.adjust.xy, 0, 1);
+            }
+            @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1); }".into()
+        ).unwrap()).unwrap();
+        let make = |size| {
+            let layout = ir::PipelineLayoutDesc::new(vec![])
+                .unwrap()
+                .with_push_constant_ranges(vec![
+                    ir::PushConstantRange::new(ir::ShaderStages::VERTEX, 0, size).unwrap(),
+                ])
+                .unwrap();
+            table
+                .define_programmable_render_pipeline(
+                    ir::ProgrammableRenderPipelineDesc::new(
+                        ir::ShaderEntryPoint::new(module, ir::ShaderStage::Vertex, "vs".into())
+                            .unwrap(),
+                        ir::ShaderEntryPoint::new(module, ir::ShaderStage::Fragment, "fs".into())
+                            .unwrap(),
+                        layout,
+                        TextureFormat::Bgra8Unorm,
+                        None,
+                        PrimitiveTopology::TriangleList,
+                        ir::BlendState::REPLACE,
+                        ir::RasterState::new(ir::CullMode::None, ir::FrontFace::CounterClockwise),
+                    )
+                    .unwrap()
+                    .with_vertex_buffers(vec![
+                        ir::VertexBufferLayout::new(
+                            8,
+                            vec![ir::VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                )
+                .unwrap()
+                .id()
+        };
+        let valid = compile_pipeline(&table, make(24)).unwrap();
+        let binding = valid.vertex.push_constants.as_ref().unwrap();
+        assert_eq!((binding.size, binding.required_size), (32, 24));
+        assert!(matches!(
+            compile_pipeline(&table, make(20)),
+            Err(IrSubmitError::InvalidIr(ir::Error::BindingLayoutMismatch))
+        ));
+    }
 
     fn pipeline(
         table: &ResourceTable,
