@@ -329,14 +329,20 @@ fn compile_pipeline(
             };
             if let Some(push) = &shader.push_constants {
                 let ranges = pipeline.layout().push_constant_ranges();
-                // Require declared members, excluding unused trailing structure alignment.
-                for byte in 0..push.required_size {
-                    if !ranges.iter().any(|range| {
-                        range.stages().contains(visibility)
-                            && byte >= range.offset()
-                            && byte < range.offset() + range.size()
-                    }) {
+                // Require each statically used declared member, including
+                // nested structs. Unused members/padding are not a dense prefix.
+                for required in &push.required_ranges {
+                    if required.start >= required.end || required.end > push.size {
                         return Err(ir::Error::BindingLayoutMismatch.into());
+                    }
+                    for byte in required.clone() {
+                        if !ranges.iter().any(|range| {
+                            range.stages().contains(visibility)
+                                && byte >= range.offset()
+                                && byte < range.offset() + range.size()
+                        }) {
+                            return Err(ir::Error::BindingLayoutMismatch.into());
+                        }
                     }
                 }
             }
@@ -1322,6 +1328,124 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn push_constant_stage_ranges_cover_only_used_whole_root_members() {
+        for (block, expression, valid_offset, valid_size, invalid_offset, invalid_size) in [
+            (
+                "adjust:vec4<f32>, atlas:vec2<f32>, spare:vec2<u32>",
+                "vec4<f32>(p * pc.atlas + pc.adjust.xy, 0, 1)",
+                0,
+                24,
+                0,
+                20,
+            ),
+            (
+                "adjust:vec4<f32>",
+                "vec4<f32>(p + pc.adjust.x, 0, 1)",
+                0,
+                16,
+                0,
+                4,
+            ),
+            (
+                "leading:vec4<f32>, adjust:vec4<f32>, trailing:vec4<u32>",
+                "vec4<f32>(p + pc.adjust.x, 0, 1)",
+                16,
+                16,
+                0,
+                16,
+            ),
+            (
+                "leading:vec4<f32>, values:array<vec4<f32>,3>, trailing:vec4<u32>",
+                "pc.values[u32(p.x) % 3u]",
+                16,
+                48,
+                16,
+                44,
+            ),
+        ] {
+            let source = format!("struct Push {{ {block} }}; var<push_constant> pc:Push;
+                @vertex fn vs(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {{ return {expression}; }}
+                @fragment fn fs()->@location(0) vec4<f32> {{ return vec4<f32>(1); }}");
+            for desc in [
+                ir::ShaderModuleDesc::wgsl(source.clone()).unwrap(),
+                spirv_module(&source),
+            ] {
+                let table = ResourceTable::new();
+                let module = table.define_shader_module(desc).unwrap();
+                let make = |stages, offset, size| {
+                    let layout = ir::PipelineLayoutDesc::new(vec![])
+                        .unwrap()
+                        .with_push_constant_ranges(vec![
+                            ir::PushConstantRange::new(stages, offset, size).unwrap(),
+                        ])
+                        .unwrap();
+                    table
+                        .define_programmable_render_pipeline(
+                            ir::ProgrammableRenderPipelineDesc::new(
+                                ir::ShaderEntryPoint::new(
+                                    module,
+                                    ir::ShaderStage::Vertex,
+                                    "vs".into(),
+                                )
+                                .unwrap(),
+                                ir::ShaderEntryPoint::new(
+                                    module,
+                                    ir::ShaderStage::Fragment,
+                                    "fs".into(),
+                                )
+                                .unwrap(),
+                                layout,
+                                TextureFormat::Bgra8Unorm,
+                                None,
+                                PrimitiveTopology::TriangleList,
+                                ir::BlendState::REPLACE,
+                                ir::RasterState::new(
+                                    ir::CullMode::None,
+                                    ir::FrontFace::CounterClockwise,
+                                ),
+                            )
+                            .unwrap()
+                            .with_vertex_buffers(vec![
+                                ir::VertexBufferLayout::new(
+                                    8,
+                                    vec![ir::VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+                                )
+                                .unwrap(),
+                            ])
+                            .unwrap(),
+                        )
+                        .unwrap()
+                        .id()
+                };
+                let valid = compile_pipeline(
+                    &table,
+                    make(ir::ShaderStages::VERTEX, valid_offset, valid_size),
+                )
+                .unwrap();
+                let push = valid.vertex.push_constants.as_ref().unwrap();
+                assert!(
+                    push.required_ranges
+                        .iter()
+                        .all(|range| range.start >= valid_offset
+                            && range.end <= valid_offset + valid_size)
+                );
+                for invalid in [
+                    make(ir::ShaderStages::VERTEX, invalid_offset, invalid_size),
+                    make(ir::ShaderStages::FRAGMENT, valid_offset, valid_size),
+                ] {
+                    assert!(
+                        matches!(
+                            compile_pipeline(&table, invalid),
+                            Err(IrSubmitError::InvalidIr(ir::Error::BindingLayoutMismatch))
+                        ),
+                        "{block}"
+                    );
+                }
+            }
+        }
+    }
+
     fn pipeline(
         table: &ResourceTable,
         vertex_format: VertexFormat,
@@ -1763,7 +1887,7 @@ mod tests {
         let module = naga::front::wgsl::parse_str(source).unwrap();
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
+            naga::valid::Capabilities::PUSH_CONSTANT,
         )
         .validate(&module)
         .unwrap();

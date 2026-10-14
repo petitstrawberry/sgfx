@@ -961,6 +961,7 @@ fn evaluate_math_tgsi(tgsi: &str, inputs: &[[f32; 4]]) -> [f32; 4] {
                 "SUB" => (f(0) - f(1)).to_bits(),
                 "MUL" => (f(0) * f(1)).to_bits(),
                 "DIV" => (f(0) / f(1)).to_bits(),
+                "FMA" => f(0).mul_add(f(1), f(2)).to_bits(),
                 "EX2" => f(0).exp2().to_bits(),
                 "LG2" => f(0).log2().to_bits(),
                 "AND" => source[0][component] & source[1][component],
@@ -1010,17 +1011,25 @@ fn module_spirv(module: &naga::Module) -> ShaderModuleDesc {
 
 #[test]
 fn fused_multiply_add_is_not_replaced_with_unfused_mad() {
-    let source = r#"@fragment fn main(@location(0) a:vec4<f32>, @location(1) b:vec4<f32>, @location(2) c:vec4<f32>) -> @location(0) vec4<f32> {
-        return fma(a,b,c);
-    }"#;
-    for module in [wgsl(source), spirv(source)] {
-        let error = compile_shader(&module, ShaderStage::Fragment, "main").unwrap_err();
-        assert!(
-            error
-                .0
-                .contains("fused multiply-add in VirGL host shader transport"),
-            "{error}"
-        );
+    for source in [
+        r#"@fragment fn main(@location(0) a:vec4<f32>, @location(1) b:vec4<f32>, @location(2) c:vec4<f32>) -> @location(0) vec4<f32> {
+            return fma(a,b,c);
+        }"#,
+        r#"@fragment fn main(@location(0) a:vec4<f32>, @location(1) b:vec4<f32>, @location(2) c:vec4<f32>) -> @location(0) vec4<f32> {
+            return vec4<f32>(fma(a.x,b.x,c.x), fma(a.y,b.y,c.y), fma(a.z,b.z,c.z), fma(a.w,b.w,c.w));
+        }"#,
+    ] {
+        let a = [1.0 + f32::EPSILON, -3.25, 8.0, 0.125];
+        let b = [1.0 - f32::EPSILON, 2.0, -0.25, 16.0];
+        let c = [-1.0, 0.125, 1.0, 0.5];
+        let expected = std::array::from_fn(|i| a[i].mul_add(b[i], c[i]));
+        assert_ne!(expected[0], a[0] * b[0] + c[0]);
+        for module in [wgsl(source), spirv(source)] {
+            let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+            assert!(shader.tgsi.contains("FMA "));
+            assert!(!shader.tgsi.contains("MAD "));
+            assert_eq!(evaluate_math_tgsi(&shader.tgsi, &[a, b, c]), expected);
+        }
     }
 }
 
@@ -1137,5 +1146,59 @@ fn skia_infinity_tags_distinguish_nan_finite_and_signed_infinity() {
             [0.0, 0.0, 1.0, 0.0]
         };
         assert_eq!(evaluate_math_tgsi(&shader.tgsi, &[value]), expected);
+    }
+}
+
+#[test]
+fn push_constant_reads_require_root_members_but_not_explicit_unused_padding() {
+    for (source, size, ranges) in [
+        (
+            r#"struct Push { adjust:vec4<f32>, atlas:vec2<f32>, spare:vec2<u32> };
+            var<push_constant> pc:Push;
+            @vertex fn main(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {
+                return vec4<f32>(p * pc.atlas + pc.adjust.xy, 0, 1);
+            }"#,
+            32,
+            vec![0..16, 16..24],
+        ),
+        (
+            r#"struct Push { leading:vec4<f32>, adjust:vec4<f32>, trailing:vec4<u32> };
+            var<push_constant> pc:Push;
+            @vertex fn main(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {
+                return vec4<f32>(p + pc.adjust.x, 0, 1);
+            }"#,
+            48,
+            vec![16..32],
+        ),
+        (
+            r#"struct Coordinates { transform:mat2x2<f32>, unused:vec4<u32> };
+                struct Push { leading:vec4<f32>, coords:Coordinates, trailing:vec4<u32> };
+                var<push_constant> pc:Push;
+                @vertex fn main(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {
+                    return vec4<f32>(p + pc.coords.transform[0][0], 0, 1);
+                }"#,
+            64,
+            vec![16..32],
+        ),
+        (
+            r#"struct Push { leading:vec4<f32>, values:array<vec4<f32>,3>, trailing:vec4<u32> };
+            var<push_constant> pc:Push;
+            @vertex fn main(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {
+                return pc.values[u32(p.x) % 3u];
+            }"#,
+            80,
+            vec![16..64],
+        ),
+    ] {
+        for module in [wgsl(source), spirv(source)] {
+            let shader = compile_shader(&module, ShaderStage::Vertex, "main").unwrap();
+            let push = shader.push_constants.unwrap();
+            assert_eq!(push.size, size);
+            assert_eq!(
+                push.required_size,
+                ranges.iter().map(|range| range.end).max().unwrap()
+            );
+            assert_eq!(push.required_ranges, ranges);
+        }
     }
 }
