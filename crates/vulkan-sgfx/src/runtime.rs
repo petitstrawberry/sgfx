@@ -5,7 +5,9 @@ use std::rc::Rc;
 pub(crate) type BackendError = sgfx::Error;
 
 pub(crate) fn backend_failure(error: BackendError) -> ash::vk::Result {
-    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+    if error.kind() == ErrorKind::DeviceLost
+        || std::env::var_os("SGFX_VULKAN_TRACE").is_some()
+    {
         eprintln!("[SGFX Vulkan] backend failure: {error:?}");
     }
     match error.kind() {
