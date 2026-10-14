@@ -2727,6 +2727,10 @@ fn blend_factor(factor: BlendFactor) -> raw::BlendFactor {
         BlendFactor::OneMinusSourceAlpha => raw::BlendFactor::OneMinusSrcAlpha,
         BlendFactor::DestinationAlpha => raw::BlendFactor::DstAlpha,
         BlendFactor::OneMinusDestinationAlpha => raw::BlendFactor::OneMinusDstAlpha,
+        BlendFactor::SourceColor => raw::BlendFactor::Src,
+        BlendFactor::OneMinusSourceColor => raw::BlendFactor::OneMinusSrc,
+        BlendFactor::DestinationColor => raw::BlendFactor::Dst,
+        BlendFactor::OneMinusDestinationColor => raw::BlendFactor::OneMinusDst,
     }
 }
 

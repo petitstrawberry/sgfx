@@ -114,6 +114,10 @@ const VIRGL_BLEND_ALPHA_SRC_FACTOR_SHIFT: u32 = 17;
 const VIRGL_BLEND_ALPHA_DST_FACTOR_SHIFT: u32 = 22;
 const VIRGL_BLEND_COLORMASK_SHIFT: u32 = 27;
 const PIPE_BLENDFACTOR_ONE: u32 = 1;
+const PIPE_BLENDFACTOR_SRC_COLOR: u32 = 2;
+const PIPE_BLENDFACTOR_DST_COLOR: u32 = 5;
+const PIPE_BLENDFACTOR_INV_SRC_COLOR: u32 = 18;
+const PIPE_BLENDFACTOR_INV_DST_COLOR: u32 = 21;
 const PIPE_BLENDFACTOR_SRC_ALPHA: u32 = 3;
 const PIPE_BLENDFACTOR_DST_ALPHA: u32 = 4;
 const PIPE_BLENDFACTOR_ZERO: u32 = 0x11;
@@ -5033,6 +5037,10 @@ fn ir_blend_factor(factor: IrBlendFactor) -> u32 {
         IrBlendFactor::OneMinusSourceAlpha => PIPE_BLENDFACTOR_INV_SRC_ALPHA,
         IrBlendFactor::DestinationAlpha => PIPE_BLENDFACTOR_DST_ALPHA,
         IrBlendFactor::OneMinusDestinationAlpha => PIPE_BLENDFACTOR_INV_DST_ALPHA,
+        IrBlendFactor::SourceColor => PIPE_BLENDFACTOR_SRC_COLOR,
+        IrBlendFactor::OneMinusSourceColor => PIPE_BLENDFACTOR_INV_SRC_COLOR,
+        IrBlendFactor::DestinationColor => PIPE_BLENDFACTOR_DST_COLOR,
+        IrBlendFactor::OneMinusDestinationColor => PIPE_BLENDFACTOR_INV_DST_COLOR,
     }
 }
 
@@ -5522,6 +5530,42 @@ mod tests {
         assert_eq!((words[2] >> 3) & 7, 3);
         assert_eq!(&words[6..10], &[0, 0, 0, 0]);
         assert_eq!(f32::from_bits(words[5]), 1000.0);
+    }
+
+    #[test]
+    fn color_blend_factors_use_exact_gallium_tokens_and_reverse_subtract() {
+        // Protocol token values from Gallium p_defines.h, not IR enum ordinals.
+        for (factor, token) in [
+            (IrBlendFactor::SourceColor, 2),
+            (IrBlendFactor::OneMinusSourceColor, 18),
+            (IrBlendFactor::DestinationColor, 5),
+            (IrBlendFactor::OneMinusDestinationColor, 21),
+        ] {
+            let blend = IrBlendState {
+                color: crate::driver::IrBlendComponent {
+                    source_factor: factor,
+                    destination_factor: IrBlendFactor::One,
+                    operation: IrBlendOp::ReverseSubtract,
+                },
+                alpha: crate::driver::IrBlendComponent {
+                    source_factor: IrBlendFactor::DestinationAlpha,
+                    destination_factor: IrBlendFactor::One,
+                    operation: IrBlendOp::ReverseSubtract,
+                },
+            };
+            let word = ir_blend_target(blend, 0xf);
+            assert_eq!((word >> VIRGL_BLEND_RGB_SRC_FACTOR_SHIFT) & 0x1f, token);
+            assert_eq!((word >> VIRGL_BLEND_RGB_DST_FACTOR_SHIFT) & 0x1f, 1);
+            assert_eq!((word >> 1) & 7, 2);
+            assert_eq!((word >> 14) & 7, 2);
+            assert_eq!((word >> VIRGL_BLEND_ALPHA_SRC_FACTOR_SHIFT) & 0x1f, 4);
+            assert_eq!((word >> VIRGL_BLEND_ALPHA_DST_FACTOR_SHIFT) & 0x1f, 1);
+            assert_eq!((word >> VIRGL_BLEND_COLORMASK_SHIFT) & 0xf, 0xf);
+            assert!(!ir_blend_factors_equal(
+                factor,
+                IrBlendFactor::DestinationAlpha
+            ));
+        }
     }
 
     fn dwords(bytes: &[u8]) -> Vec<u32> {

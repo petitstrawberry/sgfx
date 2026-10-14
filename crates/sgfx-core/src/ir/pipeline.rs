@@ -382,6 +382,14 @@ pub enum BlendFactor {
     DestinationAlpha,
     /// One minus destination alpha factor.
     OneMinusDestinationAlpha,
+    /// Source color per channel, using source alpha for the alpha component.
+    SourceColor,
+    /// One minus source color per channel (including alpha).
+    OneMinusSourceColor,
+    /// Destination color per channel, using destination alpha for alpha.
+    DestinationColor,
+    /// One minus destination color per channel (including alpha).
+    OneMinusDestinationColor,
 }
 
 /// Arithmetic operation for a blend component.

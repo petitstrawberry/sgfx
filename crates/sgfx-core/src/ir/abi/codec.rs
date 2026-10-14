@@ -166,7 +166,7 @@ enumeration!(VertexStepMode {Vertex=0,Instance=1});
 enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1,TriangleFan=2});
 enumeration!(IndexFormat {Uint16=0,Uint32=1});
 enumeration!(TextureSampleMode {Rgba=0,RgbIgnoreAlpha=1,AlphaMask=2});
-enumeration!(BlendFactor {Zero=0,One=1,SourceAlpha=2,OneMinusSourceAlpha=3,DestinationAlpha=4,OneMinusDestinationAlpha=5});
+enumeration!(BlendFactor {Zero=0,One=1,SourceAlpha=2,OneMinusSourceAlpha=3,DestinationAlpha=4,OneMinusDestinationAlpha=5,SourceColor=6,OneMinusSourceColor=7,DestinationColor=8,OneMinusDestinationColor=9});
 enumeration!(BlendOp {Add=0,Subtract=1,ReverseSubtract=2});
 enumeration!(CullMode {None=0,Front=1,Back=2});
 enumeration!(FrontFace {Clockwise=0,CounterClockwise=1});
@@ -888,5 +888,45 @@ mod sampler_border_tests {
         let mut reader = Reader { words: &words };
         assert_eq!(SamplerDesc::get(&mut reader, &table), Ok(descriptor));
         reader.end().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod color_blend_tests {
+    use super::*;
+
+    #[test]
+    fn color_factors_append_stable_tags_and_round_trip_blend_state() {
+        let table = ResourceTable::new();
+        for (factor, tag) in [
+            (BlendFactor::Zero, 0),
+            (BlendFactor::One, 1),
+            (BlendFactor::SourceAlpha, 2),
+            (BlendFactor::OneMinusSourceAlpha, 3),
+            (BlendFactor::DestinationAlpha, 4),
+            (BlendFactor::OneMinusDestinationAlpha, 5),
+            (BlendFactor::SourceColor, 6),
+            (BlendFactor::OneMinusSourceColor, 7),
+            (BlendFactor::DestinationColor, 8),
+            (BlendFactor::OneMinusDestinationColor, 9),
+        ] {
+            let mut words = Vec::new();
+            factor.put(&mut words);
+            assert_eq!(words, [tag]);
+            let mut reader = Reader { words: &words };
+            assert_eq!(BlendFactor::get(&mut reader, &table), Ok(factor));
+            reader.end().unwrap();
+            let component = BlendComponent::new(factor, BlendFactor::One, BlendOp::ReverseSubtract);
+            let blend = BlendState::new(component, component);
+            words.clear();
+            blend.put(&mut words);
+            let mut reader = Reader { words: &words };
+            assert_eq!(BlendState::get(&mut reader, &table), Ok(blend));
+            reader.end().unwrap();
+        }
+        assert_eq!(
+            BlendFactor::get(&mut Reader { words: &[10] }, &table),
+            Err(Error::InvalidValue),
+        );
     }
 }

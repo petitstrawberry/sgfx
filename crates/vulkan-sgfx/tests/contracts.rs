@@ -12,6 +12,9 @@ use std::path::PathBuf;
 #[path = "contracts/scalar_vertex.rs"]
 mod scalar_vertex;
 
+#[path = "contracts/blend_color.rs"]
+mod blend_color;
+
 #[path = "contracts/copy_image.rs"]
 mod copy_image;
 

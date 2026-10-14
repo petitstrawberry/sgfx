@@ -2101,6 +2101,40 @@ mod tests {
     }
 
     #[test]
+    fn narrow_color_targets_keep_destination_color_distinct_from_implicit_alpha() {
+        let blend = ir::BlendState::new(
+            ir::BlendComponent::new(
+                ir::BlendFactor::DestinationColor,
+                ir::BlendFactor::One,
+                ir::BlendOp::ReverseSubtract,
+            ),
+            ir::BlendComponent::new(
+                ir::BlendFactor::One,
+                ir::BlendFactor::Zero,
+                ir::BlendOp::Add,
+            ),
+        );
+        for (format, mask) in [(TextureFormat::R8Unorm, 1), (TextureFormat::Rg8Unorm, 3)] {
+            let (lowered, actual_mask) = color_target_blend(
+                ir::ColorTargetState::new(format, blend, ir::ColorWriteMask::ALL).unwrap(),
+            );
+            assert_eq!(actual_mask, mask);
+            assert!(matches!(
+                lowered.color.source_factor,
+                driver::IrBlendFactor::DestinationColor
+            ));
+            assert!(matches!(
+                lowered.color.destination_factor,
+                driver::IrBlendFactor::One
+            ));
+            assert!(matches!(
+                lowered.color.operation,
+                driver::IrBlendOp::ReverseSubtract
+            ));
+        }
+    }
+
+    #[test]
     fn narrow_color_blend_uses_implicit_destination_alpha_and_channel_masks() {
         let blend = ir::BlendState::new(
             ir::BlendComponent::new(

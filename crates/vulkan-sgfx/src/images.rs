@@ -1101,6 +1101,28 @@ unsafe fn vertex_layout(
         .collect()
 }
 
+// Vulkan's color factors use As/Ad for the alpha component. Normalize those
+// aliases before passing independent RGB/alpha factors to SGFX backends.
+fn blend_factor(value: vk::BlendFactor, alpha: bool) -> Result<ir::BlendFactor, vk::Result> {
+    Ok(match value {
+        vk::BlendFactor::ZERO => ir::BlendFactor::Zero,
+        vk::BlendFactor::ONE => ir::BlendFactor::One,
+        vk::BlendFactor::SRC_ALPHA => ir::BlendFactor::SourceAlpha,
+        vk::BlendFactor::ONE_MINUS_SRC_ALPHA => ir::BlendFactor::OneMinusSourceAlpha,
+        vk::BlendFactor::DST_ALPHA => ir::BlendFactor::DestinationAlpha,
+        vk::BlendFactor::ONE_MINUS_DST_ALPHA => ir::BlendFactor::OneMinusDestinationAlpha,
+        vk::BlendFactor::SRC_COLOR if alpha => ir::BlendFactor::SourceAlpha,
+        vk::BlendFactor::ONE_MINUS_SRC_COLOR if alpha => ir::BlendFactor::OneMinusSourceAlpha,
+        vk::BlendFactor::DST_COLOR if alpha => ir::BlendFactor::DestinationAlpha,
+        vk::BlendFactor::ONE_MINUS_DST_COLOR if alpha => ir::BlendFactor::OneMinusDestinationAlpha,
+        vk::BlendFactor::SRC_COLOR => ir::BlendFactor::SourceColor,
+        vk::BlendFactor::ONE_MINUS_SRC_COLOR => ir::BlendFactor::OneMinusSourceColor,
+        vk::BlendFactor::DST_COLOR => ir::BlendFactor::DestinationColor,
+        vk::BlendFactor::ONE_MINUS_DST_COLOR => ir::BlendFactor::OneMinusDestinationColor,
+        _ => return Err(UNSUPPORTED),
+    })
+}
+
 unsafe fn graphics_state(
     info: &vk::GraphicsPipelineCreateInfo<'_>,
 ) -> Result<GraphicsState, vk::Result> {
@@ -1262,17 +1284,6 @@ unsafe fn graphics_state(
     if scissor.is_some_and(|s| s.offset.x < 0 || s.offset.y < 0) {
         return Err(UNSUPPORTED);
     }
-    let factor = |v| {
-        Ok(match v {
-            vk::BlendFactor::ZERO => ir::BlendFactor::Zero,
-            vk::BlendFactor::ONE => ir::BlendFactor::One,
-            vk::BlendFactor::SRC_ALPHA => ir::BlendFactor::SourceAlpha,
-            vk::BlendFactor::ONE_MINUS_SRC_ALPHA => ir::BlendFactor::OneMinusSourceAlpha,
-            vk::BlendFactor::DST_ALPHA => ir::BlendFactor::DestinationAlpha,
-            vk::BlendFactor::ONE_MINUS_DST_ALPHA => ir::BlendFactor::OneMinusDestinationAlpha,
-            _ => return Err(UNSUPPORTED),
-        })
-    };
     let op = |v| {
         Ok(match v {
             vk::BlendOp::ADD => ir::BlendOp::Add,
@@ -1293,13 +1304,13 @@ unsafe fn graphics_state(
         } else {
             ir::BlendState::new(
                 ir::BlendComponent::new(
-                    factor(color.src_color_blend_factor)?,
-                    factor(color.dst_color_blend_factor)?,
+                    blend_factor(color.src_color_blend_factor, false)?,
+                    blend_factor(color.dst_color_blend_factor, false)?,
                     op(color.color_blend_op)?,
                 ),
                 ir::BlendComponent::new(
-                    factor(color.src_alpha_blend_factor)?,
-                    factor(color.dst_alpha_blend_factor)?,
+                    blend_factor(color.src_alpha_blend_factor, true)?,
+                    blend_factor(color.dst_alpha_blend_factor, true)?,
                     op(color.alpha_blend_op)?,
                 ),
             )
@@ -1625,6 +1636,45 @@ pub(crate) fn extended_image_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_blend_factors_preserve_rgb_and_normalize_alpha_aliases() {
+        for (factor, rgb, alpha) in [
+            (
+                vk::BlendFactor::SRC_COLOR,
+                ir::BlendFactor::SourceColor,
+                ir::BlendFactor::SourceAlpha,
+            ),
+            (
+                vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+                ir::BlendFactor::OneMinusSourceColor,
+                ir::BlendFactor::OneMinusSourceAlpha,
+            ),
+            (
+                vk::BlendFactor::DST_COLOR,
+                ir::BlendFactor::DestinationColor,
+                ir::BlendFactor::DestinationAlpha,
+            ),
+            (
+                vk::BlendFactor::ONE_MINUS_DST_COLOR,
+                ir::BlendFactor::OneMinusDestinationColor,
+                ir::BlendFactor::OneMinusDestinationAlpha,
+            ),
+        ] {
+            assert_eq!(blend_factor(factor, false), Ok(rgb));
+            assert_eq!(blend_factor(factor, true), Ok(alpha));
+        }
+        for alpha in [false, true] {
+            assert_eq!(
+                blend_factor(vk::BlendFactor::CONSTANT_COLOR, alpha),
+                Err(UNSUPPORTED)
+            );
+            assert_eq!(
+                blend_factor(vk::BlendFactor::SRC1_COLOR, alpha),
+                Err(UNSUPPORTED)
+            );
+        }
+    }
 
     #[test]
     fn narrow_srgb_format_list_metadata_does_not_enable_unsupported_views() {

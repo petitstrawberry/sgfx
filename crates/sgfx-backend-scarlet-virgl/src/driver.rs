@@ -539,6 +539,10 @@ pub(crate) enum IrBlendFactor {
     OneMinusSourceAlpha,
     DestinationAlpha,
     OneMinusDestinationAlpha,
+    SourceColor,
+    OneMinusSourceColor,
+    DestinationColor,
+    OneMinusDestinationColor,
 }
 
 /// Portable blend arithmetic operation carried without backend protocol constants.

@@ -3083,6 +3083,10 @@ fn blend_component(component: BlendComponent) -> IrBlendComponent {
             BlendFactor::OneMinusSourceAlpha => IrBlendFactor::OneMinusSourceAlpha,
             BlendFactor::DestinationAlpha => IrBlendFactor::DestinationAlpha,
             BlendFactor::OneMinusDestinationAlpha => IrBlendFactor::OneMinusDestinationAlpha,
+            BlendFactor::SourceColor => IrBlendFactor::SourceColor,
+            BlendFactor::OneMinusSourceColor => IrBlendFactor::OneMinusSourceColor,
+            BlendFactor::DestinationColor => IrBlendFactor::DestinationColor,
+            BlendFactor::OneMinusDestinationColor => IrBlendFactor::OneMinusDestinationColor,
         },
         destination_factor: match component.destination_factor() {
             BlendFactor::Zero => IrBlendFactor::Zero,
@@ -3091,6 +3095,10 @@ fn blend_component(component: BlendComponent) -> IrBlendComponent {
             BlendFactor::OneMinusSourceAlpha => IrBlendFactor::OneMinusSourceAlpha,
             BlendFactor::DestinationAlpha => IrBlendFactor::DestinationAlpha,
             BlendFactor::OneMinusDestinationAlpha => IrBlendFactor::OneMinusDestinationAlpha,
+            BlendFactor::SourceColor => IrBlendFactor::SourceColor,
+            BlendFactor::OneMinusSourceColor => IrBlendFactor::OneMinusSourceColor,
+            BlendFactor::DestinationColor => IrBlendFactor::DestinationColor,
+            BlendFactor::OneMinusDestinationColor => IrBlendFactor::OneMinusDestinationColor,
         },
         operation: match component.operation() {
             BlendOp::Add => IrBlendOp::Add,
@@ -3174,6 +3182,39 @@ mod tests {
         IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrCullMode, IrFragmentProgram,
         IrFrontFace,
     };
+
+    #[test]
+    fn independent_color_factors_survive_ir_bridge_in_both_components() {
+        for (factor, native) in [
+            (BlendFactor::SourceColor, IrBlendFactor::SourceColor),
+            (
+                BlendFactor::OneMinusSourceColor,
+                IrBlendFactor::OneMinusSourceColor,
+            ),
+            (
+                BlendFactor::DestinationColor,
+                IrBlendFactor::DestinationColor,
+            ),
+            (
+                BlendFactor::OneMinusDestinationColor,
+                IrBlendFactor::OneMinusDestinationColor,
+            ),
+        ] {
+            let component = BlendComponent::new(factor, factor, BlendOp::ReverseSubtract);
+            let lowered = blend_state(BlendState::new(component, component));
+            for value in [lowered.color, lowered.alpha] {
+                assert_eq!(
+                    core::mem::discriminant(&value.source_factor),
+                    core::mem::discriminant(&native)
+                );
+                assert_eq!(
+                    core::mem::discriminant(&value.destination_factor),
+                    core::mem::discriminant(&native)
+                );
+                assert!(matches!(value.operation, IrBlendOp::ReverseSubtract));
+            }
+        }
+    }
 
     #[test]
     fn full_buffer_flush_tracks_only_changed_bytes_and_merges_later_writes() {
