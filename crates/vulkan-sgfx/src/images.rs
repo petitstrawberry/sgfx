@@ -1355,7 +1355,7 @@ unsafe extern "system" fn create_graphics_pipelines(
         ) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                {
                     eprintln!(
                         "[SGFX Vulkan] graphics parse: flags={:?} pnext={:?} raster={:?} depth={:?} vertex={:?}",
                         info.flags,
@@ -1451,7 +1451,8 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .shaders
                 .get_mut(&vertex_module)
                 .ok_or(INVALID)?
-                .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)?;
+                .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)
+                .map_err(|error| { eprintln!("[SGFX Vulkan] vertex specialization: {error:?}"); error })?;
             let input_bindings = runtime
                 .resources
                 .shaders
@@ -1468,7 +1469,8 @@ unsafe extern "system" fn create_graphics_pipelines(
                     &fragment_values,
                     &input_depths,
                     &binding_maps,
-                )?;
+                )
+                .map_err(|error| { eprintln!("[SGFX Vulkan] fragment specialization: {error:?}"); error })?;
             let vertex = ir::ShaderEntryPoint::new(
                 runtime
                     .table
@@ -1548,7 +1550,7 @@ unsafe extern "system" fn create_graphics_pipelines(
         }) {
             Ok(handle) => *output.add(index) = handle,
             Err(error) => {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                {
                     eprintln!("[SGFX Vulkan] graphics compilation: {error:?}");
                 }
                 first_error.get_or_insert(error);
