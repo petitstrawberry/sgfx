@@ -3297,7 +3297,7 @@ fn finish_submissions(
     let complete = submissions.iter().enumerate().fold(true, |complete, (index, submission)| {
         let result = submission.wait(None);
         let finished = matches!(result, Ok(CompletionStatus::Complete));
-        if !finished && std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        if !finished {
             eprintln!("[SGFX Vulkan] asynchronous submission completion failed: receipt={index}/{} result={result:?}", submissions.len());
         }
         finished & complete
