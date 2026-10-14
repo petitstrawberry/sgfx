@@ -805,11 +805,12 @@ pub(crate) unsafe extern "system" fn get_physical_device_properties(
         let info = adapter.info();
         let capabilities = adapter.capabilities();
         let limits = capabilities.limits();
-        properties.api_version = if info.backend() == sgfx::BackendKind::ScarletVirgl {
-            vk::API_VERSION_1_1
-        } else {
-            vk::API_VERSION_1_0
-        };
+        properties.api_version =
+            if cfg!(target_os = "scarlet") && info.backend() == sgfx::BackendKind::ScarletVirgl {
+                vk::API_VERSION_1_1
+            } else {
+                vk::API_VERSION_1_0
+            };
         properties.driver_version = vk::make_api_version(0, 0, 1, 0);
         properties.vendor_id = info.vendor_id();
         properties.device_id = info.device_id();

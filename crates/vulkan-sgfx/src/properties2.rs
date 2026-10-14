@@ -73,20 +73,21 @@ unsafe extern "system" fn features(
                 let Some(base) = node.as_mut() else {
                     break;
                 };
-                if base.s_type == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES {
+                let tag = base.s_type;
+                let next = base.p_next;
+                if tag == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES {
                     (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
                         .timeline_semaphore =
                         u32::from(crate::instance::physical_adapter(physical).is_some());
                 }
-                if base.s_type == vk::StructureType::PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES
-                {
+                if tag == vk::StructureType::PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES {
                     (*node.cast::<vk::PhysicalDeviceImagelessFramebufferFeatures<'_>>())
                         .imageless_framebuffer =
                         u32::from(crate::instance::physical_adapter(physical).is_some());
                 }
                 macro_rules! disabled {
                     ($kind:ident, $ty:ident) => {
-                        if base.s_type == vk::StructureType::$kind {
+                        if tag == vk::StructureType::$kind {
                             let value = &mut *node.cast::<vk::$ty<'_>>();
                             let next = value.p_next;
                             *value = vk::$ty::default();
@@ -118,13 +119,13 @@ unsafe extern "system" fn features(
                     PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES,
                     PhysicalDeviceShaderDrawParametersFeatures
                 );
-                if base.s_type == vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_FEATURES {
+                if tag == vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_FEATURES {
                     let mv = &mut *node.cast::<vk::PhysicalDeviceMultiviewFeatures<'_>>();
                     mv.multiview = 0;
                     mv.multiview_geometry_shader = 0;
                     mv.multiview_tessellation_shader = 0;
                 }
-                node = base.p_next;
+                node = next;
             }
         }
     }
