@@ -12,7 +12,7 @@ pub(super) struct ActiveRenderPass {
     images: Vec<(vk::Image, ir::TextureId)>,
     used: Vec<bool>,
     accesses: Vec<Option<ir::TextureAccess>>,
-    area: ir::PixelRect,
+    pub(super) area: ir::PixelRect,
 }
 
 pub(super) fn begin(
@@ -30,14 +30,10 @@ pub(super) fn begin(
         .get(&render_pass)
         .ok_or(INVALID)?;
     let fb = rt.resources.framebuffers.get(&framebuffer).ok_or(INVALID)?;
-    if !pass.compatible(&fb.render_pass)
-        || area.offset.x != 0
-        || area.offset.y != 0
-        || area.extent.width != fb.width
-        || area.extent.height != fb.height
-    {
-        return Err(UNSUPPORTED);
+    if !pass.compatible(&fb.render_pass) {
+        return Err(INVALID);
     }
+    let area = render_area(area, fb.width, fb.height)?;
     let views = if let Some(descriptions) = &fb.imageless {
         let views = attachments.ok_or(INVALID)?;
         if views.len() != descriptions.len() {
@@ -93,11 +89,48 @@ pub(super) fn begin(
         images,
         used: vec![false; pass.attachments.len()],
         accesses: vec![None; pass.attachments.len()],
-        area: ir::PixelRect::new(0, 0, fb.width, fb.height).map_err(crate::resources::failure)?,
+        area,
     };
     active.emit(rec)?;
     rec.active_render_pass = Some(active);
     Ok(())
+}
+
+/// Retain the caller's render area; load/clear/store operations use these bounds.
+fn render_area(area: vk::Rect2D, width: u32, height: u32) -> VkResult<ir::PixelRect> {
+    let x = u32::try_from(area.offset.x).map_err(|_| INVALID)?;
+    let y = u32::try_from(area.offset.y).map_err(|_| INVALID)?;
+    let area =
+        ir::PixelRect::new(x, y, area.extent.width, area.extent.height).map_err(|_| INVALID)?;
+    if area.x() + area.width() > width || area.y() + area.height() > height {
+        return Err(INVALID);
+    }
+    Ok(area)
+}
+
+/// SGFX requires scissors to lie within the active render area. An empty
+/// intersection is a valid Vulkan scissor and suppresses the draw.
+pub(super) fn clip_scissor(
+    scissor: vk::Rect2D,
+    area: ir::PixelRect,
+) -> VkResult<Option<ir::PixelRect>> {
+    let x = u32::try_from(scissor.offset.x).map_err(|_| UNSUPPORTED)?;
+    let y = u32::try_from(scissor.offset.y).map_err(|_| UNSUPPORTED)?;
+    let right = x.checked_add(scissor.extent.width).ok_or(INVALID)?;
+    let bottom = y.checked_add(scissor.extent.height).ok_or(INVALID)?;
+    if right > i32::MAX as u32 || bottom > i32::MAX as u32 {
+        return Err(INVALID);
+    }
+    let left = x.max(area.x());
+    let top = y.max(area.y());
+    let right = right.min(area.x() + area.width());
+    let bottom = bottom.min(area.y() + area.height());
+    if left >= right || top >= bottom {
+        return Ok(None);
+    }
+    Ok(Some(
+        ir::PixelRect::new(left, top, right - left, bottom - top).map_err(|_| INVALID)?,
+    ))
 }
 
 pub(super) fn next(rec: &mut ResolvedRecording) -> VkResult<()> {
@@ -313,4 +346,154 @@ pub(super) fn validate_bindings(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, width: u32, height: u32) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D { width, height },
+        }
+    }
+
+    #[test]
+    fn render_area_preserves_partial_bounds_and_rejects_invalid_regions() {
+        assert_eq!(
+            render_area(rect(7, 9, 25, 23), 32, 32),
+            Ok(ir::PixelRect::new(7, 9, 25, 23).unwrap())
+        );
+        assert_eq!(
+            render_area(rect(0, 0, 32, 32), 32, 32),
+            Ok(ir::PixelRect::new(0, 0, 32, 32).unwrap())
+        );
+        for area in [
+            rect(-1, 0, 1, 1),
+            rect(0, -1, 1, 1),
+            rect(0, 0, 0, 1),
+            rect(0, 0, 1, 0),
+            rect(32, 0, 1, 1),
+            rect(0, 32, 1, 1),
+            rect(1, 0, 32, 1),
+            rect(0, 1, 1, 32),
+            rect(1, 0, u32::MAX, 1),
+            rect(0, 1, 1, u32::MAX),
+        ] {
+            assert_eq!(render_area(area, 32, 32), Err(INVALID), "{area:?}");
+        }
+    }
+
+    #[test]
+    fn scissors_intersect_the_render_area_and_empty_draws_are_valid() {
+        let area = ir::PixelRect::new(7, 9, 25, 23).unwrap();
+        assert_eq!(clip_scissor(rect(0, 0, 32, 32), area), Ok(Some(area)));
+        assert_eq!(
+            clip_scissor(rect(20, 20, 30, 30), area),
+            Ok(Some(ir::PixelRect::new(20, 20, 12, 12).unwrap()))
+        );
+        for scissor in [
+            rect(0, 0, 7, 9),
+            rect(32, 0, 1, 32),
+            rect(0, 32, 32, 1),
+            rect(8, 10, 0, 1),
+            rect(8, 10, 1, 0),
+        ] {
+            assert_eq!(clip_scissor(scissor, area), Ok(None), "{scissor:?}");
+        }
+        assert_eq!(clip_scissor(rect(-1, 0, 32, 32), area), Err(UNSUPPORTED));
+        assert_eq!(clip_scissor(rect(1, 0, u32::MAX, 32), area), Err(INVALID));
+        assert_eq!(clip_scissor(rect(i32::MAX, 0, 1, 1), area), Err(INVALID));
+        assert_eq!(clip_scissor(rect(0, i32::MAX, 1, 1), area), Err(INVALID));
+    }
+
+    #[test]
+    fn partial_subpasses_retain_area_clear_once_and_store_intermediates() {
+        let table = ir::ResourceTable::new();
+        let images = (0..2)
+            .map(|_| {
+                (
+                    vk::Image::null(),
+                    table
+                        .define_texture(
+                            ir::TextureDesc::new(
+                                ir::TextureFormat::Rgba8Unorm,
+                                ir::Extent2D::new(32, 32).unwrap(),
+                                ir::TextureUsage::RENDER_ATTACHMENT,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap()
+                        .id(),
+                )
+            })
+            .collect();
+        let attachment = vk::AttachmentDescription::default()
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let area = ir::PixelRect::new(7, 9, 25, 23).unwrap();
+        let mut active = ActiveRenderPass {
+            pass: crate::render_pass::RenderPass {
+                attachments: vec![attachment; 2],
+                subpasses: vec![
+                    crate::render_pass::Subpass {
+                        colors: vec![0, 1],
+                        inputs: vec![],
+                        depth: None,
+                        read_only_depth: false,
+                    },
+                    crate::render_pass::Subpass {
+                        colors: vec![0],
+                        inputs: vec![],
+                        depth: None,
+                        read_only_depth: false,
+                    },
+                ],
+            },
+            views: vec![],
+            subpass: 0,
+            clears: vec![
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [1.0, 0.0, 0.0, 1.0]
+                    }
+                };
+                2
+            ],
+            images,
+            used: vec![false; 2],
+            accesses: vec![None; 2],
+            area,
+        };
+        let mut rec = ResolvedRecording::new();
+        active.emit(&mut rec).unwrap();
+        let Some(ir::OwnedCommand::BeginRenderPassWithAttachments { desc, colors, .. }) =
+            rec.ops.last()
+        else {
+            panic!("MRT pass expected")
+        };
+        assert_eq!(desc.area, area);
+        assert!(matches!(desc.load, ir::LoadOp::Clear(_)));
+        assert_eq!(desc.store, ir::StoreOp::Store);
+        assert!(matches!(colors[0].load, ir::LoadOp::Clear(_)));
+        assert_eq!(colors[0].store, ir::StoreOp::DontCare);
+        rec.active_render_pass = Some(active);
+        next(&mut rec).unwrap();
+        let Some(ir::OwnedCommand::BeginRenderPass(desc)) = rec.ops.last() else {
+            panic!("second pass expected")
+        };
+        assert_eq!(desc.area, area);
+        assert_eq!(desc.load, ir::LoadOp::Load);
+        assert_eq!(desc.store, ir::StoreOp::DontCare);
+        end(&mut rec).unwrap();
+        assert!(matches!(
+            rec.ops.last(),
+            Some(ir::OwnedCommand::EndRenderPass)
+        ));
+    }
 }

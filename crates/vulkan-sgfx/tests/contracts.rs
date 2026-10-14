@@ -9,6 +9,9 @@
 use ash::{Entry, vk};
 use std::path::PathBuf;
 
+#[path = "contracts/render_area.rs"]
+mod render_area;
+
 #[path = "contracts/errors.rs"]
 mod errors;
 #[path = "contracts/subpasses.rs"]

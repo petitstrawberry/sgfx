@@ -2506,15 +2506,12 @@ fn graphics_bindings(
         .scissor
         .or(rec.scissor)
         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-    if scissor.offset.x < 0 || scissor.offset.y < 0 {
-        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-    }
-    let left = (scissor.offset.x as u32).min(extent.0);
-    let top = (scissor.offset.y as u32).min(extent.1);
-    let right = (u64::from(left) + u64::from(scissor.extent.width)).min(u64::from(extent.0)) as u32;
-    let bottom =
-        (u64::from(top) + u64::from(scissor.extent.height)).min(u64::from(extent.1)) as u32;
-    let visible = left < right && top < bottom;
+    let area = rec.active_render_pass.as_ref().map_or_else(
+        || ir::PixelRect::new(0, 0, extent.0, extent.1).map_err(crate::resources::failure),
+        |pass| Ok(pass.area),
+    )?;
+    let scissor = render_passes::clip_scissor(scissor, area)?;
+    let visible = scissor.is_some();
     let desc = table
         .programmable_render_pipeline_shared(
             table
@@ -2529,9 +2526,7 @@ fn graphics_bindings(
         &mut rec.ops,
         ir::OwnedCommand::SetViewport,
     );
-    if visible {
-        let scissor = ir::PixelRect::new(left, top, right - left, bottom - top)
-            .map_err(crate::resources::failure)?;
+    if let Some(scissor) = scissor {
         emit_changed(
             &mut rec.emitted_graphics.scissor,
             scissor,

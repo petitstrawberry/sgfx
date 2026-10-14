@@ -692,6 +692,7 @@ impl PendingBuffers {
 }
 
 struct ExecutionPlan {
+    has_content_preserving_pass: bool,
     events: Vec<ExecutionEvent>,
     buffer_updates: Vec<BufferShadowUpdate>,
     canonical_validations: Vec<(usize, u64)>,
@@ -715,6 +716,7 @@ enum ExecutionTarget {
 }
 
 struct ActivePass<'r> {
+    preserves_contents: bool,
     attachment: TextureRef<'r>,
     additional_attachments: Vec<TextureRef<'r>>,
     target: ExecutionTarget,
@@ -986,7 +988,7 @@ impl Queue {
             return Err(IrSubmitError::ContextMismatch);
         }
         let plan = ExecutionPlan::from_commands(resources, commands)?;
-        if !mode.is_tracked() && plan.events.is_empty() {
+        if !mode.is_tracked() && plan.events.is_empty() && !plan.has_content_preserving_pass {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::CommandSequence,
             ));
@@ -1093,6 +1095,7 @@ impl Queue {
         // only on full acceptance; Busy/Rejected must not change the logical
         // contents. An accepted partial failure invalidates the entire cache.
         let ExecutionPlan {
+            has_content_preserving_pass: _,
             events,
             mut buffer_updates,
             mut canonical_validations,
@@ -1249,6 +1252,7 @@ impl ExecutionPlan {
         let mut events = Vec::new();
         let mut active = None;
         let mut seen_pass = false;
+        let mut has_content_preserving_pass = false;
 
         #[cfg(feature = "backend-abi")]
         let mut sequence = commands.command_reader();
@@ -1468,6 +1472,7 @@ impl ExecutionPlan {
                         None
                     };
                     active = Some(ActivePass {
+                        preserves_contents: pass_preserves_contents(*desc),
                         attachment: desc.target(),
                         additional_attachments,
                         target,
@@ -1519,15 +1524,14 @@ impl ExecutionPlan {
                     let pass = active.take().ok_or(IrSubmitError::Unsupported(
                         UnsupportedIrFeature::CommandSequence,
                     ))?;
-                    if pass.submission.draws.is_empty() && !submission_has_clear(&pass.submission) {
-                        return Err(IrSubmitError::Unsupported(
-                            UnsupportedIrFeature::CommandSequence,
-                        ));
-                    }
-                    let chunks = split_pass(ExecutionPass {
-                        target: pass.target,
-                        submission: pass.submission,
-                    })?;
+                    let chunks = finish_pass(
+                        ExecutionPass {
+                            target: pass.target,
+                            submission: pass.submission,
+                        },
+                        pass.preserves_contents,
+                    )?;
+                    has_content_preserving_pass |= chunks.is_empty();
                     events
                         .try_reserve(chunks.len())
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
@@ -1759,11 +1763,39 @@ impl ExecutionPlan {
             ));
         }
         Ok(Self {
+            has_content_preserving_pass,
             events,
             buffer_updates: pending_buffers.updates,
             canonical_validations: pending_buffers.canonical_validations,
         })
     }
+}
+
+// Elide only a validated LOAD/STORE pass with no draws or clears. Its barriers
+// still go through the command resolver, and tracked submission still publishes
+// the normal queue checkpoint even when this leaves no native packets.
+fn pass_preserves_contents(desc: ir::RenderPassDesc<'_>) -> bool {
+    desc.color_attachments().all(|attachment| {
+        attachment.load() == LoadOp::Load && attachment.store() == ir::StoreOp::Store
+    }) && desc.depth_attachment().is_none_or(|attachment| {
+        attachment.load() == DepthLoadOp::Load && attachment.store() == ir::StoreOp::Store
+    })
+}
+
+fn finish_pass(
+    pass: ExecutionPass,
+    preserves_contents: bool,
+) -> Result<Vec<ExecutionPass>, IrSubmitError> {
+    if pass.submission.draws.is_empty() && !submission_has_clear(&pass.submission) {
+        return if preserves_contents {
+            Ok(Vec::new())
+        } else {
+            Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::CommandSequence,
+            ))
+        };
+    }
+    split_pass(pass)
 }
 
 /// Return whether a draw-free pass still changes an attachment.
@@ -3339,6 +3371,7 @@ mod tests {
 
     fn plan_with_pass(pass: ExecutionPass) -> ExecutionPlan {
         ExecutionPlan {
+            has_content_preserving_pass: false,
             events: vec![ExecutionEvent::Pass(pass)],
             buffer_updates: Vec::new(),
             canonical_validations: Vec::new(),
@@ -3375,6 +3408,74 @@ mod tests {
                 .validate_transport_chunks()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn pass_elision_requires_load_store_on_every_color_and_depth_attachment() {
+        let table = ResourceTable::new();
+        let texture = |format| {
+            table
+                .define_texture(
+                    TextureDesc::new(
+                        format,
+                        ir::Extent2D::new(8, 8).unwrap(),
+                        TextureUsage::RENDER_ATTACHMENT,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let first = texture(TextureFormat::Rgba8Unorm);
+        let second = texture(TextureFormat::Rgba8Unorm);
+        let depth = texture(TextureFormat::Depth32Float);
+        let area = ir::PixelRect::new(2, 3, 4, 2).unwrap();
+        let pass =
+            ir::RenderPassDesc::new(&table, first, area, LoadOp::Load, ir::StoreOp::Store).unwrap();
+        assert!(pass_preserves_contents(pass));
+        for load in [LoadOp::Load, LoadOp::DontCare] {
+            for store in [ir::StoreOp::Store, ir::StoreOp::DontCare] {
+                let mrt = pass
+                    .with_color_attachment(&table, second, load, store)
+                    .unwrap();
+                assert_eq!(
+                    pass_preserves_contents(mrt),
+                    load == LoadOp::Load && store == ir::StoreOp::Store
+                );
+            }
+        }
+        for load in [
+            DepthLoadOp::Load,
+            DepthLoadOp::DontCare,
+            DepthLoadOp::Clear(1.0),
+        ] {
+            for store in [ir::StoreOp::Store, ir::StoreOp::DontCare] {
+                let pass = pass
+                    .with_depth_attachment(&table, depth, load, store)
+                    .unwrap();
+                assert_eq!(
+                    pass_preserves_contents(pass),
+                    load == DepthLoadOp::Load && store == ir::StoreOp::Store
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draw_free_load_store_pass_is_elided_without_a_fake_clear() {
+        let mut pass = execution_pass(Vec::new(), Vec::new());
+        pass.submission.clear_color = None;
+        assert!(finish_pass(pass, true).unwrap().is_empty());
+        let mut pass = execution_pass(Vec::new(), Vec::new());
+        pass.submission.clear_color = None;
+        assert!(matches!(
+            finish_pass(pass, false),
+            Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::CommandSequence
+            ))
+        ));
+        let chunks = finish_pass(execution_pass(Vec::new(), Vec::new()), false).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].submission.clear_color.is_some());
     }
 
     #[test]
