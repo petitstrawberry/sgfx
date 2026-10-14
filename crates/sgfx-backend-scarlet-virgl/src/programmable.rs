@@ -316,137 +316,154 @@ fn compile_pipeline(
     {
         return Err(IrSubmitError::SubmissionTooLarge);
     }
-    for shader in [&vertex, &fragment] {
-        let visibility = match shader.stage {
-            ir::ShaderStage::Vertex => ir::ShaderStages::VERTEX,
-            ir::ShaderStage::Fragment => ir::ShaderStages::FRAGMENT,
-            ir::ShaderStage::Compute => {
-                return Err(IrSubmitError::Unsupported(
-                    UnsupportedIrFeature::ProgrammableExecution,
-                ));
-            }
-        };
-        if let Some(push) = &shader.push_constants {
-            let ranges = pipeline.layout().push_constant_ranges();
-            // Require declared members, excluding unused trailing structure alignment.
-            for byte in 0..push.required_size {
-                if !ranges.iter().any(|range| {
-                    range.stages().contains(visibility)
-                        && byte >= range.offset()
-                        && byte < range.offset() + range.size()
-                }) {
-                    return Err(ir::Error::BindingLayoutMismatch.into());
+    let binding_validation = (|| {
+        for shader in [&vertex, &fragment] {
+            let visibility = match shader.stage {
+                ir::ShaderStage::Vertex => ir::ShaderStages::VERTEX,
+                ir::ShaderStage::Fragment => ir::ShaderStages::FRAGMENT,
+                ir::ShaderStage::Compute => {
+                    return Err(IrSubmitError::Unsupported(
+                        UnsupportedIrFeature::ProgrammableExecution,
+                    ));
+                }
+            };
+            if let Some(push) = &shader.push_constants {
+                let ranges = pipeline.layout().push_constant_ranges();
+                // Require declared members, excluding unused trailing structure alignment.
+                for byte in 0..push.required_size {
+                    if !ranges.iter().any(|range| {
+                        range.stages().contains(visibility)
+                            && byte >= range.offset()
+                            && byte < range.offset() + range.size()
+                    }) {
+                        return Err(ir::Error::BindingLayoutMismatch.into());
+                    }
                 }
             }
-        }
-        for binding in &shader.storage_buffers {
-            let layout = pipeline
-                .layout()
-                .bind_groups()
-                .get(binding.group as usize)
-                .and_then(|group| {
-                    group
-                        .entries()
-                        .iter()
-                        .find(|entry| entry.binding() == binding.binding)
-                })
-                .ok_or(ir::Error::BindingLayoutMismatch)?;
-            if layout.ty() != (ir::BindingType::StorageBuffer { read_only: true })
-                || !layout.visibility().contains(visibility)
-            {
-                return Err(ir::Error::BindingLayoutMismatch.into());
-            }
-        }
-        for binding in &shader.uniform_buffers {
-            let layout = pipeline
-                .layout()
-                .bind_groups()
-                .get(binding.group as usize)
-                .and_then(|group| {
-                    group
-                        .entries()
-                        .iter()
-                        .find(|entry| entry.binding() == binding.binding)
-                })
-                .ok_or(ir::Error::BindingLayoutMismatch)?;
-            if layout.ty() != ir::BindingType::UniformBuffer
-                || !layout.visibility().contains(visibility)
-                || binding.size > 16 * 1024
-                || binding
-                    .first_register
-                    .checked_add(binding.size.div_ceil(16))
-                    .is_none_or(|end| end > 1024)
-            {
-                return Err(ir::Error::BindingLayoutMismatch.into());
-            }
-        }
-        for query in &shader.image_query_levels {
-            let layout = pipeline
-                .layout()
-                .bind_groups()
-                .get(query.group as usize)
-                .and_then(|group| {
-                    group
-                        .entries()
-                        .iter()
-                        .find(|entry| entry.binding() == query.binding)
-                })
-                .ok_or(ir::Error::BindingLayoutMismatch)?;
-            if !matches!(
-                layout.ty(),
-                ir::BindingType::SampledTexture | ir::BindingType::SampledTextureView { .. }
-            ) || !layout.visibility().contains(visibility)
-            {
-                return Err(ir::Error::BindingLayoutMismatch.into());
-            }
-        }
-        for pair in &shader.textures {
-            for (group, binding, ty) in [
-                (
-                    pair.image_group,
-                    pair.image_binding,
-                    ir::BindingType::SampledTextureView {
-                        dimension: pair.dimension,
-                        depth: pair.depth,
-                    },
-                ),
-                (
-                    pair.sampler_group,
-                    pair.sampler_binding,
-                    if pair.comparison {
-                        ir::BindingType::ComparisonSampler
-                    } else {
-                        ir::BindingType::Sampler
-                    },
-                ),
-            ]
-            .into_iter()
-            .take(if pair.uses_sampler { 2 } else { 1 })
-            {
-                let entry = pipeline
+            for binding in &shader.storage_buffers {
+                let layout = pipeline
                     .layout()
                     .bind_groups()
-                    .get(group as usize)
+                    .get(binding.group as usize)
                     .and_then(|group| {
                         group
                             .entries()
                             .iter()
-                            .find(|entry| entry.binding() == binding)
+                            .find(|entry| entry.binding() == binding.binding)
                     })
                     .ok_or(ir::Error::BindingLayoutMismatch)?;
-                if !(entry.ty() == ty
-                    || (entry.ty() == ir::BindingType::SampledTexture
-                        && ty
-                            == ir::BindingType::SampledTextureView {
-                                dimension: ir::TextureViewDimension::D2,
-                                depth: false,
-                            }))
-                    || !entry.visibility().contains(visibility)
+                if layout.ty() != (ir::BindingType::StorageBuffer { read_only: true })
+                    || !layout.visibility().contains(visibility)
                 {
                     return Err(ir::Error::BindingLayoutMismatch.into());
                 }
             }
+            for binding in &shader.uniform_buffers {
+                let layout = pipeline
+                    .layout()
+                    .bind_groups()
+                    .get(binding.group as usize)
+                    .and_then(|group| {
+                        group
+                            .entries()
+                            .iter()
+                            .find(|entry| entry.binding() == binding.binding)
+                    })
+                    .ok_or(ir::Error::BindingLayoutMismatch)?;
+                if layout.ty() != ir::BindingType::UniformBuffer
+                    || !layout.visibility().contains(visibility)
+                    || binding.size > 16 * 1024
+                    || binding
+                        .first_register
+                        .checked_add(binding.size.div_ceil(16))
+                        .is_none_or(|end| end > 1024)
+                {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                }
+            }
+            for query in &shader.image_query_levels {
+                let layout = pipeline
+                    .layout()
+                    .bind_groups()
+                    .get(query.group as usize)
+                    .and_then(|group| {
+                        group
+                            .entries()
+                            .iter()
+                            .find(|entry| entry.binding() == query.binding)
+                    })
+                    .ok_or(ir::Error::BindingLayoutMismatch)?;
+                if !matches!(
+                    layout.ty(),
+                    ir::BindingType::SampledTexture | ir::BindingType::SampledTextureView { .. }
+                ) || !layout.visibility().contains(visibility)
+                {
+                    return Err(ir::Error::BindingLayoutMismatch.into());
+                }
+            }
+            for pair in &shader.textures {
+                for (group, binding, ty) in [
+                    (
+                        pair.image_group,
+                        pair.image_binding,
+                        ir::BindingType::SampledTextureView {
+                            dimension: pair.dimension,
+                            depth: pair.depth,
+                        },
+                    ),
+                    (
+                        pair.sampler_group,
+                        pair.sampler_binding,
+                        if pair.comparison {
+                            ir::BindingType::ComparisonSampler
+                        } else {
+                            ir::BindingType::Sampler
+                        },
+                    ),
+                ]
+                .into_iter()
+                .take(if pair.uses_sampler { 2 } else { 1 })
+                {
+                    let entry = pipeline
+                        .layout()
+                        .bind_groups()
+                        .get(group as usize)
+                        .and_then(|group| {
+                            group
+                                .entries()
+                                .iter()
+                                .find(|entry| entry.binding() == binding)
+                        })
+                        .ok_or(ir::Error::BindingLayoutMismatch)?;
+                    if !(entry.ty() == ty
+                        || (entry.ty() == ir::BindingType::SampledTexture
+                            && ty
+                                == ir::BindingType::SampledTextureView {
+                                    dimension: ir::TextureViewDimension::D2,
+                                    depth: false,
+                                }))
+                        || !entry.visibility().contains(visibility)
+                    {
+                        return Err(ir::Error::BindingLayoutMismatch.into());
+                    }
+                }
+            }
         }
+        Ok::<_, IrSubmitError>(())
+    })();
+    if let Err(cause) = binding_validation {
+        #[cfg(feature = "std")]
+        std::eprintln!(
+            "[SGFX VirGL] binding layout mismatch: layout={:?} VS uniforms={:?} push={:?} textures={:?} FS uniforms={:?} push={:?} textures={:?}",
+            pipeline.layout(),
+            vertex.uniform_buffers,
+            vertex.push_constants,
+            vertex.textures,
+            fragment.uniform_buffers,
+            fragment.push_constants,
+            fragment.textures
+        );
+        return Err(cause);
     }
     let compiled = Rc::new(driver::IrProgrammablePipeline {
         topology: pipeline.topology(),

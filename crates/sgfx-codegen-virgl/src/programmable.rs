@@ -1954,6 +1954,39 @@ impl<'a> Compiler<'a> {
             }
             E::Relational { fun, argument } => {
                 let argument = self.expression(frame, argument)?;
+                if matches!(
+                    fun,
+                    naga::RelationalFunction::IsNan | naga::RelationalFunction::IsInf
+                ) {
+                    if argument.shape.kind()? != K::Float {
+                        return Err(unsupported("non-floating classification"));
+                    }
+                    // Classify IEEE-754 bits, rather than compare the value to itself.
+                    // Hosts may optimize floating comparisons under relaxed NaN rules.
+                    let mask = self.immediate(Literal::U32(0x7fff_ffff))?;
+                    let infinity = self.immediate(Literal::U32(0x7f80_0000))?;
+                    let magnitude = self.allocate(argument.shape.clone(), false)?;
+                    let result = self.allocate(shape, false)?;
+                    for ((dst, bits), src) in result
+                        .lanes
+                        .iter()
+                        .zip(&magnitude.lanes)
+                        .zip(&argument.lanes)
+                    {
+                        self.instruction("AND", bits, &[src, &mask.lanes[0]])?;
+                        match fun {
+                            naga::RelationalFunction::IsInf => {
+                                self.instruction("USEQ", dst, &[bits, &infinity.lanes[0]])?
+                            }
+                            naga::RelationalFunction::IsNan => {
+                                self.instruction("USLT", dst, &[&infinity.lanes[0], bits])?
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    frame.expressions[handle.index()] = Some(result.clone());
+                    return Ok(result);
+                }
                 let opcode = match fun {
                     naga::RelationalFunction::Any => "OR",
                     naga::RelationalFunction::All => "AND",
@@ -2345,6 +2378,48 @@ impl<'a> Compiler<'a> {
         }
         Ok(())
     }
+    fn matrix_minor(
+        lanes: &[Lane],
+        size: usize,
+        excluded_row: usize,
+        excluded_column: usize,
+    ) -> Vec<Lane> {
+        (0..size)
+            .filter(|&column| column != excluded_column)
+            .flat_map(|column| {
+                (0..size)
+                    .filter(move |&row| row != excluded_row)
+                    .map(move |row| lanes[column * size + row].clone())
+            })
+            .collect()
+    }
+    fn matrix_determinant(&mut self, lanes: &[Lane], size: usize) -> Result<Value> {
+        let result = self.allocate(Shape::Scalar(K::Float), false)?;
+        if size == 1 {
+            self.instruction("MOV", &result.lanes[0], &[&lanes[0]])?;
+        } else {
+            for column in 0..size {
+                let minor = Self::matrix_minor(lanes, size, 0, column);
+                let determinant = self.matrix_determinant(&minor, size - 1)?;
+                let product = self.allocate(Shape::Scalar(K::Float), false)?;
+                self.instruction(
+                    "MUL",
+                    &product.lanes[0],
+                    &[&lanes[column * size], &determinant.lanes[0]],
+                )?;
+                if column == 0 {
+                    self.instruction("MOV", &result.lanes[0], &[&product.lanes[0]])?;
+                } else {
+                    self.instruction(
+                        if column % 2 == 0 { "ADD" } else { "SUB" },
+                        &result.lanes[0],
+                        &[&result.lanes[0], &product.lanes[0]],
+                    )?;
+                }
+            }
+        }
+        Ok(result)
+    }
     fn math(
         &mut self,
         fun: naga::MathFunction,
@@ -2354,6 +2429,62 @@ impl<'a> Compiler<'a> {
         shape: Shape,
     ) -> Result<Value> {
         use naga::MathFunction as M;
+        if matches!(fun, M::Inverse | M::Determinant) {
+            let Shape::Matrix(columns, rows) = a.shape else {
+                return Err(unsupported("inverse/determinant matrix type"));
+            };
+            if columns != rows || !(2..=4).contains(&columns) {
+                return Err(unsupported("inverse/determinant matrix dimensions"));
+            }
+            let determinant = self.matrix_determinant(&a.lanes, columns)?;
+            if fun == M::Determinant {
+                return Ok(determinant);
+            }
+            let result = self.allocate(shape, false)?;
+            // Column-major inverse is the transposed cofactor matrix / det(A).
+            for column in 0..columns {
+                for row in 0..rows {
+                    let minor = Self::matrix_minor(&a.lanes, columns, column, row);
+                    let cofactor = self.matrix_determinant(&minor, columns - 1)?;
+                    let signed = if (column + row) % 2 == 0 {
+                        cofactor
+                    } else {
+                        let minus_one = self.immediate(Literal::F32(-1.0))?;
+                        self.binary(B::Multiply, &cofactor, &minus_one, Shape::Scalar(K::Float))?
+                    };
+                    self.instruction(
+                        "DIV",
+                        &result.lanes[column * rows + row],
+                        &[&signed.lanes[0], &determinant.lanes[0]],
+                    )?;
+                }
+            }
+            return Ok(result);
+        }
+        if fun == M::Fma {
+            // VirGL's TGSI-to-GLSL transport implements MAD as a*b+c but
+            // does not implement TGSI FMA. Do not silently lose fusion.
+            return Err(unsupported(
+                "fused multiply-add in VirGL host shader transport",
+            ));
+        }
+        if matches!(fun, M::Exp | M::Log) {
+            if a.shape.kind()? != K::Float {
+                return Err(unsupported("exponential/logarithm type"));
+            }
+            let factor = self.immediate(Literal::F32(if fun == M::Exp {
+                core::f32::consts::LOG2_E
+            } else {
+                core::f32::consts::LN_2
+            }))?;
+            return if fun == M::Exp {
+                let exponent = self.binary(B::Multiply, &a, &factor, shape.clone())?;
+                self.unary_instruction("EX2", &exponent, shape)
+            } else {
+                let logarithm = self.unary_instruction("LG2", &a, shape.clone())?;
+                self.binary(B::Multiply, &logarithm, &factor, shape)
+            };
+        }
         if fun == M::Cross {
             let b = b.ok_or_else(|| unsupported("cross operands"))?;
             if a.lanes.len() != 3 || b.lanes.len() != 3 || a.shape.kind()? != K::Float {
