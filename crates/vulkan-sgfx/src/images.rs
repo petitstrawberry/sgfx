@@ -465,7 +465,7 @@ unsafe extern "system" fn destroy_image(
     }
 }
 
-unsafe extern "system" fn get_image_memory_requirements(
+pub(crate) unsafe extern "system" fn get_image_memory_requirements(
     device: vk::Device,
     image: vk::Image,
     output: *mut vk::MemoryRequirements,
@@ -486,7 +486,7 @@ unsafe extern "system" fn get_image_memory_requirements(
     }
 }
 
-unsafe extern "system" fn bind_image_memory(
+pub(crate) unsafe extern "system" fn bind_image_memory(
     device: vk::Device,
     image: vk::Image,
     memory: vk::DeviceMemory,

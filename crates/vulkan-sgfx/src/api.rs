@@ -1,6 +1,7 @@
 pub(crate) mod bootstrap;
 mod buffer_operations;
 mod buffer_views;
+mod core11;
 pub(crate) mod descriptor_template;
 mod dynamic_states;
 mod maintenance1;
@@ -319,6 +320,49 @@ unsafe fn device_chain_supported(
                 ]
                 .into_iter()
                 .all(|feature| feature == vk::FALSE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_1_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceVulkan11Features<'_>>();
+                [
+                    f.storage_buffer16_bit_access,
+                    f.uniform_and_storage_buffer16_bit_access,
+                    f.storage_push_constant16,
+                    f.storage_input_output16,
+                    f.multiview,
+                    f.multiview_geometry_shader,
+                    f.multiview_tessellation_shader,
+                    f.variable_pointers_storage_buffer,
+                    f.variable_pointers,
+                    f.protected_memory,
+                    f.sampler_ycbcr_conversion,
+                    f.shader_draw_parameters,
+                ]
+                .into_iter()
+                .all(|value| value == vk::FALSE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDevice16BitStorageFeatures<'_>>();
+                [
+                    f.storage_buffer16_bit_access,
+                    f.uniform_and_storage_buffer16_bit_access,
+                    f.storage_push_constant16,
+                    f.storage_input_output16,
+                ]
+                .into_iter()
+                .all(|value| value == vk::FALSE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceVariablePointersFeatures<'_>>();
+                f.variable_pointers == vk::FALSE && f.variable_pointers_storage_buffer == vk::FALSE
+            }
+            vk::StructureType::PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES => {
+                (&*next.cast::<vk::PhysicalDeviceProtectedMemoryFeatures<'_>>()).protected_memory
+                    == vk::FALSE
+            }
+            vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES => {
+                (&*next.cast::<vk::PhysicalDeviceSamplerYcbcrConversionFeatures<'_>>())
+                    .sampler_ycbcr_conversion
+                    == vk::FALSE
             }
             vk::StructureType::PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES => {
                 let features = &*next.cast::<vk::PhysicalDeviceShaderDrawParametersFeatures<'_>>();
@@ -3757,6 +3801,9 @@ pub(crate) unsafe extern "system" fn get_device_proc_addr(
     lookup_device(name)
 }
 pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
+    if let Some(function) = core11::lookup(name) {
+        return Some(function);
+    }
     macro_rules! entry {
         ($function:path) => {
             Some(unsafe {

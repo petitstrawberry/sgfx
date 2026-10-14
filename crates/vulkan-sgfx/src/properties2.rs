@@ -84,6 +84,40 @@ unsafe extern "system" fn features(
                         .imageless_framebuffer =
                         u32::from(crate::instance::physical_adapter(physical).is_some());
                 }
+                macro_rules! disabled {
+                    ($kind:ident, $ty:ident) => {
+                        if base.s_type == vk::StructureType::$kind {
+                            let value = &mut *node.cast::<vk::$ty<'_>>();
+                            let next = value.p_next;
+                            *value = vk::$ty::default();
+                            value.p_next = next;
+                        }
+                    };
+                }
+                disabled!(
+                    PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                    PhysicalDeviceVulkan11Features
+                );
+                disabled!(
+                    PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+                    PhysicalDevice16BitStorageFeatures
+                );
+                disabled!(
+                    PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES,
+                    PhysicalDeviceVariablePointersFeatures
+                );
+                disabled!(
+                    PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+                    PhysicalDeviceSamplerYcbcrConversionFeatures
+                );
+                disabled!(
+                    PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES,
+                    PhysicalDeviceProtectedMemoryFeatures
+                );
+                disabled!(
+                    PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES,
+                    PhysicalDeviceShaderDrawParametersFeatures
+                );
                 if base.s_type == vk::StructureType::PHYSICAL_DEVICE_MULTIVIEW_FEATURES {
                     let mv = &mut *node.cast::<vk::PhysicalDeviceMultiviewFeatures<'_>>();
                     mv.multiview = 0;
@@ -221,6 +255,20 @@ unsafe extern "system" fn external_buffer(
     }
 }
 
+pub(crate) fn is_core(name: &CStr) -> bool {
+    matches!(
+        name.to_bytes(),
+        b"vkGetPhysicalDeviceProperties2"
+            | b"vkGetPhysicalDeviceFeatures2"
+            | b"vkGetPhysicalDeviceMemoryProperties2"
+            | b"vkGetPhysicalDeviceFormatProperties2"
+            | b"vkGetPhysicalDeviceImageFormatProperties2"
+            | b"vkGetPhysicalDeviceQueueFamilyProperties2"
+            | b"vkGetPhysicalDeviceSparseImageFormatProperties2"
+            | b"vkGetPhysicalDeviceExternalBufferProperties"
+    )
+}
+
 pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
     macro_rules! entry {
         ($function:path, $signature:ty) => {{
@@ -231,30 +279,34 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
         }};
     }
     match name.to_bytes() {
-        b"vkGetPhysicalDeviceProperties2KHR" => {
+        b"vkGetPhysicalDeviceProperties2" | b"vkGetPhysicalDeviceProperties2KHR" => {
             entry!(properties, vk::PFN_vkGetPhysicalDeviceProperties2)
         }
-        b"vkGetPhysicalDeviceFeatures2KHR" => {
+        b"vkGetPhysicalDeviceFeatures2" | b"vkGetPhysicalDeviceFeatures2KHR" => {
             entry!(features, vk::PFN_vkGetPhysicalDeviceFeatures2)
         }
-        b"vkGetPhysicalDeviceMemoryProperties2KHR" => {
+        b"vkGetPhysicalDeviceMemoryProperties2" | b"vkGetPhysicalDeviceMemoryProperties2KHR" => {
             entry!(memory, vk::PFN_vkGetPhysicalDeviceMemoryProperties2)
         }
-        b"vkGetPhysicalDeviceFormatProperties2KHR" => {
+        b"vkGetPhysicalDeviceFormatProperties2" | b"vkGetPhysicalDeviceFormatProperties2KHR" => {
             entry!(format, vk::PFN_vkGetPhysicalDeviceFormatProperties2)
         }
-        b"vkGetPhysicalDeviceImageFormatProperties2KHR" => entry!(
+        b"vkGetPhysicalDeviceImageFormatProperties2"
+        | b"vkGetPhysicalDeviceImageFormatProperties2KHR" => entry!(
             image_format,
             vk::PFN_vkGetPhysicalDeviceImageFormatProperties2
         ),
-        b"vkGetPhysicalDeviceQueueFamilyProperties2KHR" => {
+        b"vkGetPhysicalDeviceQueueFamilyProperties2"
+        | b"vkGetPhysicalDeviceQueueFamilyProperties2KHR" => {
             entry!(queues, vk::PFN_vkGetPhysicalDeviceQueueFamilyProperties2)
         }
-        b"vkGetPhysicalDeviceSparseImageFormatProperties2KHR" => entry!(
+        b"vkGetPhysicalDeviceSparseImageFormatProperties2"
+        | b"vkGetPhysicalDeviceSparseImageFormatProperties2KHR" => entry!(
             sparse,
             vk::PFN_vkGetPhysicalDeviceSparseImageFormatProperties2
         ),
-        b"vkGetPhysicalDeviceExternalBufferPropertiesKHR" => entry!(
+        b"vkGetPhysicalDeviceExternalBufferProperties"
+        | b"vkGetPhysicalDeviceExternalBufferPropertiesKHR" => entry!(
             external_buffer,
             vk::PFN_vkGetPhysicalDeviceExternalBufferProperties
         ),
@@ -265,6 +317,24 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unsupported_core11_features_are_zeroed_and_keep_the_chain() {
+        unsafe {
+            let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+                .sampler_ycbcr_conversion(true);
+            let mut features11 = vk::PhysicalDeviceVulkan11Features::default()
+                .protected_memory(true)
+                .shader_draw_parameters(true);
+            let mut out = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut ycbcr)
+                .push_next(&mut features11);
+            features(vk::PhysicalDevice::null(), &mut out);
+            assert_eq!(features11.protected_memory, vk::FALSE);
+            assert_eq!(features11.shader_draw_parameters, vk::FALSE);
+            assert!(!features11.p_next.is_null());
+            assert_eq!(ycbcr.sampler_ycbcr_conversion, vk::FALSE);
+        }
+    }
     #[test]
     fn uuid_is_stable_and_does_not_depend_on_instance_handles() {
         let mut properties = vk::PhysicalDeviceProperties {

@@ -3,9 +3,12 @@
 `vulkan-sgfx` is a loader-discoverable, **non-conformant development ICD**. It
 implements a bounded executable subset to exercise Vulkan → SGFX portable IR →
 backend execution, macOS presentation through Metal, and Linux ABI presentation
-through Scarlet SWS with `VK_KHR_display` and `VK_KHR_wayland_surface`. Its manifest and
-physical device use the Vulkan 1.0 ABI version. This is not a claim of Vulkan
-1.0 conformance: substantial mandatory core functionality is absent. Do not
+through Scarlet SWS with `VK_KHR_display` and `VK_KHR_wayland_surface`. The native
+Scarlet VirGL adapter additionally exposes the Vulkan 1.1 entry-point ABI used
+by Ganesh: memory requirements2/bind memory2, maintenance queries, core
+properties2 aliases, single-device groups and queue2. Other adapters continue
+to report Vulkan 1.0. Neither version is a conformance claim: substantial
+mandatory core functionality is absent. Do not
 select it as a general application driver. Cross-platform WSI, resource
 reclamation with long-lived objects, broader API coverage and conformance work
 remain incomplete.
@@ -338,3 +341,20 @@ and [dispatchable-object layout](https://github.com/KhronosGroup/Vulkan-Headers/
 Descriptor invalidation is specified by
 [`vkUpdateDescriptorSets`](https://docs.vulkan.org/refpages/latest/refpages/source/vkUpdateDescriptorSets.html).
 The Vulkan API version alone does not define an optional arbitrary subset.
+
+## Skia Vulkan ABI work
+
+The memory2 entry points use the same allocation, ownership, range and alignment
+checks as the original API. Requirements queries preserve output chains and
+write false dedicated-allocation requirements. Sparse queries report zero;
+YCbCr creation returns `ERROR_FEATURE_NOT_PRESENT`. Disabled Vulkan 1.1 feature
+records can accompany device creation, but nonzero unsupported features are
+rejected. Layout-support queries share creation's pure validation and do not
+allocate temporary layouts. Core properties2 queries require a 1.1 instance;
+KHR names retain their earlier behavior.
+
+The memory2 GPU integration contract binds real buffer/image allocations,
+clears an RGBA image on the GPU, copies it to a mapped buffer and verifies all
+16 red pixels. It also checks matching legacy/new requirements and supported
+versus rejected descriptor layouts. This contract passed on macOS Metal;
+Scarlet Ganesh drawing is a separate native verification step.

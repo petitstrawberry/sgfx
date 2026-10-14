@@ -16,6 +16,9 @@ mod subpasses;
 #[path = "contracts/textures.rs"]
 mod textures;
 
+#[path = "contracts/memory2.rs"]
+mod memory2;
+
 const WORDS: usize = 256;
 const BYTES: u64 = (WORDS * size_of::<u32>()) as u64;
 

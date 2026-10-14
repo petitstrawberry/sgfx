@@ -912,7 +912,7 @@ unsafe extern "system" fn destroy_buffer(
         Ok(())
     });
 }
-unsafe extern "system" fn buffer_requirements(
+pub(crate) unsafe extern "system" fn buffer_requirements(
     device: vk::Device,
     buffer: vk::Buffer,
     out: *mut vk::MemoryRequirements,
@@ -1009,7 +1009,7 @@ unsafe extern "system" fn free_memory(
         Ok(())
     });
 }
-unsafe extern "system" fn bind_buffer_memory(
+pub(crate) unsafe extern "system" fn bind_buffer_memory(
     device: vk::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -1368,6 +1368,117 @@ unsafe extern "system" fn destroy_shader_module(
         Ok(())
     });
 }
+type DescriptorLayoutParts = (
+    ir::BindGroupLayoutDesc,
+    BTreeMap<u32, vk::DescriptorType>,
+    BTreeMap<u32, vk::ShaderStageFlags>,
+);
+
+/// Pure validation shared by creation and maintenance3 support queries.
+pub(crate) unsafe fn descriptor_layout(
+    i: &vk::DescriptorSetLayoutCreateInfo<'_>,
+) -> Result<DescriptorLayoutParts, vk::Result> {
+    if i.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    if !i.flags.is_empty() {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    if !i.p_next.is_null() {
+        let flags = &*i
+            .p_next
+            .cast::<vk::DescriptorSetLayoutBindingFlagsCreateInfo<'_>>();
+        if flags.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
+            || !flags.p_next.is_null()
+            || (flags.binding_count != 0 && flags.binding_count != i.binding_count)
+            || copied(
+                flags.p_binding_flags,
+                flags.binding_count as usize,
+                ir::MAX_BINDINGS_PER_GROUP,
+            )?
+            .iter()
+            .any(|flag| !flag.is_empty())
+        {
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
+    }
+    let bindings = copied(
+        i.p_bindings,
+        i.binding_count as usize,
+        ir::MAX_BINDINGS_PER_GROUP,
+    )?;
+    let mut entries = Vec::with_capacity(bindings.len());
+    let mut types = BTreeMap::new();
+    let mut original_stages = BTreeMap::new();
+    for binding in &bindings {
+        if binding.descriptor_count != 1
+            || !binding.p_immutable_samplers.is_null()
+            || types
+                .insert(binding.binding, binding.descriptor_type)
+                .is_some()
+        {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX Vulkan] descriptor layout binding={} count={} type={:?} stages={:?}",
+                    binding.binding,
+                    binding.descriptor_count,
+                    binding.descriptor_type,
+                    binding.stage_flags
+                );
+            }
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
+        original_stages.insert(binding.binding, binding.stage_flags);
+    }
+    let binding_map = descriptor_binding_map(&types)?;
+    for binding in bindings {
+        let ty = match binding.descriptor_type {
+            vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
+                ir::BindingType::UniformBuffer
+            }
+            vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
+                ir::BindingType::StorageBuffer { read_only: false }
+            }
+            vk::DescriptorType::SAMPLED_IMAGE
+            | vk::DescriptorType::INPUT_ATTACHMENT
+            | vk::DescriptorType::COMBINED_IMAGE_SAMPLER => ir::BindingType::SampledTexture,
+            vk::DescriptorType::SAMPLER => ir::BindingType::Sampler,
+            vk::DescriptorType::STORAGE_IMAGE => ir::BindingType::StorageTexture {
+                format: ir::TextureFormat::Rgba8Unorm,
+                access: ir::StorageTextureAccess::WriteOnly,
+            },
+            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+        };
+        let supported = binding.stage_flags
+            & (vk::ShaderStageFlags::VERTEX
+                | vk::ShaderStageFlags::FRAGMENT
+                | vk::ShaderStageFlags::COMPUTE);
+        let visibility = if binding.stage_flags == vk::ShaderStageFlags::ALL
+            || binding.stage_flags == vk::ShaderStageFlags::ALL_GRAPHICS
+        {
+            stages(binding.stage_flags)?
+        } else if supported.is_empty() {
+            continue;
+        } else {
+            stages(supported)?
+        };
+        entries.push(ir::BindGroupLayoutEntry::new(
+            binding_map[&binding.binding],
+            visibility,
+            ty,
+        ));
+        if binding.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
+            entries.push(ir::BindGroupLayoutEntry::new(
+                binding_map[&binding.binding] + 1,
+                visibility,
+                ir::BindingType::Sampler,
+            ));
+        }
+    }
+    let desc = ir::BindGroupLayoutDesc::new(entries).map_err(failure)?;
+    Ok((desc, types, original_stages))
+}
+
 unsafe extern "system" fn create_descriptor_set_layout(
     device: vk::Device,
     info: *const vk::DescriptorSetLayoutCreateInfo<'_>,
@@ -1382,105 +1493,7 @@ unsafe extern "system" fn create_descriptor_set_layout(
         if info.is_null() || !allocator.is_null() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let i = &*info;
-        if i.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        if !i.flags.is_empty() {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        if !i.p_next.is_null() {
-            let flags = &*i
-                .p_next
-                .cast::<vk::DescriptorSetLayoutBindingFlagsCreateInfo<'_>>();
-            if flags.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
-                || !flags.p_next.is_null()
-                || (flags.binding_count != 0 && flags.binding_count != i.binding_count)
-                || copied(
-                    flags.p_binding_flags,
-                    flags.binding_count as usize,
-                    ir::MAX_BINDINGS_PER_GROUP,
-                )?
-                .iter()
-                .any(|flag| !flag.is_empty())
-            {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-        }
-        let bindings = copied(
-            i.p_bindings,
-            i.binding_count as usize,
-            ir::MAX_BINDINGS_PER_GROUP,
-        )?;
-        let mut entries = Vec::with_capacity(bindings.len());
-        let mut types = BTreeMap::new();
-        let mut original_stages = BTreeMap::new();
-        for binding in &bindings {
-            if binding.descriptor_count != 1
-                || !binding.p_immutable_samplers.is_null()
-                || types
-                    .insert(binding.binding, binding.descriptor_type)
-                    .is_some()
-            {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                    eprintln!(
-                        "[SGFX Vulkan] descriptor layout binding={} count={} type={:?} stages={:?}",
-                        binding.binding,
-                        binding.descriptor_count,
-                        binding.descriptor_type,
-                        binding.stage_flags
-                    );
-                }
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-            original_stages.insert(binding.binding, binding.stage_flags);
-        }
-        let binding_map = descriptor_binding_map(&types)?;
-        for binding in bindings {
-            let ty = match binding.descriptor_type {
-                vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
-                    ir::BindingType::UniformBuffer
-                }
-                vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
-                    ir::BindingType::StorageBuffer { read_only: false }
-                }
-                vk::DescriptorType::SAMPLED_IMAGE
-                | vk::DescriptorType::INPUT_ATTACHMENT
-                | vk::DescriptorType::COMBINED_IMAGE_SAMPLER => ir::BindingType::SampledTexture,
-                vk::DescriptorType::SAMPLER => ir::BindingType::Sampler,
-                vk::DescriptorType::STORAGE_IMAGE => ir::BindingType::StorageTexture {
-                    format: ir::TextureFormat::Rgba8Unorm,
-                    access: ir::StorageTextureAccess::WriteOnly,
-                },
-                _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-            };
-            let supported = binding.stage_flags
-                & (vk::ShaderStageFlags::VERTEX
-                    | vk::ShaderStageFlags::FRAGMENT
-                    | vk::ShaderStageFlags::COMPUTE);
-            let visibility = if binding.stage_flags == vk::ShaderStageFlags::ALL
-                || binding.stage_flags == vk::ShaderStageFlags::ALL_GRAPHICS
-            {
-                stages(binding.stage_flags)?
-            } else if supported.is_empty() {
-                continue;
-            } else {
-                stages(supported)?
-            };
-            entries.push(ir::BindGroupLayoutEntry::new(
-                binding_map[&binding.binding],
-                visibility,
-                ty,
-            ));
-            if binding.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
-                entries.push(ir::BindGroupLayoutEntry::new(
-                    binding_map[&binding.binding] + 1,
-                    visibility,
-                    ir::BindingType::Sampler,
-                ));
-            }
-        }
-        let desc = ir::BindGroupLayoutDesc::new(entries).map_err(failure)?;
+        let (desc, types, original_stages) = descriptor_layout(&*info)?;
         let handle = crate::api::with_device(device, move |r| {
             if r.resources.set_layouts.len() >= LIMIT {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
