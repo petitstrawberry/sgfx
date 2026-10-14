@@ -1759,7 +1759,7 @@ fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedR
     let mut resolved = ResolvedRecording::new();
     for (index, command) in source.commands.iter().enumerate() {
         if let Err(error) = command.apply(rt, &mut resolved) {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            {
                 eprintln!(
                     "[SGFX Vulkan] resolve command {index} {:?}: {error:?}",
                     std::mem::discriminant(command)

@@ -259,7 +259,7 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                         .iter()
                         .map(|r| {
                             resolve_recording(rt, r).inspect_err(|error| {
-                                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                                {
                                     eprintln!(
                                         "[SGFX Vulkan] queue command resolution failed: {error:?}"
                                     );
@@ -269,7 +269,7 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                         .collect::<VkResult<Vec<_>>>()?;
                     for r in &recordings {
                         validate_objects(rt, r).inspect_err(|error| {
-                            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                            {
                                 eprintln!(
                                     "[SGFX Vulkan] queue object validation failed: {error:?}"
                                 );
@@ -281,7 +281,7 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                         match execute(rt, r) {
                             Ok(mut receipts) => submissions.append(&mut receipts),
                             Err(error) => {
-                                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                                {
                                     eprintln!("[SGFX Vulkan] queue execution failed: {error:?}");
                                 }
                                 for s in &submissions {
