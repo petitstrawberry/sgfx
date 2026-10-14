@@ -105,6 +105,8 @@ pub enum VertexFormat {
     Float32x4,
     /// Four normalized unsigned 8-bit components.
     Unorm8x4,
+    /// Two 16-bit unsigned integers, widened during vertex fetch.
+    Uint16x2,
 }
 
 impl VertexFormat {
@@ -122,7 +124,8 @@ impl VertexFormat {
             | Self::Sint32
             | Self::Uint32
             | Self::Float16x2
-            | Self::Snorm10_10_10_2 => 4,
+            | Self::Snorm10_10_10_2
+            | Self::Uint16x2 => 4,
             Self::Float16x4 | Self::Sint16x4 => 8,
         }
     }

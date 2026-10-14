@@ -1270,13 +1270,15 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
             @location(1) normal: vec4<f32>,
             @location(2) material: i32,
             @location(3) uv: vec2<f32>,
+            @location(4) glyph: vec2<u32>,
         };
         struct Output { @builtin(position) position: vec4<f32>, @location(0) color: vec4<f32> };
         @vertex fn vertex(input: Input) -> Output {
             var output: Output;
             output.position = vec4<f32>(input.position, 0, 1);
             output.color = vec4<f32>(input.normal.xyz * 0.5 + 0.5, input.normal.w);
-            if input.material != -17 || any(input.uv != vec2<f32>(0.5, 1.0)) {
+            if input.material != -17 || any(input.uv != vec2<f32>(0.5, 1.0))
+                || any(input.glyph != vec2<u32>(65535, 32768)) {
                 output.color = vec4<f32>(1,0,0,0);
             }
             return output;
@@ -1301,6 +1303,9 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
         .define_buffer(BufferDesc::new(24, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap())
         .unwrap();
     let uvs = table
+        .define_buffer(BufferDesc::new(12, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap())
+        .unwrap();
+    let glyphs = table
         .define_buffer(BufferDesc::new(12, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap())
         .unwrap();
     let pipeline = table
@@ -1335,6 +1340,11 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
                     vec![VertexAttribute::new(3, VertexFormat::Float16x2, 0)],
                 )
                 .unwrap(),
+                VertexBufferLayout::new(
+                    4,
+                    vec![VertexAttribute::new(4, VertexFormat::Uint16x2, 0)],
+                )
+                .unwrap(),
             ])
             .unwrap(),
         )
@@ -1343,6 +1353,7 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
     let packed = 512u32 | (511 << 10) | (768 << 20) | (1 << 30);
     let data = [packed, (-17i32) as u32].repeat(3);
     let half = [0x3800u16, 0x3c00].repeat(3);
+    let glyph = [65535u16, 32768].repeat(3);
     let pos = [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0];
     let mut encoder = CommandEncoder::new(&table);
     encoder
@@ -1353,6 +1364,9 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
         .unwrap();
     encoder
         .write_buffer(uvs, 0, bytemuck::cast_slice(&half))
+        .unwrap();
+    encoder
+        .write_buffer(glyphs, 0, bytemuck::cast_slice(&glyph))
         .unwrap();
     let mut pass = encoder
         .begin_render_pass(
@@ -1370,6 +1384,7 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
     pass.set_vertex_buffer(positions, 0).unwrap();
     pass.set_vertex_buffer_slot(1, attributes, 0).unwrap();
     pass.set_vertex_buffer_slot(2, uvs, 0).unwrap();
+    pass.set_vertex_buffer_slot(3, glyphs, 0).unwrap();
     pass.draw(3, 0).unwrap();
     pass.end().unwrap();
     let mut cache = context.create_resources(Rc::clone(&table));

@@ -4180,6 +4180,8 @@ fn push_programmable_vertex_elements(
                 crate::ir::VertexFormat::Unorm8x4 => VIRGL_FORMAT_R8G8B8A8_UNORM,
                 crate::ir::VertexFormat::Sint32 => 197,
                 crate::ir::VertexFormat::Uint32 => 193,
+                // VIRGL_FORMAT_R16G16_UINT from the shared VirGL protocol.
+                crate::ir::VertexFormat::Uint16x2 => 186,
                 crate::ir::VertexFormat::Sint16x4 => 192,
                 crate::ir::VertexFormat::Float16x2 => 92,
                 crate::ir::VertexFormat::Float16x4 => 94,
@@ -6465,10 +6467,11 @@ mod tests {
             )
             .unwrap(),
             VertexBufferLayout::new(
-                12,
+                16,
                 alloc::vec![
                     VertexAttribute::new(1, VertexFormat::Sint16x4, 0),
                     VertexAttribute::new(2, VertexFormat::Float16x2, 8),
+                    VertexAttribute::new(3, VertexFormat::Uint16x2, 12),
                 ],
             )
             .unwrap(),
@@ -6477,7 +6480,7 @@ mod tests {
         push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
         assert_eq!(
             &dwords(&commands)[2..],
-            &[0, 0, 0, 193, 0, 0, 1, 192, 8, 0, 1, 92]
+            &[0, 0, 0, 193, 0, 0, 1, 192, 8, 0, 1, 92, 12, 0, 1, 186]
         );
     }
 

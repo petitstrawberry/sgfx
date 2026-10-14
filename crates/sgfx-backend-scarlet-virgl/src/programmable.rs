@@ -269,7 +269,7 @@ fn compile_pipeline(
             .ok_or(ir::Error::InvalidDescriptor)?;
         let scalar = match attribute.format() {
             VertexFormat::Sint32 | VertexFormat::Sint16x4 => IoScalar::Sint,
-            VertexFormat::Uint32 => IoScalar::Uint,
+            VertexFormat::Uint32 | VertexFormat::Uint16x2 => IoScalar::Uint,
             _ => IoScalar::Float,
         };
         // Vertex fetch supplies a four-component value independently of the

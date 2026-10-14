@@ -728,6 +728,7 @@ impl<'a> Compiler<'a> {
                     let format = match (scalar, shape.len()) {
                         (IoScalar::Sint, 1) => VertexFormat::Sint32,
                         (IoScalar::Uint, 1) => VertexFormat::Uint32,
+                        (IoScalar::Uint, 2) => VertexFormat::Uint16x2,
                         (IoScalar::Sint, 4) => VertexFormat::Sint16x4,
                         (IoScalar::Float, 2) => VertexFormat::Float32x2,
                         (IoScalar::Float, 3) => VertexFormat::Float32x3,

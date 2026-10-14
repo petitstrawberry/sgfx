@@ -1060,6 +1060,7 @@ unsafe fn vertex_layout(
             vk::Format::R32_SINT => ir::VertexFormat::Sint32,
             vk::Format::R32_UINT => ir::VertexFormat::Uint32,
             vk::Format::R16G16_SFLOAT => ir::VertexFormat::Float16x2,
+            vk::Format::R16G16_UINT => ir::VertexFormat::Uint16x2,
             vk::Format::R16G16B16A16_SFLOAT => ir::VertexFormat::Float16x4,
             vk::Format::R16G16B16A16_SINT => ir::VertexFormat::Sint16x4,
             vk::Format::A2B10G10R10_SNORM_PACK32 => ir::VertexFormat::Snorm10_10_10_2,
@@ -1452,7 +1453,10 @@ unsafe extern "system" fn create_graphics_pipelines(
                 .get_mut(&vertex_module)
                 .ok_or(INVALID)?
                 .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)
-                .map_err(|error| { eprintln!("[SGFX Vulkan] vertex specialization: {error:?}"); error })?;
+                .map_err(|error| {
+                    eprintln!("[SGFX Vulkan] vertex specialization: {error:?}");
+                    error
+                })?;
             let input_bindings = runtime
                 .resources
                 .shaders
@@ -1470,7 +1474,10 @@ unsafe extern "system" fn create_graphics_pipelines(
                     &input_depths,
                     &binding_maps,
                 )
-                .map_err(|error| { eprintln!("[SGFX Vulkan] fragment specialization: {error:?}"); error })?;
+                .map_err(|error| {
+                    eprintln!("[SGFX Vulkan] fragment specialization: {error:?}");
+                    error
+                })?;
             let vertex = ir::ShaderEntryPoint::new(
                 runtime
                     .table
@@ -1680,6 +1687,45 @@ mod tests {
             .vertex_binding_descriptions(&bindings)
             .vertex_attribute_descriptions(&attributes);
         assert_eq!(unsafe { vertex_layout(&instanced) }, Err(UNSUPPORTED));
+    }
+
+    #[test]
+    fn skia_glyph_coordinates_keep_unsigned_16_bit_vertex_fetch() {
+        let bindings = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: 16,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }];
+        let attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                offset: 8,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R16G16_UINT,
+                offset: 12,
+            },
+        ];
+        let info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        let parsed = unsafe { vertex_layout(&info) }.unwrap();
+        assert_eq!(
+            parsed[0].attributes()[2].format(),
+            ir::VertexFormat::Uint16x2
+        );
+        assert_eq!(parsed[0].attributes()[2].offset(), 12);
+        assert_eq!(parsed[0].stride(), 16);
     }
 
     #[test]
