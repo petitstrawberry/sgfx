@@ -151,7 +151,10 @@ unsafe extern "C" fn validate(p: Object, kind: u32, slot: u32) -> i32 {
             ),
             _ => return Err(abi::INVALID),
         }
-        .map_err(error)
+        .map_err(|cause| {
+            eprintln!("[SGFX VirGL] resource validation kind={kind} slot={slot}: {cause:?}");
+            error(cause)
+        })
     })())
 }
 unsafe fn output<'a>(ptr: *mut u8, len: usize) -> Result<&'a mut [u8], i32> {

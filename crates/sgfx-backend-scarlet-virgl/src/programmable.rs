@@ -251,7 +251,7 @@ fn compile_pipeline(
             .any(|location| !vertex.output_locations.contains(location))
     {
         #[cfg(feature = "std")]
-        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        {
             std::eprintln!(
                 "[SGFX VirGL] missing pipeline interface: attributes={:?} VS inputs={:?} VS outputs={:?} FS inputs={:?}",
                 attributes().collect::<Vec<_>>(),
@@ -279,7 +279,7 @@ fn compile_pipeline(
         // components are likewise ignored. Scalar interpretation must match.
         if scalar != input.scalar {
             #[cfg(feature = "std")]
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            {
                 std::eprintln!(
                     "[SGFX VirGL] vertex attribute mismatch: shader={input:?} attribute={attribute:?}"
                 );
