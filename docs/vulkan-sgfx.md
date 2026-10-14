@@ -356,5 +356,23 @@ KHR names retain their earlier behavior.
 The memory2 GPU integration contract binds real buffer/image allocations,
 clears an RGBA image on the GPU, copies it to a mapped buffer and verifies all
 16 red pixels. It also checks matching legacy/new requirements and supported
-versus rejected descriptor layouts. This contract passed on macOS Metal;
-Scarlet Ganesh drawing is a separate native verification step.
+versus rejected descriptor layouts. Both ignored queue-family indices and
+explicit family `0 -> 0` are tested for image and buffer barriers. The latter
+must not be interpreted as an ownership transfer. Both GPU contracts passed
+on macOS Metal; all 80 release unit tests passed as well.
+
+On 2026-10-14 the normal Scarlet AArch64 release desktop image passed
+`myrica-vulkan-probe` with HVF, four guest CPUs and `virtio-gpu-gl-pci`. WebKit
+Skia Ganesh created an exported BGRA image, drew white/red/blue regions through
+Vulkan and the native SGFX VirGL backend, checked GPU readback pixels, and
+released the context, device, loader and image. All three independent lifecycle
+cycles passed with ICD revision `7a62d766818b205fc21a69aae0d72792d4b374aa`
+and WebKit revision `a666d28d0d4b46016bc9dd42edbfafd0ad81ad06`.
+The preceding initialized C++ TLS/Rust TLS/errno isolation check also passed
+across four native threads. The existing native cube's three GPU readback
+cycles passed in the same guest.
+
+This establishes Ganesh drawing through the native driver. Myrica's browser
+page rendering still uses Cairo; the WebCore Skia port and shared-image
+presentation by Myrica are separate implementation work, not certified by
+these tests.
