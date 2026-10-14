@@ -3,6 +3,16 @@ use super::*;
 #[test]
 #[ignore = "requires the built ICD and a native GPU"]
 fn memory2_bindings_feed_real_gpu_clear_and_readback() {
+    gpu_clear_and_readback(vk::QUEUE_FAMILY_IGNORED);
+}
+
+#[test]
+#[ignore = "requires the built ICD and a native GPU"]
+fn explicit_same_family_image_and_buffer_barriers_feed_gpu_readback() {
+    gpu_clear_and_readback(0);
+}
+
+fn gpu_clear_and_readback(queue_family: u32) {
     let context = Context::new();
     unsafe {
         let device = &context.device;
@@ -111,19 +121,49 @@ fn memory2_bindings_feed_real_gpu_clear_and_readback() {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
             .layer_count(1);
+        let barrier = vk::ImageMemoryBarrier::default()
+            .src_queue_family_index(queue_family)
+            .dst_queue_family_index(queue_family)
+            .image(image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(
+            context.command,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+        );
         device.cmd_clear_color_image(
             context.command,
             image,
-            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             &vk::ClearColorValue {
                 float32: [1.0, 0.0, 0.0, 1.0],
             },
             &[range],
         );
+        device.cmd_pipeline_barrier(
+            context.command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)],
+        );
         device.cmd_copy_image_to_buffer(
             context.command,
             image,
-            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             buffer,
             &[vk::BufferImageCopy::default()
                 .image_subresource(
@@ -136,6 +176,21 @@ fn memory2_bindings_feed_real_gpu_clear_and_readback() {
                     height: 4,
                     depth: 1,
                 })],
+        );
+        device.cmd_pipeline_barrier(
+            context.command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[vk::BufferMemoryBarrier::default()
+                .src_queue_family_index(queue_family)
+                .dst_queue_family_index(queue_family)
+                .buffer(buffer)
+                .size(vk::WHOLE_SIZE)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)],
+            &[],
         );
         device.end_command_buffer(context.command).unwrap();
         context.submit(vk::Fence::null()).unwrap();

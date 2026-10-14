@@ -1616,10 +1616,7 @@ impl RecordedCommand {
                     size,
                 ) in buffers
                 {
-                    if *extended
-                        || !(*source_queue == vk::QUEUE_FAMILY_IGNORED
-                            && *destination_queue == vk::QUEUE_FAMILY_IGNORED)
-                    {
+                    if *extended || !same_queue_family(*source_queue, *destination_queue) {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
                     let buffer_data = rt
@@ -1651,10 +1648,7 @@ impl RecordedCommand {
                     range,
                 ) in images
                 {
-                    if *extended
-                        || !(*source_queue == vk::QUEUE_FAMILY_IGNORED
-                            && *destination_queue == vk::QUEUE_FAMILY_IGNORED)
-                    {
+                    if *extended || !same_queue_family(*source_queue, *destination_queue) {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
                     let image_data = rt
@@ -2912,6 +2906,12 @@ unsafe extern "system" fn cmd_pipeline_barrier(
     )
 }
 
+// This ICD exposes queue family 0 only. Equal family indices do not transfer
+// ownership; Vulkan treats them like two QUEUE_FAMILY_IGNORED indices.
+fn same_queue_family(source: u32, destination: u32) -> bool {
+    source == destination && matches!(source, 0 | vk::QUEUE_FAMILY_IGNORED)
+}
+
 fn validate_pipeline_barrier_header(
     source_stage: vk::PipelineStageFlags,
     destination_stage: vk::PipelineStageFlags,
@@ -3960,6 +3960,25 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn barriers_accept_explicit_same_family_without_ownership_transfer() {
+        assert!(same_queue_family(0, 0));
+        assert!(same_queue_family(
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::QUEUE_FAMILY_IGNORED
+        ));
+        for (source, destination) in [
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (0, vk::QUEUE_FAMILY_IGNORED),
+            (vk::QUEUE_FAMILY_EXTERNAL, 0),
+            (vk::QUEUE_FAMILY_EXTERNAL, vk::QUEUE_FAMILY_EXTERNAL),
+        ] {
+            assert!(!same_queue_family(source, destination));
+        }
+    }
 
     #[test]
     fn unmapped_buffer_uploads_are_reused_until_host_mapping_changes_them() {

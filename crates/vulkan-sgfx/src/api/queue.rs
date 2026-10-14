@@ -259,21 +259,15 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                         .iter()
                         .map(|r| {
                             resolve_recording(rt, r).inspect_err(|error| {
-                                {
-                                    eprintln!(
-                                        "[SGFX Vulkan] queue command resolution failed: {error:?}"
-                                    );
-                                }
+                                eprintln!(
+                                    "[SGFX Vulkan] queue command resolution failed: {error:?}"
+                                );
                             })
                         })
                         .collect::<VkResult<Vec<_>>>()?;
                     for r in &recordings {
                         validate_objects(rt, r).inspect_err(|error| {
-                            {
-                                eprintln!(
-                                    "[SGFX Vulkan] queue object validation failed: {error:?}"
-                                );
-                            }
+                            eprintln!("[SGFX Vulkan] queue object validation failed: {error:?}");
                         })?;
                     }
                     let mut submissions = Vec::new();
