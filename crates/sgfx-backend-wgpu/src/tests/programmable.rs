@@ -396,71 +396,82 @@ fn indexed_strips_are_rejected_before_gpu_acceptance() {
     let Some(device) = headless_device() else {
         return;
     };
-    let context = device.create_context();
-    let table = Rc::new(ResourceTable::new());
-    let module = shader(
-        &table,
-        &format!(
-            "{FULLSCREEN_VERTEX}\n@fragment fn fragment() -> @location(0) vec4<f32> {{ return vec4<f32>(0.0, 1.0, 0.0, 1.0); }}"
+    for (topology, expected) in [
+        (
+            PrimitiveTopology::TriangleStrip,
+            crate::UnsupportedFeature::IndexedTriangleStrip,
         ),
-    );
-    let pipeline = table
-        .define_programmable_render_pipeline(
-            ProgrammableRenderPipelineDesc::new(
-                entry(module, ShaderStage::Vertex, "vertex"),
-                entry(module, ShaderStage::Fragment, "fragment"),
-                PipelineLayoutDesc::new(vec![]).unwrap(),
-                TextureFormat::Rgba8Unorm,
-                None,
-                PrimitiveTopology::TriangleStrip,
-                BlendState::REPLACE,
-                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        (
+            PrimitiveTopology::LineStrip,
+            crate::UnsupportedFeature::IndexedLineStrip,
+        ),
+    ] {
+        let context = device.create_context();
+        let table = Rc::new(ResourceTable::new());
+        let module = shader(
+            &table,
+            &format!(
+                "{FULLSCREEN_VERTEX}\n@fragment fn fragment() -> @location(0) vec4<f32> {{ return vec4<f32>(0.0, 1.0, 0.0, 1.0); }}"
+            ),
+        );
+        let pipeline = table
+            .define_programmable_render_pipeline(
+                ProgrammableRenderPipelineDesc::new(
+                    entry(module, ShaderStage::Vertex, "vertex"),
+                    entry(module, ShaderStage::Fragment, "fragment"),
+                    PipelineLayoutDesc::new(vec![]).unwrap(),
+                    TextureFormat::Rgba8Unorm,
+                    None,
+                    topology,
+                    BlendState::REPLACE,
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
-    let indices = table
-        .define_buffer(BufferDesc::new(8, BufferUsage::INDEX | BufferUsage::COPY_DST).unwrap())
-        .unwrap();
-    let target = table
-        .define_texture(
-            TextureDesc::new(
-                TextureFormat::Rgba8Unorm,
-                Extent2D::new(4, 4).unwrap(),
-                TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+            .unwrap();
+        let indices = table
+            .define_buffer(BufferDesc::new(8, BufferUsage::INDEX | BufferUsage::COPY_DST).unwrap())
+            .unwrap();
+        let target = table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Rgba8Unorm,
+                    Extent2D::new(4, 4).unwrap(),
+                    TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
-    let mut encoder = CommandEncoder::new(&table);
-    encoder.write_buffer(indices, 0, &[0; 8]).unwrap();
-    let mut pass = encoder
-        .begin_render_pass(
-            RenderPassDesc::new(
-                &table,
-                target,
-                PixelRect::new(0, 0, 4, 4).unwrap(),
-                LoadOp::Clear(Color::rgba(1.0, 0.0, 0.0, 1.0).unwrap()),
-                StoreOp::Store,
+            .unwrap();
+        let mut encoder = CommandEncoder::new(&table);
+        encoder.write_buffer(indices, 0, &[0; 8]).unwrap();
+        let mut pass = encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    &table,
+                    target,
+                    PixelRect::new(0, 0, 4, 4).unwrap(),
+                    LoadOp::Clear(Color::rgba(1.0, 0.0, 0.0, 1.0).unwrap()),
+                    StoreOp::Store,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
-    pass.set_programmable_pipeline(pipeline).unwrap();
-    pass.set_index_buffer(indices, 0, IndexFormat::Uint16)
-        .unwrap();
-    pass.draw_indexed(4, 0, 0).unwrap();
-    pass.end().unwrap();
-    let commands = encoder.finish().unwrap();
-    let mut cache = context.create_resources(Rc::clone(&table));
-    let result = context.create_queue().submit_tracked(&mut cache, &commands);
-    assert!(matches!(
-        result,
-        Err(sgfx_core::backend::SubmitError::Rejected(
-            Error::Unsupported(crate::UnsupportedFeature::IndexedTriangleStrip)
-        ))
-    ));
-    assert_eq!(cache.read_texture(target.id()).unwrap(), vec![0; 4 * 4 * 4]);
+            .unwrap();
+        pass.set_programmable_pipeline(pipeline).unwrap();
+        pass.set_index_buffer(indices, 0, IndexFormat::Uint16)
+            .unwrap();
+        pass.draw_indexed(4, 0, 0).unwrap();
+        pass.end().unwrap();
+        let commands = encoder.finish().unwrap();
+        let mut cache = context.create_resources(Rc::clone(&table));
+        let result = context.create_queue().submit_tracked(&mut cache, &commands);
+        assert!(matches!(
+            result,
+            Err(sgfx_core::backend::SubmitError::Rejected(
+                Error::Unsupported(error)
+            )) if error == expected
+        ));
+        assert_eq!(cache.read_texture(target.id()).unwrap(), vec![0; 4 * 4 * 4]);
+    }
 }
 
 #[test]

@@ -116,6 +116,8 @@ pub enum UnsupportedFeature {
     /// Indexed strips need explicit restart semantics or a faithful index
     /// conversion. WGPU's implicit restart must not reinterpret ordinary indices.
     IndexedTriangleStrip,
+    /// Indexed line strips also require a faithful conversion of restart indices.
+    IndexedLineStrip,
     /// WGPU has no native triangle-fan topology; conversion is not implemented.
     TriangleFan,
     /// A sampled texture format is incompatible with the selected fragment
@@ -1121,6 +1123,11 @@ fn validate_indexed_topologies(commands: &CommandBuffer<'_, '_>) -> Result<()> {
             {
                 return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
             }
+            Command::DrawIndexed { .. } | Command::DrawIndexedInstanced { .. }
+                if pipeline == Some(ir::PrimitiveTopology::LineStrip) =>
+            {
+                return Err(Error::Unsupported(UnsupportedFeature::IndexedLineStrip));
+            }
             _ => {}
         }
     }
@@ -1834,6 +1841,9 @@ impl Queue {
         if let Some(pipeline) = &state.programmable {
             if pipeline.topology == ir::PrimitiveTopology::TriangleStrip {
                 return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
+            }
+            if pipeline.topology == ir::PrimitiveTopology::LineStrip {
+                return Err(Error::Unsupported(UnsupportedFeature::IndexedLineStrip));
             }
             self.prepare_programmable_draw(render_pass, state, pipeline)?;
             let (buffer, offset, format) =
@@ -2960,8 +2970,8 @@ fn sampled_alpha(sample: &str, sample_format: Option<TextureFormat>) -> String {
 mod tests {
     mod completion;
     mod execution;
-    mod sampler;
     mod programmable;
+    mod sampler;
 
     use alloc::rc::Rc;
     use alloc::vec;

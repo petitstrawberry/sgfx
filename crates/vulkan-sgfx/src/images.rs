@@ -1186,6 +1186,8 @@ unsafe fn graphics_state(
             vk::PrimitiveTopology::TRIANGLE_LIST
                 | vk::PrimitiveTopology::TRIANGLE_STRIP
                 | vk::PrimitiveTopology::TRIANGLE_FAN
+                | vk::PrimitiveTopology::LINE_LIST
+                | vk::PrimitiveTopology::LINE_STRIP
         )
         || assembly.primitive_restart_enable != vk::FALSE
         || !viewport.p_next.is_null()
@@ -1344,7 +1346,10 @@ unsafe fn graphics_state(
         topology: match assembly.topology {
             vk::PrimitiveTopology::TRIANGLE_STRIP => ir::PrimitiveTopology::TriangleStrip,
             vk::PrimitiveTopology::TRIANGLE_FAN => ir::PrimitiveTopology::TriangleFan,
-            _ => ir::PrimitiveTopology::TriangleList,
+            vk::PrimitiveTopology::TRIANGLE_LIST => ir::PrimitiveTopology::TriangleList,
+            vk::PrimitiveTopology::LINE_LIST => ir::PrimitiveTopology::LineList,
+            vk::PrimitiveTopology::LINE_STRIP => ir::PrimitiveTopology::LineStrip,
+            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
         },
     })
 }
@@ -2025,5 +2030,30 @@ mod tests {
         }
         .unwrap();
         assert_eq!(parsed.topology, ir::PrimitiveTopology::TriangleFan);
+        for (topology, expected) in [
+            (
+                vk::PrimitiveTopology::LINE_LIST,
+                ir::PrimitiveTopology::LineList,
+            ),
+            (
+                vk::PrimitiveTopology::LINE_STRIP,
+                ir::PrimitiveTopology::LineStrip,
+            ),
+        ] {
+            let line_assembly = assembly.topology(topology);
+            let line_base = base
+                .input_assembly_state(&line_assembly)
+                .dynamic_state(&dynamic);
+            assert_eq!(
+                unsafe { graphics_state(&line_base) }.unwrap().topology,
+                expected
+            );
+            let wide = raster.line_width(2.0);
+            assert!(unsafe { graphics_state(&line_base.rasterization_state(&wide)) }.is_err());
+            let restarted = line_assembly.primitive_restart_enable(true);
+            assert!(unsafe { graphics_state(&base.input_assembly_state(&restarted)) }.is_err());
+        }
+        let adjacency = assembly.topology(vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY);
+        assert!(unsafe { graphics_state(&base.input_assembly_state(&adjacency)) }.is_err());
     }
 }

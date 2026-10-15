@@ -271,6 +271,10 @@ pub enum PrimitiveTopology {
     TriangleStrip,
     /// Assemble triangles sharing the first vertex, in input order.
     TriangleFan,
+    /// Assemble independent pairs of vertices as one-pixel lines.
+    LineList,
+    /// Assemble connected one-pixel lines between consecutive vertices.
+    LineStrip,
 }
 
 impl PrimitiveTopology {
@@ -278,6 +282,8 @@ impl PrimitiveTopology {
         match self {
             Self::TriangleList => count != 0 && count.is_multiple_of(3),
             Self::TriangleStrip | Self::TriangleFan => count >= 3,
+            Self::LineList => count != 0 && count.is_multiple_of(2),
+            Self::LineStrip => count >= 2,
         }
     }
 }

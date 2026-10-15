@@ -680,6 +680,10 @@ pub(crate) fn draw_count_valid(draw: &IrDraw) -> bool {
         Some(
             crate::ir::PrimitiveTopology::TriangleStrip | crate::ir::PrimitiveTopology::TriangleFan,
         ) => draw.vertex_count >= 3,
+        Some(crate::ir::PrimitiveTopology::LineList) => {
+            draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(2)
+        }
+        Some(crate::ir::PrimitiveTopology::LineStrip) => draw.vertex_count >= 2,
         _ => draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(3),
     }
 }

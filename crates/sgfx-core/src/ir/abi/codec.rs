@@ -163,7 +163,7 @@ enumeration!(AddressMode {ClampToEdge=0,Repeat=1,MirrorRepeat=2,ClampToBorder=3}
 enumeration!(CompareFunction {Never=0,Less=1,Equal=2,LessEqual=3,Greater=4,NotEqual=5,GreaterEqual=6,Always=7});
 enumeration!(VertexFormat {Sint32=0,Uint32=1,Float16x2=2,Float16x4=3,Sint16x4=4,Snorm10_10_10_2=5,Float32x2=6,Float32x3=7,Float32x4=8,Unorm8x4=9,Uint16x2=10,Float32=11});
 enumeration!(VertexStepMode {Vertex=0,Instance=1});
-enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1,TriangleFan=2});
+enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1,TriangleFan=2,LineList=3,LineStrip=4});
 enumeration!(IndexFormat {Uint16=0,Uint32=1});
 enumeration!(TextureSampleMode {Rgba=0,RgbIgnoreAlpha=1,AlphaMask=2});
 enumeration!(BlendFactor {Zero=0,One=1,SourceAlpha=2,OneMinusSourceAlpha=3,DestinationAlpha=4,OneMinusDestinationAlpha=5,SourceColor=6,OneMinusSourceColor=7,DestinationColor=8,OneMinusDestinationColor=9});
@@ -927,6 +927,61 @@ mod color_blend_tests {
         assert_eq!(
             BlendFactor::get(&mut Reader { words: &[10] }, &table),
             Err(Error::InvalidValue),
+        );
+    }
+}
+
+#[cfg(test)]
+mod line_topology_tests {
+    use super::*;
+
+    #[test]
+    fn line_topologies_append_stable_tags_and_preserve_primitive_counts() {
+        let table = ResourceTable::new();
+        for (topology, tag, counts) in [
+            (
+                PrimitiveTopology::TriangleList,
+                0,
+                [false, false, false, true, false, false, true],
+            ),
+            (
+                PrimitiveTopology::TriangleStrip,
+                1,
+                [false, false, false, true, true, true, true],
+            ),
+            (
+                PrimitiveTopology::TriangleFan,
+                2,
+                [false, false, false, true, true, true, true],
+            ),
+            (
+                PrimitiveTopology::LineList,
+                3,
+                [false, false, true, false, true, false, true],
+            ),
+            (
+                PrimitiveTopology::LineStrip,
+                4,
+                [false, false, true, true, true, true, true],
+            ),
+        ] {
+            let mut words = Vec::new();
+            topology.put(&mut words);
+            assert_eq!(words, [tag]);
+            let mut reader = Reader { words: &words };
+            assert_eq!(PrimitiveTopology::get(&mut reader, &table), Ok(topology));
+            reader.end().unwrap();
+            for (count, expected) in counts.into_iter().enumerate() {
+                assert_eq!(
+                    topology.accepts_count(count as u32),
+                    expected,
+                    "{topology:?} count {count}"
+                );
+            }
+        }
+        assert_eq!(
+            PrimitiveTopology::get(&mut Reader { words: &[5] }, &table),
+            Err(Error::InvalidValue)
         );
     }
 }

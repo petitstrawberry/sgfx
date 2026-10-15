@@ -404,6 +404,8 @@ impl Resources {
                             ir::PrimitiveTopology::TriangleStrip => {
                                 raw::PrimitiveTopology::TriangleStrip
                             }
+                            ir::PrimitiveTopology::LineList => raw::PrimitiveTopology::LineList,
+                            ir::PrimitiveTopology::LineStrip => raw::PrimitiveTopology::LineStrip,
                             ir::PrimitiveTopology::TriangleFan => {
                                 return Err(Error::Unsupported(UnsupportedFeature::TriangleFan));
                             }

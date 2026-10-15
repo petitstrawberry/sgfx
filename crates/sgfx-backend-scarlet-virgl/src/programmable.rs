@@ -182,6 +182,8 @@ fn compile_pipeline(
         PrimitiveTopology::TriangleList
             | PrimitiveTopology::TriangleStrip
             | PrimitiveTopology::TriangleFan
+            | PrimitiveTopology::LineList
+            | PrimitiveTopology::LineStrip
     ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PrimitiveTopology,
@@ -784,6 +786,8 @@ pub(super) fn decode_draw(
     let valid_count = match pipeline.topology() {
         PrimitiveTopology::TriangleList => count > 0 && count.is_multiple_of(3),
         PrimitiveTopology::TriangleStrip | PrimitiveTopology::TriangleFan => count >= 3,
+        PrimitiveTopology::LineList => count > 0 && count.is_multiple_of(2),
+        PrimitiveTopology::LineStrip => count >= 2,
     };
     if !valid_count {
         return Err(ir::Error::InvalidValue.into());

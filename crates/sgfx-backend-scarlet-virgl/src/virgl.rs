@@ -82,6 +82,8 @@ const VIRGL_FORMAT_R8G8B8A8_UNORM: u32 = 67;
 const PIPE_SHADER_VERTEX: u32 = 0;
 const PIPE_SHADER_FRAGMENT: u32 = 1;
 const VIRGL_SHADER_TOKEN_COUNT_HINT: u32 = 300;
+const PIPE_PRIM_LINES: u32 = 1;
+const PIPE_PRIM_LINE_STRIP: u32 = 3;
 const PIPE_PRIM_TRIANGLES: u32 = 4;
 const PIPE_PRIM_TRIANGLE_STRIP: u32 = 5;
 const PIPE_PRIM_TRIANGLE_FAN: u32 = 6;
@@ -5268,6 +5270,10 @@ fn push_instanced_draw_parameters(
             PIPE_PRIM_TRIANGLE_STRIP
         }
         crate::ir::PrimitiveTopology::TriangleFan if vertex_count >= 3 => PIPE_PRIM_TRIANGLE_FAN,
+        crate::ir::PrimitiveTopology::LineList if vertex_count > 0 && vertex_count % 2 == 0 => {
+            PIPE_PRIM_LINES
+        }
+        crate::ir::PrimitiveTopology::LineStrip if vertex_count >= 2 => PIPE_PRIM_LINE_STRIP,
         _ => return Err(HandleError::InvalidParameter),
     };
     push_dword(commands, command_header(VIRGL_CCMD_DRAW_VBO, 0, 12));
@@ -5723,6 +5729,46 @@ mod tests {
         commands.clear();
         push_sampler_mip_view(&mut commands, 9, 7, 4);
         assert_eq!(dwords(&commands)[5], 3 << 8);
+    }
+
+    #[test]
+    fn lines_use_native_primitive_tokens_with_exact_ranges() {
+        for (topology, token, valid, invalid) in [
+            (crate::ir::PrimitiveTopology::LineList, 1, 4, 3),
+            (crate::ir::PrimitiveTopology::LineStrip, 3, 3, 1),
+        ] {
+            for indexed in [false, true] {
+                let mut commands = Vec::new();
+                push_draw_topology_parameters(&mut commands, 2, valid, indexed, -3, topology)
+                    .unwrap();
+                assert_eq!(
+                    &dwords(&commands)[1..7],
+                    &[
+                        2,
+                        valid as u32,
+                        token,
+                        u32::from(indexed),
+                        1,
+                        (-3i32) as u32
+                    ]
+                );
+                for count in [0, invalid] {
+                    commands.clear();
+                    assert_eq!(
+                        push_draw_topology_parameters(
+                            &mut commands,
+                            0,
+                            count,
+                            indexed,
+                            0,
+                            topology
+                        ),
+                        Err(HandleError::InvalidParameter)
+                    );
+                    assert!(commands.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
