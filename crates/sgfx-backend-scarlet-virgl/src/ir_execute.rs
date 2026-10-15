@@ -154,6 +154,7 @@ pub struct IrResources {
     buffer_revisions: Vec<u64>,
     canonical_buffer_revisions: Vec<Option<u64>>,
     submission_failed: bool,
+    cleanup_complete: bool,
     #[cfg(feature = "programmable")]
     programmable_pipelines: RefCell<
         Vec<(
@@ -169,9 +170,55 @@ struct ImageMapping {
     backend_registered: bool,
 }
 
+impl Drop for IrResources {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            self.abandon_cleanup();
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX teardown] stage=ir_resources error={error:?}");
+        }
+    }
+}
+
 impl IrResources {
+    pub(crate) fn abandon_cleanup(&mut self) {
+        self.submission_failed = true;
+        self.context.abandon_cleanup();
+    }
+
+    pub(crate) fn cleanup(&mut self) -> Result<(), IrSubmitError> {
+        if self.cleanup_complete {
+            return Ok(());
+        }
+        self.ensure_usable()?;
+        while let Some(mapping) = self.images.first() {
+            self.unmap_image(mapping.texture)?;
+        }
+        let result = run_retirement(&mut self.submission_failed, || {
+            self.context.retire_ir_resources(&mut self.backend)
+        });
+        if result.is_err() {
+            self.context.abandon_cleanup();
+        }
+        result?;
+        self.cleanup_complete = true;
+        Ok(())
+    }
+
+    pub(crate) fn retire_owned_image(
+        &mut self,
+        context: &Context,
+        image: Image,
+    ) -> Result<(), IrSubmitError> {
+        let result = run_retirement(&mut self.submission_failed, || context.release_image(image));
+        if result.is_err() {
+            self.context.abandon_cleanup();
+        }
+        result
+    }
+
     pub(crate) fn ensure_usable(&self) -> Result<(), IrSubmitError> {
-        ensure_submission_usable(self.submission_failed)
+        ensure_submission_usable(self.submission_failed || self.context.cleanup_failed())
     }
 
     pub(crate) fn retire_imported_texture(
@@ -179,9 +226,13 @@ impl IrResources {
         context: &Context,
         image: Texture,
     ) -> Result<(), IrSubmitError> {
-        run_retirement(&mut self.submission_failed, || {
+        let result = run_retirement(&mut self.submission_failed, || {
             context.release_texture(image)
-        })
+        });
+        if result.is_err() {
+            self.context.abandon_cleanup();
+        }
+        result
     }
 
     pub(crate) fn new(
@@ -219,6 +270,7 @@ impl IrResources {
             buffer_revisions,
             canonical_buffer_revisions,
             submission_failed: false,
+            cleanup_complete: false,
             #[cfg(feature = "programmable")]
             programmable_pipelines: RefCell::new(Vec::new()),
         })
@@ -243,7 +295,8 @@ impl IrResources {
         }
         run_retirement(&mut self.submission_failed, || {
             self.backend.release_texture(&self.context, slot)
-        })?;
+        })
+        .inspect_err(|_| self.context.abandon_cleanup())?;
         Ok(())
     }
 
@@ -254,7 +307,8 @@ impl IrResources {
         let slot = self.resources.buffer_ref(id)?.slot();
         run_retirement(&mut self.submission_failed, || {
             self.backend.release_buffer(&self.context, slot)
-        })?;
+        })
+        .inspect_err(|_| self.context.abandon_cleanup())?;
         // A mirrored table can append and retire a buffer before its first
         // submission has grown these materialization caches.
         if let Some(shadow) = self.buffer_shadows.get_mut(slot) {
@@ -338,6 +392,7 @@ impl IrResources {
 
     /// Remove a logical presentation mapping and release the cache's image owner.
     pub fn unmap_image(&mut self, texture: TextureId) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let index = self
             .images
             .iter()
@@ -347,10 +402,12 @@ impl IrResources {
         let descriptor = self.resources.texture(texture_ref)?;
         let image = Rc::clone(&self.images[index].image);
         if self.images[index].backend_registered {
-            self.backend.unmap_ir_image(
-                texture_spec(texture_ref, descriptor)?,
-                &image.as_ref().backend,
-            )?;
+            let spec = texture_spec(texture_ref, descriptor)?;
+            run_retirement(&mut self.submission_failed, || {
+                self.backend
+                    .unmap_ir_image(&self.context, spec, &image.as_ref().backend)
+            })
+            .inspect_err(|_| self.context.abandon_cleanup())?;
         }
         self.images.remove(index);
         Ok(())
@@ -403,7 +460,8 @@ impl IrResources {
             context
                 .backend
                 .unmap_ir_texture(&mut self.backend, spec, &image.backend)
-        })?;
+        })
+        .inspect_err(|_| self.context.abandon_cleanup())?;
         Ok(())
     }
 

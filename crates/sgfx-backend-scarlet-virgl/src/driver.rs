@@ -55,6 +55,23 @@ pub(crate) enum Context {
 }
 
 impl Context {
+    pub(crate) fn cleanup_failed(&self) -> bool {
+        match self {
+            Self::Virgl(context) => context.cleanup_failed(),
+        }
+    }
+    pub(crate) fn abandon_cleanup(&self) {
+        match self {
+            Self::Virgl(context) => context.abandon_cleanup(),
+        }
+    }
+    pub(crate) fn retire_ir_resources(&self, resources: &mut IrResources) -> HandleResult<()> {
+        match (self, resources) {
+            (Self::Virgl(context), IrResources::Virgl(resources)) => {
+                context.retire_ir_resources(resources)
+            }
+        }
+    }
     pub(crate) fn capabilities(&self) -> Capabilities {
         match self {
             Self::Virgl(context) => context.capabilities(),
@@ -904,12 +921,13 @@ impl IrResources {
 
     pub(crate) fn unmap_ir_image(
         &mut self,
+        context: &Context,
         texture: IrTextureSpec,
         image: &Image,
     ) -> HandleResult<()> {
-        match (self, image) {
-            (Self::Virgl(resources), Image::Virgl(image)) => {
-                resources.unmap_ir_image(texture, image)
+        match (self, context, image) {
+            (Self::Virgl(resources), Context::Virgl(context), Image::Virgl(image)) => {
+                resources.unmap_ir_image(context, texture, image)
             }
         }
     }

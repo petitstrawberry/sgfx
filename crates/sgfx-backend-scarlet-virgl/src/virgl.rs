@@ -401,7 +401,8 @@ impl Device {
     pub(crate) fn create_context(self: &Rc<Self>) -> HandleResult<Context> {
         Ok(Context {
             device: Rc::clone(self),
-            raw: self.raw.create_context(&self.dialect)?,
+            raw: Rc::new(self.raw.create_context(&self.dialect)?),
+            cleanup_failed: Rc::new(Cell::new(false)),
             next_object_handle: Cell::new(FIRST_DYNAMIC_OBJECT_HANDLE),
             scheduler: Rc::new(RefCell::new(None)),
         })
@@ -410,12 +411,28 @@ impl Device {
 
 pub(crate) struct Context {
     device: Rc<Device>,
-    raw: RawContext,
+    raw: Rc<RawContext>,
+    cleanup_failed: Rc<Cell<bool>>,
     next_object_handle: Cell<u32>,
     scheduler: SharedScheduler,
 }
 
 impl Context {
+    pub(crate) fn cleanup_failed(&self) -> bool {
+        self.cleanup_failed.get()
+    }
+    pub(crate) fn abandon_cleanup(&self) {
+        self.cleanup_failed.set(true);
+    }
+
+    pub(crate) fn retire_ir_resources(&self, resources: &mut IrResources) -> HandleResult<()> {
+        let result = resources.retire(self);
+        if result.is_err() {
+            self.abandon_cleanup();
+        }
+        result
+    }
+
     pub(crate) fn capabilities(&self) -> Capabilities {
         self.device.capabilities
     }
@@ -787,6 +804,17 @@ impl Context {
     }
 
     fn retire_texture(&self, texture: &Texture) -> HandleResult<()> {
+        if self.cleanup_failed.get() {
+            return Err(HandleError::Unsupported);
+        }
+        let result = self.retire_texture_inner(texture);
+        if result.is_err() {
+            self.abandon_cleanup();
+        }
+        result
+    }
+
+    fn retire_texture_inner(&self, texture: &Texture) -> HandleResult<()> {
         if texture.context_handle != self.handle_id() {
             return Err(HandleError::InvalidParameter);
         }
@@ -832,8 +860,29 @@ impl Context {
         if image.context_handle != self.handle_id() {
             return Err(HandleError::InvalidParameter);
         }
-        wait_scheduled(&self.scheduler)?;
-        self.raw.detach_image(&image.raw)
+        let result = (|| {
+            let objects = [
+                image
+                    .composition_surface_initialized
+                    .get()
+                    .then_some((VIRGL_OBJECT_SURFACE, image.composition_surface_handle)),
+                image
+                    .ir_surface_initialized
+                    .get()
+                    .then_some((VIRGL_OBJECT_SURFACE, image.ir_surface_handle)),
+            ];
+            retire_native_objects(
+                &self.raw,
+                &self.scheduler,
+                &self.cleanup_failed,
+                objects.into_iter().flatten(),
+            )?;
+            self.raw.detach_image(&image.raw)
+        })();
+        if result.is_err() {
+            self.abandon_cleanup();
+        }
+        result
     }
 
     pub(crate) fn create_pipeline(
@@ -880,6 +929,8 @@ impl Context {
         let composition_vertex_resource_id =
             resource_id_from_token(self.raw.attach_buffer(&raw_vertex_buffer)?)?;
         Ok(Queue {
+            context: Rc::clone(&self.raw),
+            cleanup_failed: Rc::clone(&self.cleanup_failed),
             raw: Arc::new(self.raw.create_queue()?),
             scheduler: Rc::clone(&self.scheduler),
             context_handle: self.handle_id(),
@@ -1063,6 +1114,8 @@ impl Context {
 }
 
 pub(crate) struct Queue {
+    context: Rc<RawContext>,
+    cleanup_failed: Rc<Cell<bool>>,
     raw: Arc<RawQueue>,
     scheduler: SharedScheduler,
     context_handle: i32,
@@ -1143,6 +1196,109 @@ pub(crate) struct IrStateSnapshot {
 }
 
 impl IrResources {
+    fn retire(&mut self, context: &Context) -> HandleResult<()> {
+        if context.cleanup_failed.get() {
+            return Err(HandleError::Unsupported);
+        }
+        wait_scheduled(&context.scheduler)?;
+        for slot in 0..self.textures.len() {
+            if matches!(self.textures[slot], Some(IrTexture::Mapped(_))) {
+                return Err(HandleError::InvalidParameter);
+            }
+            self.release_texture(context, slot)?;
+        }
+        for slot in 0..self.buffers.len() {
+            self.release_buffer(context, slot)?;
+        }
+        let globals = [
+            (VIRGL_OBJECT_SHADER, self.vertex_shader_handle),
+            (VIRGL_OBJECT_SHADER, self.solid_fragment_shader_handle),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.vertex_color_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_rgba_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_rgb_ignore_alpha_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_alpha_mask_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_vertex_color_rgba_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_vertex_color_rgb_ignore_alpha_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_vertex_color_alpha_mask_fragment_shader_handle,
+            ),
+            (VIRGL_OBJECT_VERTEX_ELEMENTS, self.vertex_elements_handle),
+        ];
+        let objects = globals
+            .into_iter()
+            .filter(|_| self.initialized.get())
+            .chain(
+                self.samplers
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.initialized.get())
+                    .map(|p| (VIRGL_OBJECT_SAMPLER_STATE, p.handle)),
+            )
+            .chain(
+                self.pipelines
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.initialized.get())
+                    .flat_map(|p| {
+                        [
+                            Some((VIRGL_OBJECT_BLEND, p.blend_handle)),
+                            Some((VIRGL_OBJECT_RASTERIZER, p.rasterizer_handle)),
+                            p.dsa_handle.map(|id| (VIRGL_OBJECT_DSA, id)),
+                        ]
+                        .into_iter()
+                        .flatten()
+                    }),
+            )
+            .chain(
+                self.programmable_pipelines
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.initialized.get())
+                    .flat_map(|p| {
+                        [
+                            (VIRGL_OBJECT_SHADER, p.vertex_shader_handle),
+                            (VIRGL_OBJECT_SHADER, p.fragment_shader_handle),
+                            (VIRGL_OBJECT_VERTEX_ELEMENTS, p.vertex_elements_handle),
+                        ]
+                    }),
+            );
+        retire_native_objects(
+            &context.raw,
+            &context.scheduler,
+            &context.cleanup_failed,
+            objects,
+        )?;
+        context.raw.detach_buffer(&self.vertex_buffer)?;
+        for arena in &self.upload_arenas {
+            context.raw.detach_buffer(&arena._raw)?;
+        }
+        self.upload_arenas.clear();
+        self.samplers.clear();
+        self.pipelines.clear();
+        self.programmable_pipelines.clear();
+        self.initialized.set(false);
+        Ok(())
+    }
+
     pub(crate) fn release_texture(&mut self, context: &Context, slot: usize) -> HandleResult<()> {
         if self.context_handle != context.handle_id() || slot >= self.textures.len() {
             return Err(HandleError::InvalidParameter);
@@ -1187,6 +1343,7 @@ impl IrResources {
 
     pub(crate) fn unmap_ir_image(
         &mut self,
+        context: &Context,
         texture: IrTextureSpec,
         image: &Image,
     ) -> HandleResult<()> {
@@ -1205,6 +1362,10 @@ impl IrResources {
             || mapped.height != image.height
         {
             return Err(HandleError::InvalidParameter);
+        }
+        if let Some(commands) = mapped_texture_retirement_commands(mapped)? {
+            wait_scheduled(&context.scheduler)?;
+            context.raw.create_queue()?.submit(&commands)?;
         }
         image
             .ir_surface_initialized
@@ -1385,6 +1546,77 @@ struct MappedIrTexture {
     sampler_view_initialized: Cell<bool>,
     surface_handle: u32,
     surface_initialized: Cell<bool>,
+}
+
+fn encode_retirement_objects(
+    limit: usize,
+    objects: impl IntoIterator<Item = (u32, u32)>,
+    mut submit: impl FnMut(&[u8]) -> HandleResult<()>,
+) -> HandleResult<()> {
+    let limit = limit.min(64 * 1024);
+    let mut commands = Vec::new();
+    commands
+        .try_reserve_exact(limit)
+        .map_err(|_| HandleError::OutOfResources)?;
+    push_retirement_unbinds(&mut commands);
+    for stage in [PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT] {
+        push_bind_shader(&mut commands, stage, 0);
+        push_dword(
+            &mut commands,
+            command_header(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 34),
+        );
+        push_dword(&mut commands, stage);
+        push_dword(&mut commands, 0);
+        for _ in 0..32 {
+            push_dword(&mut commands, 0);
+        }
+    }
+    for object in [
+        VIRGL_OBJECT_BLEND,
+        VIRGL_OBJECT_RASTERIZER,
+        VIRGL_OBJECT_DSA,
+        VIRGL_OBJECT_VERTEX_ELEMENTS,
+    ] {
+        push_bind_object(&mut commands, object, 0);
+    }
+    if commands.len() > limit || limit < 8 {
+        return Err(HandleError::InvalidParameter);
+    }
+    for (object, handle) in objects {
+        if commands.len() + 8 > limit {
+            submit(&commands)?;
+            commands.clear();
+        }
+        push_destroy_object(&mut commands, object, handle);
+    }
+    if !commands.is_empty() {
+        submit(&commands)?;
+    }
+    Ok(())
+}
+
+fn retire_native_objects(
+    context: &RawContext,
+    scheduler: &SharedScheduler,
+    failed: &Cell<bool>,
+    objects: impl IntoIterator<Item = (u32, u32)>,
+) -> HandleResult<()> {
+    if failed.get() {
+        return Err(HandleError::Unsupported);
+    }
+    let result = (|| {
+        wait_scheduled(scheduler)?;
+        let queue = context.create_queue()?;
+        encode_retirement_objects(
+            queue.max_opaque_command_size() as usize,
+            objects,
+            |commands| queue.submit(commands).map(|_| ()),
+        )
+    })();
+    if result.is_err() {
+        failed.set(true);
+    }
+    result
 }
 
 fn mapped_texture_retirement_commands(mapped: &MappedIrTexture) -> HandleResult<Option<Vec<u8>>> {
@@ -2815,7 +3047,23 @@ pub(crate) struct Texture {
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        let _ = &self.composition_vertex_buffer;
+        if self.cleanup_failed.get() {
+            return;
+        }
+        let result = (|| {
+            retire_native_objects(
+                &self.context,
+                &self.scheduler,
+                &self.cleanup_failed,
+                core::iter::empty(),
+            )?;
+            self.context.detach_buffer(&self.composition_vertex_buffer)
+        })();
+        if let Err(error) = result {
+            self.cleanup_failed.set(true);
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX teardown] stage=queue error={error:?}");
+        }
     }
 }
 
@@ -5583,6 +5831,55 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_teardown_packets_are_bounded_and_destroy_each_object_once() {
+        let mut destroyed = Vec::new();
+        let mut packets = 0;
+        encode_retirement_objects(
+            1024,
+            (100..10_100).map(|id| (VIRGL_OBJECT_SHADER, id)),
+            |commands| {
+                assert!(commands.len() <= 1024);
+                packets += 1;
+                let words = dwords(commands);
+                let mut offset = 0;
+                while offset < words.len() {
+                    let header = words[offset];
+                    if header & 255 == VIRGL_CCMD_DESTROY_OBJECT {
+                        assert_eq!((header >> 8) & 255, VIRGL_OBJECT_SHADER);
+                        destroyed.push(words[offset + 1]);
+                    }
+                    offset += 1 + (header >> 16) as usize;
+                }
+                assert_eq!(offset, words.len());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(packets > 1);
+        assert_eq!(destroyed, (100..10_100).collect::<Vec<_>>());
+        let mut calls = 0;
+        assert!(
+            encode_retirement_objects(
+                1024,
+                (100..10_100).map(|id| (VIRGL_OBJECT_SHADER, id)),
+                |_| {
+                    calls += 1;
+                    if calls == 2 {
+                        Err(HandleError::SystemError(-1))
+                    } else {
+                        Ok(())
+                    }
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            calls, 2,
+            "do not submit another cleanup packet after an uncertain failure"
+        );
+    }
 
     #[test]
     fn mapped_import_retirement_destroys_the_owned_ir_view_and_preserves_borrowed_surface() {

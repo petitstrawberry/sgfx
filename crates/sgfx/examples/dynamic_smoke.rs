@@ -2,6 +2,7 @@
 //! compare the dynamic boundary against the static implementation in one guest.
 //! `--copy-only` runs the async vertex-copy pixel contract directly, skipping
 //! the parent coordinator, low-level fixture, and timing benchmarks.
+//! `--import-overlap-only` checks same-context resize/session lifetime with a retained old-size image.
 //! `--narrow-only` checks native R8/RG8 upload, copies, sampling, mips and RT blending.
 // /init has no inherited stdio handles. Use the native bootstrap console for
 // diagnostics, including panics, just like Scarlet's loader smoke fixtures.
@@ -319,6 +320,179 @@ mod narrow_texture_scene {
     }
 }
 
+#[cfg(any(target_os = "scarlet", test))]
+mod import_overlap_scene {
+    use sgfx::ir::*;
+    pub const WIDTH: u32 = 13;
+    pub const HEIGHT: u32 = 7;
+    pub const SPLIT: u32 = 6;
+    pub const LEFT: [u8; 4] = [51, 179, 26, 255];
+    pub const RIGHT: [u8; 4] = [153, 26, 204, 255];
+    pub struct Scene {
+        pub target: TextureId,
+        pub source: TextureId,
+        vertices: BufferId,
+        pipeline: RenderPipelineId,
+        sampler: SamplerId,
+        pub width: u32,
+        pub height: u32,
+    }
+    pub fn target(table: &ResourceTable, width: u32, height: u32) -> TextureId {
+        table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    Extent2D::new(width, height).unwrap(),
+                    TextureUsage::PRESENT
+                        | TextureUsage::RENDER_ATTACHMENT
+                        | TextureUsage::COPY_SRC,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id()
+    }
+    pub fn define(table: &ResourceTable, width: u32, height: u32) -> Scene {
+        let target = target(table, width, height);
+        let source = table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    Extent2D::new(WIDTH, HEIGHT).unwrap(),
+                    TextureUsage::SAMPLED | TextureUsage::COPY_DST,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let vertices = table
+            .define_buffer(
+                BufferDesc::new(96, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap(),
+            )
+            .unwrap()
+            .id();
+        let pipeline = table
+            .define_render_pipeline(
+                RenderPipelineDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    PrimitiveTopology::TriangleList,
+                    VertexBufferLayout::new(
+                        16,
+                        vec![
+                            VertexAttribute::new(0, VertexFormat::Float32x2, 0),
+                            VertexAttribute::new(1, VertexFormat::Float32x2, 8),
+                        ],
+                    )
+                    .unwrap(),
+                    FragmentProgram::Texture(TextureSampleMode::Rgba),
+                    BlendState::REPLACE,
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let sampler = table
+            .define_sampler(SamplerDesc::new(
+                FilterMode::Nearest,
+                FilterMode::Nearest,
+                AddressMode::ClampToEdge,
+                AddressMode::ClampToEdge,
+            ))
+            .unwrap()
+            .id();
+        Scene {
+            target,
+            source,
+            vertices,
+            pipeline,
+            sampler,
+            width,
+            height,
+        }
+    }
+    pub fn producer<'r>(table: &'r ResourceTable, target: TextureId) -> CommandBuffer<'r, 'static> {
+        let mut encoder = CommandEncoder::new(table);
+        for (x, width, bgra) in [(0, WIDTH, LEFT), (SPLIT, WIDTH - SPLIT, RIGHT)] {
+            encoder
+                .begin_render_pass(
+                    RenderPassDesc::new(
+                        table,
+                        table.texture_ref(target).unwrap(),
+                        PixelRect::new(x, 0, width, HEIGHT).unwrap(),
+                        LoadOp::Clear(
+                            Color::rgba(
+                                bgra[2] as f32 / 255.0,
+                                bgra[1] as f32 / 255.0,
+                                bgra[0] as f32 / 255.0,
+                                1.0,
+                            )
+                            .unwrap(),
+                        ),
+                        StoreOp::Store,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .end()
+                .unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+    pub fn vertices() -> Vec<u8> {
+        [
+            [-1.0f32, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 0.0],
+            [-1.0, -1.0, 0.0, 1.0],
+            [-1.0, -1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 0.0],
+            [1.0, -1.0, 1.0, 1.0],
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(f32::to_le_bytes)
+        .collect()
+    }
+    pub fn draw<'r, 'data>(
+        table: &'r ResourceTable,
+        scene: &Scene,
+        vertices: &'data [u8],
+    ) -> CommandBuffer<'r, 'data> {
+        let mut encoder = CommandEncoder::new(table);
+        encoder
+            .write_buffer(table.buffer_ref(scene.vertices).unwrap(), 0, vertices)
+            .unwrap();
+        let mut pass = encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    table,
+                    table.texture_ref(scene.target).unwrap(),
+                    PixelRect::new(0, 0, scene.width, scene.height).unwrap(),
+                    LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 0.0).unwrap()),
+                    StoreOp::Store,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        pass.set_pipeline(table.render_pipeline_ref(scene.pipeline).unwrap())
+            .unwrap();
+        pass.set_vertex_buffer(table.buffer_ref(scene.vertices).unwrap(), 0)
+            .unwrap();
+        pass.set_texture(table.texture_ref(scene.source).unwrap())
+            .unwrap();
+        pass.set_sampler(table.sampler_ref(scene.sampler).unwrap())
+            .unwrap();
+        pass.set_uniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+        ))
+        .unwrap();
+        pass.draw(6, 0).unwrap();
+        pass.end().unwrap();
+        encoder.finish().unwrap()
+    }
+}
+
 #[cfg(target_os = "scarlet")]
 mod native {
     use sgfx::{
@@ -497,6 +671,110 @@ mod native {
         println!(
             "SGFX_ASYNC_VERTEX_COPY_OK mode={mode} updates={UPDATES} offset={PREFIX} pixels_per_update={}",
             SIDE * SIDE
+        );
+    }
+
+    fn import_overlap_contract() {
+        use super::import_overlap_scene as scene;
+        let device = sgfx::Device::open("/dev/gpu0").unwrap();
+        let producer_context = device.create_context().unwrap();
+        let shared_context = device.create_context().unwrap();
+        let producer_table = Rc::new(ResourceTable::new());
+        let producer_target = scene::target(&producer_table, scene::WIDTH, scene::HEIGHT);
+        let mut producer = producer_context
+            .create_mapped_target_session(producer_table.clone(), &[producer_target])
+            .unwrap();
+        let commands = scene::producer(&producer_table, producer_target);
+        complete(&retry_submit(&mut producer, &commands));
+        let lease = producer
+            .image(producer_target)
+            .unwrap()
+            .shared_handle()
+            .duplicate()
+            .unwrap();
+        let vertices = scene::vertices();
+        let paint = |session: &mut sgfx::MappedTargetSession,
+                     table: &ResourceTable,
+                     objects: &scene::Scene| {
+            let commands = scene::draw(table, objects, &vertices);
+            complete(&retry_submit(session, &commands));
+            let mut pixels = vec![0xa5; (objects.width * objects.height * 4) as usize];
+            session
+                .readback_bgra(
+                    objects.target,
+                    &mut pixels,
+                    objects.width * 4,
+                    PixelRect::new(0, 0, objects.width, objects.height).unwrap(),
+                )
+                .unwrap();
+            for (index, actual) in pixels.chunks_exact(4).enumerate() {
+                let x = index as u32 % objects.width;
+                let expected = if (2 * x + 1) * scene::WIDTH < 2 * scene::SPLIT * objects.width {
+                    scene::LEFT
+                } else {
+                    scene::RIGHT
+                };
+                for (a, e) in actual.iter().copied().zip(expected) {
+                    assert!(
+                        a.abs_diff(e) <= 1,
+                        "import overlap pixel mismatch at {index}: {actual:?} != {expected:?}"
+                    );
+                }
+            }
+        };
+        for generation in 0..6 {
+            let old_table = Rc::new(ResourceTable::new());
+            let old_scene = scene::define(&old_table, scene::WIDTH, scene::HEIGHT);
+            let new_table = Rc::new(ResourceTable::new());
+            let new_scene = scene::define(&new_table, 7 + generation % 3, 5 + generation % 2);
+            let mut old = shared_context
+                .create_mapped_target_session(old_table.clone(), &[old_scene.target])
+                .unwrap();
+            let mut new = shared_context
+                .create_mapped_target_session(new_table.clone(), &[new_scene.target])
+                .unwrap();
+            old.import_shared_bgra_texture(old_scene.source, lease.duplicate().unwrap())
+                .unwrap();
+            new.import_shared_bgra_texture(new_scene.source, lease.duplicate().unwrap())
+                .unwrap();
+            paint(&mut old, &old_table, &old_scene);
+            paint(&mut new, &new_table, &new_scene);
+            old.release_imported_texture(old_scene.source).unwrap();
+            paint(&mut new, &new_table, &new_scene);
+            old.import_shared_bgra_texture(old_scene.source, lease.duplicate().unwrap())
+                .unwrap();
+            let pending_commands = scene::draw(&old_table, &old_scene, &vertices);
+            let pending = retry_submit(&mut old, &pending_commands);
+            drop(pending_commands);
+            drop(old); // Normal resize retirement, without explicit import release.
+            assert_eq!(
+                pending.poll().unwrap(),
+                CompletionStatus::Complete,
+                "session Drop must settle accepted GPU work before destroying its resources"
+            );
+            paint(&mut new, &new_table, &new_scene);
+            new.release_imported_texture(new_scene.source).unwrap();
+            new.import_shared_bgra_texture(new_scene.source, lease.duplicate().unwrap())
+                .unwrap();
+            paint(&mut new, &new_table, &new_scene);
+            drop(new);
+            println!("SGFX_IMPORT_OVERLAP_GENERATION_OK generation={generation}");
+        }
+        // The producer owner can retire while a transferred old-size lease
+        // remains valid; it is not tied to the consumer viewport extent.
+        drop(producer);
+        let table = Rc::new(ResourceTable::new());
+        let objects = scene::define(&table, 7, 5);
+        let mut session = shared_context
+            .create_mapped_target_session(table.clone(), &[objects.target])
+            .unwrap();
+        session
+            .import_shared_bgra_texture(objects.source, lease)
+            .unwrap();
+        paint(&mut session, &table, &objects);
+        drop(session);
+        println!(
+            "SGFX_IMPORT_OVERLAP_ONLY_OK generations=6 old_drop_new_draw=6 producer_drop_lease=1"
         );
     }
 
@@ -695,6 +973,10 @@ mod native {
     }
 
     pub fn run() {
+        if std::env::args().any(|arg| arg == "--import-overlap-only") {
+            import_overlap_contract();
+            return;
+        }
         if std::env::args().any(|arg| arg == "--narrow-only") {
             narrow_texture_contract();
             return;
@@ -946,9 +1228,12 @@ fn main() {
         }));
         println!("SGFX_MAIN");
         #[cfg(all(target_pointer_width = "64", feature = "backend-dynamic"))]
-        if !std::env::args()
-            .any(|arg| arg == "--child" || arg == "--copy-only" || arg == "--narrow-only")
-        {
+        if !std::env::args().any(|arg| {
+            arg == "--child"
+                || arg == "--copy-only"
+                || arg == "--narrow-only"
+                || arg == "--import-overlap-only"
+        }) {
             for program in ["/bin/sgfx-probe", "/bin/sgfx-legacy-smoke"] {
                 if std::path::Path::new(program).is_file() {
                     assert!(
@@ -1005,6 +1290,19 @@ fn main() {
 mod tests {
     use super::vertex_copy_scene;
     use sgfx::ir::*;
+
+    #[test]
+    fn import_overlap_scene_passes_real_ir_validation() {
+        use super::import_overlap_scene as scene;
+        let producer = ResourceTable::new();
+        let target = scene::target(&producer, scene::WIDTH, scene::HEIGHT);
+        scene::producer(&producer, target);
+        for (width, height) in [(13, 7), (7, 5), (8, 6), (9, 5)] {
+            let table = ResourceTable::new();
+            let objects = scene::define(&table, width, height);
+            scene::draw(&table, &objects, &scene::vertices());
+        }
+    }
 
     #[test]
     fn native_narrow_scene_passes_real_ir_validation() {

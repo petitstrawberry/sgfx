@@ -300,18 +300,30 @@ impl Context {
         resources: Rc<ir::ResourceTable>,
         targets: &[ir::TextureId],
     ) -> Result<MappedTargetSession, IrSubmitError> {
-        let mut cache = self.create_ir_resources(Rc::clone(&resources))?;
-        let queue = self.create_queue()?;
-        let mut images = Vec::new();
-        images
+        // Construct the owner before fallible target materialization so a
+        // partially built session follows the same non-panicking teardown.
+        let mut session = MappedTargetSession {
+            imported_textures: Vec::new(),
+            context: Context {
+                backend: Rc::clone(&self.backend),
+            },
+            queue: self.create_queue()?,
+            resources: self.create_ir_resources(Rc::clone(&resources))?,
+            images: Vec::new(),
+        };
+        session
+            .images
             .try_reserve_exact(targets.len())
             .map_err(|_| IrSubmitError::OutOfMemory)?;
         for &target in targets {
-            if images.iter().any(|(candidate, _)| *candidate == target) {
+            if session
+                .images
+                .iter()
+                .any(|(candidate, _)| *candidate == target)
+            {
                 return Err(IrSubmitError::TextureAlreadyMapped);
             }
-            let reference = resources.texture_ref(target)?;
-            let descriptor = resources.texture(reference)?;
+            let descriptor = resources.texture(resources.texture_ref(target)?)?;
             let required = ir::TextureUsage::RENDER_ATTACHMENT | ir::TextureUsage::PRESENT;
             if !descriptor.usage().contains(required) {
                 return Err(IrSubmitError::Unsupported(
@@ -323,18 +335,19 @@ impl Context {
                     descriptor.extent().width(),
                     descriptor.extent().height(),
                 )?);
-            cache.map_image(target, Rc::clone(&image))?;
-            images.push((target, image));
+            if let Err(error) = session.resources.map_image(target, Rc::clone(&image)) {
+                if let Ok(image) = Rc::try_unwrap(image) {
+                    let _ = session
+                        .resources
+                        .retire_owned_image(&session.context, image);
+                } else {
+                    session.resources.abandon_cleanup();
+                }
+                return Err(error);
+            }
+            session.images.push((target, image));
         }
-        Ok(MappedTargetSession {
-            imported_textures: Vec::new(),
-            context: Context {
-                backend: Rc::clone(&self.backend),
-            },
-            queue,
-            resources: cache,
-            images,
-        })
+        Ok(session)
     }
 
     /// Create a presentation-capable render-target image.
@@ -600,6 +613,34 @@ pub struct MappedTargetSession {
     resources: IrResources,
     queue: Queue,
     context: Context,
+}
+
+impl Drop for MappedTargetSession {
+    fn drop(&mut self) {
+        let result = (|| -> Result<(), IrSubmitError> {
+            self.resources.ensure_usable()?;
+            self.queue.backend.wait_idle()?;
+            while let Some((texture, _)) = self.imported_textures.first() {
+                self.release_imported_texture(*texture)?;
+            }
+            for (texture, _) in &self.images {
+                self.resources.unmap_image(*texture)?;
+            }
+            // Borrowed surfaces are returned to their image owners before the
+            // private cache is destroyed. Keep image owners until afterwards.
+            self.resources.cleanup()?;
+            while let Some((_, image)) = self.images.pop() {
+                let image = Rc::try_unwrap(image).map_err(|_| IrSubmitError::ImageAlreadyMapped)?;
+                self.resources.retire_owned_image(&self.context, image)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.resources.abandon_cleanup();
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX teardown] stage=mapped_session error={error:?}");
+        }
+    }
 }
 
 impl MappedTargetSession {
