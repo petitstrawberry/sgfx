@@ -2,6 +2,7 @@
 //! compare the dynamic boundary against the static implementation in one guest.
 //! `--copy-only` runs the async vertex-copy pixel contract directly, skipping
 //! the parent coordinator, low-level fixture, and timing benchmarks.
+//! `--narrow-only` checks native R8/RG8 upload, copies, sampling, mips and RT blending.
 // /init has no inherited stdio handles. Use the native bootstrap console for
 // diagnostics, including panics, just like Scarlet's loader smoke fixtures.
 #[cfg(target_os = "scarlet")]
@@ -107,6 +108,214 @@ mod vertex_copy_scene {
             pass.draw(VERTICES / 2, first_vertex).unwrap();
             pass.end().unwrap();
         }
+    }
+}
+
+// Shared by the real guest contract and host-side IR validation.
+#[cfg(any(target_os = "scarlet", test))]
+mod narrow_texture_scene {
+    use sgfx::ir::*;
+    pub const WIDTH: u32 = 13;
+    pub const HEIGHT: u32 = 7;
+    pub const OUT_WIDTH: u32 = 15;
+    pub const OUT_HEIGHT: u32 = 9;
+
+    pub struct Scene {
+        pub source: TextureId,
+        pub copied: TextureId,
+        pub bgra: TextureId,
+        pub mipped: TextureId,
+        pub mip_read: TextureId,
+        pub blended: TextureId,
+        vertices: BufferId,
+        pipeline: RenderPipelineId,
+    }
+    pub fn define(table: &ResourceTable, format: TextureFormat) -> Scene {
+        let texture = |format, width, height, mips| {
+            table
+                .define_texture(
+                    TextureDesc::new(
+                        format,
+                        Extent2D::new(width, height).unwrap(),
+                        TextureUsage::COPY_SRC
+                            | TextureUsage::COPY_DST
+                            | TextureUsage::SAMPLED
+                            | TextureUsage::RENDER_ATTACHMENT,
+                    )
+                    .unwrap()
+                    .with_mip_level_count(mips)
+                    .unwrap(),
+                )
+                .unwrap()
+                .id()
+        };
+        let vertices = table
+            .define_buffer(
+                BufferDesc::new(24, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap(),
+            )
+            .unwrap()
+            .id();
+        let blend = BlendComponent::new(
+            BlendFactor::DestinationAlpha,
+            BlendFactor::OneMinusDestinationAlpha,
+            BlendOp::Add,
+        );
+        let pipeline = table
+            .define_render_pipeline(
+                RenderPipelineDesc::new(
+                    format,
+                    PrimitiveTopology::TriangleList,
+                    VertexBufferLayout::new(
+                        8,
+                        vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+                    )
+                    .unwrap(),
+                    FragmentProgram::Solid,
+                    BlendState::new(blend, blend),
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        Scene {
+            source: texture(format, WIDTH, HEIGHT, 1),
+            copied: texture(format, OUT_WIDTH, OUT_HEIGHT, 1),
+            bgra: texture(TextureFormat::Bgra8Unorm, WIDTH, HEIGHT, 1),
+            mipped: texture(format, 14, 10, 2),
+            mip_read: texture(format, 7, 5, 1),
+            blended: texture(format, WIDTH, HEIGHT, 1),
+            vertices,
+            pipeline,
+        }
+    }
+    pub fn pixels(bpp: usize, width: u32, height: u32) -> (Vec<u8>, Vec<u8>, u32) {
+        let stride = width as usize * bpp + 5;
+        let mut padded = vec![0xa5; stride * height as usize];
+        let mut tight = Vec::new();
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                for c in 0..bpp {
+                    let value = (19 + x * 23 + y * 37 + c * 79) as u8;
+                    padded[y * stride + x * bpp + c] = value;
+                    tight.push(value);
+                }
+            }
+        }
+        (padded, tight, stride as u32)
+    }
+    pub fn record_copy<'r, 'data>(
+        table: &'r ResourceTable,
+        scene: &Scene,
+        data: &'data [u8],
+        stride: u32,
+    ) -> CommandBuffer<'r, 'data> {
+        let mut encoder = CommandEncoder::new(table);
+        let full = PixelRect::new(0, 0, WIDTH, HEIGHT).unwrap();
+        encoder
+            .write_texture(
+                table.texture_ref(scene.source).unwrap(),
+                TextureWrite::new(full, stride, data).unwrap(),
+            )
+            .unwrap();
+        encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    table,
+                    table.texture_ref(scene.copied).unwrap(),
+                    PixelRect::new(0, 0, OUT_WIDTH, OUT_HEIGHT).unwrap(),
+                    LoadOp::Clear(Color::rgba(0.25, 0.5, 0.75, 0.125).unwrap()),
+                    StoreOp::Store,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .end()
+            .unwrap();
+        encoder
+            .copy_texture_to_texture(
+                table.texture_ref(scene.source).unwrap(),
+                PixelRect::new(3, 2, 7, 3).unwrap(),
+                table.texture_ref(scene.copied).unwrap(),
+                PixelRect::new(1, 1, 7, 3).unwrap(),
+            )
+            .unwrap();
+        encoder
+            .blit_texture(
+                table.texture_ref(scene.source).unwrap(),
+                0,
+                table.texture_ref(scene.bgra).unwrap(),
+                0,
+                FilterMode::Nearest,
+            )
+            .unwrap();
+        encoder.finish().unwrap()
+    }
+    pub fn record_mip<'r, 'data>(
+        table: &'r ResourceTable,
+        scene: &Scene,
+        data: &'data [u8],
+        stride: u32,
+    ) -> CommandBuffer<'r, 'data> {
+        let mut encoder = CommandEncoder::new(table);
+        encoder
+            .write_texture(
+                table.texture_ref(scene.mipped).unwrap(),
+                TextureWrite::new(PixelRect::new(0, 0, 7, 5).unwrap(), stride, data)
+                    .unwrap()
+                    .with_mip_level(1),
+            )
+            .unwrap();
+        encoder
+            .blit_texture(
+                table.texture_ref(scene.mipped).unwrap(),
+                1,
+                table.texture_ref(scene.mip_read).unwrap(),
+                0,
+                FilterMode::Linear,
+            )
+            .unwrap();
+        encoder.finish().unwrap()
+    }
+    pub fn record_blend<'r, 'data>(
+        table: &'r ResourceTable,
+        scene: &Scene,
+        vertices: &'data [u8],
+    ) -> CommandBuffer<'r, 'data> {
+        let mut encoder = CommandEncoder::new(table);
+        encoder
+            .write_buffer(table.buffer_ref(scene.vertices).unwrap(), 0, vertices)
+            .unwrap();
+        let mut pass = encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    table,
+                    table.texture_ref(scene.blended).unwrap(),
+                    PixelRect::new(0, 0, WIDTH, HEIGHT).unwrap(),
+                    LoadOp::Clear(Color::rgba(0.25, 0.5, 0.75, 0.125).unwrap()),
+                    StoreOp::Store,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        pass.set_pipeline(table.render_pipeline_ref(scene.pipeline).unwrap())
+            .unwrap();
+        pass.set_vertex_buffer(table.buffer_ref(scene.vertices).unwrap(), 0)
+            .unwrap();
+        pass.set_uniforms(DrawUniforms::new(
+            Transform::identity(),
+            Color::rgba(0.5, 0.25, 0.75, 0.5).unwrap(),
+        ))
+        .unwrap();
+        pass.draw(3, 0).unwrap();
+        pass.end().unwrap();
+        encoder.finish().unwrap()
+    }
+    pub fn vertices() -> Vec<u8> {
+        [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect()
     }
 }
 
@@ -291,6 +500,113 @@ mod native {
         );
     }
 
+    fn narrow_texture_contract() {
+        use super::narrow_texture_scene as scene;
+        let info = gpu_raw::Gpu::open("/dev/gpu0")
+            .unwrap()
+            .query_info()
+            .unwrap();
+        let native =
+            info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_NATIVE_NARROW_COLOR != 0;
+        println!("SGFX_NARROW_CAP native={native}");
+        assert!(
+            native,
+            "--narrow-only requires native narrow kernel storage, not emulation"
+        );
+        let instance =
+            sgfx::driver::Instance::with_preference(sgfx::BackendPreference::ScarletVirgl).unwrap();
+        let device = instance.adapters()[0].create_device().unwrap();
+        let queue = device.create_queue().unwrap();
+        let close = |actual: u8, expected: u8| {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "native narrow channel mismatch: {actual} != {expected}"
+            )
+        };
+        for (format, bpp) in [(TextureFormat::R8Unorm, 1), (TextureFormat::Rg8Unorm, 2)] {
+            let table = Rc::new(ResourceTable::new());
+            let objects = scene::define(&table, format);
+            let mut resources = device.create_resources(table.clone()).unwrap();
+            let (padded, tight, stride) = scene::pixels(bpp, scene::WIDTH, scene::HEIGHT);
+            let commands = scene::record_copy(&table, &objects, &padded, stride);
+            let receipt = queue.submit(&mut resources, &commands).unwrap();
+            assert_eq!(
+                receipt.wait(Some(Duration::from_secs(10))).unwrap(),
+                CompletionStatus::Complete
+            );
+            assert_eq!(
+                queue.read_texture(&mut resources, objects.source).unwrap(),
+                tight,
+                "raw native upload/readback"
+            );
+            let copied = queue.read_texture(&mut resources, objects.copied).unwrap();
+            for y in 0..scene::OUT_HEIGHT as usize {
+                for x in 0..scene::OUT_WIDTH as usize {
+                    for c in 0..bpp {
+                        let actual = copied[(y * scene::OUT_WIDTH as usize + x) * bpp + c];
+                        if (1..8).contains(&x) && (1..4).contains(&y) {
+                            assert_eq!(
+                                actual,
+                                tight[((y + 1) * scene::WIDTH as usize + x + 2) * bpp + c],
+                                "native region copy"
+                            );
+                        } else {
+                            close(actual, if c == 0 { 64 } else { 128 });
+                        }
+                    }
+                }
+            }
+            let bgra = queue.read_texture(&mut resources, objects.bgra).unwrap();
+            for (index, actual) in bgra.chunks_exact(4).enumerate() {
+                for (a, e) in actual.iter().copied().zip([
+                    0,
+                    if bpp == 2 { tight[index * bpp + 1] } else { 0 },
+                    tight[index * bpp],
+                    255,
+                ]) {
+                    close(a, e);
+                }
+            }
+            let (mip_data, mip_tight, mip_stride) = scene::pixels(bpp, 7, 5);
+            let commands = scene::record_mip(&table, &objects, &mip_data, mip_stride);
+            let receipt = queue.submit(&mut resources, &commands).unwrap();
+            assert_eq!(
+                receipt.wait(Some(Duration::from_secs(10))).unwrap(),
+                CompletionStatus::Complete
+            );
+            for (actual, expected) in queue
+                .read_texture(&mut resources, objects.mip_read)
+                .unwrap()
+                .into_iter()
+                .zip(mip_tight)
+            {
+                close(actual, expected);
+            }
+            let vertices = scene::vertices();
+            let commands = scene::record_blend(&table, &objects, &vertices);
+            let receipt = queue.submit(&mut resources, &commands).unwrap();
+            assert_eq!(
+                receipt.wait(Some(Duration::from_secs(10))).unwrap(),
+                CompletionStatus::Complete
+            );
+            for pixel in queue
+                .read_texture(&mut resources, objects.blended)
+                .unwrap()
+                .chunks_exact(bpp)
+            {
+                for (c, actual) in pixel.iter().copied().enumerate() {
+                    close(actual, if c == 0 { 128 } else { 64 });
+                }
+            }
+            println!(
+                "SGFX_NARROW_TEXTURE_OK format={format:?} bpp={bpp} upload_pixels={} copy_pixels=21 mip_pixels=35 blend_pixels={}",
+                scene::WIDTH * scene::HEIGHT,
+                scene::WIDTH * scene::HEIGHT
+            );
+        }
+        println!("SGFX_NARROW_ONLY_OK");
+    }
+
     fn low_level() {
         let instance =
             sgfx::driver::Instance::with_preference(sgfx::BackendPreference::ScarletVirgl).unwrap();
@@ -377,6 +693,10 @@ mod native {
     }
 
     pub fn run() {
+        if std::env::args().any(|arg| arg == "--narrow-only") {
+            narrow_texture_contract();
+            return;
+        }
         let copy_only = std::env::args().any(|arg| arg == "--copy-only");
         if !copy_only {
             low_level();
@@ -624,7 +944,9 @@ fn main() {
         }));
         println!("SGFX_MAIN");
         #[cfg(all(target_pointer_width = "64", feature = "backend-dynamic"))]
-        if !std::env::args().any(|arg| arg == "--child" || arg == "--copy-only") {
+        if !std::env::args()
+            .any(|arg| arg == "--child" || arg == "--copy-only" || arg == "--narrow-only")
+        {
             for program in ["/bin/sgfx-probe", "/bin/sgfx-legacy-smoke"] {
                 if std::path::Path::new(program).is_file() {
                     assert!(
@@ -681,6 +1003,20 @@ fn main() {
 mod tests {
     use super::vertex_copy_scene;
     use sgfx::ir::*;
+
+    #[test]
+    fn native_narrow_scene_passes_real_ir_validation() {
+        use super::narrow_texture_scene as scene;
+        for (format, bpp) in [(TextureFormat::R8Unorm, 1), (TextureFormat::Rg8Unorm, 2)] {
+            let table = ResourceTable::new();
+            let objects = scene::define(&table, format);
+            let (data, _, stride) = scene::pixels(bpp, scene::WIDTH, scene::HEIGHT);
+            scene::record_copy(&table, &objects, &data, stride);
+            let (data, _, stride) = scene::pixels(bpp, 7, 5);
+            scene::record_mip(&table, &objects, &data, stride);
+            scene::record_blend(&table, &objects, &scene::vertices());
+        }
+    }
 
     #[test]
     fn copy_scene_passes_real_ir_validation_with_nonzero_buffer_offsets() {

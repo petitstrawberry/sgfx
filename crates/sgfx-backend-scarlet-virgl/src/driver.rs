@@ -55,6 +55,12 @@ pub(crate) enum Context {
 }
 
 impl Context {
+    pub(crate) fn capabilities(&self) -> Capabilities {
+        match self {
+            Self::Virgl(context) => context.capabilities(),
+        }
+    }
+
     pub(crate) fn context_id(&self) -> i32 {
         match self {
             Self::Virgl(context) => context.context_id(),
@@ -786,12 +792,13 @@ pub(crate) struct IrTextureBinding {
     pub(crate) sampler: Option<IrSamplerState>,
 }
 
-/// Converted BGRA texture upload retained until all stream validation succeeds.
+/// Tightly packed physical texture upload retained until stream validation succeeds.
 #[derive(Clone)]
 pub(crate) struct IrTextureUpload {
     pub(crate) texture: IrTextureSpec,
     pub(crate) destination: IrRect,
     pub(crate) pixels: Vec<u8>,
+    pub(crate) storage_format: IrTextureFormat,
     pub(crate) mip_level: u32,
     pub(crate) array_layer: u32,
 }
@@ -819,6 +826,24 @@ pub(crate) enum IrTextureFormat {
     R8,
     Rg8,
     Depth32Float,
+}
+
+impl IrTextureFormat {
+    pub(crate) const fn storage_format(self, native_narrow: bool) -> Self {
+        match self {
+            Self::R8 | Self::Rg8 if native_narrow => self,
+            Self::Depth32Float => self,
+            _ => Self::Bgra8,
+        }
+    }
+
+    pub(crate) const fn bytes_per_texel(self) -> usize {
+        match self {
+            Self::R8 => 1,
+            Self::Rg8 => 2,
+            _ => 4,
+        }
+    }
 }
 
 /// One validated texture copy request without backend identifiers.

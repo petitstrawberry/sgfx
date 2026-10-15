@@ -570,8 +570,9 @@ impl Context {
             return Err(ir::Error::OutOfBounds.into());
         }
         let narrow = matches!(spec.format, IrTextureFormat::R8 | IrTextureFormat::Rg8);
+        let emulated_narrow = narrow && !self.backend.capabilities().supports_native_narrow_color();
         let mut transport = Vec::new();
-        let pixels = if narrow {
+        let pixels = if emulated_narrow {
             let length = (spec.width as usize)
                 .checked_mul(spec.height as usize)
                 .and_then(|n| n.checked_mul(4))
@@ -600,7 +601,7 @@ impl Context {
             }
             Err(error) => return Err(error),
         };
-        if narrow {
+        if emulated_narrow {
             pack_color_readback(&mut transport, spec.format);
             bytes.copy_from_slice(&transport);
         } else if spec.format == IrTextureFormat::Rgba8 {
@@ -619,8 +620,8 @@ fn color_target_blend(target: ir::ColorTargetState) -> (driver::IrBlendState, u8
         target.format(),
         TextureFormat::R8Unorm | TextureFormat::Rg8Unorm
     ) {
-        // Missing destination alpha is one, independent of the wider BGRA
-        // transport allocation. Do not allow writes to nonexistent channels.
+        // Missing destination alpha is one, for native narrow storage as well
+        // as BGRA transport emulation. Do not write nonexistent channels.
         let factor = |factor| match factor {
             driver::IrBlendFactor::DestinationAlpha => driver::IrBlendFactor::One,
             driver::IrBlendFactor::OneMinusDestinationAlpha => driver::IrBlendFactor::Zero,

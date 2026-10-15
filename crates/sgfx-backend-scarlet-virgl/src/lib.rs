@@ -71,6 +71,7 @@ pub struct Capabilities {
     image_mips: bool,
     texture_arrays: bool,
     depth_sampling: bool,
+    native_narrow_color: bool,
 }
 
 impl Capabilities {
@@ -99,7 +100,15 @@ impl Capabilities {
                 && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_DEPTH_SAMPLING != 0,
             image_mips: rendering
                 && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_IMAGE_MIPS != 0,
+            native_narrow_color: rendering
+                && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_NATIVE_NARROW_COLOR != 0,
         }
+    }
+
+    /// Return whether R8/RG8 storage and typed transfers are native.
+    /// Older kernels retain the equivalent BGRA transport representation.
+    pub const fn supports_native_narrow_color(&self) -> bool {
+        self.native_narrow_color
     }
 
     /// Return whether the device can execute the built-in rendering pipeline.
@@ -1433,5 +1442,28 @@ impl<'a> RenderPass<'a> {
             pipeline: Rc::clone(&pipeline.backend),
             vertices: Vec::from(vertices),
         });
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn native_narrow_storage_requires_an_explicit_ready_kernel_capability() {
+        let mut info = GpuQueryInfo::new();
+        info.result = GPU_RESULT_SUCCESS;
+        info.device_state = GPU_DEVICE_STATE_READY;
+        info.execution_support = GPU_EXECUTION_SUPPORT_QUEUE;
+        info.backend_id_len = BACKEND_ID.len() as u32;
+        info.backend_id[..BACKEND_ID.len()].copy_from_slice(BACKEND_ID);
+        assert!(!Capabilities::from_query_info(&info).supports_native_narrow_color());
+        info.execution_support |= gpu_raw::GPU_EXECUTION_SUPPORT_NATIVE_NARROW_COLOR;
+        assert!(Capabilities::from_query_info(&info).supports_native_narrow_color());
+        info.execution_support &= !GPU_EXECUTION_SUPPORT_QUEUE;
+        assert!(!Capabilities::from_query_info(&info).supports_native_narrow_color());
+        info.execution_support |= GPU_EXECUTION_SUPPORT_QUEUE;
+        info.device_state = gpu_raw::GPU_DEVICE_STATE_LOST;
+        assert!(!Capabilities::from_query_info(&info).supports_native_narrow_color());
     }
 }

@@ -987,7 +987,14 @@ impl Queue {
         {
             return Err(IrSubmitError::ContextMismatch);
         }
-        let plan = ExecutionPlan::from_commands(resources, commands)?;
+        let plan = ExecutionPlan::from_commands(
+            resources,
+            commands,
+            context
+                .backend
+                .capabilities()
+                .supports_native_narrow_color(),
+        )?;
         if !mode.is_tracked() && plan.events.is_empty() && !plan.has_content_preserving_pass {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::CommandSequence,
@@ -1226,6 +1233,7 @@ impl ExecutionPlan {
     fn from_commands<'r, 'data>(
         resources: &IrResources,
         commands: &CommandBuffer<'r, 'data>,
+        native_narrow: bool,
     ) -> Result<Self, IrSubmitError> {
         // Reject the complete unsupported stream before resolving images,
         // building buffer shadows, materializing resources, or submitting work.
@@ -1399,7 +1407,7 @@ impl ExecutionPlan {
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
                     events.push(ExecutionEvent::Upload(
                         spec,
-                        convert_texture_upload(spec, *write)?,
+                        convert_texture_upload(spec, *write, native_narrow)?,
                     ));
                 }
                 Command::BeginRenderPass(desc) if active.is_none() => {
@@ -2944,6 +2952,7 @@ fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, IrSubmitError> {
 fn convert_texture_upload(
     texture: driver::IrTextureSpec,
     write: TextureWrite<'_>,
+    native_narrow: bool,
 ) -> Result<IrTextureUpload, IrSubmitError> {
     if matches!(texture.format, IrTextureFormat::Depth32Float) {
         return Err(IrSubmitError::Unsupported(
@@ -2986,10 +2995,11 @@ fn convert_texture_upload(
     if write.data().len() < required || source_stride < tight {
         return Err(IrSubmitError::InvalidVertexData);
     }
+    let storage_format = texture.format.storage_format(native_narrow);
     let output_len = usize::try_from(destination.width())
         .ok()
         .and_then(|width| width.checked_mul(height))
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(storage_format.bytes_per_texel()))
         .ok_or(IrSubmitError::OutOfMemory)?;
     let mut pixels = Vec::new();
     pixels
@@ -3010,6 +3020,8 @@ fn convert_texture_upload(
                     pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
                 }
             }
+            IrTextureFormat::R8 if native_narrow => pixels.extend_from_slice(source),
+            IrTextureFormat::Rg8 if native_narrow => pixels.extend_from_slice(source),
             IrTextureFormat::R8 => {
                 for value in source {
                     pixels.extend_from_slice(&[0, 0, *value, 255]);
@@ -3034,6 +3046,7 @@ fn convert_texture_upload(
             height: destination.height(),
         },
         pixels,
+        storage_format,
     })
 }
 
@@ -3182,6 +3195,61 @@ mod tests {
         IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrCullMode, IrFragmentProgram,
         IrFrontFace,
     };
+
+    #[test]
+    fn narrow_upload_preserves_padded_rows_mip_layer_and_logical_channels() {
+        for format in [IrTextureFormat::R8, IrTextureFormat::Rg8] {
+            let bpp = format.bytes_per_texel();
+            let spec = driver::IrTextureSpec {
+                slot: 0,
+                width: 16,
+                height: 16,
+                mip_levels: 2,
+                array_layers: 2,
+                cube: false,
+                sampled: true,
+                render_attachment: true,
+                copy_destination: true,
+                present: false,
+                format,
+            };
+            let row_bytes = 3 * bpp;
+            let stride = row_bytes + 5;
+            let mut source = alloc::vec![0xa5; stride + row_bytes];
+            let mut tight = Vec::new();
+            for row in 0..2 {
+                for byte in 0..row_bytes {
+                    let value = (row * 41 + byte * 17 + 3) as u8;
+                    source[row * stride + byte] = value;
+                    tight.push(value);
+                }
+            }
+            let write = TextureWrite::new(
+                ir::PixelRect::new(2, 3, 3, 2).unwrap(),
+                stride as u32,
+                &source,
+            )
+            .unwrap()
+            .with_mip_level(1)
+            .with_array_layer(1);
+            let native = convert_texture_upload(spec, write, true).unwrap();
+            assert!(native.storage_format == format);
+            assert_eq!(native.pixels, tight);
+            assert_eq!((native.mip_level, native.array_layer), (1, 1));
+            assert_eq!((native.destination.x, native.destination.y), (2, 3));
+            let emulated = convert_texture_upload(spec, write, false).unwrap();
+            assert!(emulated.storage_format == IrTextureFormat::Bgra8);
+            for (pixel, logical) in emulated.pixels.chunks_exact(4).zip(tight.chunks_exact(bpp)) {
+                assert_eq!(
+                    pixel,
+                    &[0, if bpp == 2 { logical[1] } else { 0 }, logical[0], 255]
+                );
+            }
+            let invalid =
+                TextureWrite::new(write.destination(), row_bytes as u32 - 1, &source).unwrap();
+            assert!(convert_texture_upload(spec, invalid, true).is_err());
+        }
+    }
 
     #[test]
     fn independent_color_factors_survive_ir_bridge_in_both_components() {
