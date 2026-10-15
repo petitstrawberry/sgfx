@@ -152,18 +152,20 @@ impl ResourceTable {
     /// copy nothing. Large upload payloads never appear in this snapshot.
     pub fn abi_snapshot(&self) -> Result<Ref<'_, [u64]>> {
         if self.abi.snapshot.borrow().0 != self.abi_revision() {
-            let mut out = Vec::new();
+            let mut snapshot = self.abi.snapshot.borrow_mut();
+            let out = &mut snapshot.1;
+            out.clear();
             out.try_reserve(64).map_err(|_| Error::OutOfMemory)?;
             out.extend_from_slice(&[MAGIC, self.abi_identity(), self.abi_revision()]);
-            rows(&self.textures.borrow(), &mut out);
-            rows(&self.buffers.borrow(), &mut out);
-            rows(&self.samplers.borrow(), &mut out);
-            rows(&self.pipelines.borrow(), &mut out);
-            rows(&self.shader_modules.borrow(), &mut out);
-            rows(&self.bind_groups.borrow(), &mut out);
-            rows(&self.compute_pipelines.borrow(), &mut out);
-            rows(&self.programmable_pipelines.borrow(), &mut out);
-            *self.abi.snapshot.borrow_mut() = (self.abi_revision(), out);
+            rows(&self.textures.borrow(), out);
+            rows(&self.buffers.borrow(), out);
+            rows(&self.samplers.borrow(), out);
+            rows(&self.pipelines.borrow(), out);
+            rows(&self.shader_modules.borrow(), out);
+            rows(&self.bind_groups.borrow(), out);
+            rows(&self.compute_pipelines.borrow(), out);
+            rows(&self.programmable_pipelines.borrow(), out);
+            snapshot.0 = self.abi_revision();
         }
         Ok(Ref::map(self.abi.snapshot.borrow(), |v| v.1.as_slice()))
     }
@@ -335,6 +337,7 @@ fn sync_slots<T: Slot>(
     if count < current.len() || count > maximum {
         return Err(Error::ResourceLimitExceeded);
     }
+    let mut expected = Vec::new();
     for index in 0..count {
         let len = usize::get(r, table)?;
         let words = r.take(len)?;
@@ -346,7 +349,7 @@ fn sync_slots<T: Slot>(
             if generation == old.generation() {
                 // Definitions are immutable within a generation. Comparing
                 // scalar metadata avoids recreating shared bind-group owners.
-                let mut expected = Vec::new();
+                expected.clear();
                 old.put(&mut expected);
                 if expected == words {
                     continue;
