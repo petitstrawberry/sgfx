@@ -1,5 +1,7 @@
 //! Build this same scene with backend-dynamic and backend-scarlet-virgl to
 //! compare the dynamic boundary against the static implementation in one guest.
+//! `--copy-only` runs the async vertex-copy pixel contract directly, skipping
+//! the parent coordinator, low-level fixture, and timing benchmarks.
 // /init has no inherited stdio handles. Use the native bootstrap console for
 // diagnostics, including panics, just like Scarlet's loader smoke fixtures.
 #[cfg(target_os = "scarlet")]
@@ -110,6 +112,156 @@ mod native {
         }
     }
 
+    fn async_vertex_copy_contract(
+        table: &ResourceTable,
+        session: &mut sgfx::MappedTargetSession,
+        target: TextureId,
+        mode: &str,
+    ) {
+        const SIDE: u32 = 64;
+        const BANDS: u32 = 4;
+        const PREFIX: u64 = 64;
+        const STRIDE: u64 = 12;
+        const VERTICES: u32 = BANDS * 6;
+        const UPDATES: u32 = 10;
+        assert!(session.executor().supports_async_submission());
+        let vertices = table
+            .define_buffer(
+                BufferDesc::new(
+                    PREFIX + u64::from(VERTICES) * STRIDE,
+                    BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let pipeline = table
+            .define_render_pipeline(
+                RenderPipelineDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    PrimitiveTopology::TriangleList,
+                    VertexBufferLayout::new(
+                        STRIDE as u32,
+                        vec![
+                            VertexAttribute::new(0, VertexFormat::Float32x2, 0),
+                            VertexAttribute::new(1, VertexFormat::Unorm8x4, 8),
+                        ],
+                    )
+                    .unwrap(),
+                    FragmentProgram::VertexColor,
+                    BlendState::REPLACE,
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let palette = |update: u32, band: u32| -> [u8; 4] {
+            [
+                (17 + update * 29 + band * 47) as u8,
+                (53 + update * 11 + band * 71) as u8,
+                (97 + update * 43 + band * 23) as u8,
+                (64 + (update * 17 + band * 19) % 192) as u8,
+            ]
+        };
+        let mut pixels = vec![0; (SIDE * SIDE * 4) as usize];
+        for update in 0..UPDATES {
+            let mut data = Vec::with_capacity((VERTICES as u64 * STRIDE) as usize);
+            for band in 0..BANDS {
+                let left = -1.0 + 2.0 * band as f32 / BANDS as f32;
+                let right = -1.0 + 2.0 * (band + 1) as f32 / BANDS as f32;
+                for [x, y] in [
+                    [left, -1.0f32],
+                    [right, -1.0],
+                    [left, 1.0],
+                    [left, 1.0],
+                    [right, -1.0],
+                    [right, 1.0],
+                ] {
+                    data.extend_from_slice(&x.to_le_bytes());
+                    data.extend_from_slice(&y.to_le_bytes());
+                    data.extend_from_slice(&palette(update, band));
+                }
+            }
+            let mut encoder = CommandEncoder::new(table);
+            if update == 0 {
+                // Ignoring the bound byte offset must not accidentally draw
+                // valid vertices from a zero-initialized allocation prefix.
+                encoder
+                    .write_buffer(
+                        table.buffer_ref(vertices).unwrap(),
+                        0,
+                        &[0xcd; PREFIX as usize],
+                    )
+                    .unwrap();
+            }
+            encoder
+                .write_buffer(table.buffer_ref(vertices).unwrap(), PREFIX, &data)
+                .unwrap();
+            for first_vertex in [0, VERTICES / 2] {
+                let desc = RenderPassDesc::new(
+                    table,
+                    table.texture_ref(target).unwrap(),
+                    PixelRect::new(0, 0, SIDE, SIDE).unwrap(),
+                    if first_vertex == 0 {
+                        LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 0.0).unwrap())
+                    } else {
+                        LoadOp::Load
+                    },
+                    StoreOp::Store,
+                )
+                .unwrap();
+                let mut pass = encoder.begin_render_pass(desc).unwrap();
+                pass.set_pipeline(table.render_pipeline_ref(pipeline).unwrap())
+                    .unwrap();
+                pass.set_vertex_buffer(table.buffer_ref(vertices).unwrap(), PREFIX)
+                    .unwrap();
+                pass.set_uniforms(DrawUniforms::new(
+                    Transform::identity(),
+                    Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+                ))
+                .unwrap();
+                pass.draw(VERTICES / 2, first_vertex).unwrap();
+                pass.end().unwrap();
+            }
+            // Both passes share one tracked logical submission. The backend
+            // may split them into native packets; ten changing generations
+            // reuse its three upload arenas without accepting stale A/B data.
+            let commands = encoder.finish().unwrap();
+            let receipt = retry_submit(session, &commands);
+            drop(commands);
+            drop(data);
+            complete(&receipt);
+            pixels.fill(0xa5);
+            session
+                .readback_bgra(
+                    target,
+                    &mut pixels,
+                    SIDE * 4,
+                    PixelRect::new(0, 0, SIDE, SIDE).unwrap(),
+                )
+                .unwrap();
+            for (index, actual) in pixels.chunks_exact(4).enumerate() {
+                let x = index as u32 % SIDE;
+                let band = x / (SIDE / BANDS);
+                let [r, g, b, a] = palette(update, band);
+                assert_eq!(
+                    actual,
+                    [b, g, r, a],
+                    "native vertex copy mismatch: mode={mode} update={update} x={x} y={}",
+                    index as u32 / SIDE
+                );
+            }
+        }
+        // VertexColor interprets source attributes on the CPU, then stages the
+        // resulting native VBO. Actual GPU pixels certify that final VBO copy;
+        // this is not an arbitrary packed-source-buffer byte readback test.
+        println!(
+            "SGFX_ASYNC_VERTEX_COPY_OK mode={mode} updates={UPDATES} offset={PREFIX} pixels_per_update={}",
+            SIDE * SIDE
+        );
+    }
+
     fn low_level() {
         let instance =
             sgfx::driver::Instance::with_preference(sgfx::BackendPreference::ScarletVirgl).unwrap();
@@ -196,7 +348,10 @@ mod native {
     }
 
     pub fn run() {
-        low_level();
+        let copy_only = std::env::args().any(|arg| arg == "--copy-only");
+        if !copy_only {
+            low_level();
+        }
         let mode = if cfg!(all(
             target_pointer_width = "64",
             feature = "backend-dynamic"
@@ -235,6 +390,14 @@ mod native {
             )
             .unwrap()
             .id();
+        if copy_only {
+            let mut session = context
+                .create_mapped_target_session(table.clone(), &[target])
+                .unwrap();
+            async_vertex_copy_contract(&table, &mut session, target, mode);
+            println!("SGFX_COPY_ONLY_OK mode={mode}");
+            return;
+        }
         let vertices = table
             .define_buffer(
                 BufferDesc::new(24, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap(),
@@ -319,6 +482,7 @@ mod native {
             &pixels[..16]
         );
         println!("SGFX_PIXELS_OK mode={mode}");
+        async_vertex_copy_contract(&table, &mut session, target, mode);
         // Synchronous execution uses the same borrowed boundary.
         session.executor().execute(&commands).unwrap();
         // Resource definitions added after session creation are synchronized once.
@@ -431,7 +595,7 @@ fn main() {
         }));
         println!("SGFX_MAIN");
         #[cfg(all(target_pointer_width = "64", feature = "backend-dynamic"))]
-        if !std::env::args().any(|arg| arg == "--child") {
+        if !std::env::args().any(|arg| arg == "--child" || arg == "--copy-only") {
             for program in ["/bin/sgfx-probe", "/bin/sgfx-legacy-smoke"] {
                 if std::path::Path::new(program).is_file() {
                     assert!(
