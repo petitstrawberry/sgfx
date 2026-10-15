@@ -613,31 +613,6 @@ impl Context {
     }
 }
 
-fn color_target_blend(target: ir::ColorTargetState) -> (driver::IrBlendState, u8) {
-    let mut blend = blend_state(target.blend());
-    let mut mask = target.write_mask().bits();
-    if matches!(
-        target.format(),
-        TextureFormat::R8Unorm | TextureFormat::Rg8Unorm
-    ) {
-        // Missing destination alpha is one, for native narrow storage as well
-        // as BGRA transport emulation. Do not write nonexistent channels.
-        let factor = |factor| match factor {
-            driver::IrBlendFactor::DestinationAlpha => driver::IrBlendFactor::One,
-            driver::IrBlendFactor::OneMinusDestinationAlpha => driver::IrBlendFactor::Zero,
-            other => other,
-        };
-        blend.color.source_factor = factor(blend.color.source_factor);
-        blend.color.destination_factor = factor(blend.color.destination_factor);
-        mask &= if target.format() == TextureFormat::R8Unorm {
-            1
-        } else {
-            3
-        };
-    }
-    (blend, mask)
-}
-
 fn pack_color_readback(bytes: &mut Vec<u8>, format: IrTextureFormat) {
     match format {
         IrTextureFormat::Rgba8 => {

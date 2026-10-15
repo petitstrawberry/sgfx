@@ -567,6 +567,7 @@ mod native {
                     close(a, e);
                 }
             }
+            println!("SGFX_NARROW_UPLOAD_COPY_SAMPLE_OK format={format:?}");
             let (mip_data, mip_tight, mip_stride) = scene::pixels(bpp, 7, 5);
             let commands = scene::record_mip(&table, &objects, &mip_data, mip_stride);
             let receipt = queue.submit(&mut resources, &commands).unwrap();
@@ -582,6 +583,7 @@ mod native {
             {
                 close(actual, expected);
             }
+            println!("SGFX_NARROW_MIP_OK format={format:?}");
             let vertices = scene::vertices();
             let commands = scene::record_blend(&table, &objects, &vertices);
             let receipt = queue.submit(&mut resources, &commands).unwrap();

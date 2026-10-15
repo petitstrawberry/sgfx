@@ -2522,11 +2522,19 @@ fn pipeline_info(
             tertiary,
         )
     };
-    if target != TextureFormat::Bgra8Unorm {
+    if !matches!(
+        target,
+        TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm | TextureFormat::Rg8Unorm
+    ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PipelineTargetFormat,
         ));
     }
+    let (blend, color_write_mask) = color_target_blend(ir::ColorTargetState::new(
+        target,
+        blend,
+        ir::ColorWriteMask::ALL,
+    )?);
     if topology != PrimitiveTopology::TriangleList {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PrimitiveTopology,
@@ -2572,8 +2580,8 @@ fn pipeline_info(
         state: IrPipelineState {
             slot: reference.slot(),
             fragment: fragment_program(fragment),
-            blend: blend_state(blend),
-            color_write_mask: 0xf,
+            blend,
+            color_write_mask,
             additional_color_blends: [None; 7],
             cull_mode: match raster.cull_mode() {
                 ir::CullMode::None => IrCullMode::None,
@@ -3080,6 +3088,31 @@ fn fragment_program(fragment: FragmentProgram) -> IrFragmentProgram {
     }
 }
 
+fn color_target_blend(target: ir::ColorTargetState) -> (driver::IrBlendState, u8) {
+    let mut blend = blend_state(target.blend());
+    let mut mask = target.write_mask().bits();
+    if matches!(
+        target.format(),
+        TextureFormat::R8Unorm | TextureFormat::Rg8Unorm
+    ) {
+        // Missing destination alpha is one, for native narrow storage as well
+        // as BGRA transport emulation. Do not write nonexistent channels.
+        let factor = |factor| match factor {
+            driver::IrBlendFactor::DestinationAlpha => driver::IrBlendFactor::One,
+            driver::IrBlendFactor::OneMinusDestinationAlpha => driver::IrBlendFactor::Zero,
+            other => other,
+        };
+        blend.color.source_factor = factor(blend.color.source_factor);
+        blend.color.destination_factor = factor(blend.color.destination_factor);
+        mask &= if target.format() == TextureFormat::R8Unorm {
+            1
+        } else {
+            3
+        };
+    }
+    (blend, mask)
+}
+
 fn blend_state(state: BlendState) -> IrBlendState {
     IrBlendState {
         color: blend_component(state.color()),
@@ -3248,6 +3281,61 @@ mod tests {
             let invalid =
                 TextureWrite::new(write.destination(), row_bytes as u32 - 1, &source).unwrap();
             assert!(convert_texture_upload(spec, invalid, true).is_err());
+        }
+    }
+
+    #[test]
+    fn fixed_narrow_render_pipeline_lowers_implicit_alpha_and_channel_masks() {
+        for (format, mask) in [
+            (TextureFormat::R8Unorm, 1),
+            (TextureFormat::Rg8Unorm, 3),
+            (TextureFormat::Bgra8Unorm, 15),
+        ] {
+            let table = ResourceTable::new();
+            let component = BlendComponent::new(
+                BlendFactor::DestinationAlpha,
+                BlendFactor::OneMinusDestinationAlpha,
+                BlendOp::Add,
+            );
+            let pipeline = table
+                .define_render_pipeline(
+                    ir::RenderPipelineDesc::new(
+                        format,
+                        PrimitiveTopology::TriangleList,
+                        ir::VertexBufferLayout::new(
+                            8,
+                            alloc::vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+                        )
+                        .unwrap(),
+                        FragmentProgram::Solid,
+                        BlendState::new(component, component),
+                        ir::RasterState::new(ir::CullMode::None, ir::FrontFace::CounterClockwise),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            // Exercise the actual fixed pipeline lowering, beyond core IR validation.
+            let lowered = pipeline_info(&table, pipeline).unwrap();
+            assert_eq!(lowered.state.color_write_mask, mask);
+            if format == TextureFormat::Bgra8Unorm {
+                assert!(matches!(
+                    lowered.state.blend.color.source_factor,
+                    IrBlendFactor::DestinationAlpha
+                ));
+                assert!(matches!(
+                    lowered.state.blend.color.destination_factor,
+                    IrBlendFactor::OneMinusDestinationAlpha
+                ));
+            } else {
+                assert!(matches!(
+                    lowered.state.blend.color.source_factor,
+                    IrBlendFactor::One
+                ));
+                assert!(matches!(
+                    lowered.state.blend.color.destination_factor,
+                    IrBlendFactor::Zero
+                ));
+            }
         }
     }
 
