@@ -318,13 +318,6 @@ fn graphics_lifecycle(long_lived_modules: bool) {
                     d.destroy_shader_module(shader, None);
                 }
             }
-            // Force more allocations and rollback while the old pipeline is
-            // live. Premature module retirement must not overwrite its code.
-            let churn = modules(index);
-            expect_failed_creation(churn);
-            for shader in churn {
-                d.destroy_shader_module(shader, None);
-            }
             d.reset_fences(&[fence]).unwrap();
             context.reset();
             d.begin_command_buffer(context.command, &Default::default())
@@ -366,6 +359,14 @@ fn graphics_lifecycle(long_lived_modules: bool) {
             );
             d.end_command_buffer(context.command).unwrap();
             context.submit(fence).unwrap();
+            // Force more allocations and rollback while the old pipeline is
+            // live and its draw may still be in flight. Rollback may not mark the
+            // device lost merely because another submission is pending.
+            let churn = modules(index);
+            expect_failed_creation(churn);
+            for shader in churn {
+                d.destroy_shader_module(shader, None);
+            }
             d.wait_for_fences(&[fence], true, 5_000_000_000).unwrap();
             let pixels = output.read();
             let expected = if long_lived_modules {

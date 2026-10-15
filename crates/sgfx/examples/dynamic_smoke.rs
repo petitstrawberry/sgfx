@@ -3,6 +3,7 @@
 //! `--copy-only` runs the async vertex-copy pixel contract directly, skipping
 //! the parent coordinator, low-level fixture, and timing benchmarks.
 //! `--import-overlap-only` checks same-context resize/session lifetime with a retained old-size image.
+//! `--program-churn-only` checks 512 native shader/pipeline generations and retained receipts.
 //! `--narrow-only` checks native R8/RG8 upload, copies, sampling, mips and RT blending.
 // /init has no inherited stdio handles. Use the native bootstrap console for
 // diagnostics, including panics, just like Scarlet's loader smoke fixtures.
@@ -493,6 +494,201 @@ mod import_overlap_scene {
     }
 }
 
+#[cfg(any(target_os = "scarlet", test))]
+mod program_churn {
+    use sgfx::{
+        backend::{Completion, CompletionStatus},
+        driver,
+        ir::*,
+    };
+    use std::{rc::Rc, time::Duration};
+
+    fn define(table: &ResourceTable, blue: bool) -> (ShaderModuleId, ProgrammableRenderPipelineId) {
+        let colour = if blue {
+            "vec4<f32>(0.0,0.0,1.0,1.0)"
+        } else {
+            "vec4<f32>(1.0,0.0,0.0,1.0)"
+        };
+        let module = table.define_shader_module(ShaderModuleDesc::wgsl(format!(r#"
+            @vertex fn vs(@location(0) p:vec2<f32>) -> @builtin(position) vec4<f32> {{ return vec4<f32>(p,0.0,1.0); }}
+            @fragment fn fs() -> @location(0) vec4<f32> {{ return {colour}; }}
+        "#)).unwrap()).unwrap();
+        let pipeline = table
+            .define_programmable_render_pipeline(
+                ProgrammableRenderPipelineDesc::new(
+                    ShaderEntryPoint::new(module, ShaderStage::Vertex, "vs".into()).unwrap(),
+                    ShaderEntryPoint::new(module, ShaderStage::Fragment, "fs".into()).unwrap(),
+                    PipelineLayoutDesc::new(vec![]).unwrap(),
+                    TextureFormat::Bgra8Unorm,
+                    None,
+                    PrimitiveTopology::TriangleList,
+                    BlendState::REPLACE,
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap()
+                .with_vertex_buffers(vec![
+                    VertexBufferLayout::new(
+                        8,
+                        vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        (module.id(), pipeline)
+    }
+
+    fn draw(
+        table: &ResourceTable,
+        queue: &driver::Queue,
+        resources: &mut driver::Resources,
+        target: TextureId,
+        vertices: BufferId,
+        pipeline: ProgrammableRenderPipelineId,
+    ) -> driver::Submission {
+        let mut encoder = CommandEncoder::new(table);
+        let mut pass = encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    table,
+                    table.texture_ref(target).unwrap(),
+                    PixelRect::new(0, 0, 8, 8).unwrap(),
+                    LoadOp::Clear(Color::rgba(0.0, 1.0, 0.0, 1.0).unwrap()),
+                    StoreOp::Store,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        pass.set_programmable_pipeline(table.programmable_render_pipeline_ref(pipeline).unwrap())
+            .unwrap();
+        pass.set_vertex_buffer(table.buffer_ref(vertices).unwrap(), 0)
+            .unwrap();
+        pass.draw(3, 0).unwrap();
+        pass.end().unwrap();
+        let commands = encoder.finish().unwrap();
+        queue.submit(resources, &commands).unwrap()
+    }
+
+    pub fn run(preference: sgfx::BackendPreference) {
+        let instance = driver::Instance::with_preference(preference).unwrap();
+        let device = instance.adapters()[0].create_device().unwrap();
+        let queue = device.create_queue().unwrap();
+        let table = Rc::new(ResourceTable::new());
+        let mut resources = device.create_resources(table.clone()).unwrap();
+        let target = || {
+            table
+                .define_texture(
+                    TextureDesc::new(
+                        TextureFormat::Bgra8Unorm,
+                        Extent2D::new(8, 8).unwrap(),
+                        TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id()
+        };
+        let preserved = target();
+        let current = target();
+        let vertices = table
+            .define_buffer(
+                BufferDesc::new(24, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap(),
+            )
+            .unwrap()
+            .id();
+        let data: Vec<_> = [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let mut encoder = CommandEncoder::new(&table);
+        encoder
+            .write_buffer(table.buffer_ref(vertices).unwrap(), 0, &data)
+            .unwrap();
+        let upload = queue
+            .submit(&mut resources, &encoder.finish().unwrap())
+            .unwrap();
+        assert_eq!(
+            upload.wait(Some(Duration::from_secs(10))).unwrap(),
+            CompletionStatus::Complete
+        );
+        let mut old_receipt = None;
+        let mut old_pixels = Vec::new();
+        let mut old_ids = None;
+        for generation in 0..512 {
+            let (shader, pipeline) = define(&table, generation % 2 != 0);
+            if let Some((old_shader, old_pipeline)) = old_ids {
+                assert!(
+                    table.shader_module_ref(old_shader).is_err(),
+                    "old shader revived at {generation}"
+                );
+                assert!(
+                    table
+                        .programmable_render_pipeline_ref(old_pipeline)
+                        .is_err(),
+                    "old pipeline revived at {generation}"
+                );
+            }
+            let target = if generation == 0 { preserved } else { current };
+            let receipt = draw(&table, &queue, &mut resources, target, vertices, pipeline);
+            assert_eq!(
+                receipt.wait(Some(Duration::from_secs(10))).unwrap(),
+                CompletionStatus::Complete
+            );
+            let pixels = queue.read_texture(&mut resources, target).unwrap();
+            let expected = if generation % 2 == 0 {
+                [0, 0, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            assert_eq!(pixels.len(), 8 * 8 * 4);
+            for pixel in pixels.chunks_exact(4) {
+                assert_eq!(pixel, expected, "native program generation {generation}");
+            }
+            resources
+                .release_programmable_render_pipeline(pipeline)
+                .unwrap();
+            table
+                .release_programmable_render_pipeline(pipeline)
+                .unwrap();
+            resources.release_shader_module(shader).unwrap();
+            table.release_shader_module(shader).unwrap();
+            assert!(table.programmable_render_pipeline_ref(pipeline).is_err());
+            assert!(table.shader_module_ref(shader).is_err());
+            if generation == 0 {
+                old_ids = Some((shader, pipeline));
+                old_receipt = Some(receipt);
+                old_pixels = pixels;
+            } else {
+                assert_eq!(
+                    old_receipt
+                        .as_ref()
+                        .unwrap()
+                        .wait(Some(Duration::ZERO))
+                        .unwrap(),
+                    CompletionStatus::Complete
+                );
+                assert_eq!(
+                    queue.read_texture(&mut resources, preserved).unwrap(),
+                    old_pixels,
+                    "old generation image changed at {generation}"
+                );
+            }
+        }
+        println!(
+            "SGFX_PROGRAM_CHURN_OK generations=512 stale_ids=rejected retained_receipt=complete retained_pixels=unchanged"
+        );
+    }
+
+    #[cfg(all(test, feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU"]
+    fn real_gpu_program_generation_churn() {
+        run(sgfx::BackendPreference::Wgpu);
+    }
+}
+
 #[cfg(target_os = "scarlet")]
 mod native {
     use sgfx::{
@@ -973,6 +1169,10 @@ mod native {
     }
 
     pub fn run() {
+        if std::env::args().any(|arg| arg == "--program-churn-only") {
+            crate::program_churn::run(sgfx::BackendPreference::ScarletVirgl);
+            return;
+        }
         if std::env::args().any(|arg| arg == "--import-overlap-only") {
             import_overlap_contract();
             return;
@@ -1233,6 +1433,7 @@ fn main() {
                 || arg == "--copy-only"
                 || arg == "--narrow-only"
                 || arg == "--import-overlap-only"
+                || arg == "--program-churn-only"
         }) {
             for program in ["/bin/sgfx-probe", "/bin/sgfx-legacy-smoke"] {
                 if std::path::Path::new(program).is_file() {
