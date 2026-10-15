@@ -209,48 +209,187 @@ fn driver(id: u64, kind: Kind) -> VkResult<Arc<Driver>> {
         .map(|(_, d)| Arc::clone(d))
         .ok_or(vk::Result::ERROR_DEVICE_LOST)
 }
+
+fn call_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SGFX_VULKAN_CALL_PROFILE").is_ok_and(|v| v == "1"))
+}
+
+#[derive(Clone, Copy)]
+struct CallServiceTiming {
+    queued_ns: u128,
+    service_ns: u128,
+}
+
+#[derive(Default)]
+struct CallProfileCounters {
+    calls: u64,
+    errors: u64,
+    services: u64,
+    roundtrip_ns: u128,
+    queued_ns: u128,
+    service_ns: u128,
+    max_roundtrip_ns: u128,
+    max_service_ns: u128,
+}
+
+impl CallProfileCounters {
+    fn observe(&mut self, roundtrip_ns: u128, service: Option<CallServiceTiming>, failed: bool) {
+        self.calls += 1;
+        self.errors += u64::from(failed);
+        self.roundtrip_ns += roundtrip_ns;
+        self.max_roundtrip_ns = self.max_roundtrip_ns.max(roundtrip_ns);
+        if let Some(service) = service {
+            self.services += 1;
+            self.queued_ns += service.queued_ns;
+            self.service_ns += service.service_ns;
+            self.max_service_ns = self.max_service_ns.max(service.service_ns);
+        }
+    }
+}
+
+fn call_profile_label(operation: &str) -> &str {
+    let operation = operation.strip_prefix("vulkan_sgfx::").unwrap_or(operation);
+    let operation = operation.split("::{{closure}}").next().unwrap_or(operation);
+    let mut start = operation.len().saturating_sub(120);
+    while !operation.is_char_boundary(start) {
+        start += 1;
+    }
+    &operation[start..]
+}
+
+fn record_call_profile(
+    operation: &'static str,
+    started: std::time::Instant,
+    service: Option<CallServiceTiming>,
+    failed: bool,
+) {
+    struct Profile {
+        period: std::time::Instant,
+        operations: HashMap<&'static str, CallProfileCounters>,
+    }
+    static PROFILE: OnceLock<Mutex<Profile>> = OnceLock::new();
+    let finished = std::time::Instant::now();
+    let mut profile = PROFILE
+        .get_or_init(|| {
+            Mutex::new(Profile {
+                period: started,
+                operations: HashMap::new(),
+            })
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    profile.operations.entry(operation).or_default().observe(
+        finished.duration_since(started).as_nanos(),
+        service,
+        failed,
+    );
+    let period = finished.duration_since(profile.period);
+    if period.as_secs() == 0 {
+        return;
+    }
+    let mut top: Vec<_> = profile.operations.iter().collect();
+    top.sort_unstable_by(|(a_name, a), (b_name, b)| {
+        b.roundtrip_ns
+            .cmp(&a.roundtrip_ns)
+            .then_with(|| a_name.cmp(b_name))
+    });
+    let calls: u64 = top.iter().map(|(_, c)| c.calls).sum();
+    let errors: u64 = top.iter().map(|(_, c)| c.errors).sum();
+    eprintln!(
+        "SGFX_VULKAN_CALL_PROFILE period_us={} calls={calls} errors={errors} operations={} top={}",
+        period.as_micros(),
+        top.len(),
+        top.len().min(6),
+    );
+    for (operation, c) in top.iter().take(6) {
+        // Service includes the operation, idle-cache reclamation, and lost-state
+        // publication. Queue/wake delays are host thread/channel scheduling,
+        // not evidence of GPU execution time. Missing service means channel loss.
+        let wake_ns = c.roundtrip_ns.saturating_sub(c.queued_ns + c.service_ns);
+        eprintln!(
+            "SGFX_VULKAN_CALL_TOP op={} calls={} errors={} missing_service={} roundtrip_us={} queued_us={} service_us={} wake_us={} max_roundtrip_us={} max_service_us={}",
+            call_profile_label(operation),
+            c.calls,
+            c.errors,
+            c.calls - c.services,
+            c.roundtrip_ns / 1000,
+            c.queued_ns / 1000,
+            c.service_ns / 1000,
+            wake_ns / 1000,
+            c.max_roundtrip_ns / 1000,
+            c.max_service_ns / 1000,
+        );
+    }
+    profile.operations.clear();
+    profile.period = finished;
+}
+
 fn call<T: Send + 'static>(
     driver: &Driver,
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
 ) -> VkResult<T> {
-    let (tx, rx) = mpsc::sync_channel(1);
-    driver
-        .sender
-        .send(Request::Run(Box::new(move |runtime| {
-            let result = if runtime.device_lost.load(Ordering::Acquire) {
-                runtime.lost = true;
-                Err(vk::Result::ERROR_DEVICE_LOST)
-            } else {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime)))
-                    .unwrap_or_else(|_| {
-                        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                            eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
-                        }
-                        runtime.lost = true;
-                        Err(vk::Result::ERROR_DEVICE_LOST)
-                    })
-            };
-            runtime.reclaim_idle_resources();
-            if runtime.lost {
-                runtime.device_lost.store(true, Ordering::Release);
-                runtime.in_flight.notify();
-            }
-            let _ = tx.send(result);
-        })))
-        .map_err(|_| {
+    // The disabled path performs no clock reads, type-name formatting, or
+    // statistics-map access. The opt-in flag is sampled once per process.
+    let profile_start = call_profile_enabled().then(std::time::Instant::now);
+    let operation = profile_start.map(|_| std::any::type_name_of_val(&op));
+    let mut service = None;
+    let result = (|| {
+        let (tx, rx) = mpsc::sync_channel(1);
+        driver
+            .sender
+            .send(Request::Run(Box::new(move |runtime| {
+                let service_start = profile_start.map(|_| std::time::Instant::now());
+                let result = if runtime.device_lost.load(Ordering::Acquire) {
+                    runtime.lost = true;
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                } else {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime)))
+                        .unwrap_or_else(|_| {
+                            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                                eprintln!(
+                                    "[SGFX Vulkan] device worker panicked; marking device lost"
+                                );
+                            }
+                            runtime.lost = true;
+                            Err(vk::Result::ERROR_DEVICE_LOST)
+                        })
+                };
+                runtime.reclaim_idle_resources();
+                if runtime.lost {
+                    runtime.device_lost.store(true, Ordering::Release);
+                    runtime.in_flight.notify();
+                }
+                let service =
+                    profile_start
+                        .zip(service_start)
+                        .map(|(queued, start)| CallServiceTiming {
+                            queued_ns: start.duration_since(queued).as_nanos(),
+                            service_ns: start.elapsed().as_nanos(),
+                        });
+                let _ = tx.send((result, service));
+            })))
+            .map_err(|_| {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!("[SGFX Vulkan] device worker request channel closed");
+                }
+                driver.mark_lost();
+                vk::Result::ERROR_DEVICE_LOST
+            })?;
+        let (result, timing) = rx.recv().map_err(|_| {
             if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!("[SGFX Vulkan] device worker request channel closed");
+                eprintln!("[SGFX Vulkan] device worker response channel closed");
             }
             driver.mark_lost();
             vk::Result::ERROR_DEVICE_LOST
         })?;
-    rx.recv().map_err(|_| {
-        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-            eprintln!("[SGFX Vulkan] device worker response channel closed");
-        }
-        driver.mark_lost();
-        vk::Result::ERROR_DEVICE_LOST
-    })?
+        service = timing;
+        result
+    })();
+    if let (Some(started), Some(operation)) = (profile_start, operation) {
+        record_call_profile(operation, started, service, result.is_err());
+    }
+    result
 }
 pub(crate) fn with_device<T: Send + 'static>(
     device: vk::Device,
@@ -4111,6 +4250,51 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_profile_counts_worker_errors_and_missing_channel_responses_separately() {
+        let mut counters = CallProfileCounters::default();
+        counters.observe(
+            30_500,
+            Some(CallServiceTiming {
+                queued_ns: 4_000,
+                service_ns: 10_500,
+            }),
+            false,
+        );
+        counters.observe(
+            50_500,
+            Some(CallServiceTiming {
+                queued_ns: 5_000,
+                service_ns: 20_500,
+            }),
+            true,
+        );
+        counters.observe(7_500, None, true);
+        assert_eq!(
+            (counters.calls, counters.errors, counters.services),
+            (3, 2, 2)
+        );
+        assert_eq!(counters.roundtrip_ns, 88_500);
+        assert_eq!(counters.queued_ns, 9_000);
+        assert_eq!(counters.service_ns, 31_000);
+        assert_eq!(counters.max_roundtrip_ns, 50_500);
+        assert_eq!(counters.max_service_ns, 20_500);
+    }
+
+    #[test]
+    fn call_profile_labels_keep_api_names_and_bound_multibyte_type_names() {
+        assert_eq!(
+            call_profile_label(
+                "vulkan_sgfx::resources::update_descriptor_sets::{{closure}}::{{closure}}"
+            ),
+            "resources::update_descriptor_sets"
+        );
+        let long_name = "あ".repeat(100);
+        let label = call_profile_label(&long_name);
+        assert!(label.len() <= 120);
+        assert!(long_name.ends_with(label));
+    }
 
     #[test]
     fn copy_image_is_a_transfer_and_cannot_be_recorded_inside_render_pass() {
