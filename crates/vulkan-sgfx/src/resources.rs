@@ -31,27 +31,56 @@ pub(crate) struct AlignedBytes {
     len: usize,
 }
 impl AlignedBytes {
+    /// GPU image storage lives in the backend. Reserve its logical byte range
+    /// without allocating and clearing a redundant CPU mirror for every image.
+    /// Buffers and explicit mappings materialize the mirror before access.
+    fn unbacked(len: usize) -> Result<Self, vk::Result> {
+        len.checked_add(7)
+            .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+        Ok(Self {
+            words: Vec::new(),
+            len,
+        })
+    }
+    #[cfg(test)]
     pub(crate) fn zeroed(len: usize) -> Result<Self, vk::Result> {
-        let word_count = len
-            .checked_add(7)
-            .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?
-            / 8;
-        let mut words = Vec::new();
-        words
+        let mut bytes = Self::unbacked(len)?;
+        bytes.materialize()?;
+        Ok(bytes)
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn materialize(&mut self) -> Result<(), vk::Result> {
+        let word_count = (self.len + 7) / 8;
+        if self.words.len() == word_count {
+            return Ok(());
+        }
+        self.words
             .try_reserve_exact(word_count)
             .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
-        words.resize(word_count, 0);
-        Ok(Self { words, len })
+        self.words.resize(word_count, 0);
+        Ok(())
     }
 }
 impl std::ops::Deref for AlignedBytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
+        assert_eq!(
+            self.words.len(),
+            (self.len + 7) / 8,
+            "CPU mirror must be materialized before access"
+        );
         unsafe { slice::from_raw_parts(self.words.as_ptr().cast(), self.len) }
     }
 }
 impl std::ops::DerefMut for AlignedBytes {
     fn deref_mut(&mut self) -> &mut [u8] {
+        assert_eq!(
+            self.words.len(),
+            (self.len + 7) / 8,
+            "CPU mirror must be materialized before access"
+        );
         unsafe { slice::from_raw_parts_mut(self.words.as_mut_ptr().cast(), self.len) }
     }
 }
@@ -1026,9 +1055,25 @@ unsafe extern "system" fn allocate_memory(
                 .checked_add(size)
                 .is_none_or(|v| v > MAX_ALLOCATED)
             {
+                // Allocation failures must identify the exhausted budget even
+                // in ordinary builds. Do not dump mapped application payloads.
+                let mut largest: Vec<_> = r
+                    .resources
+                    .memories
+                    .values()
+                    .map(|m| (m.bytes.len(), m.mapped))
+                    .collect();
+                largest.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                largest.truncate(12);
+                eprintln!(
+                    "[SGFX Vulkan] allocation budget exhausted: requested={size} allocated={allocated} limit={MAX_ALLOCATED} allocations={} buffers={} images={} largest_bytes_mapped={largest:?}",
+                    r.resources.memories.len(),
+                    r.resources.buffers.len(),
+                    r.resources.images.len(),
+                );
                 return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
             }
-            let bytes = AlignedBytes::zeroed(size)?;
+            let bytes = AlignedBytes::unbacked(size)?;
             let handle = vk::DeviceMemory::from_raw(crate::api::next_id());
             r.resources.memories.insert(
                 handle,
@@ -1129,7 +1174,7 @@ pub(crate) unsafe extern "system" fn bind_buffer_memory(
             let mem = r
                 .resources
                 .memories
-                .get(&memory)
+                .get_mut(&memory)
                 .ok_or(vk::Result::ERROR_UNKNOWN)?;
             let buf = r
                 .resources
@@ -1152,6 +1197,9 @@ pub(crate) unsafe extern "system" fn bind_buffer_memory(
                 }
                 return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
             }
+            // Bound buffers can be snapshotted without an application mapping.
+            // Allocate their CPU storage before publishing a successful bind.
+            mem.bytes.materialize()?;
             buf.bound = Some((memory, offset));
             Ok(())
         })
@@ -1189,6 +1237,9 @@ unsafe extern "system" fn map_memory(
             if mem.mapped || size == 0 || offset.checked_add(size).is_none_or(|end| end > len) {
                 return Err(vk::Result::ERROR_MEMORY_MAP_FAILED);
             }
+            mem.bytes
+                .materialize()
+                .map_err(|_| vk::Result::ERROR_MEMORY_MAP_FAILED)?;
             mem.mapped = true;
             let address = mem.bytes.as_mut_ptr().add(offset as usize) as usize;
             r.resources.forget_uploads_for_memory(memory);
@@ -3542,6 +3593,25 @@ mod tests {
             failure(ir::Error::ResourceLimitExceeded),
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
         );
+    }
+
+    #[test]
+    fn image_cpu_mirrors_materialize_only_on_host_access_and_keep_mapping_stable() {
+        let mut bytes = AlignedBytes::unbacked(64 * 1024 * 1024 + 1).unwrap();
+        assert_eq!(bytes.len(), 64 * 1024 * 1024 + 1);
+        assert_eq!(bytes.words.capacity(), 0);
+        bytes.materialize().unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        let address = bytes.as_mut_ptr();
+        let last = bytes.len() - 1;
+        bytes[last] = 17;
+        bytes.materialize().unwrap();
+        assert_eq!(bytes.as_mut_ptr(), address);
+        assert_eq!(bytes[bytes.len() - 1], 17);
+        assert!(matches!(
+            AlignedBytes::unbacked(usize::MAX),
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        ));
     }
 
     #[test]
