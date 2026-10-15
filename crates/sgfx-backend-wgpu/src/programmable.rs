@@ -19,6 +19,18 @@ pub(super) struct Cache {
     pub(super) groups: Vec<(ir::BindGroupId, Arc<raw::BindGroup>)>,
 }
 
+#[cfg(test)]
+impl Cache {
+    pub(super) fn cached_program_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.shaders.len(),
+            self.render.len(),
+            self.compute.len(),
+            self.layouts.len(),
+        )
+    }
+}
+
 pub(super) struct RenderPipeline {
     pub pipeline: raw::RenderPipeline,
     pub vertex_buffer_count: usize,
@@ -65,6 +77,38 @@ pub(super) fn validated<T>(device: &raw::Device, create: impl FnOnce() -> Result
 }
 
 impl Resources {
+    /// Release cached shader module objects; submitted WGPU work owns its resources.
+    pub fn release_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<()> {
+        self.resources.shader_module_ref(id)?;
+        self.programmable
+            .shaders
+            .retain(|(candidate, _)| *candidate != id);
+        Ok(())
+    }
+
+    /// Release cached compute pipeline objects; submitted WGPU work owns its resources.
+    pub fn release_compute_pipeline(&mut self, id: ir::ComputePipelineId) -> Result<()> {
+        self.resources.compute_pipeline_ref(id)?;
+        self.programmable
+            .compute
+            .retain(|(candidate, _)| *candidate != id);
+        self.programmable.layouts.clear();
+        Ok(())
+    }
+
+    /// Release cached programmable render pipeline objects; submitted WGPU work owns its resources.
+    pub fn release_programmable_render_pipeline(
+        &mut self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<()> {
+        self.resources.programmable_render_pipeline_ref(id)?;
+        self.programmable
+            .render
+            .retain(|(candidate, _, _, _)| *candidate != id);
+        self.programmable.layouts.clear();
+        Ok(())
+    }
+
     /// Validate and materialize a shader module without submitting GPU work.
     /// Shader compilation failures are returned as [`Error::Validation`].
     pub fn validate_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<()> {
@@ -122,6 +166,7 @@ impl Resources {
     }
 
     fn shader(&mut self, id: ir::ShaderModuleId) -> Result<Arc<raw::ShaderModule>> {
+        self.resources.shader_module_ref(id)?;
         #[cfg(target_arch = "wasm32")]
         return Err(Error::Unsupported(UnsupportedFeature::ProgrammableOnWeb));
         #[cfg(not(target_arch = "wasm32"))]
@@ -286,6 +331,7 @@ impl Resources {
         format: raw::TextureFormat,
         has_depth: bool,
     ) -> Result<Arc<RenderPipeline>> {
+        self.resources.programmable_render_pipeline_ref(id)?;
         if let Some((_, _, _, pipeline)) =
             self.programmable
                 .render
@@ -461,6 +507,7 @@ impl Resources {
         &mut self,
         id: ir::ComputePipelineId,
     ) -> Result<Arc<ComputePipeline>> {
+        self.resources.compute_pipeline_ref(id)?;
         if let Some((_, pipeline)) = self
             .programmable
             .compute

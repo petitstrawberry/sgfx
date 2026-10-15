@@ -797,6 +797,84 @@ impl Resources {
         }
     }
 
+    /// Release cached materialization for a shader module.
+    /// Wait for accepted work first; retire the resource-table identity afterward.
+    pub fn release_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<()> {
+        match &mut self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            ResourcesBackend::Wgpu(resources) => {
+                resources.release_shader_module(id).map_err(Error::Wgpu)
+            }
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+            ))]
+            ResourcesBackend::ScarletVirgl(resources) => {
+                resources.release_shader_module(id).map_err(Error::from)
+            }
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            ResourcesBackend::Dynamic(resources) => {
+                resources.release_shader_module(id).map_err(Error::from)
+            }
+        }
+    }
+
+    /// Release cached materialization for a compute pipeline.
+    /// Wait for accepted work first; retire the resource-table identity afterward.
+    pub fn release_compute_pipeline(&mut self, id: ir::ComputePipelineId) -> Result<()> {
+        match &mut self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            ResourcesBackend::Wgpu(resources) => {
+                resources.release_compute_pipeline(id).map_err(Error::Wgpu)
+            }
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+            ))]
+            ResourcesBackend::ScarletVirgl(resources) => {
+                resources.release_compute_pipeline(id).map_err(Error::from)
+            }
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            ResourcesBackend::Dynamic(resources) => {
+                resources.release_compute_pipeline(id).map_err(Error::from)
+            }
+        }
+    }
+
+    /// Release cached materialization for a programmable render pipeline.
+    /// Wait for accepted work first; retire the resource-table identity afterward.
+    pub fn release_programmable_render_pipeline(
+        &mut self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<()> {
+        match &mut self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            ResourcesBackend::Wgpu(resources) => resources
+                .release_programmable_render_pipeline(id)
+                .map_err(Error::Wgpu),
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+            ))]
+            ResourcesBackend::ScarletVirgl(resources) => resources
+                .release_programmable_render_pipeline(id)
+                .map_err(Error::from),
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            ResourcesBackend::Dynamic(resources) => resources
+                .release_programmable_render_pipeline(id)
+                .map_err(Error::from),
+        }
+    }
+
     /// Map a logical render target to a device-local shareable image.
     #[cfg(any(
         sgfx_dynamic,

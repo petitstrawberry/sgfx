@@ -271,7 +271,17 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
             .abi_retired_resources(words)
             .map_err(|_| abi::INVALID)?;
         // Never turn resource retirement into a hidden GPU wait in submit.
-        if (!textures.is_empty() || !buffers.is_empty()) && !s.inner.is_idle().map_err(error)? {
+        let (shaders, compute, render) = s
+            .table
+            .abi_retired_programs(words)
+            .map_err(|_| abi::INVALID)?;
+        if (!textures.is_empty()
+            || !buffers.is_empty()
+            || !shaders.is_empty()
+            || !compute.is_empty()
+            || !render.is_empty())
+            && !s.inner.is_idle().map_err(error)?
+        {
             return Err(abi::BUSY);
         }
         for id in textures {
@@ -279,6 +289,17 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         }
         for id in buffers {
             s.inner.release_buffer(id).map_err(error)?;
+        }
+        for id in render {
+            s.inner
+                .release_programmable_render_pipeline(id)
+                .map_err(error)?;
+        }
+        for id in compute {
+            s.inner.release_compute_pipeline(id).map_err(error)?;
+        }
+        for id in shaders {
+            s.inner.release_shader_module(id).map_err(error)?;
         }
         match s.table.sync_abi_snapshot(words) {
             Ok((_, revision)) => s.revision = revision,

@@ -53,6 +53,53 @@ impl IrResources {
         self.sync()?;
         status(unsafe { (api(&self.owner.library)?.release_bind_group)(self.owner.raw, slot) })
     }
+    pub(crate) fn release_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<()> {
+        let reference = self.table.shader_module_ref(id).map_err(invalid)?;
+        let slot = reference.slot() as u32;
+        let generation = reference.generation();
+        self.sync()?;
+        let api = self
+            .owner
+            .library
+            .program_release
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        status(unsafe { (api.release_shader_module)(self.owner.raw, slot, generation) })
+    }
+    pub(crate) fn release_compute_pipeline(&mut self, id: ir::ComputePipelineId) -> Result<()> {
+        let reference = self.table.compute_pipeline_ref(id).map_err(invalid)?;
+        let slot = reference.slot() as u32;
+        let generation = reference.generation();
+        self.sync()?;
+        let api = self
+            .owner
+            .library
+            .program_release
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        status(unsafe { (api.release_compute_pipeline)(self.owner.raw, slot, generation) })
+    }
+    pub(crate) fn release_programmable_render_pipeline(
+        &mut self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<()> {
+        let reference = self
+            .table
+            .programmable_render_pipeline_ref(id)
+            .map_err(invalid)?;
+        let slot = reference.slot() as u32;
+        let generation = reference.generation();
+        self.sync()?;
+        let api = self
+            .owner
+            .library
+            .program_release
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        status(unsafe {
+            (api.release_programmable_render_pipeline)(self.owner.raw, slot, generation)
+        })
+    }
     pub(crate) fn map_image(
         &mut self,
         id: ir::TextureId,

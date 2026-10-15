@@ -97,12 +97,23 @@ typedef struct sgfx_driver_api {
 } sgfx_driver_api;
 typedef int32_t (*sgfx_get_driver_api)(uint32_t version, size_t size, sgfx_driver_api *out);
 
+/* Optional program-cache retirement; slot identity includes its generation. */
+typedef int32_t (*sgfx_release_program)(sgfx_object, uint32_t slot, uint64_t generation);
+typedef struct {
+    uint32_t version, size;
+    sgfx_release_program release_shader_module;
+    sgfx_release_program release_compute_pipeline;
+    sgfx_release_program release_programmable_render_pipeline;
+} sgfx_program_release_api;
+typedef int32_t (*sgfx_get_program_release_api)(uint32_t version, size_t size, sgfx_program_release_api *out);
+
 typedef int32_t (*sgfx_get_api)(uint32_t version, size_t size, const sgfx_host_info *host, sgfx_backend_api *out);
 /* A successful call initializes the entire table. An incompatible version or
  * short output buffer returns SGFX_ABI_MISMATCH without writing the table. */
 #ifdef __cplusplus
 extern "C" {
 #endif
+int32_t sgfx_backend_get_program_release_api_v2(uint32_t version, size_t size, sgfx_program_release_api *out);
 int32_t sgfx_backend_get_driver_api_v2(uint32_t version, size_t size, sgfx_driver_api *out);
 int32_t sgfx_backend_get_api_v2(uint32_t version, size_t size, const sgfx_host_info *host, sgfx_backend_api *out);
 #ifdef __cplusplus

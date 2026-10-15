@@ -323,6 +323,43 @@ impl IrResources {
         Ok(())
     }
 
+    /// Remove a shader's cached validation metadata before retiring its table ID.
+    pub fn release_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
+        self.resources.shader_module_ref(id)?;
+        // Native stages belong to compiled pipelines, not standalone modules.
+        Ok(())
+    }
+
+    /// Remove a compute pipeline cache (native compute execution is unsupported).
+    pub fn release_compute_pipeline(
+        &mut self,
+        id: ir::ComputePipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
+        self.resources.compute_pipeline_ref(id)?;
+        Ok(())
+    }
+
+    /// Retire native pipeline objects only after all accepted submissions finish.
+    pub fn release_programmable_render_pipeline(
+        &mut self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
+        let slot = self.resources.programmable_render_pipeline_ref(id)?.slot();
+        run_retirement(&mut self.submission_failed, || {
+            self.backend
+                .release_programmable_render_pipeline(&self.context, slot)
+        })
+        .inspect_err(|_| self.context.abandon_cleanup())?;
+        #[cfg(feature = "programmable")]
+        self.programmable_pipelines
+            .borrow_mut()
+            .retain(|(candidate, _)| *candidate != id);
+        Ok(())
+    }
+
     /// Forget materialization of a bind group after its recorded commands have
     /// been consumed. Native lowering copies all bindings into owned packets,
     /// so there is no persistent group cache or GPU completion wait here.

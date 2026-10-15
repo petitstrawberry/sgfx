@@ -126,6 +126,7 @@ impl IrResources {
         &self,
         id: ir::ProgrammableRenderPipelineId,
     ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
+        self.resources.programmable_render_pipeline_ref(id)?;
         if let Some((_, compiled)) = self
             .programmable_pipelines
             .borrow()

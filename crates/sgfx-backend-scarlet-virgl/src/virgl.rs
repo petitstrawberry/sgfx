@@ -1360,6 +1360,35 @@ impl IrResources {
         Ok(())
     }
 
+    pub(crate) fn release_programmable_render_pipeline(
+        &mut self,
+        context: &Context,
+        slot: usize,
+    ) -> HandleResult<()> {
+        if self.context_handle != context.handle_id() || slot >= self.programmable_pipelines.len() {
+            return Err(HandleError::InvalidParameter);
+        }
+        let fixed_slot = slot + IR_PROGRAMMABLE_PIPELINE_SLOTS;
+        if self.programmable_pipelines[slot].is_none() && self.pipelines[fixed_slot].is_none() {
+            return Ok(());
+        }
+        let objects = programmable_retirement_objects(
+            self.programmable_pipelines[slot].as_ref(),
+            self.pipelines[fixed_slot].as_ref(),
+        );
+        // Keep both old descriptions/handle sets until retirement succeeds. An
+        // accepted asynchronous packet may still reference these object handles.
+        retire_native_objects(
+            &context.raw,
+            &context.scheduler,
+            &context.cleanup_failed,
+            objects.into_iter().flatten(),
+        )?;
+        self.programmable_pipelines[slot] = None;
+        self.pipelines[fixed_slot] = None;
+        Ok(())
+    }
+
     pub(crate) fn unmap_ir_image(
         &mut self,
         context: &Context,
@@ -1565,6 +1594,27 @@ struct MappedIrTexture {
     sampler_view_initialized: Cell<bool>,
     surface_handle: u32,
     surface_initialized: Cell<bool>,
+}
+
+fn programmable_retirement_objects(
+    stages: Option<&IrNativeProgrammablePipeline>,
+    state: Option<&IrPipeline>,
+) -> [Option<(u32, u32)>; 6] {
+    let stages = stages.filter(|pipeline| pipeline.initialized.get());
+    let state = state.filter(|pipeline| pipeline.initialized.get());
+    [
+        stages.map(|pipeline| (VIRGL_OBJECT_SHADER, pipeline.vertex_shader_handle)),
+        stages.map(|pipeline| (VIRGL_OBJECT_SHADER, pipeline.fragment_shader_handle)),
+        stages.map(|pipeline| {
+            (
+                VIRGL_OBJECT_VERTEX_ELEMENTS,
+                pipeline.vertex_elements_handle,
+            )
+        }),
+        state.map(|pipeline| (VIRGL_OBJECT_BLEND, pipeline.blend_handle)),
+        state.map(|pipeline| (VIRGL_OBJECT_RASTERIZER, pipeline.rasterizer_handle)),
+        state.and_then(|pipeline| pipeline.dsa_handle.map(|handle| (VIRGL_OBJECT_DSA, handle))),
+    ]
 }
 
 fn encode_retirement_objects(
@@ -5860,6 +5910,95 @@ mod tests {
             Err(HandleError::SystemError(-1))
         ));
         assert!(scheduler.borrow().is_none());
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn programmable_retirement_destroys_both_stage_and_fixed_state_objects_once() {
+        let module = crate::ir::ShaderModuleDesc::wgsl("@vertex fn v() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0,0.0,0.0,1.0); } @fragment fn f() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }".into()).unwrap();
+        let description = Rc::new(IrProgrammablePipeline {
+            slot: 17,
+            vertex: sgfx_codegen_virgl::programmable::compile_shader(
+                &module,
+                crate::ir::ShaderStage::Vertex,
+                "v",
+            )
+            .unwrap(),
+            fragment: sgfx_codegen_virgl::programmable::compile_shader(
+                &module,
+                crate::ir::ShaderStage::Fragment,
+                "f",
+            )
+            .unwrap(),
+            vertex_buffers: Vec::new(),
+            topology: crate::ir::PrimitiveTopology::TriangleList,
+        });
+        let pipeline = IrNativeProgrammablePipeline {
+            description,
+            vertex_shader_handle: 11,
+            fragment_shader_handle: 12,
+            vertex_elements_handle: 13,
+            initialized: Cell::new(false),
+        };
+        let replace = IrBlendComponent {
+            source_factor: IrBlendFactor::One,
+            destination_factor: IrBlendFactor::Zero,
+            operation: IrBlendOp::Add,
+        };
+        let state = IrPipeline {
+            blend_handle: 21,
+            rasterizer_handle: 22,
+            dsa_handle: Some(23),
+            initialized: Cell::new(false),
+            state: IrPipelineState {
+                slot: 17 + IR_PROGRAMMABLE_PIPELINE_SLOTS,
+                fragment: IrFragmentProgram::Solid,
+                blend: IrBlendState {
+                    color: replace,
+                    alpha: replace,
+                },
+                color_write_mask: 0xf,
+                additional_color_blends: [None; 7],
+                cull_mode: IrCullMode::None,
+                front_face: IrFrontFace::CounterClockwise,
+                depth: None,
+            },
+        };
+        assert!(
+            programmable_retirement_objects(Some(&pipeline), Some(&state))
+                .iter()
+                .all(Option::is_none)
+        );
+        pipeline.initialized.set(true);
+        state.initialized.set(true);
+        let expected = vec![
+            (VIRGL_OBJECT_SHADER, 11),
+            (VIRGL_OBJECT_SHADER, 12),
+            (VIRGL_OBJECT_VERTEX_ELEMENTS, 13),
+            (VIRGL_OBJECT_BLEND, 21),
+            (VIRGL_OBJECT_RASTERIZER, 22),
+            (VIRGL_OBJECT_DSA, 23),
+        ];
+        let objects = programmable_retirement_objects(Some(&pipeline), Some(&state));
+        assert_eq!(objects.into_iter().flatten().collect::<Vec<_>>(), expected);
+        let mut destroyed = Vec::new();
+        encode_retirement_objects(1024, objects.into_iter().flatten(), |commands| {
+            let words = dwords(commands);
+            let mut offset = 0;
+            while offset < words.len() {
+                let header = words[offset];
+                if header & 255 == VIRGL_CCMD_DESTROY_OBJECT {
+                    destroyed.push(((header >> 8) & 255, words[offset + 1]));
+                }
+                offset += 1 + (header >> 16) as usize;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(destroyed, expected);
+        // Preparing retirement does not discard ownership before the fenced
+        // caller succeeds; a submission failure must retain and poison it.
+        assert!(pipeline.initialized.get() && state.initialized.get());
     }
 
     #[test]

@@ -1555,3 +1555,135 @@ fn comparison_sampler_reads_depth_produced_by_a_render_pass_on_gpu() {
         bytemuck::cast_slice::<f32, u8>(&[1.0, 0.0])
     );
 }
+
+#[test]
+fn generational_program_cache_churn_preserves_already_submitted_pixels() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().unwrap();
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let table = Rc::new(ResourceTable::new());
+    let mut cache = context.create_resources(Rc::clone(&table));
+    let queue = context.create_queue();
+    let mut targets = Vec::new();
+    for _ in 0..2 {
+        targets.push(
+            table
+                .define_texture(
+                    TextureDesc::new(
+                        TextureFormat::Rgba8Unorm,
+                        Extent2D::new(4, 4).unwrap(),
+                        TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id(),
+        );
+    }
+    let mut previous: Option<(crate::Submission, TextureId, u8)> = None;
+    let mut retired = None;
+    for iteration in 0..300u32 {
+        let red = if iteration % 2 == 0 { 1.0 } else { 0.0 };
+        let module = shader(
+            &table,
+            &format!(
+                "{FULLSCREEN_VERTEX}\n@fragment fn fragment() -> @location(0) vec4<f32> {{ return vec4<f32>({red}, 0.0, 0.0, 1.0); }}\n@compute @workgroup_size(1) fn compute() {{}}"
+            ),
+        );
+        let graphics = table
+            .define_programmable_render_pipeline(
+                ProgrammableRenderPipelineDesc::new(
+                    entry(module, ShaderStage::Vertex, "vertex"),
+                    entry(module, ShaderStage::Fragment, "fragment"),
+                    PipelineLayoutDesc::new(vec![]).unwrap(),
+                    TextureFormat::Rgba8Unorm,
+                    None,
+                    PrimitiveTopology::TriangleList,
+                    BlendState::REPLACE,
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let compute = table
+            .define_compute_pipeline(
+                ComputePipelineDesc::new(
+                    entry(module, ShaderStage::Compute, "compute"),
+                    PipelineLayoutDesc::new(vec![]).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        cache.validate_shader_module(module.id()).unwrap();
+        cache.validate_compute_pipeline(compute.id()).unwrap();
+        cache
+            .validate_programmable_render_pipeline(graphics.id())
+            .unwrap();
+        if let Some((shader, graphics, compute)) = retired {
+            assert!(cache.validate_shader_module(shader).is_err());
+            assert!(
+                cache
+                    .validate_programmable_render_pipeline(graphics)
+                    .is_err()
+            );
+            assert!(cache.validate_compute_pipeline(compute).is_err());
+        }
+        let mut encoder = CommandEncoder::new(&table);
+        let mut pass = encoder.begin_compute_pass().unwrap();
+        pass.set_pipeline(compute).unwrap();
+        pass.dispatch(1, 1, 1).unwrap();
+        pass.end().unwrap();
+        let target = table.texture_ref(targets[iteration as usize % 2]).unwrap();
+        let mut pass = encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    &table,
+                    target,
+                    PixelRect::new(0, 0, 4, 4).unwrap(),
+                    LoadOp::Load,
+                    StoreOp::Store,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        pass.set_programmable_pipeline(graphics).unwrap();
+        pass.draw(3, 0).unwrap();
+        pass.end().unwrap();
+        let commands = encoder.finish().unwrap();
+        let receipt = queue.submit_tracked(&mut cache, &commands).unwrap();
+        // WGPU submissions own GPU references independently of this cache. Drop
+        // its old generation immediately and recreate the same slots next time.
+        cache
+            .release_programmable_render_pipeline(graphics.id())
+            .unwrap();
+        table
+            .release_programmable_render_pipeline(graphics.id())
+            .unwrap();
+        cache.release_compute_pipeline(compute.id()).unwrap();
+        table.release_compute_pipeline(compute.id()).unwrap();
+        cache.release_shader_module(module.id()).unwrap();
+        table.release_shader_module(module.id()).unwrap();
+        assert_eq!(cache.programmable.cached_program_counts(), (0, 0, 0, 0));
+        if let Some((old_receipt, old_target, red)) = previous.take() {
+            assert_eq!(old_receipt.wait(None), Ok(CompletionStatus::Complete));
+            assert_eq!(
+                cache.read_texture(old_target).unwrap(),
+                [red, 0, 0, 255].repeat(16)
+            );
+        }
+        previous = Some((
+            receipt,
+            target.id(),
+            if iteration % 2 == 0 { 255 } else { 0 },
+        ));
+        retired = Some((module.id(), graphics.id(), compute.id()));
+    }
+    let (receipt, target, red) = previous.unwrap();
+    assert_eq!(receipt.wait(None), Ok(CompletionStatus::Complete));
+    assert_eq!(
+        cache.read_texture(target).unwrap(),
+        [red, 0, 0, 255].repeat(16)
+    );
+}

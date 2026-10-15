@@ -926,6 +926,18 @@ impl IrResources {
         }
     }
 
+    pub(crate) fn release_programmable_render_pipeline(
+        &mut self,
+        context: &Context,
+        slot: usize,
+    ) -> HandleResult<()> {
+        match (self, context) {
+            (Self::Virgl(resources), Context::Virgl(context)) => {
+                resources.release_programmable_render_pipeline(context, slot)
+            }
+        }
+    }
+
     pub(crate) fn unmap_ir_image(
         &mut self,
         context: &Context,

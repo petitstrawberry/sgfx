@@ -663,6 +663,27 @@ impl MappedTargetSession {
         self.resources.release_buffer(id)
     }
 
+    /// Release retired programmable-resource materialization before updating table metadata.
+    pub fn release_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<(), IrSubmitError> {
+        self.resources.release_shader_module(id)
+    }
+
+    /// Release retired programmable-resource materialization before updating table metadata.
+    pub fn release_compute_pipeline(
+        &mut self,
+        id: ir::ComputePipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.resources.release_compute_pipeline(id)
+    }
+
+    /// Release retired programmable-resource materialization before updating table metadata.
+    pub fn release_programmable_render_pipeline(
+        &mut self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.resources.release_programmable_render_pipeline(id)
+    }
+
     /// Import a transferred shared BGRA image into a logical sampled texture.
     pub fn import_shared_bgra_texture(
         &mut self,

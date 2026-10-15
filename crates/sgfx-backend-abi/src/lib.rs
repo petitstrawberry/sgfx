@@ -237,6 +237,25 @@ const _: () = {
     assert!(core::mem::offset_of!(DriverApi, create_resources) == 8);
 };
 
+/// Optional generational program-cache retirement; the original driver table
+/// remains binary compatible. IDs are resolved before their table tombstones.
+pub const PROGRAM_RELEASE_ENTRY: &[u8] = b"sgfx_backend_get_program_release_api_v2\0";
+pub type ReleaseProgram = unsafe extern "C" fn(Object, u32, u64) -> i32;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProgramReleaseApi {
+    pub version: u32,
+    pub size: u32,
+    pub release_shader_module: ReleaseProgram,
+    pub release_compute_pipeline: ReleaseProgram,
+    pub release_programmable_render_pipeline: ReleaseProgram,
+}
+pub type GetProgramReleaseApi = unsafe extern "C" fn(u32, usize, *mut ProgramReleaseApi) -> i32;
+const _: () = {
+    assert!(core::mem::size_of::<ProgramReleaseApi>() == 32);
+    assert!(core::mem::offset_of!(ProgramReleaseApi, release_shader_module) == 8);
+};
+
 /// Optional v2 extension for importing YCbCr images into a mapped session.
 /// The original backend and low-level driver tables remain binary compatible.
 pub const YCBCR_ENTRY: &[u8] = b"sgfx_backend_get_ycbcr_api_v2\0";
