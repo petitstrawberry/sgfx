@@ -212,7 +212,22 @@ fn driver(id: u64, kind: Kind) -> VkResult<Arc<Driver>> {
 
 fn call_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("SGFX_VULKAN_CALL_PROFILE").is_ok_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| {
+        // Loaded Scarlet Rust DSOs have their own uninitialized std environment.
+        // libc getenv also consults the loader's process environment.
+        #[cfg(target_os = "scarlet")]
+        unsafe {
+            unsafe extern "C" {
+                fn getenv(name: *const c_char) -> *const c_char;
+            }
+            let value = getenv(c"SGFX_VULKAN_CALL_PROFILE".as_ptr());
+            !value.is_null() && CStr::from_ptr(value).to_bytes() == b"1"
+        }
+        #[cfg(not(target_os = "scarlet"))]
+        {
+            std::env::var("SGFX_VULKAN_CALL_PROFILE").is_ok_and(|v| v == "1")
+        }
+    })
 }
 
 #[derive(Clone, Copy)]
