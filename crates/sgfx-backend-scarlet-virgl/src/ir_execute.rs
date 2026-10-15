@@ -170,6 +170,20 @@ struct ImageMapping {
 }
 
 impl IrResources {
+    pub(crate) fn ensure_usable(&self) -> Result<(), IrSubmitError> {
+        ensure_submission_usable(self.submission_failed)
+    }
+
+    pub(crate) fn retire_imported_texture(
+        &mut self,
+        context: &Context,
+        image: Texture,
+    ) -> Result<(), IrSubmitError> {
+        run_retirement(&mut self.submission_failed, || {
+            context.release_texture(image)
+        })
+    }
+
     pub(crate) fn new(
         resources: Rc<ResourceTable>,
         context: &driver::Context,
@@ -222,19 +236,25 @@ impl IrResources {
     /// Release an unmapped texture after all submissions using it complete.
     /// The caller separately retires the logical identity in its table.
     pub fn release_texture(&mut self, id: TextureId) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let slot = self.resources.texture_ref(id)?.slot();
         if self.images.iter().any(|mapping| mapping.texture == id) {
             return Err(ir::Error::InvalidDescriptor.into());
         }
-        self.backend.release_texture(&self.context, slot)?;
+        run_retirement(&mut self.submission_failed, || {
+            self.backend.release_texture(&self.context, slot)
+        })?;
         Ok(())
     }
 
     /// Forget a retired logical buffer and its physical VirGL allocation.
     /// Callers must ensure previously submitted work has completed first.
     pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let slot = self.resources.buffer_ref(id)?.slot();
-        self.backend.release_buffer(&self.context, slot)?;
+        run_retirement(&mut self.submission_failed, || {
+            self.backend.release_buffer(&self.context, slot)
+        })?;
         // A mirrored table can append and retire a buffer before its first
         // submission has grown these materialization caches.
         if let Some(shadow) = self.buffer_shadows.get_mut(slot) {
@@ -342,6 +362,7 @@ impl IrResources {
         texture: TextureId,
         image: &Texture,
     ) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let texture_ref = self.resources.texture_ref(texture)?;
         let descriptor = self.resources.texture(texture_ref)?;
         if descriptor.format() != TextureFormat::Bgra8Unorm
@@ -374,13 +395,15 @@ impl IrResources {
         texture: TextureId,
         image: &Texture,
     ) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let texture_ref = self.resources.texture_ref(texture)?;
         let descriptor = self.resources.texture(texture_ref)?;
-        context.backend.unmap_ir_texture(
-            &mut self.backend,
-            texture_spec(texture_ref, descriptor)?,
-            &image.backend,
-        )?;
+        let spec = texture_spec(texture_ref, descriptor)?;
+        run_retirement(&mut self.submission_failed, || {
+            context
+                .backend
+                .unmap_ir_texture(&mut self.backend, spec, &image.backend)
+        })?;
         Ok(())
     }
 
@@ -433,6 +456,27 @@ impl IrResources {
             }
         }
     }
+}
+
+fn ensure_submission_usable(failed: bool) -> Result<(), IrSubmitError> {
+    if failed {
+        Err(IrSubmitError::SubmissionFailed)
+    } else {
+        Ok(())
+    }
+}
+
+// A failed fenced cleanup may have destroyed an accepted prefix. Never
+// restore cached CREATE flags or retry its object ids in the same resources.
+fn run_retirement(
+    failed: &mut bool,
+    retire: impl FnOnce() -> Result<(), HandleError>,
+) -> Result<(), IrSubmitError> {
+    ensure_submission_usable(*failed)?;
+    retire().map_err(|error| {
+        *failed = true;
+        IrSubmitError::Backend(error)
+    })
 }
 
 struct BufferShadowUpdate {
@@ -980,9 +1024,7 @@ impl Queue {
         commands: &CommandBuffer<'r, 'data>,
         mode: &mut SubmitMode,
     ) -> Result<(), IrSubmitError> {
-        if resources.submission_failed {
-            return Err(IrSubmitError::SubmissionFailed);
-        }
+        resources.ensure_usable()?;
         if !core::ptr::eq(resources.resources(), commands.resources()) {
             return Err(IrSubmitError::ResourceTableMismatch);
         }
@@ -3232,6 +3274,45 @@ mod tests {
         IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrCullMode, IrFragmentProgram,
         IrFrontFace,
     };
+
+    #[test]
+    fn cleanup_failure_after_a_destroy_prefix_blocks_retry_and_submission() {
+        let destroyed = core::cell::Cell::new(0);
+        let mut failed = false;
+        let result = run_retirement(&mut failed, || {
+            // The transport can execute DESTROY then fail its fence/response.
+            destroyed.set(destroyed.get() + 1);
+            Err(HandleError::SystemError(-1))
+        });
+        assert!(matches!(result, Err(IrSubmitError::Backend(_))));
+        assert!(failed);
+        assert_eq!(destroyed.get(), 1);
+        assert!(matches!(
+            ensure_submission_usable(failed),
+            Err(IrSubmitError::SubmissionFailed)
+        ));
+        assert!(matches!(
+            run_retirement(&mut failed, || {
+                destroyed.set(destroyed.get() + 1);
+                Ok(())
+            }),
+            Err(IrSubmitError::SubmissionFailed)
+        ));
+        assert_eq!(
+            destroyed.get(),
+            1,
+            "an uncertain destroyed id must never be retired again"
+        );
+    }
+
+    #[test]
+    fn successful_retirement_preserves_a_usable_resource_cache() {
+        let mut failed = false;
+        run_retirement(&mut failed, || Ok(())).unwrap();
+        ensure_submission_usable(failed).unwrap();
+        run_retirement(&mut failed, || Ok(())).unwrap();
+        assert!(!failed);
+    }
 
     #[test]
     fn narrow_upload_preserves_padded_rows_mip_layer_and_logical_channels() {

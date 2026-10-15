@@ -628,6 +628,7 @@ impl MappedTargetSession {
         texture: ir::TextureId,
         handle: Handle,
     ) -> Result<(), IrSubmitError> {
+        self.resources.ensure_usable()?;
         if self
             .imported_textures
             .iter()
@@ -640,7 +641,9 @@ impl MappedTargetSession {
             .resources
             .map_texture(&self.context, texture, &imported)
         {
-            let _ = self.context.release_texture(imported);
+            let _ = self
+                .resources
+                .retire_imported_texture(&self.context, imported);
             return Err(error);
         }
         self.imported_textures.push((texture, imported));
@@ -652,6 +655,7 @@ impl MappedTargetSession {
         &mut self,
         texture: ir::TextureId,
     ) -> Result<(), IrSubmitError> {
+        self.resources.ensure_usable()?;
         let index = self
             .imported_textures
             .iter()
@@ -661,7 +665,8 @@ impl MappedTargetSession {
         self.resources
             .unmap_texture(&self.context, texture, imported)?;
         let (_, imported) = self.imported_textures.remove(index);
-        self.context.release_texture(imported)?;
+        self.resources
+            .retire_imported_texture(&self.context, imported)?;
         Ok(())
     }
 
