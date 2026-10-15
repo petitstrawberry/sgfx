@@ -55,6 +55,13 @@ pub(crate) enum Context {
 }
 
 impl Context {
+    #[cfg(feature = "backend-abi")]
+    pub(crate) fn is_idle(&self) -> HandleResult<bool> {
+        match self {
+            Self::Virgl(context) => context.is_idle(),
+        }
+    }
+
     pub(crate) fn cleanup_failed(&self) -> bool {
         match self {
             Self::Virgl(context) => context.cleanup_failed(),

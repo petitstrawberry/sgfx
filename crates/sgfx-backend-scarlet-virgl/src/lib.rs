@@ -260,7 +260,7 @@ impl Context {
     /// Poll all accepted work without waiting, for resource retirement at ABI boundaries.
     #[cfg(feature = "backend-abi")]
     pub fn is_idle(&self) -> HandleResult<bool> {
-        self.create_queue()?.backend.is_idle()
+        self.backend.is_idle()
     }
 
     /// Create an empty persistent cache for one logical IR resource table.

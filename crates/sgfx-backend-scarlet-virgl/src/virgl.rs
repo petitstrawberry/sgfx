@@ -160,6 +160,17 @@ fn wait_scheduled(scheduler: &SharedScheduler) -> HandleResult<()> {
         .map_or(Ok(()), |scheduler| scheduler.wait_idle())
 }
 
+#[cfg(feature = "backend-abi")]
+fn poll_scheduled(scheduler: &SharedScheduler, cleanup_failed: &Cell<bool>) -> HandleResult<bool> {
+    if cleanup_failed.get() {
+        return Err(HandleError::SystemError(-1));
+    }
+    scheduler
+        .borrow()
+        .as_ref()
+        .map_or(Ok(true), |scheduler| scheduler.is_idle())
+}
+
 #[derive(Clone, Copy)]
 struct FramebufferOrientation {
     origin_upper_left: bool,
@@ -418,6 +429,14 @@ pub(crate) struct Context {
 }
 
 impl Context {
+    #[cfg(feature = "backend-abi")]
+    pub(crate) fn is_idle(&self) -> HandleResult<bool> {
+        // Poll the existing dispatch state directly. Creating a temporary
+        // rendering queue here allocates/attaches a private VBO, and dropping
+        // that queue must wait for GPU retirement before detaching it.
+        poll_scheduled(&self.scheduler, &self.cleanup_failed)
+    }
+
     pub(crate) fn cleanup_failed(&self) -> bool {
         self.cleanup_failed.get()
     }
@@ -1885,10 +1904,7 @@ impl Queue {
 
     #[cfg(feature = "backend-abi")]
     pub(crate) fn is_idle(&self) -> HandleResult<bool> {
-        self.scheduler
-            .borrow()
-            .as_ref()
-            .map_or(Ok(true), |s| s.is_idle())
+        poll_scheduled(&self.scheduler, &self.cleanup_failed)
     }
 
     fn max_command_size(&self) -> usize {
@@ -5831,6 +5847,20 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "backend-abi")]
+    #[test]
+    fn idle_poll_without_dispatch_state_rejects_uncertain_cleanup() {
+        let scheduler = Rc::new(RefCell::new(None));
+        let cleanup_failed = Cell::new(false);
+        assert!(poll_scheduled(&scheduler, &cleanup_failed).unwrap());
+        cleanup_failed.set(true);
+        assert!(matches!(
+            poll_scheduled(&scheduler, &cleanup_failed),
+            Err(HandleError::SystemError(-1))
+        ));
+        assert!(scheduler.borrow().is_none());
+    }
 
     #[test]
     fn resource_teardown_packets_are_bounded_and_destroy_each_object_once() {
