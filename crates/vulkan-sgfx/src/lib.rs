@@ -4,6 +4,7 @@
 //! a Vulkan-conformant implementation. See `docs/vulkan-sgfx.md` for the supported
 //! contracts, device selection, and explicit limitations.
 #![allow(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(target_os = "scarlet", feature(linkage))]
 
 // The ICD may embed its own std after LTO. Native startup symbols belong to
 // that runtime and must not interpose the application's or backend's std.

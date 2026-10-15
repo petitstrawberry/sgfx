@@ -214,14 +214,32 @@ fn call_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         // Loaded Scarlet Rust DSOs have their own uninitialized std environment.
-        // libc getenv also consults the loader's process environment.
+        // Read the process envp published by scarlet-ld without requiring a
+        // libc getenv export from the application.
         #[cfg(target_os = "scarlet")]
         unsafe {
             unsafe extern "C" {
-                fn getenv(name: *const c_char) -> *const c_char;
+                // extern_weak contains the symbol's ADDRESS. The C data at
+                // that address is itself the char ** environment pointer.
+                #[linkage = "extern_weak"]
+                static environ: *const *const *const c_char;
             }
-            let value = getenv(c"SGFX_VULKAN_CALL_PROFILE".as_ptr());
-            !value.is_null() && CStr::from_ptr(value).to_bytes() == b"1"
+            let address = environ;
+            if address.is_null() {
+                return false;
+            }
+            let mut cursor = *address;
+            if cursor.is_null() {
+                return false;
+            }
+            while !(*cursor).is_null() {
+                let entry = CStr::from_ptr(*cursor).to_bytes();
+                if let Some(value) = entry.strip_prefix(b"SGFX_VULKAN_CALL_PROFILE=") {
+                    return value == b"1";
+                }
+                cursor = cursor.add(1);
+            }
+            false
         }
         #[cfg(not(target_os = "scarlet"))]
         {
