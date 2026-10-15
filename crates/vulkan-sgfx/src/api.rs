@@ -358,6 +358,39 @@ fn record_call_profile(
     profile.period = finished;
 }
 
+// Both synchronous requests and owned void requests use the same panic/lost
+// publication path. A void operation has no result channel, so its errors must
+// become device loss instead of silently preserving stale state.
+fn run_device_operation<T>(
+    runtime: &mut Runtime,
+    op: impl FnOnce(&mut Runtime) -> VkResult<T>,
+    void: bool,
+) -> VkResult<T> {
+    let result = if runtime.device_lost.load(Ordering::Acquire) {
+        runtime.lost = true;
+        Err(vk::Result::ERROR_DEVICE_LOST)
+    } else {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime))).unwrap_or_else(
+            |_| {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
+                }
+                runtime.lost = true;
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            },
+        )
+    };
+    if void && result.is_err() {
+        runtime.lost = true;
+    }
+    runtime.reclaim_idle_resources();
+    if runtime.lost {
+        runtime.device_lost.store(true, Ordering::Release);
+        runtime.in_flight.notify();
+    }
+    result
+}
+
 fn call<T: Send + 'static>(
     driver: &Driver,
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
@@ -373,26 +406,7 @@ fn call<T: Send + 'static>(
             .sender
             .send(Request::Run(Box::new(move |runtime| {
                 let service_start = profile_start.map(|_| std::time::Instant::now());
-                let result = if runtime.device_lost.load(Ordering::Acquire) {
-                    runtime.lost = true;
-                    Err(vk::Result::ERROR_DEVICE_LOST)
-                } else {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime)))
-                        .unwrap_or_else(|_| {
-                            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                                eprintln!(
-                                    "[SGFX Vulkan] device worker panicked; marking device lost"
-                                );
-                            }
-                            runtime.lost = true;
-                            Err(vk::Result::ERROR_DEVICE_LOST)
-                        })
-                };
-                runtime.reclaim_idle_resources();
-                if runtime.lost {
-                    runtime.device_lost.store(true, Ordering::Release);
-                    runtime.in_flight.notify();
-                }
+                let result = run_device_operation(runtime, op, false);
                 let service =
                     profile_start
                         .zip(service_start)
@@ -429,6 +443,46 @@ pub(crate) fn with_device<T: Send + 'static>(
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
 ) -> VkResult<T> {
     call(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
+}
+
+/// Publish fully owned descriptor metadata on the device FIFO without waiting
+/// for a reply. Invalidation belongs to the API invocation, before a subsequent
+/// command recording can bind the newly updated set. Doing it in the worker
+/// would incorrectly invalidate recordings made after this call returns.
+pub(crate) fn update_descriptors_owned(
+    device: vk::Device,
+    sets: &[vk::DescriptorSet],
+    op: impl FnOnce(&mut Runtime) -> VkResult<()> + Send + 'static,
+) -> VkResult<()> {
+    let driver = driver(device.as_raw(), Kind::Device)?;
+    invalidate_recorded_descriptor_sets(&driver.recordings, sets);
+    // The synchronous call profiler intentionally excludes this one-way job:
+    // enqueue-to-completion is not an API round trip or response wake delay.
+    driver
+        .sender
+        .send(Request::Run(Box::new(move |runtime| {
+            // There is no response receiver to notice a worker unwind. Also
+            // publish loss if post-operation reclamation itself panics.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_device_operation(runtime, op, true)
+            }))
+            .is_err()
+            {
+                runtime.lost = true;
+                runtime.device_lost.store(true, Ordering::Release);
+                runtime.in_flight.notify();
+            }
+        })))
+        .map_err(|_| {
+            driver.mark_lost();
+            vk::Result::ERROR_DEVICE_LOST
+        })
+}
+
+pub(crate) fn mark_device_lost(device: vk::Device) {
+    if let Ok(driver) = driver(device.as_raw(), Kind::Device) {
+        driver.mark_lost();
+    }
 }
 
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
@@ -4208,9 +4262,8 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
 
 /// Descriptor indexing is not exposed. Updating a referenced set invalidates
 /// every recording or executable command buffer under Vulkan 1.0 rules.
-pub(crate) fn invalidate_descriptor_sets(rt: &mut Runtime, sets: &[vk::DescriptorSet]) {
-    let recordings = rt
-        .recordings
+fn invalidate_recorded_descriptor_sets(recordings: &Recordings, sets: &[vk::DescriptorSet]) {
+    let recordings = recordings
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .commands
@@ -5395,5 +5448,379 @@ mod fence_notification_tests {
         assert_eq!(thread.join().unwrap(), vk::Result::ERROR_DEVICE_LOST);
         remove_handle(a_device.as_raw());
         remove_handle(b_device.as_raw());
+    }
+}
+
+#[cfg(test)]
+mod owned_descriptor_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Fixture {
+        driver: Arc<Driver>,
+        device: vk::Device,
+        requests: mpsc::Receiver<Request>,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let (sender, requests) = mpsc::channel();
+            let driver = Arc::new(Driver {
+                sender,
+                thread: Mutex::new(None),
+                completion_sender: mpsc::channel().0,
+                completion_thread: Mutex::new(None),
+                queue: AtomicU64::new(0),
+                queue_sender: mpsc::channel().0,
+                queue_thread: Mutex::new(None),
+                timeline_enabled: false,
+                timelines: Default::default(),
+                events: Default::default(),
+                fences: Default::default(),
+                semaphores: Default::default(),
+                recordings: Default::default(),
+                in_flight: Default::default(),
+                pending: Default::default(),
+                lost: Arc::new(AtomicBool::new(false)),
+            });
+            let device = vk::Device::from_raw(add_handle(Kind::Device, &driver));
+            Self {
+                driver,
+                device,
+                requests,
+            }
+        }
+        fn recording(&self, sets: Vec<vk::DescriptorSet>) -> RecordingCell {
+            let mut recording = Recording::new(0);
+            recording.state = RecordingState::Recording;
+            if !sets.is_empty() {
+                recording.push(binding(sets)).unwrap();
+            }
+            let recording = Arc::new(Mutex::new(recording));
+            self.driver
+                .recordings
+                .lock()
+                .unwrap()
+                .commands
+                .insert(next_id(), recording.clone());
+            recording
+        }
+        #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+        fn runtime(&self) -> Runtime {
+            let instance = sgfx::driver::Instance::new().unwrap();
+            Runtime::new(
+                instance.adapters()[0].clone(),
+                self.driver.recordings.clone(),
+                self.driver.in_flight.clone(),
+                self.driver.lost.clone(),
+            )
+            .unwrap()
+        }
+        fn service(&self, runtime: &mut Runtime) {
+            match self.requests.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Request::Run(job) => job(runtime),
+                Request::Stop => panic!("unexpected stop"),
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            remove_handle(self.device.as_raw());
+        }
+    }
+    fn binding(sets: Vec<vk::DescriptorSet>) -> RecordedCommand {
+        RecordedCommand::BindDescriptorSets {
+            point: vk::PipelineBindPoint::GRAPHICS,
+            layout: vk::PipelineLayout::null(),
+            first: 0,
+            sets,
+            dynamic_offsets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn owned_update_returns_without_worker_and_invalidates_only_prior_bindings() {
+        let fixture = Fixture::new();
+        let set = vk::DescriptorSet::from_raw(1);
+        let old = fixture.recording(vec![set]);
+        old.lock().unwrap().state = RecordingState::Executable;
+        let recording = fixture.recording(vec![set]);
+        let new = fixture.recording(Vec::new());
+        let unrelated = fixture.recording(vec![vk::DescriptorSet::from_raw(2)]);
+        let device = fixture.device;
+        let (done, received) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            // No worker is running. A synchronous implementation cannot finish.
+            let image = [vk::DescriptorImageInfo::default().sampler(vk::Sampler::from_raw(7))];
+            let writes = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&image)];
+            unsafe {
+                crate::resources::update_descriptor_sets(
+                    device,
+                    1,
+                    writes.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                );
+            }
+            done.send(()).unwrap();
+        });
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        caller.join().unwrap();
+        assert!(old.lock().unwrap().state == RecordingState::Invalid);
+        assert!(old.lock().unwrap().error.is_some());
+        assert!(recording.lock().unwrap().error.is_some());
+        new.lock().unwrap().push(binding(vec![set])).unwrap();
+        assert!(new.lock().unwrap().error.is_none());
+        assert!(unrelated.lock().unwrap().error.is_none());
+        assert!(matches!(fixture.requests.try_recv(), Ok(Request::Run(_))));
+        assert!(fixture.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn closed_owned_update_channel_and_malformed_void_batch_mark_device_lost() {
+        let mut fixture = Fixture::new();
+        drop(std::mem::replace(&mut fixture.requests, mpsc::channel().1));
+        assert_eq!(
+            update_descriptors_owned(fixture.device, &[], |_| Ok(())),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert!(fixture.driver.lost.load(Ordering::Acquire));
+        let fixture = Fixture::new();
+        unsafe {
+            crate::resources::update_descriptor_sets(
+                fixture.device,
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            );
+        }
+        assert!(fixture.driver.lost.load(Ordering::Acquire));
+        assert!(fixture.requests.try_recv().is_err());
+    }
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    fn descriptors(
+        runtime: &mut Runtime,
+    ) -> (vk::DescriptorPool, [vk::DescriptorSet; 2], vk::Buffer) {
+        use crate::resources::{Buffer, DescriptorPool, DescriptorSet};
+        let pool = vk::DescriptorPool::from_raw(1);
+        let sets = [
+            vk::DescriptorSet::from_raw(2),
+            vk::DescriptorSet::from_raw(3),
+        ];
+        let buffer = vk::Buffer::from_raw(4);
+        let id = runtime
+            .table
+            .define_buffer(ir::BufferDesc::new(1024, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        runtime.resources.buffers.insert(
+            buffer,
+            Buffer {
+                id,
+                size: 1024,
+                usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+                bound: Some((vk::DeviceMemory::from_raw(5), 0)),
+            },
+        );
+        runtime.resources.descriptor_pools.insert(
+            pool,
+            DescriptorPool {
+                max_sets: 2,
+                free_sets: true,
+                capacity: HashMap::from([(vk::DescriptorType::UNIFORM_BUFFER, 2)]),
+                remaining: HashMap::from([(vk::DescriptorType::UNIFORM_BUFFER, 0)]),
+            },
+        );
+        for set in sets {
+            runtime.resources.descriptor_sets.insert(
+                set,
+                DescriptorSet {
+                    pool,
+                    layout: ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+                        0,
+                        ir::ShaderStages::VERTEX,
+                        ir::BindingType::UniformBuffer,
+                    )])
+                    .unwrap(),
+                    types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                    stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                    bindings: HashMap::new(),
+                    cached_group: None,
+                    invalid: false,
+                },
+            );
+        }
+        (pool, sets, buffer)
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU to construct the actual Runtime"]
+    fn owned_update_fifo_preserves_copied_input_later_resolution_free_and_pool_destroy() {
+        let fixture = Fixture::new();
+        let mut runtime = fixture.runtime();
+        let (pool, sets, buffer) = descriptors(&mut runtime);
+        let after = fixture.recording(Vec::new());
+        let mut info = [vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(256)
+            .range(16)];
+        {
+            let writes = [vk::WriteDescriptorSet::default()
+                .dst_set(sets[0])
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&info)];
+            unsafe {
+                crate::resources::update_descriptor_sets(
+                    fixture.device,
+                    1,
+                    writes.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                );
+            }
+        }
+        // Application input need only live through vkUpdateDescriptorSets.
+        info[0].offset = 512;
+        assert_eq!(info[0].offset, 512);
+        let copies = [vk::CopyDescriptorSet::default()
+            .src_set(sets[0])
+            .src_binding(0)
+            .dst_set(sets[1])
+            .dst_binding(0)
+            .descriptor_count(1)];
+        unsafe {
+            crate::resources::update_descriptor_sets(
+                fixture.device,
+                0,
+                std::ptr::null(),
+                1,
+                copies.as_ptr(),
+            );
+        }
+        after.lock().unwrap().push(binding(vec![sets[1]])).unwrap();
+        let device = fixture.device;
+        let resolved = std::thread::spawn(move || {
+            with_device(device, move |r| {
+                // Descriptor resolution uses the same worker/FIFO as queue submit.
+                let group = r.resources.descriptor_group(&r.table, sets[1], &[])?;
+                let group = r
+                    .table
+                    .bind_group(r.table.bind_group_ref(group).unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    group.entries()[0].resource(),
+                    ir::BindingResource::Buffer {
+                        offset: 256,
+                        size: 16,
+                        ..
+                    }
+                ));
+                Ok(())
+            })
+        });
+        fixture.service(&mut runtime); // write
+        fixture.service(&mut runtime); // copy, seeing preceding write
+        fixture.service(&mut runtime); // later descriptor resolution
+        resolved.join().unwrap().unwrap();
+        assert!(after.lock().unwrap().error.is_none());
+
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(sets[0])
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&info)];
+        unsafe {
+            crate::resources::update_descriptor_sets(
+                fixture.device,
+                1,
+                writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+        let free: vk::PFN_vkFreeDescriptorSets = unsafe {
+            std::mem::transmute(crate::resources::lookup(c"vkFreeDescriptorSets").unwrap())
+        };
+        let freed = std::thread::spawn(move || unsafe { free(device, pool, 1, sets.as_ptr()) });
+        fixture.service(&mut runtime); // update before free
+        fixture.service(&mut runtime);
+        assert_eq!(freed.join().unwrap(), vk::Result::SUCCESS);
+        assert!(!runtime.resources.descriptor_sets.contains_key(&sets[0]));
+        assert!(runtime.resources.descriptor_sets.contains_key(&sets[1]));
+
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(sets[1])
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&info)];
+        unsafe {
+            crate::resources::update_descriptor_sets(
+                fixture.device,
+                1,
+                writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+        let destroy: vk::PFN_vkDestroyDescriptorPool = unsafe {
+            std::mem::transmute(crate::resources::lookup(c"vkDestroyDescriptorPool").unwrap())
+        };
+        let destroyed =
+            std::thread::spawn(move || unsafe { destroy(device, pool, std::ptr::null()) });
+        fixture.service(&mut runtime); // update before destroy
+        fixture.service(&mut runtime);
+        destroyed.join().unwrap();
+        assert!(runtime.resources.descriptor_sets.is_empty());
+        assert!(!runtime.resources.descriptor_pools.contains_key(&pool));
+        assert!(!runtime.lost);
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU to construct the actual Runtime"]
+    fn owned_worker_errors_and_panics_publish_loss_and_reject_later_jobs() {
+        for panic in [false, true] {
+            let fixture = Fixture::new();
+            let mut runtime = fixture.runtime();
+            let _ = descriptors(&mut runtime);
+            // A normal synchronous validation error still does not lose device.
+            assert_eq!(
+                run_device_operation(
+                    &mut runtime,
+                    |_| Err::<(), _>(vk::Result::ERROR_UNKNOWN),
+                    false
+                ),
+                Err(vk::Result::ERROR_UNKNOWN)
+            );
+            assert!(!runtime.lost);
+            update_descriptors_owned(fixture.device, &[], move |_| {
+                if panic {
+                    panic!("injected owned metadata panic");
+                }
+                Err(vk::Result::ERROR_UNKNOWN)
+            })
+            .unwrap();
+            fixture.service(&mut runtime);
+            assert!(runtime.lost && fixture.driver.lost.load(Ordering::Acquire));
+            update_descriptors_owned(fixture.device, &[], |_| {
+                panic!("lost device must reject job")
+            })
+            .unwrap();
+            fixture.service(&mut runtime);
+            assert_eq!(
+                run_device_operation(
+                    &mut runtime,
+                    |_| panic!("lost device must reject sync call"),
+                    false
+                ),
+                Err::<(), _>(vk::Result::ERROR_DEVICE_LOST)
+            );
+        }
     }
 }

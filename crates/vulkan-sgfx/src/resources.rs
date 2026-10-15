@@ -1992,13 +1992,12 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
                 )
             })
             .collect::<Vec<_>>();
-        crate::api::with_device(device, move |r| {
-            let modified_sets = owned_writes
-                .iter()
-                .map(|w| w.set)
-                .chain(owned_copies.iter().map(|c| c.2))
-                .collect::<Vec<_>>();
-            crate::api::invalidate_descriptor_sets(r, &modified_sets);
+        let modified_sets = owned_writes
+            .iter()
+            .map(|w| w.set)
+            .chain(owned_copies.iter().map(|c| c.2))
+            .collect::<Vec<_>>();
+        crate::api::update_descriptors_owned(device, &modified_sets, move |r| {
             for write in owned_writes {
                 let valid = write.value.is_some_and(|v| match v {
                     DescriptorBinding::Buffer {
@@ -2145,10 +2144,7 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
                 "[SGFX Vulkan] descriptor update batch failed; marking device lost: writes={write_count} copies={copy_count} result={result:?}"
             );
         }
-        let _ = crate::api::with_device(device, |r| {
-            r.lost = true;
-            Ok(())
-        });
+        crate::api::mark_device_lost(device);
     }
 }
 unsafe extern "system" fn create_compute_pipelines(
