@@ -359,10 +359,20 @@ impl MappedTargetSession {
         handle: Handle,
     ) -> Result<()> {
         let slot = self.resources.texture_ref(texture).map_err(invalid)?.slot() as u32;
-        self.sync()?;
+        self.sync().inspect_err(|error| {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX import] stage=sync_resources slot={slot} handle={} error={error:?}",
+                handle.as_raw()
+            );
+        })?;
         let raw = handle.as_raw();
         core::mem::forget(handle);
         status(unsafe { (self.owner.library.api.import_bgra)(self.owner.raw, slot, raw) })
+            .inspect_err(|error| {
+                #[cfg(feature = "std")]
+                std::eprintln!("[SGFX import] stage=import_bgra slot={slot} transferred_handle={raw} error={error:?}");
+            })
     }
     pub fn import_ycbcr_texture(
         &mut self,

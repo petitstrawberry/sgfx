@@ -348,6 +348,10 @@ impl IrResources {
             || !descriptor.usage().contains(TextureUsage::SAMPLED)
             || descriptor.usage().contains(TextureUsage::PRESENT)
         {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX import] stage=map_logical_texture texture={texture:?} descriptor={descriptor:?}"
+            );
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::TargetUsage,
             ));

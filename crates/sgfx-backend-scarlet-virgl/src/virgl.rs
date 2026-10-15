@@ -539,16 +539,31 @@ impl Context {
         &self,
         handle: Handle,
     ) -> HandleResult<(Texture, u32, u32)> {
-        let raw = RawImage::from_handle(handle)?;
-        let info = raw.query()?;
+        let transferred_handle = handle.as_raw();
+        let raw = RawImage::from_handle(handle).inspect_err(|error| {
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX import] stage=adopt_image context={} transferred_handle={transferred_handle} error={error:?}", self.handle_id());
+        })?;
+        let info = raw.query().inspect_err(|error| {
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX import] stage=query_image context={} transferred_handle={transferred_handle} error={error:?}", self.handle_id());
+        })?;
         if info.format != gpu_raw::GPU_IMAGE_FORMAT_BGRA8_UNORM
             || info.usage & GPU_IMAGE_USAGE_SAMPLED == 0
             || info.width == 0
             || info.height == 0
         {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX import] stage=validate_image context={} transferred_handle={transferred_handle} info={info:?}",
+                self.handle_id()
+            );
             return Err(HandleError::InvalidParameter);
         }
-        let resource_id = resource_id_from_token(self.raw.attach_image(&raw)?)?;
+        let resource_id = resource_id_from_token(self.raw.attach_image(&raw).inspect_err(|error| {
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX import] stage=attach_image context={} transferred_handle={transferred_handle} info={info:?} error={error:?}", self.handle_id());
+        })?)?;
         let texture = Texture {
             raw,
             resource_id,
@@ -776,32 +791,34 @@ impl Context {
             return Err(HandleError::InvalidParameter);
         }
         wait_scheduled(&self.scheduler)?;
-        let mut commands = Vec::new();
-        push_retirement_unbinds(&mut commands);
-        if texture.sampler_view_initialized.get() {
-            push_destroy_object(
-                &mut commands,
-                VIRGL_OBJECT_SAMPLER_VIEW,
-                texture.sampler_view_handle,
-            );
-            if texture.r8_sampler_view_handle != 0 {
+        if texture.sampler_view_initialized.get() || texture.ir_surface_initialized.get() {
+            let mut commands = Vec::new();
+            push_retirement_unbinds(&mut commands);
+            if texture.sampler_view_initialized.get() {
                 push_destroy_object(
                     &mut commands,
                     VIRGL_OBJECT_SAMPLER_VIEW,
-                    texture.r8_sampler_view_handle,
+                    texture.sampler_view_handle,
+                );
+                if texture.r8_sampler_view_handle != 0 {
+                    push_destroy_object(
+                        &mut commands,
+                        VIRGL_OBJECT_SAMPLER_VIEW,
+                        texture.r8_sampler_view_handle,
+                    );
+                }
+            }
+            if texture.ir_surface_initialized.get() {
+                push_destroy_object(
+                    &mut commands,
+                    VIRGL_OBJECT_SURFACE,
+                    texture.ir_surface_handle,
                 );
             }
+            // Views and surfaces hold renderer references after resource detach.
+            // Complete their destruction before closing the image capability.
+            self.raw.create_queue()?.submit(&commands)?;
         }
-        if texture.ir_surface_initialized.get() {
-            push_destroy_object(
-                &mut commands,
-                VIRGL_OBJECT_SURFACE,
-                texture.ir_surface_handle,
-            );
-        }
-        // Views and surfaces hold renderer references even after resource detach.
-        // Synchronous completion makes it safe to detach and close the owned FD.
-        self.raw.create_queue()?.submit(&commands)?;
         texture.sampler_view_initialized.set(false);
         texture.ir_surface_initialized.set(false);
         self.raw.detach_image(&texture.raw)
@@ -1007,6 +1024,18 @@ impl Context {
         if mapped.resource_id != image.resource_id {
             return Err(HandleError::InvalidParameter);
         }
+        // map_ir_texture owns a distinct IR sampler view. Closing the original
+        // Texture destroys only its legacy view, so retire this view while its
+        // mapping and image are still alive. Otherwise each imported frame
+        // leaves a renderer reference to the full GPU image until context exit.
+        if let Some(commands) = mapped_texture_retirement_commands(mapped)? {
+            wait_scheduled(&self.scheduler)?;
+            self.raw.create_queue()?.submit(&commands)?;
+        }
+        // The surface is borrowed from Texture, unlike the IR sampler view.
+        image
+            .ir_surface_initialized
+            .set(mapped.surface_initialized.get());
         *slot = None;
         if let Some(spec) = resources.texture_specs.get_mut(texture.slot) {
             *spec = None;
@@ -1356,6 +1385,23 @@ struct MappedIrTexture {
     sampler_view_initialized: Cell<bool>,
     surface_handle: u32,
     surface_initialized: Cell<bool>,
+}
+
+fn mapped_texture_retirement_commands(mapped: &MappedIrTexture) -> HandleResult<Option<Vec<u8>>> {
+    if !mapped.sampler_view_initialized.get() {
+        return Ok(None);
+    }
+    let mut commands = Vec::new();
+    commands
+        .try_reserve_exact(512)
+        .map_err(|_| HandleError::OutOfResources)?;
+    push_retirement_unbinds(&mut commands);
+    push_destroy_object(
+        &mut commands,
+        VIRGL_OBJECT_SAMPLER_VIEW,
+        mapped.sampler_view_handle,
+    );
+    Ok(Some(commands))
 }
 
 struct IrPassTarget {
@@ -5537,6 +5583,51 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_import_retirement_destroys_the_owned_ir_view_and_preserves_borrowed_surface() {
+        let mapped = MappedIrTexture {
+            resource_id: 77,
+            width: 2196,
+            height: 1282,
+            sampler_view_handle: 123,
+            sampler_view_initialized: Cell::new(false),
+            surface_handle: 124,
+            surface_initialized: Cell::new(true),
+        };
+        assert!(
+            mapped_texture_retirement_commands(&mapped)
+                .unwrap()
+                .is_none()
+        );
+        mapped.sampler_view_initialized.set(true);
+        let commands = mapped_texture_retirement_commands(&mapped)
+            .unwrap()
+            .unwrap();
+        let words = dwords(&commands);
+        let mut offset = 0;
+        let mut unbound_stages = Vec::new();
+        let mut destroyed = Vec::new();
+        while offset < words.len() {
+            let header = words[offset];
+            let payload = &words[offset + 1..offset + 1 + (header >> 16) as usize];
+            if header & 255 == VIRGL_CCMD_SET_SAMPLER_VIEWS {
+                assert!(destroyed.is_empty());
+                assert!(payload[2..].iter().all(|word| *word == 0));
+                unbound_stages.push(payload[0]);
+            } else if header & 255 == VIRGL_CCMD_DESTROY_OBJECT {
+                assert_eq!(unbound_stages, [PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT]);
+                destroyed.push(((header >> 8) & 255, payload[0]));
+            }
+            offset += 1 + (header >> 16) as usize;
+        }
+        assert_eq!(offset, words.len());
+        assert_eq!(destroyed, [(VIRGL_OBJECT_SAMPLER_VIEW, 123)]);
+        // Successful queue completion and mapping removal are performed by the
+        // caller; preparing a retirement must not lose ownership on failure.
+        assert!(mapped.sampler_view_initialized.get());
+        assert!(mapped.surface_initialized.get());
+    }
 
     #[test]
     fn retirement_unbinds_renderer_resource_references_before_destroying_views() {

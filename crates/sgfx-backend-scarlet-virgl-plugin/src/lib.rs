@@ -350,8 +350,13 @@ unsafe extern "C" fn import_bgra(p: Object, slot: u32, raw: i32) -> i32 {
         let handle = unsafe { virgl::Handle::from_raw(raw) }.map_err(handle_error)?;
         let s = unsafe { object::<Session>(p) }?;
         let id = s.table.abi_texture(slot).map_err(|_| abi::INVALID)?.id();
+        let descriptor = s
+            .table
+            .texture(s.table.texture_ref(id).map_err(|_| abi::INVALID)?)
+            .map_err(|_| abi::INVALID)?;
         s.inner
             .import_shared_bgra_texture(id, handle)
+            .inspect_err(|error| std::eprintln!("[SGFX import] stage=native_session slot={slot} transferred_handle={raw} source={} revision={} descriptor={descriptor:?} error={error:?}", s.source, s.revision))
             .map_err(error)
     })())
 }
