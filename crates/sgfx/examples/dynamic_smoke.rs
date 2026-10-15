@@ -27,6 +27,89 @@ fn console(args: std::fmt::Arguments<'_>) {
 macro_rules! println {
     ($($arg:tt)*) => { crate::console(format_args!("{}\n", format_args!($($arg)*))) };
 }
+#[cfg(any(target_os = "scarlet", test))]
+mod vertex_copy_scene {
+    use sgfx::ir::*;
+
+    pub const SIDE: u32 = 64;
+    pub const BANDS: u32 = 4;
+    pub const PREFIX: u64 = 96;
+    pub const STRIDE: u64 = 12;
+    pub const VERTICES: u32 = BANDS * 6;
+    #[cfg(target_os = "scarlet")]
+    pub const UPDATES: u32 = 10;
+
+    pub fn define(table: &ResourceTable) -> (BufferId, RenderPipelineId) {
+        let vertices = table
+            .define_buffer(
+                BufferDesc::new(
+                    PREFIX + u64::from(VERTICES) * STRIDE,
+                    BufferUsage::VERTEX | BufferUsage::COPY_DST,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let pipeline = table
+            .define_render_pipeline(
+                RenderPipelineDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    PrimitiveTopology::TriangleList,
+                    VertexBufferLayout::new(
+                        STRIDE as u32,
+                        vec![
+                            VertexAttribute::new(0, VertexFormat::Float32x2, 0),
+                            VertexAttribute::new(1, VertexFormat::Unorm8x4, 8),
+                        ],
+                    )
+                    .unwrap(),
+                    FragmentProgram::VertexColor,
+                    BlendState::REPLACE,
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        (vertices, pipeline)
+    }
+
+    pub fn record_passes<'r, 'data>(
+        encoder: &mut CommandEncoder<'r, 'data>,
+        table: &'r ResourceTable,
+        target: TextureId,
+        vertices: BufferId,
+        pipeline: RenderPipelineId,
+    ) {
+        for first_vertex in [0, VERTICES / 2] {
+            let desc = RenderPassDesc::new(
+                table,
+                table.texture_ref(target).unwrap(),
+                PixelRect::new(0, 0, SIDE, SIDE).unwrap(),
+                if first_vertex == 0 {
+                    LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 0.0).unwrap())
+                } else {
+                    LoadOp::Load
+                },
+                StoreOp::Store,
+            )
+            .unwrap();
+            let mut pass = encoder.begin_render_pass(desc).unwrap();
+            pass.set_pipeline(table.render_pipeline_ref(pipeline).unwrap())
+                .unwrap();
+            pass.set_vertex_buffer(table.buffer_ref(vertices).unwrap(), PREFIX)
+                .unwrap();
+            pass.set_uniforms(DrawUniforms::new(
+                Transform::identity(),
+                Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
+            ))
+            .unwrap();
+            pass.draw(VERTICES / 2, first_vertex).unwrap();
+            pass.end().unwrap();
+        }
+    }
+}
+
 #[cfg(target_os = "scarlet")]
 mod native {
     use sgfx::{
@@ -118,44 +201,9 @@ mod native {
         target: TextureId,
         mode: &str,
     ) {
-        const SIDE: u32 = 64;
-        const BANDS: u32 = 4;
-        const PREFIX: u64 = 64;
-        const STRIDE: u64 = 12;
-        const VERTICES: u32 = BANDS * 6;
-        const UPDATES: u32 = 10;
+        use super::vertex_copy_scene::{BANDS, PREFIX, SIDE, STRIDE, UPDATES, VERTICES};
         assert!(session.executor().supports_async_submission());
-        let vertices = table
-            .define_buffer(
-                BufferDesc::new(
-                    PREFIX + u64::from(VERTICES) * STRIDE,
-                    BufferUsage::VERTEX | BufferUsage::COPY_DST,
-                )
-                .unwrap(),
-            )
-            .unwrap()
-            .id();
-        let pipeline = table
-            .define_render_pipeline(
-                RenderPipelineDesc::new(
-                    TextureFormat::Bgra8Unorm,
-                    PrimitiveTopology::TriangleList,
-                    VertexBufferLayout::new(
-                        STRIDE as u32,
-                        vec![
-                            VertexAttribute::new(0, VertexFormat::Float32x2, 0),
-                            VertexAttribute::new(1, VertexFormat::Unorm8x4, 8),
-                        ],
-                    )
-                    .unwrap(),
-                    FragmentProgram::VertexColor,
-                    BlendState::REPLACE,
-                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
-                )
-                .unwrap(),
-            )
-            .unwrap()
-            .id();
+        let (vertices, pipeline) = super::vertex_copy_scene::define(table);
         let palette = |update: u32, band: u32| -> [u8; 4] {
             [
                 (17 + update * 29 + band * 47) as u8,
@@ -198,32 +246,13 @@ mod native {
             encoder
                 .write_buffer(table.buffer_ref(vertices).unwrap(), PREFIX, &data)
                 .unwrap();
-            for first_vertex in [0, VERTICES / 2] {
-                let desc = RenderPassDesc::new(
-                    table,
-                    table.texture_ref(target).unwrap(),
-                    PixelRect::new(0, 0, SIDE, SIDE).unwrap(),
-                    if first_vertex == 0 {
-                        LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 0.0).unwrap())
-                    } else {
-                        LoadOp::Load
-                    },
-                    StoreOp::Store,
-                )
-                .unwrap();
-                let mut pass = encoder.begin_render_pass(desc).unwrap();
-                pass.set_pipeline(table.render_pipeline_ref(pipeline).unwrap())
-                    .unwrap();
-                pass.set_vertex_buffer(table.buffer_ref(vertices).unwrap(), PREFIX)
-                    .unwrap();
-                pass.set_uniforms(DrawUniforms::new(
-                    Transform::identity(),
-                    Color::rgba(1.0, 1.0, 1.0, 1.0).unwrap(),
-                ))
-                .unwrap();
-                pass.draw(VERTICES / 2, first_vertex).unwrap();
-                pass.end().unwrap();
-            }
+            super::vertex_copy_scene::record_passes(
+                &mut encoder,
+                table,
+                target,
+                vertices,
+                pipeline,
+            );
             // Both passes share one tracked logical submission. The backend
             // may split them into native packets; ten changing generations
             // reuse its three upload arenas without accepting stale A/B data.
@@ -646,4 +675,39 @@ fn main() {
     }
     #[cfg(not(target_os = "scarlet"))]
     eprintln!("This fixture executes Scarlet GPU syscalls; run it in the isolated guest.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vertex_copy_scene;
+    use sgfx::ir::*;
+
+    #[test]
+    fn copy_scene_passes_real_ir_validation_with_nonzero_buffer_offsets() {
+        let table = ResourceTable::new();
+        let target = table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    Extent2D::new(vertex_copy_scene::SIDE, vertex_copy_scene::SIDE).unwrap(),
+                    TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let (vertices, pipeline) = vertex_copy_scene::define(&table);
+        let data =
+            vec![0; (u64::from(vertex_copy_scene::VERTICES) * vertex_copy_scene::STRIDE) as usize];
+        let mut encoder = CommandEncoder::new(&table);
+        encoder
+            .write_buffer(
+                table.buffer_ref(vertices).unwrap(),
+                vertex_copy_scene::PREFIX,
+                &data,
+            )
+            .unwrap();
+        vertex_copy_scene::record_passes(&mut encoder, &table, target, vertices, pipeline);
+        encoder.finish().unwrap();
+    }
 }
