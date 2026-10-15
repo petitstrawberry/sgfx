@@ -255,7 +255,7 @@ mod native {
             );
             // Both passes share one tracked logical submission. The backend
             // may split them into native packets; ten changing generations
-            // reuse its three upload arenas without accepting stale A/B data.
+            // reuse its four upload arenas without accepting stale A/B data.
             let commands = encoder.finish().unwrap();
             let receipt = retry_submit(session, &commands);
             drop(commands);
