@@ -1440,151 +1440,169 @@ unsafe extern "system" fn create_graphics_pipelines(
         // Shader-module normalization already compensates for Vulkan's positive
         // viewport height. Framebuffer winding therefore maps without reversal.
         match with_device(device, move |runtime| {
-            crate::api::bootstrap::validate_cache(&runtime.resources, cache)?;
-            let pass = runtime
-                .resources
-                .render_passes
-                .get(&render_pass)
-                .ok_or(INVALID)?;
-            let pass = pass.clone();
-            let subpass = pass.subpasses.get(subpass_index).ok_or(INVALID)?;
-            if subpass.colors.len() != state.colors.len() {
-                return Err(INVALID);
-            }
-            let targets = subpass
-                .colors
-                .iter()
-                .zip(&state.colors)
-                .map(|(&i, &(blend, mask))| {
-                    ir::ColorTargetState::new(
-                        texture_format(pass.attachments[i].format).ok_or(UNSUPPORTED)?,
-                        blend,
-                        mask,
+            let checkpoints = crate::resources::shader_checkpoints(
+                &runtime.resources,
+                &[vertex_module, fragment_module],
+            );
+            let result = (|| {
+                crate::api::bootstrap::validate_cache(&runtime.resources, cache)?;
+                let pass = runtime
+                    .resources
+                    .render_passes
+                    .get(&render_pass)
+                    .ok_or(INVALID)?;
+                let pass = pass.clone();
+                let subpass = pass.subpasses.get(subpass_index).ok_or(INVALID)?;
+                if subpass.colors.len() != state.colors.len() {
+                    return Err(INVALID);
+                }
+                let targets = subpass
+                    .colors
+                    .iter()
+                    .zip(&state.colors)
+                    .map(|(&i, &(blend, mask))| {
+                        ir::ColorTargetState::new(
+                            texture_format(pass.attachments[i].format).ok_or(UNSUPPORTED)?,
+                            blend,
+                            mask,
+                        )
+                        .map_err(|_| INVALID)
+                    })
+                    .collect::<Result<Vec<_>, vk::Result>>()?;
+                let target_format = targets[0].format();
+                let input_depths = pass.input_depths(subpass_index);
+                let binding_maps = runtime
+                    .resources
+                    .pipeline_binding_maps
+                    .get(&layout)
+                    .ok_or(INVALID)?
+                    .clone();
+                let layout = runtime
+                    .resources
+                    .pipeline_layouts
+                    .get(&layout)
+                    .ok_or(INVALID)?
+                    .clone();
+                let vertex_id = runtime
+                    .resources
+                    .shaders
+                    .get_mut(&vertex_module)
+                    .ok_or(INVALID)?
+                    .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)
+                    .map_err(|error| {
+                        eprintln!("[SGFX Vulkan] vertex specialization: {error:?}");
+                        error
+                    })?;
+                let input_bindings = runtime
+                    .resources
+                    .shaders
+                    .get(&fragment_module)
+                    .ok_or(INVALID)?
+                    .input_bindings()?;
+                let fragment_id = runtime
+                    .resources
+                    .shaders
+                    .get_mut(&fragment_module)
+                    .ok_or(INVALID)?
+                    .variant_for_layout(
+                        &runtime.table,
+                        &fragment_values,
+                        &input_depths,
+                        &binding_maps,
                     )
-                    .map_err(|_| INVALID)
-                })
-                .collect::<Result<Vec<_>, vk::Result>>()?;
-            let target_format = targets[0].format();
-            let input_depths = pass.input_depths(subpass_index);
-            let binding_maps = runtime
-                .resources
-                .pipeline_binding_maps
-                .get(&layout)
-                .ok_or(INVALID)?
-                .clone();
-            let layout = runtime
-                .resources
-                .pipeline_layouts
-                .get(&layout)
-                .ok_or(INVALID)?
-                .clone();
-            let vertex_id = runtime
-                .resources
-                .shaders
-                .get_mut(&vertex_module)
-                .ok_or(INVALID)?
-                .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)
-                .map_err(|error| {
-                    eprintln!("[SGFX Vulkan] vertex specialization: {error:?}");
-                    error
-                })?;
-            let input_bindings = runtime
-                .resources
-                .shaders
-                .get(&fragment_module)
-                .ok_or(INVALID)?
-                .input_bindings()?;
-            let fragment_id = runtime
-                .resources
-                .shaders
-                .get_mut(&fragment_module)
-                .ok_or(INVALID)?
-                .variant_for_layout(
-                    &runtime.table,
-                    &fragment_values,
-                    &input_depths,
-                    &binding_maps,
+                    .map_err(|error| {
+                        eprintln!("[SGFX Vulkan] fragment specialization: {error:?}");
+                        error
+                    })?;
+                let vertex = ir::ShaderEntryPoint::new(
+                    runtime
+                        .table
+                        .shader_module_ref(vertex_id)
+                        .map_err(|_| INVALID)?,
+                    ir::ShaderStage::Vertex,
+                    vertex_name,
                 )
-                .map_err(|error| {
-                    eprintln!("[SGFX Vulkan] fragment specialization: {error:?}");
-                    error
-                })?;
-            let vertex = ir::ShaderEntryPoint::new(
-                runtime
+                .map_err(|_| INVALID)?;
+                let fragment = ir::ShaderEntryPoint::new(
+                    runtime
+                        .table
+                        .shader_module_ref(fragment_id)
+                        .map_err(|_| INVALID)?,
+                    ir::ShaderStage::Fragment,
+                    fragment_name,
+                )
+                .map_err(|_| INVALID)?;
+                let mut desc = ir::ProgrammableRenderPipelineDesc::new(
+                    vertex.clone(),
+                    fragment.clone(),
+                    crate::spirv::specialize_layout(
+                        &runtime.table,
+                        &layout,
+                        &[&vertex, &fragment],
+                    )?,
+                    target_format,
+                    None,
+                    state.topology,
+                    targets[0].blend(),
+                    state.raster,
+                )
+                .map_err(|_| INVALID)?
+                .with_vertex_buffers(state.vertex)
+                .map_err(|_| INVALID)?
+                .with_color_targets(targets)
+                .map_err(|_| INVALID)?;
+                if subpass.read_only_depth && state.depth.is_some_and(|d| d.write_enabled()) {
+                    return Err(INVALID);
+                }
+                if subpass.depth.is_some() {
+                    desc = desc
+                        .with_depth_state(state.depth.ok_or(UNSUPPORTED)?)
+                        .map_err(|_| INVALID)?;
+                } else if state.depth.is_some_and(|depth| {
+                    depth.write_enabled() || depth.compare() != ir::CompareFunction::Always
+                }) {
+                    return Err(UNSUPPORTED);
+                }
+                let id = runtime
                     .table
-                    .shader_module_ref(vertex_id)
-                    .map_err(|_| INVALID)?,
-                ir::ShaderStage::Vertex,
-                vertex_name,
-            )
-            .map_err(|_| INVALID)?;
-            let fragment = ir::ShaderEntryPoint::new(
+                    .define_programmable_render_pipeline(desc)
+                    .map_err(crate::resources::failure)?
+                    .id();
+                if let Err(error) = runtime.cache.validate_programmable_render_pipeline(id) {
+                    let error = crate::resources::backend_failure(error);
+                    crate::resources::retire_ir_pipeline(
+                        runtime,
+                        crate::resources::Pipeline::Graphics(id),
+                    )?;
+                    return Err(error);
+                }
+                let handle = vk::Pipeline::from_raw(next_id());
                 runtime
-                    .table
-                    .shader_module_ref(fragment_id)
-                    .map_err(|_| INVALID)?,
-                ir::ShaderStage::Fragment,
-                fragment_name,
-            )
-            .map_err(|_| INVALID)?;
-            let mut desc = ir::ProgrammableRenderPipelineDesc::new(
-                vertex.clone(),
-                fragment.clone(),
-                crate::spirv::specialize_layout(&runtime.table, &layout, &[&vertex, &fragment])?,
-                target_format,
-                None,
-                state.topology,
-                targets[0].blend(),
-                state.raster,
-            )
-            .map_err(|_| INVALID)?
-            .with_vertex_buffers(state.vertex)
-            .map_err(|_| INVALID)?
-            .with_color_targets(targets)
-            .map_err(|_| INVALID)?;
-            if subpass.read_only_depth && state.depth.is_some_and(|d| d.write_enabled()) {
-                return Err(INVALID);
+                    .resources
+                    .pipelines
+                    .insert(handle, crate::resources::Pipeline::Graphics(id));
+                runtime
+                    .resources
+                    .graphics_subpasses
+                    .insert(handle, (pass, subpass_index));
+                runtime
+                    .resources
+                    .graphics_inputs
+                    .insert(handle, input_bindings);
+                runtime
+                    .resources
+                    .graphics_extents
+                    .insert(handle, state.extent);
+                runtime
+                    .resources
+                    .graphics_state
+                    .insert(handle, state.dynamic);
+                Ok(handle)
+            })();
+            if result.is_err() {
+                crate::resources::rollback_shader_variants(runtime, &checkpoints)?;
             }
-            if subpass.depth.is_some() {
-                desc = desc
-                    .with_depth_state(state.depth.ok_or(UNSUPPORTED)?)
-                    .map_err(|_| INVALID)?;
-            } else if state.depth.is_some_and(|depth| {
-                depth.write_enabled() || depth.compare() != ir::CompareFunction::Always
-            }) {
-                return Err(UNSUPPORTED);
-            }
-            let id = runtime
-                .table
-                .define_programmable_render_pipeline(desc)
-                .map_err(crate::resources::failure)?
-                .id();
-            runtime
-                .cache
-                .validate_programmable_render_pipeline(id)
-                .map_err(crate::resources::backend_failure)?;
-            let handle = vk::Pipeline::from_raw(next_id());
-            runtime
-                .resources
-                .pipelines
-                .insert(handle, crate::resources::Pipeline::Graphics(id));
-            runtime
-                .resources
-                .graphics_subpasses
-                .insert(handle, (pass, subpass_index));
-            runtime
-                .resources
-                .graphics_inputs
-                .insert(handle, input_bindings);
-            runtime
-                .resources
-                .graphics_extents
-                .insert(handle, state.extent);
-            runtime
-                .resources
-                .graphics_state
-                .insert(handle, state.dynamic);
-            Ok(handle)
+            result
         }) {
             Ok(handle) => *output.add(index) = handle,
             Err(error) => {

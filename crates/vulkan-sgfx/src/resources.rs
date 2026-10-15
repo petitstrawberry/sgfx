@@ -59,7 +59,7 @@ pub(crate) struct Memory {
     pub bytes: AlignedBytes,
     pub mapped: bool,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pipeline {
     Compute(ir::ComputePipelineId),
     Graphics(ir::ProgrammableRenderPipelineId),
@@ -207,6 +207,9 @@ pub(crate) struct Resources {
     /// Buffers whose unmapped host allocation has already been staged to SGFX.
     pub uploaded_unmapped_buffers: HashSet<vk::Buffer>,
     pub shaders: HashMap<vk::ShaderModule, Shader>,
+    // Destroying VkShaderModule must not retire modules still referenced by a
+    // live VkPipeline. View-swizzle modules have no VkShaderModule owner.
+    orphaned_shader_modules: HashSet<ir::ShaderModuleId>,
     pub set_layouts: HashMap<vk::DescriptorSetLayout, ir::BindGroupLayoutDesc>,
     pub set_layout_types: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::DescriptorType>>,
     pub set_layout_stages: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::ShaderStageFlags>>,
@@ -277,31 +280,39 @@ impl Resources {
         {
             return Ok(*id);
         }
-        let shader = |entry| swizzle_entry(table, entry, &maps);
-        let mut variant = ir::ProgrammableRenderPipelineDesc::new(
-            shader(desc.vertex())?,
-            shader(desc.fragment())?,
-            desc.layout().clone(),
-            desc.target_format(),
-            None,
-            desc.topology(),
-            desc.blend(),
-            desc.raster(),
-        )
-        .map_err(failure)?
-        .with_vertex_buffers(desc.vertex_buffers().to_vec())
-        .map_err(failure)?
-        .with_color_targets(desc.color_targets().collect())
-        .map_err(failure)?;
-        if let Some(depth) = desc.depth_state() {
-            variant = variant.with_depth_state(depth).map_err(failure)?;
-        }
-        let id = table
-            .define_programmable_render_pipeline(variant)
+        let previous_modules = self.orphaned_shader_modules.clone();
+        let result = (|| {
+            let mut shader =
+                |entry| swizzle_entry(table, entry, &maps, &mut self.orphaned_shader_modules);
+            let mut variant = ir::ProgrammableRenderPipelineDesc::new(
+                shader(desc.vertex())?,
+                shader(desc.fragment())?,
+                desc.layout().clone(),
+                desc.target_format(),
+                None,
+                desc.topology(),
+                desc.blend(),
+                desc.raster(),
+            )
             .map_err(failure)?
-            .id();
-        self.graphics_swizzles.insert((handle, maps), id);
-        Ok(id)
+            .with_vertex_buffers(desc.vertex_buffers().to_vec())
+            .map_err(failure)?
+            .with_color_targets(desc.color_targets().collect())
+            .map_err(failure)?;
+            if let Some(depth) = desc.depth_state() {
+                variant = variant.with_depth_state(depth).map_err(failure)?;
+            }
+            let id = table
+                .define_programmable_render_pipeline(variant)
+                .map_err(failure)?
+                .id();
+            self.graphics_swizzles.insert((handle, maps), id);
+            Ok(id)
+        })();
+        if result.is_err() {
+            self.rollback_swizzle_modules(table, &previous_modules)?;
+        }
+        result
     }
 
     pub(crate) fn compute_pipeline_for_views(
@@ -328,17 +339,48 @@ impl Resources {
         {
             return Ok(*id);
         }
-        let variant = ir::ComputePipelineDesc::new(
-            swizzle_entry(table, desc.shader(), &maps)?,
-            desc.layout().clone(),
-        )
-        .map_err(failure)?;
-        let id = table
-            .define_compute_pipeline(variant)
-            .map_err(failure)?
-            .id();
-        self.compute_swizzles.insert((handle, maps), id);
-        Ok(id)
+        let previous_modules = self.orphaned_shader_modules.clone();
+        let result = (|| {
+            let variant = ir::ComputePipelineDesc::new(
+                swizzle_entry(
+                    table,
+                    desc.shader(),
+                    &maps,
+                    &mut self.orphaned_shader_modules,
+                )?,
+                desc.layout().clone(),
+            )
+            .map_err(failure)?;
+            let id = table
+                .define_compute_pipeline(variant)
+                .map_err(failure)?
+                .id();
+            self.compute_swizzles.insert((handle, maps), id);
+            Ok(id)
+        })();
+        if result.is_err() {
+            self.rollback_swizzle_modules(table, &previous_modules)?;
+        }
+        result
+    }
+
+    fn rollback_swizzle_modules(
+        &mut self,
+        table: &ir::ResourceTable,
+        previous: &HashSet<ir::ShaderModuleId>,
+    ) -> Result<(), vk::Result> {
+        let created = self
+            .orphaned_shader_modules
+            .difference(previous)
+            .copied()
+            .collect::<Vec<_>>();
+        // These descriptors were never published to an executor/materialization
+        // cache: a failed view variant cannot retain just its first shader.
+        for id in created {
+            table.release_shader_module(id).map_err(failure)?;
+            self.orphaned_shader_modules.remove(&id);
+        }
+        Ok(())
     }
 
     fn texture_swizzles(
@@ -402,6 +444,7 @@ impl Resources {
         self.bind_group_cache.clear();
         self.graphics_swizzles.clear();
         self.compute_swizzles.clear();
+        self.orphaned_shader_modules.clear();
         for set in self.descriptor_sets.values_mut() {
             set.cached_group = None;
         }
@@ -646,6 +689,7 @@ fn swizzle_entry(
     table: &ir::ResourceTable,
     entry: &ir::ShaderEntryPoint,
     maps: &crate::spirv::TextureSwizzles,
+    orphaned: &mut HashSet<ir::ShaderModuleId>,
 ) -> Result<ir::ShaderEntryPoint, vk::Result> {
     let original = table
         .shader_module(table.shader_module_ref(entry.module()).map_err(failure)?)
@@ -660,6 +704,7 @@ fn swizzle_entry(
     let module = table
         .define_shader_module(ir::ShaderModuleDesc::spirv(changed).map_err(failure)?)
         .map_err(failure)?;
+    orphaned.insert(module.id());
     ir::ShaderEntryPoint::new(module, entry.stage(), entry.entry_point().into()).map_err(failure)
 }
 
@@ -1363,10 +1408,19 @@ unsafe extern "system" fn destroy_shader_module(
     handle: vk::ShaderModule,
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
-    let _ = crate::api::with_device(device, move |r| {
-        r.resources.shaders.remove(&handle);
-        Ok(())
-    });
+    let _ = crate::api::with_device(device, move |r| retire_vk_shader_module(r, handle));
+}
+fn retire_vk_shader_module(
+    r: &mut crate::runtime::Runtime,
+    handle: vk::ShaderModule,
+) -> Result<(), vk::Result> {
+    if let Some(shader) = r.resources.shaders.remove(&handle) {
+        r.resources
+            .orphaned_shader_modules
+            .extend(shader.variants.into_iter().map(|variant| variant.3));
+        retire_unused_shader_modules(r)?;
+    }
+    Ok(())
 }
 type DescriptorLayoutParts = (
     ir::BindGroupLayoutDesc,
@@ -2196,58 +2250,82 @@ unsafe extern "system" fn create_compute_pipelines(
         }
         let handles = crate::api::with_device(device, move |r| {
             crate::api::bootstrap::validate_cache(&r.resources, cache)?;
-            if r.resources
-                .pipelines
-                .len()
-                .checked_add(requests.len())
-                .is_none_or(|n| n > 256)
-            {
-                return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
+            let checkpoints =
+                shader_variant_checkpoints(&r.resources, requests.iter().map(|request| request.0));
+            let result = (|| {
+                if r.resources
+                    .pipelines
+                    .len()
+                    .checked_add(requests.len())
+                    .is_none_or(|n| n > 256)
+                {
+                    return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
+                }
+                let mut descriptors = Vec::with_capacity(requests.len());
+                for (module, name, layout, values) in requests {
+                    let bindings = r
+                        .resources
+                        .pipeline_binding_maps
+                        .get(&layout)
+                        .cloned()
+                        .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                    let module = r
+                        .resources
+                        .shaders
+                        .get_mut(&module)
+                        .ok_or(vk::Result::ERROR_UNKNOWN)?
+                        .variant_for_layout(&r.table, &values, &[], &bindings)?;
+                    let shader = ir::ShaderEntryPoint::new(
+                        r.table.shader_module_ref(module).map_err(failure)?,
+                        ir::ShaderStage::Compute,
+                        name,
+                    )
+                    .map_err(failure)?;
+                    let layout = r
+                        .resources
+                        .pipeline_layouts
+                        .get(&layout)
+                        .cloned()
+                        .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                    let layout = crate::spirv::specialize_layout(&r.table, &layout, &[&shader])?;
+                    descriptors
+                        .push(ir::ComputePipelineDesc::new(shader, layout).map_err(failure)?);
+                }
+                let mut ids = Vec::with_capacity(descriptors.len());
+                for desc in descriptors {
+                    let created = (|| {
+                        let id = r.table.define_compute_pipeline(desc).map_err(failure)?.id();
+                        if let Err(error) = r.cache.validate_compute_pipeline(id) {
+                            let error = backend_failure(error);
+                            retire_ir_pipeline(r, Pipeline::Compute(id))?;
+                            return Err(error);
+                        }
+                        Ok(id)
+                    })();
+                    match created {
+                        Ok(id) => ids.push(id),
+                        Err(error) => {
+                            // This frontend publishes compute handles only once the
+                            // whole batch succeeds. Retire every unpublished prefix.
+                            for id in ids {
+                                retire_ir_pipeline(r, Pipeline::Compute(id))?;
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                let mut result = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let handle = vk::Pipeline::from_raw(crate::api::next_id());
+                    r.resources.pipelines.insert(handle, Pipeline::Compute(id));
+                    result.push(handle);
+                }
+                Ok(result)
+            })();
+            if result.is_err() {
+                rollback_shader_variants(r, &checkpoints)?;
             }
-            let mut descriptors = Vec::with_capacity(requests.len());
-            for (module, name, layout, values) in requests {
-                let bindings = r
-                    .resources
-                    .pipeline_binding_maps
-                    .get(&layout)
-                    .cloned()
-                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
-                let module = r
-                    .resources
-                    .shaders
-                    .get_mut(&module)
-                    .ok_or(vk::Result::ERROR_UNKNOWN)?
-                    .variant_for_layout(&r.table, &values, &[], &bindings)?;
-                let shader = ir::ShaderEntryPoint::new(
-                    r.table.shader_module_ref(module).map_err(failure)?,
-                    ir::ShaderStage::Compute,
-                    name,
-                )
-                .map_err(failure)?;
-                let layout = r
-                    .resources
-                    .pipeline_layouts
-                    .get(&layout)
-                    .cloned()
-                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
-                let layout = crate::spirv::specialize_layout(&r.table, &layout, &[&shader])?;
-                descriptors.push(ir::ComputePipelineDesc::new(shader, layout).map_err(failure)?);
-            }
-            let mut ids = Vec::with_capacity(descriptors.len());
-            for desc in descriptors {
-                let id = r.table.define_compute_pipeline(desc).map_err(failure)?.id();
-                r.cache
-                    .validate_compute_pipeline(id)
-                    .map_err(backend_failure)?;
-                ids.push(id);
-            }
-            let mut result = Vec::with_capacity(ids.len());
-            for id in ids {
-                let handle = vk::Pipeline::from_raw(crate::api::next_id());
-                r.resources.pipelines.insert(handle, Pipeline::Compute(id));
-                result.push(handle);
-            }
-            Ok(result)
+            result
         })?;
         ptr::copy_nonoverlapping(handles.as_ptr(), out, handles.len());
         Ok(())
@@ -2258,20 +2336,205 @@ unsafe extern "system" fn destroy_pipeline(
     handle: vk::Pipeline,
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
-    let _ = crate::api::with_device(device, move |r| {
-        r.resources.pipelines.remove(&handle);
+    let _ = crate::api::with_device(device, move |r| retire_vk_pipeline(r, handle));
+}
+
+fn retire_vk_pipeline(
+    r: &mut crate::runtime::Runtime,
+    handle: vk::Pipeline,
+) -> Result<(), vk::Result> {
+    let mut pipelines = r
+        .resources
+        .pipelines
+        .get(&handle)
+        .copied()
+        .into_iter()
+        .collect::<Vec<_>>();
+    pipelines.extend(
         r.resources
             .graphics_swizzles
-            .retain(|(pipeline, _), _| *pipeline != handle);
+            .iter()
+            .filter_map(|((owner, _), id)| (*owner == handle).then_some(Pipeline::Graphics(*id))),
+    );
+    pipelines.extend(
         r.resources
             .compute_swizzles
-            .retain(|(pipeline, _), _| *pipeline != handle);
-        r.resources.graphics_extents.remove(&handle);
-        r.resources.graphics_state.remove(&handle);
-        r.resources.graphics_subpasses.remove(&handle);
-        r.resources.graphics_inputs.remove(&handle);
+            .iter()
+            .filter_map(|((owner, _), id)| (*owner == handle).then_some(Pipeline::Compute(*id))),
+    );
+    if !pipelines.is_empty() {
+        for pipeline in pipelines {
+            retire_ir_pipeline(r, pipeline)?;
+        }
+    }
+    r.resources.pipelines.remove(&handle);
+    r.resources
+        .graphics_swizzles
+        .retain(|(pipeline, _), _| *pipeline != handle);
+    r.resources
+        .compute_swizzles
+        .retain(|(pipeline, _), _| *pipeline != handle);
+    r.resources.graphics_extents.remove(&handle);
+    r.resources.graphics_state.remove(&handle);
+    r.resources.graphics_subpasses.remove(&handle);
+    r.resources.graphics_inputs.remove(&handle);
+    retire_unused_shader_modules(r)
+}
+
+/// Retire one logical pipeline only after its backend materialization. Used for
+/// normal destruction and for unpublished pipelines whose validation failed.
+pub(crate) fn retire_ir_pipeline(
+    r: &mut crate::runtime::Runtime,
+    pipeline: Pipeline,
+) -> Result<(), vk::Result> {
+    // Metadata synchronization also imports previous retirement tombstones.
+    // Its nonblocking ABI refuses them while accepted GPU work is pending.
+    // Do not turn an ordinary failed pipeline creation into device loss merely
+    // because unrelated accepted work is still running. Never wait on pending
+    // device requests from this worker itself.
+    r.in_flight.wait();
+    let result = (|| match pipeline {
+        Pipeline::Graphics(id) => {
+            r.cache
+                .release_programmable_render_pipeline(id)
+                .map_err(backend_failure)?;
+            r.table
+                .release_programmable_render_pipeline(id)
+                .map_err(failure)
+        }
+        Pipeline::Compute(id) => {
+            r.cache
+                .release_compute_pipeline(id)
+                .map_err(backend_failure)?;
+            r.table.release_compute_pipeline(id).map_err(failure)
+        }
+    })();
+    if result.is_err() {
+        r.lost = true;
+    }
+    result
+}
+
+fn shader_variant_checkpoints(
+    resources: &Resources,
+    modules: impl IntoIterator<Item = vk::ShaderModule>,
+) -> HashMap<vk::ShaderModule, usize> {
+    modules
+        .into_iter()
+        .filter_map(|module| {
+            resources
+                .shaders
+                .get(&module)
+                .map(|shader| (module, shader.variants.len()))
+        })
+        .collect()
+}
+
+pub(crate) fn rollback_shader_variants(
+    r: &mut crate::runtime::Runtime,
+    checkpoints: &HashMap<vk::ShaderModule, usize>,
+) -> Result<(), vk::Result> {
+    // An unsuccessful attempt must not pin new IR modules in its live Vulkan
+    // shader's specialization cache. Existing/shared variants precede the mark.
+    for (module, mark) in checkpoints {
+        if let Some(shader) = r.resources.shaders.get_mut(module) {
+            r.resources
+                .orphaned_shader_modules
+                .extend(shader.variants.drain(*mark..).map(|variant| variant.3));
+        }
+    }
+    if r.lost {
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    retire_unused_shader_modules(r)
+}
+
+pub(crate) fn shader_checkpoints(
+    resources: &Resources,
+    modules: &[vk::ShaderModule],
+) -> HashMap<vk::ShaderModule, usize> {
+    shader_variant_checkpoints(resources, modules.iter().copied())
+}
+
+fn retire_unused_shader_modules(r: &mut crate::runtime::Runtime) -> Result<(), vk::Result> {
+    let result = (|| {
+        let mut retained = HashSet::new();
+        for pipeline in r
+            .resources
+            .pipelines
+            .values()
+            .copied()
+            .chain(
+                r.resources
+                    .graphics_swizzles
+                    .values()
+                    .copied()
+                    .map(Pipeline::Graphics),
+            )
+            .chain(
+                r.resources
+                    .compute_swizzles
+                    .values()
+                    .copied()
+                    .map(Pipeline::Compute),
+            )
+        {
+            match pipeline {
+                Pipeline::Graphics(id) => {
+                    let desc = r
+                        .table
+                        .programmable_render_pipeline_shared(
+                            r.table
+                                .programmable_render_pipeline_ref(id)
+                                .map_err(failure)?,
+                        )
+                        .map_err(failure)?;
+                    retained.insert(desc.vertex().module());
+                    retained.insert(desc.fragment().module());
+                }
+                Pipeline::Compute(id) => {
+                    let desc = r
+                        .table
+                        .compute_pipeline(r.table.compute_pipeline_ref(id).map_err(failure)?)
+                        .map_err(failure)?;
+                    retained.insert(desc.shader().module());
+                }
+            }
+        }
+        // A Vulkan shader module owns source, not every specialization ever
+        // requested. Drop cache entries once no live pipeline uses them; a later
+        // pipeline can regenerate them from the original words.
+        for shader in r.resources.shaders.values_mut() {
+            shader.variants.retain(|variant| {
+                if retained.contains(&variant.3) {
+                    true
+                } else {
+                    r.resources.orphaned_shader_modules.insert(variant.3);
+                    false
+                }
+            });
+        }
+        let retired = r
+            .resources
+            .orphaned_shader_modules
+            .iter()
+            .copied()
+            .filter(|id| !retained.contains(id))
+            .collect::<Vec<_>>();
+        if !retired.is_empty() {
+            r.in_flight.wait();
+        }
+        for id in retired {
+            r.cache.release_shader_module(id).map_err(backend_failure)?;
+            r.table.release_shader_module(id).map_err(failure)?;
+            r.resources.orphaned_shader_modules.remove(&id);
+        }
         Ok(())
-    });
+    })();
+    if result.is_err() {
+        r.lost = true;
+    }
+    result
 }
 
 fn sampler_descriptor(
@@ -2449,6 +2712,153 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    fn lifecycle_runtime() -> crate::runtime::Runtime {
+        let instance = sgfx::driver::Instance::new().unwrap();
+        crate::runtime::Runtime::new(
+            instance.adapters()[0].clone(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    fn compute_module(table: &ir::ResourceTable) -> ir::ShaderModuleId {
+        table
+            .define_shader_module(
+                ir::ShaderModuleDesc::wgsl("@compute @workgroup_size(1) fn main() {}".to_owned())
+                    .unwrap(),
+            )
+            .unwrap()
+            .id()
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU to construct the actual Runtime"]
+    fn long_lived_shader_evicts_unused_variants_across_more_than_256_pipelines() {
+        let mut runtime = lifecycle_runtime();
+        let module = vk::ShaderModule::from_raw(1);
+        runtime.resources.shaders.insert(
+            module,
+            Shader {
+                words: Vec::new(),
+                variants: Vec::new(),
+            },
+        );
+        for iteration in 0u32..1024 {
+            let id = compute_module(&runtime.table);
+            runtime
+                .resources
+                .shaders
+                .get_mut(&module)
+                .unwrap()
+                .variants
+                .push((
+                    vec![(0, iteration.to_le_bytes().to_vec())],
+                    Vec::new(),
+                    Vec::new(),
+                    id,
+                ));
+            let shader = ir::ShaderEntryPoint::new(
+                runtime.table.shader_module_ref(id).unwrap(),
+                ir::ShaderStage::Compute,
+                "main".to_owned(),
+            )
+            .unwrap();
+            let pipeline = runtime
+                .table
+                .define_compute_pipeline(
+                    ir::ComputePipelineDesc::new(
+                        shader,
+                        ir::PipelineLayoutDesc::new(Vec::new()).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id();
+            let handle = vk::Pipeline::from_raw(2);
+            runtime
+                .resources
+                .pipelines
+                .insert(handle, Pipeline::Compute(pipeline));
+            retire_vk_pipeline(&mut runtime, handle).unwrap();
+            assert!(
+                runtime.table.shader_module_ref(id).is_err(),
+                "iteration {iteration}"
+            );
+            assert!(runtime.table.compute_pipeline_ref(pipeline).is_err());
+            assert!(runtime.resources.shaders[&module].variants.is_empty());
+            assert!(runtime.resources.orphaned_shader_modules.is_empty());
+            assert!(!runtime.lost);
+        }
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU to construct the actual Runtime"]
+    fn failed_shader_attempt_evicts_new_variant_but_preserves_shared_live_pipeline() {
+        let mut runtime = lifecycle_runtime();
+        let module = vk::ShaderModule::from_raw(1);
+        let existing = compute_module(&runtime.table);
+        runtime.resources.shaders.insert(
+            module,
+            Shader {
+                words: Vec::new(),
+                variants: vec![(Vec::new(), Vec::new(), Vec::new(), existing)],
+            },
+        );
+        let shader = ir::ShaderEntryPoint::new(
+            runtime.table.shader_module_ref(existing).unwrap(),
+            ir::ShaderStage::Compute,
+            "main".to_owned(),
+        )
+        .unwrap();
+        let pipeline = runtime
+            .table
+            .define_compute_pipeline(
+                ir::ComputePipelineDesc::new(
+                    shader,
+                    ir::PipelineLayoutDesc::new(Vec::new()).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let handle = vk::Pipeline::from_raw(2);
+        runtime
+            .resources
+            .pipelines
+            .insert(handle, Pipeline::Compute(pipeline));
+        let checkpoints = shader_checkpoints(&runtime.resources, &[module]);
+        let failed = compute_module(&runtime.table);
+        runtime
+            .resources
+            .shaders
+            .get_mut(&module)
+            .unwrap()
+            .variants
+            .push((vec![(0, vec![1, 0, 0, 0])], Vec::new(), Vec::new(), failed));
+        rollback_shader_variants(&mut runtime, &checkpoints).unwrap();
+        assert!(runtime.table.shader_module_ref(failed).is_err());
+        assert_eq!(runtime.resources.shaders[&module].variants.len(), 1);
+        assert!(runtime.table.shader_module_ref(existing).is_ok());
+        retire_vk_shader_module(&mut runtime, module).unwrap();
+        assert!(runtime.table.shader_module_ref(existing).is_ok());
+        assert!(
+            runtime
+                .resources
+                .orphaned_shader_modules
+                .contains(&existing)
+        );
+        retire_vk_pipeline(&mut runtime, handle).unwrap();
+        assert!(runtime.table.shader_module_ref(existing).is_err());
+        assert!(runtime.resources.orphaned_shader_modules.is_empty());
+        assert!(!runtime.lost);
+    }
 
     fn decal_sampler() -> vk::SamplerCreateInfo<'static> {
         vk::SamplerCreateInfo::default()
