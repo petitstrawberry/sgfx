@@ -220,7 +220,7 @@ pub(super) unsafe fn submit(
         run(task_driver, packets, task_fence)
     })));
     if sent.is_err() {
-        d.lost.store(true, Ordering::Release);
+        d.mark_lost();
         for (s, v) in reserved {
             s.cancel(v);
         }
@@ -347,7 +347,7 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
         })();
         if let Err(error) = result {
             eprintln!("[SGFX Vulkan] queue packet {index} failed: {error:?}");
-            d.lost.store(true, Ordering::Release);
+            d.mark_lost();
             cancel(&packets[index..]);
             if let Some(s) = &fence {
                 s.store(0, Ordering::Release);

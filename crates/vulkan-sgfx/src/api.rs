@@ -83,6 +83,39 @@ impl InFlight {
         self.changed.notify_all();
     }
 
+    // State stores happen before acquiring this mutex. Sharing the mutex with
+    // wait_until closes the check-to-sleep race without holding runtime locks.
+    fn notify(&self) {
+        let _count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
+    }
+
+    fn wait_until(&self, timeout: u64, mut ready: impl FnMut() -> VkResult<bool>) -> VkResult<()> {
+        let started = std::time::Instant::now();
+        let mut guard = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            // This predicate must inspect only pre-resolved atomic state. In
+            // particular, never resolve handles or enter the device worker here.
+            if ready()? {
+                return Ok(());
+            }
+            if timeout == u64::MAX {
+                guard = self.changed.wait(guard).unwrap_or_else(|e| e.into_inner());
+            } else {
+                let remaining =
+                    std::time::Duration::from_nanos(timeout).saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(vk::Result::TIMEOUT);
+                }
+                let (next, _) = self
+                    .changed
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next;
+            }
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         *self
             .count
@@ -121,6 +154,12 @@ struct Driver {
     in_flight: Arc<InFlight>,
     pending: Arc<InFlight>,
     lost: Arc<AtomicBool>,
+}
+impl Driver {
+    fn mark_lost(&self) {
+        self.lost.store(true, Ordering::Release);
+        self.in_flight.notify();
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -194,6 +233,7 @@ fn call<T: Send + 'static>(
             runtime.reclaim_idle_resources();
             if runtime.lost {
                 runtime.device_lost.store(true, Ordering::Release);
+                runtime.in_flight.notify();
             }
             let _ = tx.send(result);
         })))
@@ -201,12 +241,14 @@ fn call<T: Send + 'static>(
             if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                 eprintln!("[SGFX Vulkan] device worker request channel closed");
             }
+            driver.mark_lost();
             vk::Result::ERROR_DEVICE_LOST
         })?;
     rx.recv().map_err(|_| {
         if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
             eprintln!("[SGFX Vulkan] device worker response channel closed");
         }
+        driver.mark_lost();
         vk::Result::ERROR_DEVICE_LOST
     })?
 }
@@ -650,7 +692,7 @@ pub(crate) unsafe extern "system" fn destroy_device(
     {
         let _ = thread.join();
     }
-    driver.lost.store(true, Ordering::Release);
+    driver.mark_lost();
     let _ = driver.sender.send(Request::Stop);
     if let Some(thread) = driver
         .thread
@@ -3218,24 +3260,19 @@ unsafe extern "system" fn wait_for_fences(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let start = std::time::Instant::now();
-    loop {
+    // Resolve the selected fence Arcs before taking the notification mutex.
+    // Completion updates the atomics and then notifies under the same mutex.
+    // The predicate deliberately does not depend on all device work retiring.
+    status(d.in_flight.wait_until(timeout, || {
         if d.lost.load(Ordering::Acquire) {
-            return vk::Result::ERROR_DEVICE_LOST;
+            return Err(vk::Result::ERROR_DEVICE_LOST);
         }
-        let ready = if all != 0 {
+        Ok(if all != 0 {
             fs.iter().all(|f| f.load(Ordering::Acquire) == 1)
         } else {
             fs.iter().any(|f| f.load(Ordering::Acquire) == 1)
-        };
-        if ready {
-            return vk::Result::SUCCESS;
-        }
-        if timeout != u64::MAX && start.elapsed().as_nanos() >= timeout as u128 {
-            return vk::Result::TIMEOUT;
-        }
-        std::thread::sleep(std::time::Duration::from_micros(50));
-    }
+        })
+    }))
 }
 
 unsafe extern "system" fn create_semaphore(
@@ -3372,6 +3409,7 @@ pub(crate) fn signal_acquire_sync(
     if let Some(state) = fence {
         state.store(1, Ordering::Release);
     }
+    d.in_flight.notify();
     Ok(())
 }
 
@@ -4906,5 +4944,239 @@ mod tests {
                 &supported,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_notification_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    fn fixture() -> (Arc<Driver>, vk::Device, [vk::Fence; 2], [Arc<AtomicU8>; 2]) {
+        // Unserviced/closed channels prove that waiting never enters Runtime.
+        let d = Arc::new(Driver {
+            sender: mpsc::channel().0,
+            thread: Mutex::new(None),
+            completion_sender: mpsc::channel().0,
+            completion_thread: Mutex::new(None),
+            queue: AtomicU64::new(0),
+            queue_sender: mpsc::channel().0,
+            queue_thread: Mutex::new(None),
+            timeline_enabled: true,
+            timelines: Default::default(),
+            events: Default::default(),
+            fences: Default::default(),
+            semaphores: Default::default(),
+            recordings: Default::default(),
+            in_flight: Default::default(),
+            pending: Default::default(),
+            lost: Arc::new(AtomicBool::new(false)),
+        });
+        let states = [Arc::new(AtomicU8::new(0)), Arc::new(AtomicU8::new(0))];
+        let fences = states.each_ref().map(|state| {
+            let fence = vk::Fence::from_raw(next_id());
+            d.fences
+                .lock()
+                .unwrap()
+                .insert(fence.as_raw(), Arc::clone(state));
+            fence
+        });
+        let device = vk::Device::from_raw(add_handle(Kind::Device, &d));
+        (d, device, fences, states)
+    }
+
+    fn waiter(
+        device: vk::Device,
+        fences: Vec<vk::Fence>,
+        all: bool,
+    ) -> std::thread::JoinHandle<vk::Result> {
+        std::thread::spawn(move || unsafe {
+            wait_for_fences(
+                device,
+                fences.len() as u32,
+                fences.as_ptr(),
+                u32::from(all),
+                5_000_000_000,
+            )
+        })
+    }
+
+    #[test]
+    fn selected_fences_preserve_all_any_zero_timeout_and_presignaled_semantics() {
+        let (d, device, fences, states) = fixture();
+        unsafe {
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::FALSE, 0),
+                vk::Result::TIMEOUT
+            );
+            states[0].store(1, Ordering::Release);
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::FALSE, 0),
+                vk::Result::SUCCESS
+            );
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::TRUE, 0),
+                vk::Result::TIMEOUT
+            );
+            states[1].store(1, Ordering::Release);
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::TRUE, 0),
+                vk::Result::SUCCESS
+            );
+            d.mark_lost();
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::TRUE, 0),
+                vk::Result::ERROR_DEVICE_LOST
+            );
+        }
+        remove_handle(device.as_raw());
+    }
+
+    #[test]
+    fn selected_fence_wakes_before_unrelated_work_retires() {
+        let (d, device, fences, states) = fixture();
+        d.in_flight.begin();
+        d.in_flight.begin();
+        d.pending.begin();
+        let thread = waiter(device, vec![fences[0]], true);
+        finish_submissions(
+            &[],
+            Some(&states[0]),
+            &[],
+            &[],
+            &d.in_flight,
+            &d.pending,
+            &d.lost,
+        );
+        assert_eq!(thread.join().unwrap(), vk::Result::SUCCESS);
+        assert!(!d.in_flight.is_empty());
+        assert_eq!(states[1].load(Ordering::Acquire), 0);
+        d.in_flight.finish();
+        remove_handle(device.as_raw());
+    }
+
+    #[test]
+    fn notification_before_and_after_wait_cannot_be_lost() {
+        for notify_before_wait in [true, false] {
+            let state = Arc::new(AtomicBool::new(false));
+            let signal = Arc::new(InFlight::default());
+            let (checked, first_check) = mpsc::channel();
+            if notify_before_wait {
+                state.store(true, Ordering::Release);
+                signal.notify();
+            }
+            let worker_state = Arc::clone(&state);
+            let worker_signal = Arc::clone(&signal);
+            let thread = std::thread::spawn(move || {
+                worker_signal.wait_until(u64::MAX, || {
+                    let ready = worker_state.load(Ordering::Acquire);
+                    checked.send(()).unwrap(); // Executed under the actual wait mutex.
+                    Ok(ready)
+                })
+            });
+            first_check.recv().unwrap();
+            if !notify_before_wait {
+                // notify() cannot pass the waiter's mutex until it atomically
+                // enters Condvar::wait. This exercises the check-to-sleep race.
+                state.store(true, Ordering::Release);
+                signal.notify();
+            }
+            assert_eq!(thread.join().unwrap(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn spurious_notifications_recheck_predicate_without_restarting_timeout() {
+        let signal = Arc::new(InFlight::default());
+        let checks = Arc::new(AtomicUsize::new(0));
+        let worker_signal = Arc::clone(&signal);
+        let worker_checks = Arc::clone(&checks);
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(worker_signal.wait_until(50_000_000, || {
+                worker_checks.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }))
+            .unwrap();
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let notifier = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                signal.notify();
+                std::thread::yield_now();
+            }
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        stop.store(true, Ordering::Release);
+        notifier.join().unwrap();
+        waiter.join().unwrap();
+        assert_eq!(result.unwrap(), Err(vk::Result::TIMEOUT));
+        assert!(checks.load(Ordering::Relaxed) > 1);
+    }
+
+    #[test]
+    fn acquire_sync_wakes_selected_fence_waiter() {
+        let (_d, device, fences, _states) = fixture();
+        let thread = waiter(device, fences.to_vec(), false);
+        signal_acquire_sync(device, vk::Semaphore::null(), fences[1]).unwrap();
+        assert_eq!(thread.join().unwrap(), vk::Result::SUCCESS);
+        remove_handle(device.as_raw());
+    }
+
+    #[test]
+    fn queue_failure_worker_channel_loss_and_destroy_wake_fence_waiters() {
+        for path in 0..4 {
+            let (d, device, fences, _states) = fixture();
+            let thread = waiter(device, fences.to_vec(), true);
+            match path {
+                0 => d.mark_lost(),
+                1 => {
+                    let queue = vk::Queue::from_raw(add_handle(Kind::Queue, &d));
+                    assert_eq!(
+                        unsafe { queue::submit(queue, 0, core::ptr::null(), vk::Fence::null()) },
+                        Err(vk::Result::ERROR_DEVICE_LOST)
+                    );
+                    remove_handle(queue.as_raw());
+                }
+                2 => {
+                    let result: VkResult<()> = call(&d, |_| Ok(()));
+                    assert_eq!(result, Err(vk::Result::ERROR_DEVICE_LOST));
+                }
+                3 => unsafe { destroy_device(device, core::ptr::null()) },
+                _ => unreachable!(),
+            }
+            assert_eq!(thread.join().unwrap(), vk::Result::ERROR_DEVICE_LOST);
+            remove_handle(device.as_raw());
+        }
+    }
+
+    #[test]
+    fn fence_notifications_are_scoped_to_their_device() {
+        let (a, a_device, a_fences, _a_states) = fixture();
+        let (b, b_device, _b_fences, b_states) = fixture();
+        let thread = waiter(a_device, a_fences.to_vec(), false);
+        b.in_flight.begin();
+        b.pending.begin();
+        finish_submissions(
+            &[],
+            Some(&b_states[0]),
+            &[],
+            &[],
+            &b.in_flight,
+            &b.pending,
+            &b.lost,
+        );
+        unsafe {
+            assert_eq!(
+                wait_for_fences(a_device, 2, a_fences.as_ptr(), vk::FALSE, 0),
+                vk::Result::TIMEOUT
+            );
+        }
+        a.mark_lost();
+        assert_eq!(thread.join().unwrap(), vk::Result::ERROR_DEVICE_LOST);
+        remove_handle(a_device.as_raw());
+        remove_handle(b_device.as_raw());
     }
 }
