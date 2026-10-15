@@ -709,13 +709,17 @@ pub struct ResourceTable {
     pub(crate) free_buffer: Cell<Option<usize>>,
     pub(crate) samplers: RefCell<Vec<SamplerDesc>>,
     pub(crate) pipelines: RefCell<Vec<RenderPipelineDesc>>,
-    pub(crate) shader_modules: RefCell<Vec<ShaderModuleDesc>>,
+    pub(crate) shader_modules: RefCell<Vec<ProgramSlot<ShaderModuleDesc>>>,
+    pub(crate) free_shader_module: Cell<Option<usize>>,
     pub(crate) bind_groups: RefCell<Vec<BindGroupSlot>>,
     pub(crate) free_bind_group: Cell<Option<usize>>,
-    pub(crate) compute_pipelines: RefCell<Vec<ComputePipelineDesc>>,
+    pub(crate) compute_pipelines: RefCell<Vec<ProgramSlot<ComputePipelineDesc>>>,
+    pub(crate) free_compute_pipeline: Cell<Option<usize>>,
     #[cfg(feature = "backend-abi")]
     pub(crate) abi: super::abi::State,
-    pub(crate) programmable_pipelines: RefCell<Vec<Rc<ProgrammableRenderPipelineDesc>>>,
+    pub(crate) programmable_pipelines:
+        RefCell<Vec<ProgramSlot<Rc<ProgrammableRenderPipelineDesc>>>>,
+    pub(crate) free_programmable_pipeline: Cell<Option<usize>>,
 }
 
 pub(crate) struct TextureSlot {
@@ -732,6 +736,12 @@ pub(crate) struct BufferSlot {
 
 pub(crate) struct BindGroupSlot {
     pub(crate) descriptor: Option<Rc<BindGroupDesc>>,
+    pub(crate) generation: u64,
+    pub(crate) next_free: Option<usize>,
+}
+
+pub(crate) struct ProgramSlot<T> {
+    pub(crate) descriptor: Option<T>,
     pub(crate) generation: u64,
     pub(crate) next_free: Option<usize>,
 }
@@ -753,10 +763,13 @@ impl ResourceTable {
             samplers: RefCell::new(Vec::new()),
             pipelines: RefCell::new(Vec::new()),
             shader_modules: RefCell::new(Vec::new()),
+            free_shader_module: Cell::new(None),
             bind_groups: RefCell::new(Vec::new()),
             free_bind_group: Cell::new(None),
             compute_pipelines: RefCell::new(Vec::new()),
+            free_compute_pipeline: Cell::new(None),
             programmable_pipelines: RefCell::new(Vec::new()),
+            free_programmable_pipeline: Cell::new(None),
         }
     }
 
@@ -1000,15 +1013,21 @@ impl ResourceTable {
 
     /// Define an immutable shader module and return its branded reference.
     pub fn define_shader_module(&self, desc: ShaderModuleDesc) -> Result<ShaderModuleRef<'_>> {
-        let index = self.push(&self.shader_modules, desc, 256)?;
-        Ok(ShaderModuleRef { owner: self, index })
+        let (index, generation) =
+            self.define_program_slot(&self.shader_modules, &self.free_shader_module, desc)?;
+        Ok(ShaderModuleRef {
+            owner: self,
+            index,
+            generation,
+        })
     }
     /// Resolve a persistent shader module identity in its owning table.
     pub fn shader_module_ref(&self, id: ShaderModuleId) -> Result<ShaderModuleRef<'_>> {
-        self.validate_id(id.owner, id.index, &self.shader_modules)?;
+        self.validate_program_id(id.owner, id.index, id.generation, &self.shader_modules)?;
         Ok(ShaderModuleRef {
             owner: self,
             index: id.index,
+            generation: id.generation,
         })
     }
     /// Return an owned copy of a validated shader module descriptor.
@@ -1019,7 +1038,8 @@ impl ResourceTable {
         self.shader_modules
             .borrow()
             .get(reference.index)
-            .cloned()
+            .filter(|slot| slot.generation == reference.generation)
+            .and_then(|slot| slot.descriptor.clone())
             .ok_or(Error::InvalidDescriptor)
     }
     /// Define an immutable bind group and return its branded reference.
@@ -1119,15 +1139,21 @@ impl ResourceTable {
         desc: ComputePipelineDesc,
     ) -> Result<ComputePipelineRef<'_>> {
         self.shader_module_ref(desc.shader().module())?;
-        let index = self.push(&self.compute_pipelines, desc, 256)?;
-        Ok(ComputePipelineRef { owner: self, index })
+        let (index, generation) =
+            self.define_program_slot(&self.compute_pipelines, &self.free_compute_pipeline, desc)?;
+        Ok(ComputePipelineRef {
+            owner: self,
+            index,
+            generation,
+        })
     }
     /// Resolve a persistent compute pipeline identity in its owning table.
     pub fn compute_pipeline_ref(&self, id: ComputePipelineId) -> Result<ComputePipelineRef<'_>> {
-        self.validate_id(id.owner, id.index, &self.compute_pipelines)?;
+        self.validate_program_id(id.owner, id.index, id.generation, &self.compute_pipelines)?;
         Ok(ComputePipelineRef {
             owner: self,
             index: id.index,
+            generation: id.generation,
         })
     }
     /// Return an owned copy of a validated compute pipeline descriptor.
@@ -1141,7 +1167,8 @@ impl ResourceTable {
         self.compute_pipelines
             .borrow()
             .get(reference.index)
-            .cloned()
+            .filter(|slot| slot.generation == reference.generation)
+            .and_then(|slot| slot.descriptor.clone())
             .ok_or(Error::InvalidDescriptor)
     }
     /// Define an immutable programmable render pipeline and return its branded reference.
@@ -1151,18 +1178,32 @@ impl ResourceTable {
     ) -> Result<ProgrammableRenderPipelineRef<'_>> {
         self.shader_module_ref(desc.vertex().module())?;
         self.shader_module_ref(desc.fragment().module())?;
-        let index = self.push(&self.programmable_pipelines, Rc::new(desc), 256)?;
-        Ok(ProgrammableRenderPipelineRef { owner: self, index })
+        let (index, generation) = self.define_program_slot(
+            &self.programmable_pipelines,
+            &self.free_programmable_pipeline,
+            Rc::new(desc),
+        )?;
+        Ok(ProgrammableRenderPipelineRef {
+            owner: self,
+            index,
+            generation,
+        })
     }
     /// Resolve a persistent programmable render pipeline identity in its owning table.
     pub fn programmable_render_pipeline_ref(
         &self,
         id: ProgrammableRenderPipelineId,
     ) -> Result<ProgrammableRenderPipelineRef<'_>> {
-        self.validate_id(id.owner, id.index, &self.programmable_pipelines)?;
+        self.validate_program_id(
+            id.owner,
+            id.index,
+            id.generation,
+            &self.programmable_pipelines,
+        )?;
         Ok(ProgrammableRenderPipelineRef {
             owner: self,
             index: id.index,
+            generation: id.generation,
         })
     }
     /// Return an owned copy of a validated programmable render pipeline descriptor.
@@ -1186,8 +1227,123 @@ impl ResourceTable {
         self.programmable_pipelines
             .borrow()
             .get(reference.index)
-            .cloned()
+            .filter(|slot| slot.generation == reference.generation)
+            .and_then(|slot| slot.descriptor.clone())
             .ok_or(Error::InvalidDescriptor)
+    }
+
+    /// Retire a shader only after all logical pipelines referencing it retire.
+    /// Backend cache retirement and accepted-work completion must precede this call.
+    pub fn release_shader_module(&self, id: ShaderModuleId) -> Result<()> {
+        self.shader_module_ref(id)?;
+        if self.compute_pipelines.borrow().iter().any(|slot| {
+            slot.descriptor
+                .as_ref()
+                .is_some_and(|p| p.shader().module() == id)
+        }) || self.programmable_pipelines.borrow().iter().any(|slot| {
+            slot.descriptor
+                .as_ref()
+                .is_some_and(|p| p.vertex().module() == id || p.fragment().module() == id)
+        }) {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.release_program_slot(&self.shader_modules, &self.free_shader_module, id.index)
+    }
+
+    /// Retire this generation after backend resources and accepted work retire.
+    /// Existing recordings and references become invalid, even if its slot is reused.
+    pub fn release_compute_pipeline(&self, id: ComputePipelineId) -> Result<()> {
+        self.compute_pipeline_ref(id)?;
+        self.release_program_slot(
+            &self.compute_pipelines,
+            &self.free_compute_pipeline,
+            id.index,
+        )
+    }
+
+    /// Retire this generation after backend resources and accepted work retire.
+    /// Shared immutable descriptor snapshots retain their metadata, not a live identity.
+    pub fn release_programmable_render_pipeline(
+        &self,
+        id: ProgrammableRenderPipelineId,
+    ) -> Result<()> {
+        self.programmable_render_pipeline_ref(id)?;
+        self.release_program_slot(
+            &self.programmable_pipelines,
+            &self.free_programmable_pipeline,
+            id.index,
+        )
+    }
+
+    fn define_program_slot<T>(
+        &self,
+        slots: &RefCell<Vec<ProgramSlot<T>>>,
+        free: &Cell<Option<usize>>,
+        descriptor: T,
+    ) -> Result<(usize, u64)> {
+        let mut slots = slots.borrow_mut();
+        let result = if let Some(index) = free.get() {
+            let slot = &mut slots[index];
+            free.set(slot.next_free.take());
+            slot.descriptor = Some(descriptor);
+            (index, slot.generation)
+        } else {
+            if slots.len() >= 256 {
+                return Err(Error::ResourceLimitExceeded);
+            }
+            slots.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+            let index = slots.len();
+            slots.push(ProgramSlot {
+                descriptor: Some(descriptor),
+                generation: 0,
+                next_free: None,
+            });
+            (index, 0)
+        };
+        #[cfg(feature = "backend-abi")]
+        self.abi_changed();
+        Ok(result)
+    }
+
+    fn release_program_slot<T>(
+        &self,
+        slots: &RefCell<Vec<ProgramSlot<T>>>,
+        free: &Cell<Option<usize>>,
+        index: usize,
+    ) -> Result<()> {
+        let mut slots = slots.borrow_mut();
+        let slot = &mut slots[index];
+        let next_generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or(Error::ResourceLimitExceeded)?;
+        slot.descriptor = None;
+        slot.generation = next_generation;
+        slot.next_free = free.get();
+        free.set(Some(index));
+        #[cfg(feature = "backend-abi")]
+        self.abi_changed();
+        Ok(())
+    }
+
+    fn validate_program_id<T>(
+        &self,
+        owner: usize,
+        index: usize,
+        generation: u64,
+        slots: &RefCell<Vec<ProgramSlot<T>>>,
+    ) -> Result<()> {
+        if owner != self.id {
+            return Err(Error::ResourceTableMismatch);
+        }
+        if slots
+            .borrow()
+            .get(index)
+            .is_none_or(|slot| slot.generation != generation || slot.descriptor.is_none())
+        {
+            return Err(Error::InvalidDescriptor);
+        }
+        Ok(())
     }
 
     pub(super) fn push<T>(
@@ -1525,32 +1681,57 @@ impl_resource_ref_traits!(BufferRef);
 impl_resource_ref_traits!(SamplerRef);
 impl_resource_ref_traits!(RenderPipelineRef);
 
+macro_rules! impl_program_ref_traits {
+    ($reference:ident) => {
+        impl fmt::Debug for $reference<'_> {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!(stringify!($reference), "(..)"))
+            }
+        }
+        impl PartialEq for $reference<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                core::ptr::eq(self.owner, other.owner)
+                    && self.index == other.index
+                    && self.generation == other.generation
+            }
+        }
+        impl Eq for $reference<'_> {}
+    };
+}
+
 /// Borrowed reference to an immutable shader module.
 #[derive(Clone, Copy)]
 pub struct ShaderModuleRef<'r> {
     pub(crate) owner: &'r ResourceTable,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 /// Persistent table-qualified shader module identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShaderModuleId {
     pub(crate) owner: usize,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 impl ShaderModuleRef<'_> {
-    /// Return the stable table-local backend slot.
+    /// Return the table-local backend slot for this generation.
     pub const fn slot(self) -> usize {
         self.index
+    }
+    /// Return this slot's generation for cache and ABI retirement checks.
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
     /// Return a persistent identity for later resolution by the owning table.
     pub const fn id(self) -> ShaderModuleId {
         ShaderModuleId {
             owner: self.owner.id,
             index: self.index,
+            generation: self.generation,
         }
     }
 }
-impl_resource_ref_traits!(ShaderModuleRef);
+impl_program_ref_traits!(ShaderModuleRef);
 
 /// Borrowed reference to an immutable bind group.
 #[derive(Clone, Copy)]
@@ -1599,54 +1780,68 @@ impl Eq for BindGroupRef<'_> {}
 pub struct ComputePipelineRef<'r> {
     pub(crate) owner: &'r ResourceTable,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 /// Persistent table-qualified compute pipeline identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComputePipelineId {
     pub(crate) owner: usize,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 impl ComputePipelineRef<'_> {
-    /// Return the stable table-local backend slot.
+    /// Return the table-local backend slot for this generation.
     pub const fn slot(self) -> usize {
         self.index
+    }
+    /// Return this slot's generation for cache and ABI retirement checks.
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
     /// Return a persistent identity for later resolution by the owning table.
     pub const fn id(self) -> ComputePipelineId {
         ComputePipelineId {
             owner: self.owner.id,
             index: self.index,
+            generation: self.generation,
         }
     }
 }
-impl_resource_ref_traits!(ComputePipelineRef);
+impl_program_ref_traits!(ComputePipelineRef);
 
 /// Borrowed reference to an immutable programmable render pipeline.
 #[derive(Clone, Copy)]
 pub struct ProgrammableRenderPipelineRef<'r> {
     pub(crate) owner: &'r ResourceTable,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 /// Persistent table-qualified programmable render pipeline identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProgrammableRenderPipelineId {
     pub(crate) owner: usize,
     pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 impl ProgrammableRenderPipelineRef<'_> {
-    /// Return the stable table-local backend slot.
+    /// Return the table-local backend slot for this generation.
     pub const fn slot(self) -> usize {
         self.index
+    }
+    /// Return this slot's generation for cache and ABI retirement checks.
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
     /// Return a persistent identity for later resolution by the owning table.
     pub const fn id(self) -> ProgrammableRenderPipelineId {
         ProgrammableRenderPipelineId {
             owner: self.owner.id,
             index: self.index,
+            generation: self.generation,
         }
     }
 }
-impl_resource_ref_traits!(ProgrammableRenderPipelineRef);
+impl_program_ref_traits!(ProgrammableRenderPipelineRef);
 
 #[cfg(test)]
 mod shared_metadata_tests {

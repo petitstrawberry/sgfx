@@ -19,6 +19,7 @@ pub use sgfx_backend_abi::{Batch, Span};
 
 pub(crate) struct State {
     pub enabled: Cell<bool>,
+    pub legacy_program_ids: Cell<bool>,
     pub revision: Cell<u64>,
     pub snapshot: RefCell<(u64, Vec<u64>)>,
 }
@@ -27,6 +28,7 @@ impl State {
     pub const fn new() -> Self {
         Self {
             enabled: Cell::new(false),
+            legacy_program_ids: Cell::new(false),
             revision: Cell::new(1),
             snapshot: RefCell::new((0, Vec::new())),
         }
@@ -108,9 +110,16 @@ impl ResourceTable {
     }
     /// Resolve an immutable definition in a backend-owned mirrored table.
     pub fn abi_shader_module(&self, slot: u32) -> Result<ShaderModuleRef<'_>> {
+        let generation = self
+            .shader_modules
+            .borrow()
+            .get(slot as usize)
+            .ok_or(Error::InvalidDescriptor)?
+            .generation;
         self.shader_module_ref(ShaderModuleId {
             owner: self.id,
             index: slot as usize,
+            generation,
         })
     }
     /// Resolve an immutable definition in a backend-owned mirrored table.
@@ -118,16 +127,30 @@ impl ResourceTable {
         &self,
         slot: u32,
     ) -> Result<ProgrammableRenderPipelineRef<'_>> {
+        let generation = self
+            .programmable_pipelines
+            .borrow()
+            .get(slot as usize)
+            .ok_or(Error::InvalidDescriptor)?
+            .generation;
         self.programmable_render_pipeline_ref(ProgrammableRenderPipelineId {
             owner: self.id,
             index: slot as usize,
+            generation,
         })
     }
     /// Resolve an immutable definition in a backend-owned mirrored table.
     pub fn abi_compute_pipeline(&self, slot: u32) -> Result<ComputePipelineRef<'_>> {
+        let generation = self
+            .compute_pipelines
+            .borrow()
+            .get(slot as usize)
+            .ok_or(Error::InvalidDescriptor)?
+            .generation;
         self.compute_pipeline_ref(ComputePipelineId {
             owner: self.id,
             index: slot as usize,
+            generation,
         })
     }
 }

@@ -1,4 +1,4 @@
-//! Frozen v2 scalar/descriptor encoding. Enum numbers here are ABI numbers,
+//! Scalar/descriptor encoding for R2 and R3 snapshots. Enum numbers here are ABI numbers,
 //! independent of Rust discriminants. Existing numbers must never be reordered.
 
 use super::*;
@@ -448,12 +448,36 @@ macro_rules! identity {
     };
 }
 
+macro_rules! program_identity {
+    ($id:ident, $resolve:ident) => {
+        impl Codec for $id {
+            fn put(&self, w: &mut Vec<u64>) {
+                self.index.put(w);
+                self.generation.put(w);
+            }
+            fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
+                let id = Self {
+                    owner: t.id,
+                    index: r.value(t)?,
+                    generation: if t.abi.legacy_program_ids.get() {
+                        0
+                    } else {
+                        r.value(t)?
+                    },
+                };
+                t.$resolve(id)?;
+                Ok(id)
+            }
+        }
+    };
+}
+
 identity!(SamplerId, sampler_ref);
 identity!(RenderPipelineId, render_pipeline_ref);
-identity!(ShaderModuleId, shader_module_ref);
+program_identity!(ShaderModuleId, shader_module_ref);
 
-identity!(ComputePipelineId, compute_pipeline_ref);
-identity!(
+program_identity!(ComputePipelineId, compute_pipeline_ref);
+program_identity!(
     ProgrammableRenderPipelineId,
     programmable_render_pipeline_ref
 );

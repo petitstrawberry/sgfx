@@ -1,4 +1,4 @@
-use super::super::resource::{BindGroupSlot, BufferSlot, TextureSlot};
+use super::super::resource::{BindGroupSlot, BufferSlot, ProgramSlot, TextureSlot};
 use super::{
     codec::{Codec, Reader},
     *,
@@ -6,7 +6,8 @@ use super::{
 use alloc::{rc::Rc, vec::Vec};
 use core::cell::Ref;
 
-const MAGIC: u64 = 0x3252_5846_4753; // SGFXR2
+const MAGIC: u64 = 0x3352_5846_4753; // SGFXR3
+const LEGACY_MAGIC: u64 = 0x3252_5846_4753; // SGFXR2
 
 fn rows<T: Codec>(items: &[T], out: &mut Vec<u64>) {
     items.len().put(out);
@@ -31,7 +32,7 @@ impl ResourceTable {
     /// Retire their physical caches before applying the new generations.
     pub fn abi_retired_resources(&self, words: &[u64]) -> Result<(Vec<TextureId>, Vec<BufferId>)> {
         let mut r = Reader { words };
-        if r.word()? != MAGIC {
+        if !matches!(r.word()?, MAGIC | LEGACY_MAGIC) {
             return Err(Error::InvalidDescriptor);
         }
         r.take(2)?;
@@ -66,6 +67,81 @@ impl ResourceTable {
         Ok((textures, buffers))
     }
 
+    /// Program identities replaced by newer metadata generations. Retire
+    /// pipeline caches before shader caches, and all caches before importing.
+    /// R2 clients have immutable append-only program rows and cannot retire them.
+    pub fn abi_retired_programs(
+        &self,
+        words: &[u64],
+    ) -> Result<(
+        Vec<ShaderModuleId>,
+        Vec<ComputePipelineId>,
+        Vec<ProgrammableRenderPipelineId>,
+    )> {
+        let mut r = Reader { words };
+        let magic = r.word()?;
+        if magic == LEGACY_MAGIC {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        if magic != MAGIC {
+            return Err(Error::InvalidDescriptor);
+        }
+        r.take(2)?;
+        for maximum in [
+            MAX_TEXTURES,
+            MAX_BUFFERS,
+            MAX_SAMPLERS,
+            MAX_RENDER_PIPELINES,
+        ] {
+            skip_rows(&mut r, maximum, self)?;
+        }
+        let mut shaders = Vec::new();
+        scan_retired(
+            &mut r,
+            &self.shader_modules.borrow(),
+            256,
+            self,
+            |index, generation| {
+                shaders.push(ShaderModuleId {
+                    owner: self.id,
+                    index,
+                    generation,
+                });
+            },
+        )?;
+        skip_rows(&mut r, MAX_BIND_GROUP_DEFINITIONS, self)?;
+        let mut compute = Vec::new();
+        scan_retired(
+            &mut r,
+            &self.compute_pipelines.borrow(),
+            256,
+            self,
+            |index, generation| {
+                compute.push(ComputePipelineId {
+                    owner: self.id,
+                    index,
+                    generation,
+                });
+            },
+        )?;
+        let mut programmable = Vec::new();
+        scan_retired(
+            &mut r,
+            &self.programmable_pipelines.borrow(),
+            256,
+            self,
+            |index, generation| {
+                programmable.push(ProgrammableRenderPipelineId {
+                    owner: self.id,
+                    index,
+                    generation,
+                });
+            },
+        )?;
+        r.end()?;
+        Ok((shaders, compute, programmable))
+    }
+
     /// Buffer-only compatibility view of the retirement scan.
     pub fn abi_retired_buffers(&self, words: &[u64]) -> Result<Vec<BufferId>> {
         self.abi_retired_resources(words)
@@ -92,18 +168,20 @@ impl ResourceTable {
         Ok(Ref::map(self.abi.snapshot.borrow(), |v| v.1.as_slice()))
     }
 
-    /// Apply a caller's v2 metadata snapshot to a backend-owned mirror. Existing
+    /// Apply a caller's R2 or R3 metadata snapshot to a backend-owned mirror. Existing
     /// immutable definitions remain cached; only changed definitions allocate.
-    /// Texture, buffer and bind-group slots carry generations, so retired IDs
+    /// R3 program rows and texture, buffer and bind-group slots carry generations, so retired IDs
     /// cannot alias replacements.
     ///
     /// On error the mirror must be discarded, since a valid prefix may have
     /// been applied. The resource table is never shared across the library ABI.
     pub fn sync_abi_snapshot(&self, words: &[u64]) -> Result<(u64, u64)> {
         let mut r = Reader { words };
-        if r.word()? != MAGIC {
+        let magic = r.word()?;
+        if !matches!(magic, MAGIC | LEGACY_MAGIC) {
             return Err(Error::InvalidDescriptor);
         }
+        self.abi.legacy_program_ids.set(magic == LEGACY_MAGIC);
         let source = r.word()?;
         let revision = r.word()?;
         if source == 0 || revision == 0 {
@@ -119,10 +197,7 @@ impl ResourceTable {
         self.append_abi_rows::<RenderPipelineDesc>(&mut r, existing, MAX_RENDER_PIPELINES, |d| {
             self.define_render_pipeline(d).map(|_| ())
         })?;
-        let existing = self.shader_modules.borrow().len();
-        self.append_abi_rows::<ShaderModuleDesc>(&mut r, existing, 256, |d| {
-            self.define_shader_module(d).map(|_| ())
-        })?;
+        sync_program_slots(&mut r, &mut self.shader_modules.borrow_mut(), self)?;
         // Historical descriptors can reference retired resources. Their IDs
         // are checked when used, without reviving old generations on import.
         sync_slots(
@@ -131,15 +206,34 @@ impl ResourceTable {
             MAX_BIND_GROUP_DEFINITIONS,
             self,
         )?;
-        let existing = self.compute_pipelines.borrow().len();
-        self.append_abi_rows::<ComputePipelineDesc>(&mut r, existing, 256, |d| {
-            self.define_compute_pipeline(d).map(|_| ())
-        })?;
-        let existing = self.programmable_pipelines.borrow().len();
-        self.append_abi_rows::<ProgrammableRenderPipelineDesc>(&mut r, existing, 256, |d| {
-            self.define_programmable_render_pipeline(d).map(|_| ())
-        })?;
+        sync_program_slots(&mut r, &mut self.compute_pipelines.borrow_mut(), self)?;
+        sync_program_slots(&mut r, &mut self.programmable_pipelines.borrow_mut(), self)?;
         r.end()?;
+        // A cached unchanged pipeline row may not outlive the shader generation
+        // it names. Check this even when sync_slots reused its Rc metadata.
+        for slot in self.compute_pipelines.borrow().iter() {
+            if let Some(pipeline) = &slot.descriptor {
+                self.shader_module_ref(pipeline.shader().module())?;
+            }
+        }
+        for slot in self.programmable_pipelines.borrow().iter() {
+            if let Some(pipeline) = &slot.descriptor {
+                self.shader_module_ref(pipeline.vertex().module())?;
+                self.shader_module_ref(pipeline.fragment().module())?;
+            }
+        }
+        rebuild_program_free_list(
+            &mut self.shader_modules.borrow_mut(),
+            &self.free_shader_module,
+        );
+        rebuild_program_free_list(
+            &mut self.compute_pipelines.borrow_mut(),
+            &self.free_compute_pipeline,
+        );
+        rebuild_program_free_list(
+            &mut self.programmable_pipelines.borrow_mut(),
+            &self.free_programmable_pipeline,
+        );
         Ok((source, revision))
     }
 
@@ -273,4 +367,88 @@ fn sync_slots<T: Slot>(
         }
     }
     Ok(())
+}
+
+fn skip_rows(r: &mut Reader<'_>, maximum: usize, table: &ResourceTable) -> Result<()> {
+    let count = usize::get(r, table)?;
+    if count > maximum {
+        return Err(Error::ResourceLimitExceeded);
+    }
+    for _ in 0..count {
+        let len = usize::get(r, table)?;
+        r.take(len)?;
+    }
+    Ok(())
+}
+
+impl<T: Codec> Codec for ProgramSlot<T> {
+    fn put(&self, words: &mut Vec<u64>) {
+        self.generation.put(words);
+        self.descriptor.put(words);
+    }
+    fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
+        Ok(Self {
+            generation: r.value(t)?,
+            descriptor: r.value(t)?,
+            next_free: None,
+        })
+    }
+}
+impl<T: Codec> Slot for ProgramSlot<T> {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+    fn active(&self) -> bool {
+        self.descriptor.is_some()
+    }
+}
+
+fn sync_program_slots<T: Codec + PartialEq>(
+    r: &mut Reader<'_>,
+    current: &mut Vec<ProgramSlot<T>>,
+    table: &ResourceTable,
+) -> Result<()> {
+    if !table.abi.legacy_program_ids.get() {
+        return sync_slots(r, current, 256, table);
+    }
+    let count = usize::get(r, table)?;
+    if count < current.len() || count > 256 {
+        return Err(Error::ResourceLimitExceeded);
+    }
+    for index in 0..count {
+        let len = usize::get(r, table)?;
+        let mut fields = Reader {
+            words: r.take(len)?,
+        };
+        let descriptor = T::get(&mut fields, table)?;
+        fields.end()?;
+        if let Some(old) = current.get(index) {
+            if old.generation != 0 || old.descriptor.as_ref() != Some(&descriptor) {
+                return Err(Error::InvalidDescriptor);
+            }
+        } else {
+            current.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+            current.push(ProgramSlot {
+                descriptor: Some(descriptor),
+                generation: 0,
+                next_free: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_program_free_list<T>(
+    slots: &mut [ProgramSlot<T>],
+    free: &core::cell::Cell<Option<usize>>,
+) {
+    let mut head = None;
+    for (index, slot) in slots.iter_mut().enumerate().rev() {
+        slot.next_free = None;
+        if slot.descriptor.is_none() {
+            slot.next_free = head;
+            head = Some(index);
+        }
+    }
+    free.set(head);
 }
