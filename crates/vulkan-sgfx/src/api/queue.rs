@@ -255,24 +255,31 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
             let recordings = packet.recordings.clone();
             let submissions = call(&d, move |rt| {
                 let result = (|| {
-                    let recordings = recordings
-                        .iter()
-                        .map(|r| {
-                            resolve_recording(rt, r).inspect_err(|error| {
-                                eprintln!(
-                                    "[SGFX Vulkan] queue command resolution failed: {error:?}"
-                                );
+                    let recordings = profile_work("queue::resolve_recordings", || {
+                        recordings
+                            .iter()
+                            .map(|r| {
+                                resolve_recording(rt, r).inspect_err(|error| {
+                                    eprintln!(
+                                        "[SGFX Vulkan] queue command resolution failed: {error:?}"
+                                    );
+                                })
                             })
-                        })
-                        .collect::<VkResult<Vec<_>>>()?;
-                    for r in &recordings {
-                        validate_objects(rt, r).inspect_err(|error| {
-                            eprintln!("[SGFX Vulkan] queue object validation failed: {error:?}");
-                        })?;
-                    }
+                            .collect::<VkResult<Vec<_>>>()
+                    })?;
+                    profile_work("queue::validate_recordings", || {
+                        for r in &recordings {
+                            validate_objects(rt, r).inspect_err(|error| {
+                                eprintln!(
+                                    "[SGFX Vulkan] queue object validation failed: {error:?}"
+                                );
+                            })?;
+                        }
+                        Ok(())
+                    })?;
                     let mut submissions = Vec::new();
                     for r in &recordings {
-                        match execute(rt, r) {
+                        match profile_work("queue::execute", || execute(rt, r)) {
                             Ok(mut receipts) => submissions.append(&mut receipts),
                             Err(error) => {
                                 {
@@ -293,10 +300,12 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                 // consumed. Backends retain native bindings for submitted
                 // commands, so these immutable descriptor snapshots no longer
                 // need logical table slots or materialization-cache entries.
-                let cleanup = rt.resources.release_descriptor_groups(&rt.table, |id| {
-                    rt.cache
-                        .release_bind_group(id)
-                        .map_err(crate::runtime::backend_failure)
+                let cleanup = profile_work("queue::release_descriptors", || {
+                    rt.resources.release_descriptor_groups(&rt.table, |id| {
+                        rt.cache
+                            .release_bind_group(id)
+                            .map_err(crate::runtime::backend_failure)
+                    })
                 });
                 let submissions = result?;
                 if let Err(error) = cleanup {

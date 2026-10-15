@@ -358,6 +358,25 @@ fn record_call_profile(
     profile.period = finished;
 }
 
+// Nested worker phases share the existing opt-in profiler. Their durations
+// overlap the enclosing API call and must not be summed as separate GPU time.
+fn profile_work<T>(operation: &'static str, work: impl FnOnce() -> VkResult<T>) -> VkResult<T> {
+    let started = call_profile_enabled().then(std::time::Instant::now);
+    let result = work();
+    if let Some(started) = started {
+        record_call_profile(
+            operation,
+            started,
+            Some(CallServiceTiming {
+                queued_ns: 0,
+                service_ns: started.elapsed().as_nanos(),
+            }),
+            result.is_err(),
+        );
+    }
+    result
+}
+
 // Both synchronous requests and owned void requests use the same panic/lost
 // publication path. A void operation has no result channel, so its errors must
 // become device loss instead of silently preserving stale state.
@@ -383,7 +402,10 @@ fn run_device_operation<T>(
     if void && result.is_err() {
         runtime.lost = true;
     }
-    runtime.reclaim_idle_resources();
+    let _ = profile_work("worker::reclaim_idle_resources", || {
+        runtime.reclaim_idle_resources();
+        Ok(())
+    });
     if runtime.lost {
         runtime.device_lost.store(true, Ordering::Release);
         runtime.in_flight.notify();
@@ -3785,35 +3807,39 @@ fn submit_owned(
         return Ok(None);
     }
     let owned = ir::OwnedCommandBuffer::new(ops);
-    let commands = owned.record(&rt.table).map_err(|error| {
-        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-            trace_owned_recording_failure(&rt.table, &owned, error);
-        }
-        crate::resources::failure(error)
+    let commands = profile_work("submit::record_ir", || {
+        owned.record(&rt.table).map_err(|error| {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                trace_owned_recording_failure(&rt.table, &owned, error);
+            }
+            crate::resources::failure(error)
+        })
     })?;
-    match rt.queue.submit(&mut rt.cache, &commands) {
-        Ok(receipt) => Ok(Some(receipt)),
-        Err(SubmitError::Busy) => Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
-        Err(SubmitError::Rejected(error)) => Err(crate::runtime::backend_failure(error)),
-        Err(SubmitError::Failed { error, completion }) => {
-            let result = completion.wait(None);
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!(
-                    "[SGFX Vulkan] submission failed after execution began: error={error:?} completion={result:?}"
-                );
+    profile_work("submit::backend", || {
+        match rt.queue.submit(&mut rt.cache, &commands) {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(SubmitError::Busy) => Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+            Err(SubmitError::Rejected(error)) => Err(crate::runtime::backend_failure(error)),
+            Err(SubmitError::Failed { error, completion }) => {
+                let result = completion.wait(None);
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] submission failed after execution began: error={error:?} completion={result:?}"
+                    );
+                }
+                rt.lost = true;
+                Err(vk::Result::ERROR_DEVICE_LOST)
             }
-            rt.lost = true;
-            Err(vk::Result::ERROR_DEVICE_LOST)
-        }
-        Err(_) => {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!(
-                    "[SGFX Vulkan] submission returned an unrecognized error; reporting device lost"
-                );
+            Err(_) => {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] submission returned an unrecognized error; reporting device lost"
+                    );
+                }
+                Err(vk::Result::ERROR_DEVICE_LOST)
             }
-            Err(vk::Result::ERROR_DEVICE_LOST)
         }
-    }
+    })
 }
 
 /// Failure-only metadata: never print upload or push-constant payloads.
@@ -4031,12 +4057,14 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
     }
     used.sort_unstable_by_key(|b| b.as_raw());
     used.dedup();
-    let (mut ops, fresh_uploads) =
-        snapshot_buffer_uploads(&rt.resources, &used).inspect_err(|error| {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!("[SGFX Vulkan] buffer snapshot failed: {error:?} used={used:?}");
-            }
-        })?;
+    let (mut ops, fresh_uploads) = profile_work("execute::snapshot_buffers", || {
+        snapshot_buffer_uploads(&rt.resources, &used)
+    })
+    .inspect_err(|error| {
+        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            eprintln!("[SGFX Vulkan] buffer snapshot failed: {error:?} used={used:?}");
+        }
+    })?;
     let mut descriptors = rec.descriptors.as_slice();
     let mut barriers = rec.barriers.as_slice();
     let mut copies = rec.copies.as_slice();
@@ -4091,25 +4119,28 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
             }
         }
         for copy in take_positioned(&mut copies, position, |c| c.position) {
-            if let Some(submission) = submit_owned(rt, std::mem::take(&mut ops))? {
-                wait_submission(rt, &submission)?;
-            }
-            let image_id = rt
-                .resources
-                .images
-                .get(&copy.image)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
-                .id;
-            let bytes = rt
-                .queue
-                .read_texture_mip(&mut rt.cache, image_id, copy.mip_level)
-                .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-            let buffer = rt
-                .resources
-                .buffers
-                .get(&copy.buffer)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            ops.extend(copy.region.writes(&bytes, buffer.id)?);
+            profile_work("execute::texture_readback", || {
+                if let Some(submission) = submit_owned(rt, std::mem::take(&mut ops))? {
+                    wait_submission(rt, &submission)?;
+                }
+                let image_id = rt
+                    .resources
+                    .images
+                    .get(&copy.image)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                    .id;
+                let bytes = rt
+                    .queue
+                    .read_texture_mip(&mut rt.cache, image_id, copy.mip_level)
+                    .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+                let buffer = rt
+                    .resources
+                    .buffers
+                    .get(&copy.buffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                ops.extend(copy.region.writes(&bytes, buffer.id)?);
+                Ok(())
+            })?;
         }
         if let Some(op) = rec.ops.get(position) {
             ops.push(op.clone());
@@ -4120,33 +4151,39 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
     readback.sort_unstable_by_key(|buffer| buffer.as_raw());
     readback.dedup();
     if !readback.is_empty() {
-        for submission in &submissions {
-            wait_submission(rt, submission)?;
-        }
+        profile_work("execute::readback_wait", || {
+            for submission in &submissions {
+                wait_submission(rt, submission)?;
+            }
+            Ok(())
+        })?;
         submissions.clear();
     }
     // Stage only GPU-written bytes back into allocations returned by MapMemory.
     let mut dirty_memories = Vec::new();
     for handle in &readback {
-        let buffer = rt
-            .resources
-            .buffers
-            .get(handle)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if let Some((memory_handle, offset)) = buffer.bound {
-            let bytes = rt
-                .cache
-                .read_buffer(buffer.id, 0, buffer.size)
-                .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-            let allocation = rt
+        profile_work("execute::buffer_readback", || {
+            let buffer = rt
                 .resources
-                .memories
-                .get_mut(&memory_handle)
+                .buffers
+                .get(handle)
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            allocation.bytes[offset as usize..(offset + buffer.size) as usize]
-                .copy_from_slice(&bytes);
-            dirty_memories.push(memory_handle);
-        }
+            if let Some((memory_handle, offset)) = buffer.bound {
+                let bytes = rt
+                    .cache
+                    .read_buffer(buffer.id, 0, buffer.size)
+                    .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+                let allocation = rt
+                    .resources
+                    .memories
+                    .get_mut(&memory_handle)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                allocation.bytes[offset as usize..(offset + buffer.size) as usize]
+                    .copy_from_slice(&bytes);
+                dirty_memories.push(memory_handle);
+            }
+            Ok(())
+        })?;
     }
     for memory in &dirty_memories {
         rt.resources.forget_uploads_for_memory(*memory);

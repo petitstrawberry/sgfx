@@ -372,7 +372,24 @@ The preceding initialized C++ TLS/Rust TLS/errno isolation check also passed
 across four native threads. The existing native cube's three GPU readback
 cycles passed in the same guest.
 
-This establishes Ganesh drawing through the native driver. Myrica's browser
-page rendering still uses Cairo; the WebCore Skia port and shared-image
-presentation by Myrica are separate implementation work, not certified by
-these tests.
+These initial tests established Ganesh drawing through the native driver.
+Subsequent native Myrica integration uses WebCore's Skia Vulkan renderer and
+shared BGRA presentation, including native NV12/I420 video composition.
+
+## Queue worker diagnostics and descriptor retirement
+
+`SGFX_VULKAN_CALL_PROFILE=1` reports one-second API queue/service timings and
+the six most expensive operations. Nested worker phases distinguish command
+resolution, validation, buffer snapshots, IR recording, backend submission,
+readback and descriptor retirement. Nested durations overlap the enclosing
+API call; summing them double-counts work. The disabled path reads no clocks.
+
+Transient descriptor groups are retired at the end of a queue packet. Backend
+retirements now see one unchanged resource-table revision; logical identities
+are invalidated after that batch. Interleaving those steps previously caused
+the dynamic backend to resynchronize the entire table for every group.
+Failed groups remain available for retry, while successful groups retire and
+keep their generation checks. Native YouTube profiling identified 150-210ms
+per second in the old retirement path. Unit tests cover a failure between two
+successful releases, an unchanged revision throughout the backend batch,
+retry and repeated slot reuse with immutable submitted descriptor snapshots.

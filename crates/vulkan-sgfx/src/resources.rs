@@ -463,14 +463,24 @@ impl Resources {
             set.cached_group = None;
         }
         let mut result = Ok(());
+        let mut retired = Vec::new();
         for (desc, id) in std::mem::take(&mut self.bind_group_cache) {
             if desc.layout().entries().is_empty() {
                 self.bind_group_cache.push((desc, id));
-            } else if let Err(error) =
-                release_backend(id).and_then(|()| table.release_bind_group(id).map_err(failure))
-            {
+            } else if let Err(error) = release_backend(id) {
                 // Preserve failed retirements for diagnosis or a retry, while
                 // still releasing the rest of this packet's snapshots.
+                self.bind_group_cache.push((desc, id));
+                result = Err(error);
+            } else {
+                retired.push((desc, id));
+            }
+        }
+        // Keep one table revision for the whole backend retirement batch.
+        // Each logical release changes the ABI revision; interleaving it with
+        // backend calls would serialize the entire resource table per group.
+        for (desc, id) in retired {
+            if let Err(error) = table.release_bind_group(id).map_err(failure) {
                 self.bind_group_cache.push((desc, id));
                 result = Err(error);
             }
@@ -3308,7 +3318,7 @@ mod tests {
             ir::BindingType::UniformBuffer,
         )])
         .unwrap();
-        let groups = [0, 16].map(|offset| {
+        let groups = [0, 16, 32].map(|offset| {
             let desc = ir::BindGroupDesc::new(
                 &table,
                 layout.clone(),
@@ -3327,11 +3337,14 @@ mod tests {
             id
         });
         let empty = resources.empty_bind_group(&table).unwrap();
+        let revision = table.abi_revision();
         let mut attempted = Vec::new();
         assert_eq!(
             resources.release_descriptor_groups(&table, |id| {
+                assert_eq!(table.abi_revision(), revision);
+                assert!(groups.iter().all(|id| table.bind_group_ref(*id).is_ok()));
                 attempted.push(id);
-                if id == groups[0] {
+                if id == groups[1] {
                     Err(vk::Result::ERROR_DEVICE_LOST)
                 } else {
                     Ok(())
@@ -3340,14 +3353,15 @@ mod tests {
             Err(vk::Result::ERROR_DEVICE_LOST)
         );
         assert_eq!(attempted, groups);
-        assert!(table.bind_group_ref(groups[0]).is_ok());
-        assert!(table.bind_group_ref(groups[1]).is_err());
+        assert!(table.bind_group_ref(groups[0]).is_err());
+        assert!(table.bind_group_ref(groups[1]).is_ok());
+        assert!(table.bind_group_ref(groups[2]).is_err());
         assert_eq!(resources.bind_group_cache.len(), 2);
         assert_eq!(resources.empty_bind_group(&table).unwrap(), empty);
         resources
             .release_descriptor_groups(&table, |_| Ok(()))
             .unwrap();
-        assert!(table.bind_group_ref(groups[0]).is_err());
+        assert!(table.bind_group_ref(groups[1]).is_err());
         assert_eq!(resources.bind_group_cache.len(), 1);
     }
 
