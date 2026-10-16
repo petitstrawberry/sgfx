@@ -99,7 +99,7 @@ impl ResourceTable {
         scan_retired(
             &mut r,
             &self.shader_modules.borrow(),
-            256,
+            MAX_SHADER_MODULES,
             self,
             |index, generation| {
                 shaders.push(ShaderModuleId {
@@ -114,7 +114,7 @@ impl ResourceTable {
         scan_retired(
             &mut r,
             &self.compute_pipelines.borrow(),
-            256,
+            MAX_COMPUTE_PIPELINES,
             self,
             |index, generation| {
                 compute.push(ComputePipelineId {
@@ -128,7 +128,7 @@ impl ResourceTable {
         scan_retired(
             &mut r,
             &self.programmable_pipelines.borrow(),
-            256,
+            MAX_PROGRAMMABLE_RENDER_PIPELINES,
             self,
             |index, generation| {
                 programmable.push(ProgrammableRenderPipelineId {
@@ -199,7 +199,12 @@ impl ResourceTable {
         self.append_abi_rows::<RenderPipelineDesc>(&mut r, existing, MAX_RENDER_PIPELINES, |d| {
             self.define_render_pipeline(d).map(|_| ())
         })?;
-        sync_program_slots(&mut r, &mut self.shader_modules.borrow_mut(), self)?;
+        sync_program_slots(
+            &mut r,
+            &mut self.shader_modules.borrow_mut(),
+            MAX_SHADER_MODULES,
+            self,
+        )?;
         // Historical descriptors can reference retired resources. Their IDs
         // are checked when used, without reviving old generations on import.
         sync_slots(
@@ -208,8 +213,18 @@ impl ResourceTable {
             MAX_BIND_GROUP_DEFINITIONS,
             self,
         )?;
-        sync_program_slots(&mut r, &mut self.compute_pipelines.borrow_mut(), self)?;
-        sync_program_slots(&mut r, &mut self.programmable_pipelines.borrow_mut(), self)?;
+        sync_program_slots(
+            &mut r,
+            &mut self.compute_pipelines.borrow_mut(),
+            MAX_COMPUTE_PIPELINES,
+            self,
+        )?;
+        sync_program_slots(
+            &mut r,
+            &mut self.programmable_pipelines.borrow_mut(),
+            MAX_PROGRAMMABLE_RENDER_PIPELINES,
+            self,
+        )?;
         r.end()?;
         // A cached unchanged pipeline row may not outlive the shader generation
         // it names. Check this even when sync_slots reused its Rc metadata.
@@ -409,13 +424,14 @@ impl<T: Codec> Slot for ProgramSlot<T> {
 fn sync_program_slots<T: Codec + PartialEq>(
     r: &mut Reader<'_>,
     current: &mut Vec<ProgramSlot<T>>,
+    maximum: usize,
     table: &ResourceTable,
 ) -> Result<()> {
     if !table.abi.legacy_program_ids.get() {
-        return sync_slots(r, current, 256, table);
+        return sync_slots(r, current, maximum, table);
     }
     let count = usize::get(r, table)?;
-    if count < current.len() || count > 256 {
+    if count < current.len() || count > maximum.min(256) {
         return Err(Error::ResourceLimitExceeded);
     }
     for index in 0..count {
@@ -454,4 +470,49 @@ fn rebuild_program_free_list<T>(
         }
     }
     free.set(head);
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    #[test]
+    fn shared_shader_capacity_roundtrips_and_recycles_beyond_256_slots() {
+        let producer = ResourceTable::new();
+        let consumer = ResourceTable::new();
+        let descriptor =
+            ShaderModuleDesc::wgsl("@compute @workgroup_size(1) fn main() {}".into()).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_SHADER_MODULES {
+            ids.push(
+                producer
+                    .define_shader_module(descriptor.clone())
+                    .unwrap()
+                    .id(),
+            );
+        }
+        assert_eq!(
+            producer
+                .define_shader_module(descriptor.clone())
+                .unwrap_err(),
+            Error::ResourceLimitExceeded
+        );
+        consumer
+            .sync_abi_snapshot(&producer.abi_snapshot().unwrap())
+            .unwrap();
+        assert!(
+            consumer
+                .abi_shader_module((MAX_SHADER_MODULES - 1) as u32)
+                .is_ok()
+        );
+        let old = consumer.abi_shader_module(300).unwrap().id();
+        producer.release_shader_module(ids[300]).unwrap();
+        let replacement = producer.define_shader_module(descriptor).unwrap().id();
+        assert_eq!(replacement.index, 300);
+        let snapshot = producer.abi_snapshot().unwrap();
+        let (retired, _, _) = consumer.abi_retired_programs(&snapshot).unwrap();
+        assert!(retired.contains(&old));
+        consumer.sync_abi_snapshot(&snapshot).unwrap();
+        assert!(consumer.shader_module_ref(old).is_err());
+        assert!(consumer.abi_shader_module(300).is_ok());
+    }
 }

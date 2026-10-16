@@ -393,3 +393,13 @@ keep their generation checks. Native YouTube profiling identified 150-210ms
 per second in the old retirement path. Unit tests cover a failure between two
 successful releases, an unchanged revision throughout the backend batch,
 retry and repeated slot reuse with immutable submitted descriptor snapshots.
+
+Shader modules have a separate bounded table of 1,024 live entries; compute
+and programmable graphics pipelines each retain their existing 256-entry
+limits. A graphics pipeline can own two distinct shader stages. Several Skia
+contexts share the device table, so a 256-entry shader table could exhaust
+before the graphics-pipeline limit. The R3 metadata importer and retirement
+scanner use the same declared capacities. Released generations remain invalid
+and slots remain reusable. The simultaneous-pipeline contract test retains
+160 graphics pipelines (320 distinct shader modules) while rendering and
+validating their pixels, rather than testing only sequential create/destroy.

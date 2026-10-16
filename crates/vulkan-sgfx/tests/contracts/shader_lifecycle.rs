@@ -32,13 +32,19 @@ fn stage_words(stage: naga::ShaderStage, entry: &str, colour: &str) -> Vec<u32> 
 #[test]
 #[ignore = "requires a native GPU and freshly built SGFX ICD"]
 fn shader_modules_and_pipelines_recycle_beyond_256_with_failed_creation_rollback() {
-    graphics_lifecycle(false);
+    graphics_lifecycle(false, 0);
 }
 
 #[test]
 #[ignore = "requires a native GPU and freshly built SGFX ICD"]
 fn live_shader_modules_recycle_1024_unique_specialized_pipelines() {
-    graphics_lifecycle(true);
+    graphics_lifecycle(true, 0);
+}
+
+#[test]
+#[ignore = "requires a native GPU and freshly built SGFX ICD"]
+fn simultaneous_graphics_pipelines_retain_more_than_256_shader_stages() {
+    graphics_lifecycle(false, 160);
 }
 
 fn specialized_fragment_words() -> Vec<u32> {
@@ -70,7 +76,7 @@ fn specialized_fragment_words() -> Vec<u32> {
     words
 }
 
-fn graphics_lifecycle(long_lived_modules: bool) {
+fn graphics_lifecycle(long_lived_modules: bool, keep_live: usize) {
     let context = Context::new();
     let vertices = Storage::with_usage(&context, vk::BufferUsageFlags::VERTEX_BUFFER);
     let output = Storage::with_usage(&context, vk::BufferUsageFlags::TRANSFER_DST);
@@ -279,7 +285,8 @@ fn graphics_lifecycle(long_lived_modules: bool) {
         };
         let persistent = long_lived_modules.then(|| modules(0));
         // A new VkDevice per iteration would hide the append-only 256-slot leak.
-        for iteration in 0..1024 {
+        let mut retained = std::collections::VecDeque::new();
+        for iteration in 0..if keep_live == 0 { 1024 } else { 350 } {
             let index = if long_lived_modules { 0 } else { iteration % 2 };
             let red = iteration as f32 / 1023.0;
             let data = red.to_ne_bytes();
@@ -387,6 +394,12 @@ fn graphics_lifecycle(long_lived_modules: bool) {
                     pixel.to_le_bytes()
                 );
             }
+            retained.push_back(pipeline);
+            if retained.len() > keep_live {
+                d.destroy_pipeline(retained.pop_front().unwrap(), None);
+            }
+        }
+        for pipeline in retained {
             d.destroy_pipeline(pipeline, None);
         }
         if let Some(shaders) = persistent {

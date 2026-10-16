@@ -122,11 +122,16 @@ fn foreign_and_repeated_release_do_not_change_live_program_slots() {
 }
 
 #[test]
-fn unreleased_program_categories_keep_the_256_live_slot_limit() {
+fn unreleased_program_categories_enforce_their_declared_live_slot_limits() {
     for kind in 0..3 {
         let table = ResourceTable::new();
         let module = shader(&table, 0);
-        for index in 0..256 {
+        let limit = [
+            MAX_SHADER_MODULES,
+            MAX_COMPUTE_PIPELINES,
+            MAX_PROGRAMMABLE_RENDER_PIPELINES,
+        ][kind];
+        for index in 0..limit {
             match kind {
                 0 if index > 0 => {
                     shader(&table, index);

@@ -20,6 +20,14 @@ pub const MAX_BUFFERS: usize = 4_096;
 pub const MAX_SAMPLERS: usize = 256;
 /// Maximum render pipelines held by one [`ResourceTable`].
 pub const MAX_RENDER_PIPELINES: usize = 256;
+/// Maximum graphics and compute shader modules held by one shared table.
+/// Shader capacity is separate: one graphics pipeline can retain two modules,
+/// and several frontend contexts share a Vulkan device's resource table.
+pub const MAX_SHADER_MODULES: usize = 1_024;
+/// Maximum programmable render pipelines held by one shared table.
+pub const MAX_PROGRAMMABLE_RENDER_PIPELINES: usize = 256;
+/// Maximum compute pipelines held by one shared table.
+pub const MAX_COMPUTE_PIPELINES: usize = 256;
 /// Maximum immutable bind-group definitions held by one resource table.
 pub const MAX_BIND_GROUP_DEFINITIONS: usize = 4_096;
 
@@ -1013,8 +1021,12 @@ impl ResourceTable {
 
     /// Define an immutable shader module and return its branded reference.
     pub fn define_shader_module(&self, desc: ShaderModuleDesc) -> Result<ShaderModuleRef<'_>> {
-        let (index, generation) =
-            self.define_program_slot(&self.shader_modules, &self.free_shader_module, desc)?;
+        let (index, generation) = self.define_program_slot(
+            &self.shader_modules,
+            &self.free_shader_module,
+            MAX_SHADER_MODULES,
+            desc,
+        )?;
         Ok(ShaderModuleRef {
             owner: self,
             index,
@@ -1139,8 +1151,12 @@ impl ResourceTable {
         desc: ComputePipelineDesc,
     ) -> Result<ComputePipelineRef<'_>> {
         self.shader_module_ref(desc.shader().module())?;
-        let (index, generation) =
-            self.define_program_slot(&self.compute_pipelines, &self.free_compute_pipeline, desc)?;
+        let (index, generation) = self.define_program_slot(
+            &self.compute_pipelines,
+            &self.free_compute_pipeline,
+            MAX_COMPUTE_PIPELINES,
+            desc,
+        )?;
         Ok(ComputePipelineRef {
             owner: self,
             index,
@@ -1181,6 +1197,7 @@ impl ResourceTable {
         let (index, generation) = self.define_program_slot(
             &self.programmable_pipelines,
             &self.free_programmable_pipeline,
+            MAX_PROGRAMMABLE_RENDER_PIPELINES,
             Rc::new(desc),
         )?;
         Ok(ProgrammableRenderPipelineRef {
@@ -1279,6 +1296,7 @@ impl ResourceTable {
         &self,
         slots: &RefCell<Vec<ProgramSlot<T>>>,
         free: &Cell<Option<usize>>,
+        maximum: usize,
         descriptor: T,
     ) -> Result<(usize, u64)> {
         let mut slots = slots.borrow_mut();
@@ -1288,7 +1306,7 @@ impl ResourceTable {
             slot.descriptor = Some(descriptor);
             (index, slot.generation)
         } else {
-            if slots.len() >= 256 {
+            if slots.len() >= maximum {
                 return Err(Error::ResourceLimitExceeded);
             }
             slots.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
