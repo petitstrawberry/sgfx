@@ -15,7 +15,7 @@ use super::{
 /// Maximum textures held by one [`ResourceTable`].
 pub const MAX_TEXTURES: usize = 1_024;
 /// Maximum buffers held by one [`ResourceTable`].
-pub const MAX_BUFFERS: usize = 1_024;
+pub const MAX_BUFFERS: usize = 4_096;
 /// Maximum samplers held by one [`ResourceTable`].
 pub const MAX_SAMPLERS: usize = 256;
 /// Maximum render pipelines held by one [`ResourceTable`].

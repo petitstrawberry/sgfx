@@ -300,7 +300,7 @@ and verify the chosen Mesa driver. The Linux check also used
   A test creates/destroys 1250 buffers on an otherwise idle device, then performs
   real compute work. With long-lived pipelines/resources, unique transient
   resources and descriptor configurations still consume that epoch's table
-  budget (including 1024 buffers and 4096 bind-group configurations). Identical
+  budget (including 4096 buffers, 4096 memory allocations and 4096 bind-group configurations). Identical
   descriptor configurations reuse definitions and physical groups; GPU image
   remapping invalidates physical groups. Exhaustion returns an allocation
   error. General reclamation requires generational core/backend slots or a safe

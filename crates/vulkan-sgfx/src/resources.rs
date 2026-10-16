@@ -9,6 +9,9 @@ use std::{
 };
 
 const LIMIT: usize = 1024;
+// Skia keeps many small uniform/staging allocations alive alongside images.
+// Keep their count separate from metadata limits and from the byte budget.
+pub(crate) const MAX_MEMORY_ALLOCATIONS: usize = 4_096;
 const MAX_DESCRIPTOR_SETS: usize = 16_384;
 const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
 const MAX_ALLOCATED: usize = 512 * 1024 * 1024;
@@ -945,7 +948,7 @@ unsafe extern "system" fn create_buffer(
             }
         }
         let handle = crate::api::with_device(device, move |r| {
-            if r.resources.buffers.len() >= LIMIT {
+            if r.resources.buffers.len() >= ir::MAX_BUFFERS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
             let id = r
@@ -1047,7 +1050,7 @@ unsafe extern "system" fn allocate_memory(
         let size =
             usize::try_from(i.allocation_size).map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
         let handle = crate::api::with_device(device, move |r| {
-            if r.resources.memories.len() >= LIMIT {
+            if r.resources.memories.len() >= MAX_MEMORY_ALLOCATIONS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
             let allocated: usize = r.resources.memories.values().map(|m| m.bytes.len()).sum();

@@ -863,7 +863,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_properties(
             } else {
                 0
             },
-            max_memory_allocation_count: 1024,
+            max_memory_allocation_count: crate::resources::MAX_MEMORY_ALLOCATIONS as u32,
             buffer_image_granularity: 256,
             max_bound_descriptor_sets: limits.max_bound_descriptor_sets,
             max_per_stage_descriptor_input_attachments: if capabilities

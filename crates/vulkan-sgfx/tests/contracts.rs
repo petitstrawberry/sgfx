@@ -40,6 +40,9 @@ mod memory2;
 #[path = "contracts/shader_lifecycle.rs"]
 mod shader_lifecycle;
 
+#[path = "contracts/resource_limits.rs"]
+mod resource_limits;
+
 const WORDS: usize = 256;
 const BYTES: u64 = (WORDS * size_of::<u32>()) as u64;
 
