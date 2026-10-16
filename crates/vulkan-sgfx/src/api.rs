@@ -3799,6 +3799,20 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
     }
     Ok(())
 }
+// Vulkan's queue worker may wait for backend capacity. Busy guarantees that
+// nothing was accepted, so only that result is safe to retry. The backend's
+// completion thread returns capacity independently of this runtime worker.
+fn submit_with_backpressure<E, S>(
+    mut submit: impl FnMut() -> Result<S, SubmitError<E, S>>,
+) -> Result<S, SubmitError<E, S>> {
+    loop {
+        match submit() {
+            Err(SubmitError::Busy) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            result => return result,
+        }
+    }
+}
+
 fn submit_owned(
     rt: &mut Runtime,
     ops: Vec<ir::OwnedCommand>,
@@ -3816,9 +3830,8 @@ fn submit_owned(
         })
     })?;
     profile_work("submit::backend", || {
-        match rt.queue.submit(&mut rt.cache, &commands) {
+        match submit_with_backpressure(|| rt.queue.submit(&mut rt.cache, &commands)) {
             Ok(receipt) => Ok(Some(receipt)),
-            Err(SubmitError::Busy) => Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
             Err(SubmitError::Rejected(error)) => Err(crate::runtime::backend_failure(error)),
             Err(SubmitError::Failed { error, completion }) => {
                 let result = completion.wait(None);
@@ -4373,6 +4386,61 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_backpressure_waits_for_independent_completion_capacity() {
+        let (entered, started) = mpsc::sync_channel(1);
+        let (credit, available) = mpsc::sync_channel(1);
+        let (finished, result) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut first = true;
+            let outcome: Result<usize, SubmitError<&str, usize>> = submit_with_backpressure(|| {
+                if first {
+                    entered.send(()).unwrap();
+                    first = false;
+                }
+                match available.try_recv() {
+                    Ok(receipt) => Ok(receipt),
+                    Err(mpsc::TryRecvError::Empty) => Err(SubmitError::Busy),
+                    Err(mpsc::TryRecvError::Disconnected) => Err(SubmitError::Rejected("closed")),
+                }
+            });
+            finished.send(outcome).unwrap();
+        });
+        let timeout = std::time::Duration::from_secs(2);
+        started.recv_timeout(timeout).unwrap();
+        assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        credit.send(17).unwrap();
+        assert!(matches!(result.recv_timeout(timeout).unwrap(), Ok(17)));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn queue_backpressure_never_replays_rejected_or_partially_accepted_work() {
+        let mut calls = 0;
+        let result = submit_with_backpressure(|| {
+            calls += 1;
+            Err::<usize, _>(SubmitError::Failed {
+                error: "failed prefix",
+                completion: 19,
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(SubmitError::Failed {
+                error: "failed prefix",
+                completion: 19
+            })
+        ));
+        assert_eq!(calls, 1);
+        calls = 0;
+        let result = submit_with_backpressure(|| {
+            calls += 1;
+            Err::<usize, SubmitError<_, usize>>(SubmitError::Rejected("invalid"))
+        });
+        assert!(matches!(result, Err(SubmitError::Rejected("invalid"))));
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn call_profile_counts_worker_errors_and_missing_channel_responses_separately() {
