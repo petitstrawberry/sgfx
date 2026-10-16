@@ -58,7 +58,10 @@ fn error(e: virgl::IrSubmitError) -> i32 {
         | E::ImageAlreadyMapped
         | E::InvalidVertexData => abi::INVALID,
         E::Backend(e) => handle_error(e),
-        _ => abi::DEVICE_LOST,
+        cause => {
+            eprintln!("[SGFX VirGL] operation failed: {cause:?}");
+            abi::DEVICE_LOST
+        }
     }
 }
 fn handle_error(e: virgl::HandleError) -> i32 {
@@ -68,7 +71,10 @@ fn handle_error(e: virgl::HandleError) -> i32 {
         E::Unsupported => abi::UNSUPPORTED,
         E::OutOfResources => abi::OUT_OF_MEMORY,
         E::NotFound => abi::INITIALIZATION_FAILED,
-        _ => abi::DEVICE_LOST,
+        cause => {
+            eprintln!("[SGFX VirGL] native operation failed: {cause:?}");
+            abi::DEVICE_LOST
+        }
     }
 }
 fn status(result: Result<(), i32>) -> i32 {
