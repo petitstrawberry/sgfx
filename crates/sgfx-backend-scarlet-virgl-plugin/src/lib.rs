@@ -47,7 +47,7 @@ fn core_batch(batch: abi::Batch) -> ir::abi::Batch {
 fn error(e: virgl::IrSubmitError) -> i32 {
     use virgl::IrSubmitError as E;
     match e {
-        E::OutOfMemory => abi::OUT_OF_MEMORY,
+        E::OutOfMemory | E::SubmissionTooLarge => abi::OUT_OF_MEMORY,
         E::Unsupported(_) | E::ShaderCompile(_) => abi::UNSUPPORTED,
         E::InvalidIr(_)
         | E::ResourceTableMismatch

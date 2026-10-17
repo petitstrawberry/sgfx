@@ -44,6 +44,11 @@ impl Packets {
     // native chunk must happen before choosing its arena and source offsets.
     pub(crate) fn prepare(&mut self, maximum: usize) -> Result<(), Error> {
         if maximum > self.limit {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX VirGL] packet exceeds transport: bytes={maximum} limit={}",
+                self.limit
+            );
             return Err(Error::TooLarge);
         }
         if self.current.bytes.len().saturating_add(maximum) > self.limit {
@@ -54,6 +59,13 @@ impl Packets {
 
     pub(crate) fn upload_range(&mut self, length: u32) -> Result<(usize, u32), Error> {
         let start = self.upload_offset;
+        #[cfg(feature = "std")]
+        if u64::from(start) + u64::from(length) > self.limit as u64 {
+            std::eprintln!(
+                "[SGFX VirGL] upload exceeds arena: offset={start} bytes={length} commands={} limit={}",
+                self.current.bytes.len(), self.limit
+            );
+        }
         let end = start
             .checked_add(length)
             .filter(|end| *end as usize <= self.limit)
@@ -65,6 +77,13 @@ impl Packets {
     }
 
     pub(crate) fn append(&mut self, commands: &[u8]) -> Result<(), Error> {
+        #[cfg(feature = "std")]
+        if self.bytes.saturating_add(commands.len()) > MAX_STREAM_BYTES {
+            std::eprintln!(
+                "[SGFX VirGL] stream exceeds admission: staged={} packet={} chunks={} limit={MAX_STREAM_BYTES}",
+                self.bytes, commands.len(), self.chunks.len()
+            );
+        }
         let bytes = self
             .bytes
             .checked_add(commands.len())

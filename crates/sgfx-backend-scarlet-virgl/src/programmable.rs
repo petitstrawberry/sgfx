@@ -324,6 +324,11 @@ fn compile_pipeline(
         .iter()
         .any(|shader| shader.tgsi.len() > 256 * 1024)
     {
+        #[cfg(feature = "std")]
+        std::eprintln!(
+            "[SGFX VirGL] shader exceeds source limit: vertex={} fragment={} limit={}",
+            vertex.tgsi.len(), fragment.tgsi.len(), 256 * 1024
+        );
         return Err(IrSubmitError::SubmissionTooLarge);
     }
     let binding_validation = (|| {
