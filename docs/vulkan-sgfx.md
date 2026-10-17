@@ -130,10 +130,11 @@ fence, and retires in-flight work. GPU acceptance and retirement errors do not
 manufacture successful completion; uncertain backend failures mark the device
 lost.
 
-Texture-upload-only recordings above 8 MiB are validated in full, then admitted
+Texture-transfer-only recordings above 8 MiB are validated in full, then admitted
 as ordered batches with at most 8 MiB of source pixels each. Large individual
 uploads are divided at row boundaries, preserving subrectangles, mip levels,
-array layers and overwrite order. Every batch receipt participates in fence
+array layers and overwrite order. Texture barriers, copies and mip blits retain
+their position between uploads. Every batch receipt participates in fence
 completion and readback waits. A failure after an accepted prefix drains its
 receipts and marks the device lost; the prefix is never replayed. Mixed
 render/transfer recordings retain their existing whole-recording path.

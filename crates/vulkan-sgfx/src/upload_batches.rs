@@ -11,6 +11,12 @@ fn upload_bytes(command: &OwnedCommand) -> Option<usize> {
         OwnedCommand::WriteTexture { data, .. }
         | OwnedCommand::WriteTextureMip { data, .. }
         | OwnedCommand::WriteTextureLayer { data, .. } => Some(data.len()),
+        OwnedCommand::ResourceBarrier(
+            ir::OwnedResourceBarrier::Texture { .. } | ir::OwnedResourceBarrier::TextureMip { .. },
+        )
+        | OwnedCommand::CopyTextureToTexture { .. }
+        | OwnedCommand::BlitTexture { .. }
+        | OwnedCommand::BlitTextureRegion { .. } => Some(0),
         _ => None,
     }
 }
@@ -24,8 +30,9 @@ pub(crate) fn needs_batches(commands: &[OwnedCommand], budget: usize) -> bool {
         .is_some_and(|bytes| bytes > budget)
 }
 
-/// Validate the entire recording before admitting any prefix. Only independent
-/// texture writes are eligible; ordering and all mip/layer identities survive.
+/// Validate the entire recording before admitting any prefix. Only
+/// texture transfers and their barriers are eligible. Ordering and all mip/layer
+/// identities survive; render-pass bindings are never split.
 pub(crate) fn split(
     owned: OwnedCommandBuffer,
     table: &ir::ResourceTable,
@@ -148,7 +155,9 @@ mod tests {
                 ir::TextureDesc::new(
                     ir::TextureFormat::Rgba8Unorm,
                     ir::Extent2D::new(32, 32).unwrap(),
-                    ir::TextureUsage::COPY_DST,
+                    ir::TextureUsage::COPY_DST
+                        | ir::TextureUsage::COPY_SRC
+                        | ir::TextureUsage::SAMPLED,
                 )
                 .unwrap()
                 .with_mip_level_count(2)
@@ -259,6 +268,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mip_uploads_keep_barriers_and_dependent_blits_in_queue_order() {
+        let table = ir::ResourceTable::new();
+        let texture = table
+            .define_texture(
+                ir::TextureDesc::new(
+                    ir::TextureFormat::Rgba8Unorm,
+                    ir::Extent2D::new(32, 32).unwrap(),
+                    ir::TextureUsage::COPY_DST
+                        | ir::TextureUsage::COPY_SRC
+                        | ir::TextureUsage::SAMPLED,
+                )
+                .unwrap()
+                .with_mip_level_count(2)
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let commands = vec![
+            OwnedCommand::WriteTexture {
+                texture,
+                destination: ir::PixelRect::new(0, 0, 32, 32).unwrap(),
+                bytes_per_row: 128,
+                data: vec![9; 4096],
+            },
+            OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::TextureMip {
+                texture,
+                mip_level: 0,
+                before: ir::TextureAccess::CopyDestination,
+                after: ir::TextureAccess::CopySource,
+            }),
+            OwnedCommand::BlitTexture {
+                source: texture,
+                source_mip: 0,
+                destination: texture,
+                destination_mip: 1,
+                filter: ir::FilterMode::Linear,
+            },
+            OwnedCommand::WriteTextureMip {
+                texture,
+                mip_level: 1,
+                destination: ir::PixelRect::new(0, 0, 16, 16).unwrap(),
+                bytes_per_row: 64,
+                data: vec![3; 1024],
+            },
+            OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::TextureMip {
+                texture,
+                mip_level: 1,
+                before: ir::TextureAccess::CopyDestination,
+                after: ir::TextureAccess::Sampled,
+            }),
+        ];
+        assert!(needs_batches(&commands, 1024));
+        let batches = split(OwnedCommandBuffer::new(commands), &table, 1024).unwrap();
+        let mut order = Vec::new();
+        for batch in &batches {
+            batch.validate(&table).unwrap();
+            assert!(
+                batch
+                    .commands()
+                    .iter()
+                    .map(|c| upload_bytes(c).unwrap())
+                    .sum::<usize>()
+                    <= 1024
+            );
+            for command in batch.commands() {
+                order.push(match command {
+                    OwnedCommand::WriteTextureLayer { mip_level: 0, .. } => "base",
+                    OwnedCommand::WriteTextureMip { mip_level: 1, .. } => "overwrite",
+                    OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::TextureMip {
+                        mip_level: 0,
+                        ..
+                    }) => "source-barrier",
+                    OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::TextureMip {
+                        mip_level: 1,
+                        ..
+                    }) => "sample-barrier",
+                    OwnedCommand::BlitTexture { .. } => "blit",
+                    _ => panic!("unexpected transfer"),
+                });
+            }
+        }
+        assert_eq!(
+            order,
+            [
+                "base",
+                "base",
+                "base",
+                "base",
+                "source-barrier",
+                "blit",
+                "overwrite",
+                "sample-barrier"
+            ]
+        );
     }
 
     #[test]
