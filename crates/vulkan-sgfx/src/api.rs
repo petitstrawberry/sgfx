@@ -3816,11 +3816,45 @@ fn submit_with_backpressure<E, S>(
 fn submit_owned(
     rt: &mut Runtime,
     ops: Vec<ir::OwnedCommand>,
+) -> VkResult<Vec<sgfx::driver::Submission>> {
+    let owned = ir::OwnedCommandBuffer::new(ops);
+    let batches = if crate::upload_batches::needs_batches(
+        owned.commands(),
+        crate::upload_batches::UPLOAD_BATCH_BYTES,
+    ) {
+        crate::upload_batches::split(owned, &rt.table, crate::upload_batches::UPLOAD_BATCH_BYTES)
+            .map_err(crate::resources::failure)?
+    } else {
+        vec![owned]
+    };
+    let mut submissions = Vec::new();
+    for batch in batches {
+        match submit_owned_batch(rt, batch) {
+            Ok(Some(receipt)) => submissions.push(receipt),
+            Ok(None) => {}
+            Err(error) => {
+                // Earlier batches are accepted work: retain and drain every
+                // receipt, and never make their prefix eligible for replay.
+                if !submissions.is_empty() {
+                    for receipt in &submissions {
+                        let _ = wait_submission(rt, receipt);
+                    }
+                    rt.lost = true;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(submissions)
+}
+
+fn submit_owned_batch(
+    rt: &mut Runtime,
+    owned: ir::OwnedCommandBuffer,
 ) -> VkResult<Option<sgfx::driver::Submission>> {
-    if ops.is_empty() {
+    if owned.is_empty() {
         return Ok(None);
     }
-    let owned = ir::OwnedCommandBuffer::new(ops);
     let commands = profile_work("submit::record_ir", || {
         owned.record(&rt.table).map_err(|error| {
             if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
@@ -3858,7 +3892,10 @@ fn submit_owned(
                         _ => {}
                     }
                 }
-                eprintln!("[SGFX Vulkan] rejected stream: operations={} buffer_bytes={buffer_bytes} texture_bytes={texture_bytes} largest_buffer={largest_buffer} passes={passes} draws={draws}", owned.command_count());
+                eprintln!(
+                    "[SGFX Vulkan] rejected stream: operations={} buffer_bytes={buffer_bytes} texture_bytes={texture_bytes} largest_buffer={largest_buffer} passes={passes} draws={draws}",
+                    owned.command_count()
+                );
                 Err(crate::runtime::backend_failure(error))
             }
             Err(SubmitError::Failed { error, completion }) => {
@@ -4161,7 +4198,7 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
         }
         for copy in take_positioned(&mut copies, position, |c| c.position) {
             profile_work("execute::texture_readback", || {
-                if let Some(submission) = submit_owned(rt, std::mem::take(&mut ops))? {
+                for submission in submit_owned(rt, std::mem::take(&mut ops))? {
                     wait_submission(rt, &submission)?;
                 }
                 let image_id = rt
@@ -4187,7 +4224,7 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
             ops.push(op.clone());
         }
     }
-    let mut submissions = submit_owned(rt, ops)?.into_iter().collect::<Vec<_>>();
+    let mut submissions = submit_owned(rt, ops)?;
     let mut readback = rec.readback_buffers.clone();
     readback.sort_unstable_by_key(|buffer| buffer.as_raw());
     readback.dedup();

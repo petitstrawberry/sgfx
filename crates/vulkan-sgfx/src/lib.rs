@@ -33,6 +33,7 @@ mod spirv;
 mod stage_inputs;
 mod transfer;
 mod uniform_arrays;
+mod upload_batches;
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
 mod wsi;
 
