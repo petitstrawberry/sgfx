@@ -14,7 +14,7 @@ const LIMIT: usize = 1024;
 pub(crate) const MAX_MEMORY_ALLOCATIONS: usize = 4_096;
 const MAX_DESCRIPTOR_SETS: usize = 16_384;
 const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
-const MAX_ALLOCATED: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_ALLOCATED: usize = 512 * 1024 * 1024;
 pub(crate) struct Buffer {
     pub id: ir::BufferId,
     pub size: u64,

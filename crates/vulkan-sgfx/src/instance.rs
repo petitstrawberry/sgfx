@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const LOADER_MAGIC: usize = 0x01cd_c0de;
-const MEMORY_HEAP_SIZE: u64 = 256 * 1024 * 1024;
+const MEMORY_HEAP_SIZE: u64 = crate::resources::MAX_ALLOCATED as u64;
 
 // The loader replaces this first word with its own dispatch table pointer.
 #[repr(C)]

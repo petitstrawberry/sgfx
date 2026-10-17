@@ -3832,7 +3832,35 @@ fn submit_owned(
     profile_work("submit::backend", || {
         match submit_with_backpressure(|| rt.queue.submit(&mut rt.cache, &commands)) {
             Ok(receipt) => Ok(Some(receipt)),
-            Err(SubmitError::Rejected(error)) => Err(crate::runtime::backend_failure(error)),
+            Err(SubmitError::Rejected(error)) => {
+                let mut buffer_bytes = 0usize;
+                let mut texture_bytes = 0usize;
+                let mut draws = 0usize;
+                let mut passes = 0usize;
+                let mut largest_buffer = 0usize;
+                for command in owned.commands() {
+                    match command {
+                        ir::OwnedCommand::WriteBuffer { data, .. } => {
+                            buffer_bytes = buffer_bytes.saturating_add(data.len());
+                            largest_buffer = largest_buffer.max(data.len());
+                        }
+                        ir::OwnedCommand::WriteTexture { data, .. }
+                        | ir::OwnedCommand::WriteTextureMip { data, .. }
+                        | ir::OwnedCommand::WriteTextureLayer { data, .. } => {
+                            texture_bytes = texture_bytes.saturating_add(data.len());
+                        }
+                        ir::OwnedCommand::BeginRenderPass(_)
+                        | ir::OwnedCommand::BeginRenderPassWithAttachments { .. } => passes += 1,
+                        ir::OwnedCommand::Draw { .. }
+                        | ir::OwnedCommand::DrawIndexed { .. }
+                        | ir::OwnedCommand::DrawInstanced { .. }
+                        | ir::OwnedCommand::DrawIndexedInstanced { .. } => draws += 1,
+                        _ => {}
+                    }
+                }
+                eprintln!("[SGFX Vulkan] rejected stream: operations={} buffer_bytes={buffer_bytes} texture_bytes={texture_bytes} largest_buffer={largest_buffer} passes={passes} draws={draws}", owned.command_count());
+                Err(crate::runtime::backend_failure(error))
+            }
             Err(SubmitError::Failed { error, completion }) => {
                 let result = completion.wait(None);
                 if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
