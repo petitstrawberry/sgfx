@@ -1068,11 +1068,51 @@ unsafe extern "system" fn allocate_memory(
                     .collect();
                 largest.sort_unstable_by(|a, b| b.0.cmp(&a.0));
                 largest.truncate(12);
+                let mut image_groups = BTreeMap::<_, (usize, u64)>::new();
+                for image in r
+                    .resources
+                    .images
+                    .values()
+                    .filter(|image| image.bound.is_some())
+                {
+                    let key = (
+                        image.extent.width,
+                        image.extent.height,
+                        image.format.as_raw(),
+                        image.usage.as_raw(),
+                    );
+                    let group = image_groups.entry(key).or_default();
+                    group.0 += 1;
+                    group.1 = group.1.saturating_add(image.byte_size());
+                }
+                let mut image_groups: Vec<_> = image_groups.into_iter().collect();
+                image_groups.sort_unstable_by(|a, b| b.1.1.cmp(&a.1.1));
+                image_groups.truncate(12);
+                let mut buffer_groups = BTreeMap::<_, (usize, u64)>::new();
+                for buffer in r
+                    .resources
+                    .buffers
+                    .values()
+                    .filter(|buffer| buffer.bound.is_some())
+                {
+                    let group = buffer_groups.entry(buffer.usage.as_raw()).or_default();
+                    group.0 += 1;
+                    group.1 = group.1.saturating_add(buffer.size);
+                }
+                let cpu_bytes = r
+                    .resources
+                    .memories
+                    .values()
+                    .map(|memory| memory.bytes.words.len() * 8)
+                    .sum::<usize>();
                 eprintln!(
                     "[SGFX Vulkan] allocation budget exhausted: requested={size} allocated={allocated} limit={MAX_ALLOCATED} allocations={} buffers={} images={} largest_bytes_mapped={largest:?}",
                     r.resources.memories.len(),
                     r.resources.buffers.len(),
                     r.resources.images.len(),
+                );
+                eprintln!(
+                    "[SGFX Vulkan] allocation owners: cpu_mirror_bytes={cpu_bytes} image_groups=((width,height,format,usage),(count,bytes)) {image_groups:?} buffer_groups=(usage,(count,bytes)) {buffer_groups:?}"
                 );
                 return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
             }
