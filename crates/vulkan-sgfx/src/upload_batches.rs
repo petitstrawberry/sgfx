@@ -1,14 +1,15 @@
-//! Bound texture-only transfer recordings without splitting render-pass state.
+//! Bound uploads in transfer and mixed recordings without splitting pass state.
 
 use sgfx::ir::{self, OwnedCommand, OwnedCommandBuffer};
 
-// A pacing budget for upload-only work, independent of native packet encoding.
+// A pacing budget for uploads, independent of native packet encoding.
 // Leaves room for resource/transfer metadata in bounded backend schedulers.
 pub(crate) const UPLOAD_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn upload_bytes(command: &OwnedCommand) -> Option<usize> {
     match command {
-        OwnedCommand::WriteTexture { data, .. }
+        OwnedCommand::WriteBuffer { data, .. }
+        | OwnedCommand::WriteTexture { data, .. }
         | OwnedCommand::WriteTextureMip { data, .. }
         | OwnedCommand::WriteTextureLayer { data, .. } => Some(data.len()),
         OwnedCommand::ResourceBarrier(
@@ -22,22 +23,21 @@ fn upload_bytes(command: &OwnedCommand) -> Option<usize> {
 }
 
 pub(crate) fn needs_batches(commands: &[OwnedCommand], budget: usize) -> bool {
-    commands
-        .iter()
-        .try_fold(0usize, |total, command| {
-            upload_bytes(command).map(|bytes| total.saturating_add(bytes))
-        })
-        .is_some_and(|bytes| bytes > budget)
+    commands.iter().fold(0usize, |total, command| {
+        total.saturating_add(upload_bytes(command).unwrap_or(0))
+    }) > budget
 }
 
-/// Validate the entire recording before admitting any prefix. Only
-/// texture transfers and their barriers are eligible. Ordering and all mip/layer
-/// identities survive; render-pass bindings are never split.
+/// Validate the entire recording before admitting any prefix. Preserve command
+/// order and resource identities, and split only outside render/compute passes.
 pub(crate) fn split(
     owned: OwnedCommandBuffer,
     table: &ir::ResourceTable,
     budget: usize,
 ) -> ir::Result<Vec<OwnedCommandBuffer>> {
+    if budget == 0 {
+        return Err(ir::Error::InvalidValue);
+    }
     owned.validate(table)?;
     if !needs_batches(owned.commands(), budget) {
         return Ok(vec![owned]);
@@ -45,12 +45,59 @@ pub(crate) fn split(
     let mut batches = Vec::new();
     let mut batch = Vec::new();
     let mut bytes = 0usize;
+    let mut in_pass = false;
     for command in owned.into_commands() {
-        let length = upload_bytes(&command).expect("texture-only recording");
+        match &command {
+            OwnedCommand::BeginRenderPass(_)
+            | OwnedCommand::BeginRenderPassWithAttachments { .. }
+            | OwnedCommand::BeginComputePass => {
+                if bytes >= budget && !batch.is_empty() {
+                    batches.push(OwnedCommandBuffer::new(std::mem::take(&mut batch)));
+                    bytes = 0;
+                }
+                in_pass = true;
+                batch.push(command);
+                continue;
+            }
+            OwnedCommand::EndRenderPass | OwnedCommand::EndComputePass => {
+                in_pass = false;
+                batch.push(command);
+                continue;
+            }
+            _ if in_pass => {
+                batch.push(command);
+                continue;
+            }
+            _ => {}
+        }
+        let length = upload_bytes(&command).unwrap_or(0);
         if length <= budget {
             push(&mut batches, &mut batch, &mut bytes, command, budget);
             continue;
         }
+        let command = match command {
+            OwnedCommand::WriteBuffer {
+                buffer,
+                offset,
+                data,
+            } => {
+                for (index, chunk) in data.chunks(budget).enumerate() {
+                    push(
+                        &mut batches,
+                        &mut batch,
+                        &mut bytes,
+                        OwnedCommand::WriteBuffer {
+                            buffer,
+                            offset: offset + (index * budget) as u64,
+                            data: chunk.to_vec(),
+                        },
+                        budget,
+                    );
+                }
+                continue;
+            }
+            command => command,
+        };
         let (texture, mip_level, array_layer, rect, stride, data) = match command {
             OwnedCommand::WriteTexture {
                 texture,
@@ -80,7 +127,7 @@ pub(crate) fn split(
                 bytes_per_row,
                 data,
             ),
-            _ => unreachable!("texture-only recording"),
+            _ => unreachable!("oversized upload"),
         };
         let pixel_bytes = table
             .texture(table.texture_ref(texture)?)?
@@ -136,7 +183,7 @@ fn push(
     command: OwnedCommand,
     budget: usize,
 ) {
-    let length = upload_bytes(&command).expect("texture upload");
+    let length = upload_bytes(&command).unwrap_or(0);
     if bytes.saturating_add(length) > budget && !batch.is_empty() {
         batches.push(OwnedCommandBuffer::new(std::mem::take(batch)));
         *bytes = 0;
@@ -388,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_work_is_kept_in_one_recording_and_small_uploads_keep_their_allocation() {
+    fn small_uploads_keep_their_allocation_and_invalid_mixed_work_is_rejected() {
         let table = ir::ResourceTable::new();
         let id = texture(&table);
         let data = vec![3; 16];
@@ -402,12 +449,169 @@ mod tests {
         }];
         let batches = split(OwnedCommandBuffer::new(commands), &table, 32).unwrap();
         assert_eq!(payload(&batches[0].commands()[0]).5.as_ptr(), address);
-        assert!(!needs_batches(
-            &[
-                batches[0].commands()[0].clone(),
-                OwnedCommand::EndRenderPass
-            ],
-            8
-        ));
+        let invalid = vec![
+            batches[0].commands()[0].clone(),
+            OwnedCommand::EndRenderPass,
+        ];
+        assert!(needs_batches(&invalid, 8));
+        assert!(split(OwnedCommandBuffer::new(invalid), &table, 8).is_err());
+    }
+
+    fn render_pass(table: &ir::ResourceTable) -> Vec<OwnedCommand> {
+        let target = table
+            .define_texture(
+                ir::TextureDesc::new(
+                    ir::TextureFormat::Rgba8Unorm,
+                    ir::Extent2D::new(2, 2).unwrap(),
+                    ir::TextureUsage::RENDER_ATTACHMENT,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        vec![
+            OwnedCommand::BeginRenderPass(ir::OwnedRenderPassDesc {
+                target,
+                area: ir::PixelRect::new(0, 0, 2, 2).unwrap(),
+                load: ir::LoadOp::DontCare,
+                store: ir::StoreOp::Store,
+                depth: None,
+            }),
+            OwnedCommand::SetScissor(Some(ir::PixelRect::new(0, 0, 1, 1).unwrap())),
+            OwnedCommand::EndRenderPass,
+        ]
+    }
+
+    #[test]
+    fn mixed_uploads_preserve_complete_passes_and_buffer_ranges() {
+        let table = ir::ResourceTable::new();
+        let texture = texture(&table);
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(80, ir::BufferUsage::COPY_DST).unwrap())
+            .unwrap()
+            .id();
+        let mut commands = vec![OwnedCommand::WriteTexture {
+            texture,
+            destination: ir::PixelRect::new(0, 0, 4, 4).unwrap(),
+            bytes_per_row: 16,
+            data: (0..64).collect(),
+        }];
+        commands.extend(render_pass(&table));
+        commands.push(OwnedCommand::WriteBuffer {
+            buffer,
+            offset: 4,
+            data: (0..64).collect(),
+        });
+        commands.extend([OwnedCommand::BeginComputePass, OwnedCommand::EndComputePass]);
+        commands.extend(render_pass(&table));
+        assert!(needs_batches(&commands, 24));
+        let batches = split(OwnedCommandBuffer::new(commands), &table, 24).unwrap();
+        let mut pixels: Vec<u8> = Vec::new();
+        let mut buffer_bytes: Vec<u8> = Vec::new();
+        let mut passes = 0;
+        let mut compute = 0;
+        for batch in batches {
+            batch.validate(&table).unwrap();
+            assert!(
+                batch
+                    .commands()
+                    .iter()
+                    .map(|c| upload_bytes(c).unwrap_or(0))
+                    .sum::<usize>()
+                    <= 24
+            );
+            let mut active = false;
+            for command in batch.commands() {
+                match command {
+                    OwnedCommand::WriteTextureLayer { data, .. } => pixels.extend(data),
+                    OwnedCommand::WriteBuffer {
+                        buffer: id,
+                        offset,
+                        data,
+                    } => {
+                        assert_eq!(*id, buffer);
+                        assert_eq!(*offset, 4 + buffer_bytes.len() as u64);
+                        buffer_bytes.extend(data);
+                    }
+                    OwnedCommand::BeginRenderPass(_) => {
+                        assert!(!active);
+                        active = true;
+                        passes += 1;
+                    }
+                    OwnedCommand::SetScissor(_) => assert!(active),
+                    OwnedCommand::EndRenderPass => {
+                        assert!(active);
+                        active = false;
+                    }
+                    OwnedCommand::BeginComputePass => {
+                        assert!(!active);
+                        active = true;
+                        compute += 1;
+                    }
+                    OwnedCommand::EndComputePass => {
+                        assert!(active);
+                        active = false;
+                    }
+                    _ => panic!("unexpected command"),
+                }
+            }
+            assert!(!active);
+        }
+        assert_eq!(passes, 2);
+        assert_eq!(compute, 1);
+        assert_eq!(pixels, (0..64).collect::<Vec<u8>>());
+        assert_eq!(buffer_bytes, (0..64).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn page_uploads_over_backend_admission_are_batched_even_with_rendering() {
+        let table = ir::ResourceTable::new();
+        let texture = table
+            .define_texture(
+                ir::TextureDesc::new(
+                    ir::TextureFormat::Rgba8Unorm,
+                    ir::Extent2D::new(2048, 2048).unwrap(),
+                    ir::TextureUsage::COPY_DST,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let mut commands = Vec::new();
+        for value in 0..5 {
+            commands.push(OwnedCommand::WriteTexture {
+                texture,
+                destination: ir::PixelRect::new(0, 0, 2048, 2048).unwrap(),
+                bytes_per_row: 8192,
+                data: vec![value; 16 * 1024 * 1024],
+            });
+            commands.extend(render_pass(&table));
+        }
+        assert!(needs_batches(&commands, UPLOAD_BATCH_BYTES));
+        let batches = split(
+            OwnedCommandBuffer::new(commands),
+            &table,
+            UPLOAD_BATCH_BYTES,
+        )
+        .unwrap();
+        let mut total = 0;
+        let mut passes = 0;
+        for batch in batches {
+            batch.validate(&table).unwrap();
+            let bytes: usize = batch
+                .commands()
+                .iter()
+                .map(|c| upload_bytes(c).unwrap_or(0))
+                .sum();
+            assert!(bytes <= UPLOAD_BATCH_BYTES);
+            total += bytes;
+            passes += batch
+                .commands()
+                .iter()
+                .filter(|c| matches!(c, OwnedCommand::BeginRenderPass(_)))
+                .count();
+        }
+        assert_eq!(total, 80 * 1024 * 1024);
+        assert_eq!(passes, 5);
     }
 }
