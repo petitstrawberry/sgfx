@@ -117,6 +117,14 @@ need to be replaced by a reusable canonical owned program and generational
 resource identities. Image-to-buffer copies currently split SGFX submissions
 and use backend image readback followed by an ordered buffer write.
 
+Resolved recordings are consumed when building the final submission stream.
+Texture and buffer upload vectors move into that stream without a second
+payload allocation/copy; application-owned staging memory is still snapshotted
+during resolution. Descriptor buffer references are collected and sorted once
+before deduplication, avoiding a growing linear search for each reference.
+Validation, positioned descriptor/barrier/readback insertions, and completion
+ownership are unchanged.
+
 All `Rc`-backed core/backend state stays on one dedicated device worker. Vulkan
 callers record commands without a worker round trip; resource creation,
 submit-time resolution, and backend queue access use the worker. No `unsafe

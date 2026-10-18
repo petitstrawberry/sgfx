@@ -4116,8 +4116,8 @@ fn snapshot_buffer_uploads(
     Ok((ops, fresh_uploads))
 }
 
-fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
-    let mut used = rec.used_buffers.clone();
+fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
+    let mut used = rec.used_buffers;
     for insertion in &rec.descriptors {
         let set = rt
             .resources
@@ -4128,9 +4128,7 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
             let crate::resources::DescriptorBinding::Buffer { buffer, .. } = binding else {
                 continue;
             };
-            if !used.contains(buffer) {
-                used.push(*buffer);
-            }
+            used.push(*buffer);
         }
     }
     used.sort_unstable_by_key(|b| b.as_raw());
@@ -4146,7 +4144,12 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
     let mut descriptors = rec.descriptors.as_slice();
     let mut barriers = rec.barriers.as_slice();
     let mut copies = rec.copies.as_slice();
-    for position in 0..=rec.ops.len() {
+    // Resolution already owns upload payloads. Transfer them to the final
+    // stream instead of cloning every texture/buffer byte a second time.
+    // Include the final insertion position after the last recorded command.
+    let command_count = rec.ops.len();
+    let mut commands = rec.ops.into_iter();
+    for position in 0..=command_count {
         for d in take_positioned(&mut descriptors, position, |d| d.position) {
             let group = rt.resources.descriptor_group_with_layout(
                 &rt.table,
@@ -4220,12 +4223,12 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
                 Ok(())
             })?;
         }
-        if let Some(op) = rec.ops.get(position) {
-            ops.push(op.clone());
+        if let Some(op) = commands.next() {
+            ops.push(op);
         }
     }
     let mut submissions = submit_owned(rt, ops)?;
-    let mut readback = rec.readback_buffers.clone();
+    let mut readback = rec.readback_buffers;
     readback.sort_unstable_by_key(|buffer| buffer.as_raw());
     readback.dedup();
     if !readback.is_empty() {

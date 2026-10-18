@@ -278,7 +278,7 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                         Ok(())
                     })?;
                     let mut submissions = Vec::new();
-                    for r in &recordings {
+                    for r in recordings {
                         match profile_work("queue::execute", || execute(rt, r)) {
                             Ok(mut receipts) => submissions.append(&mut receipts),
                             Err(error) => {
