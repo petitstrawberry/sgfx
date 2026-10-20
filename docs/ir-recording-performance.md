@@ -53,9 +53,17 @@ renderer passes 90 tests with the updated local core when run serially. Its
 parallel run aborted in the custom Rust panic runtime; that run is not counted
 as passing.
 
-These are source changes in this checkout. Published consumers remain pinned
-to their previous shared core revision until a coordinated dependency update;
-this record does not claim that installed application binaries contain the
-new recorder. Updating the core revision must keep the facade, ScarletUI and
-statically linked backend crates on the same core source identity. The C ABI
-and existing dynamic driver manifests remain compatible.
+The optimized recorder is published at core revision
+`77e64a81115d78fab7c63671c2a6c16aac060c05`. The facade, WGPU, VirGL and
+Adreno producer/consumer manifests select that shared core source identity.
+The core's existing ABI dependency stays on its unchanged stable revision;
+no ABI or schema change is required. Adreno's pinned backend revision is
+`4ac9d7ec890a178d934324809b8c68c8445650a1`, based on the previous facade
+backend pin rather than unrelated platform changes. Its host suites pass
+16 code-generation, 41 backend, 19 preparation and 26 submit-validation tests.
+These tests do not establish performance on physical Adreno hardware.
+
+ScarletUI and Scarlet image consumers must select the updated frontend and
+core revisions together. Their integration and installed-artifact validation
+are recorded in Scarlet's `docs/graphics/gpu-async-submission.md`. The C ABI
+and existing dynamic driver manifests remain compatible, including Maxwell.
