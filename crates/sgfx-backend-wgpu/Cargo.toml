@@ -18,4 +18,5 @@ name = "sgfx_backend_wgpu"
 path = "src/lib.rs"
 
 [dev-dependencies]
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "040dbb5cf42b75489504e1765183d37f6131f54c", default-features = false, features = ["backend-abi"] }
 naga = { version = "24", features = ["wgsl-in", "spv-out"] }

@@ -427,6 +427,12 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
     /// Select a compute pipeline from this command buffer's resource table.
     pub fn set_pipeline(&mut self, pipeline: ComputePipelineRef<'r>) -> Result<()> {
         self.encoder.resources.compute_pipeline(pipeline)?;
+        if self
+            .pipeline
+            .is_some_and(|current| current.id() == pipeline.id())
+        {
+            return Ok(());
+        }
         self.encoder.push(Command::SetComputePipeline(pipeline))?;
         self.pipeline = Some(pipeline);
         Ok(())
@@ -437,6 +443,9 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
             return Err(Error::OutOfBounds);
         }
         self.encoder.resources.bind_group_shared(bind_group)?;
+        if self.bind_groups[index as usize].is_some_and(|current| current.id() == bind_group.id()) {
+            return Ok(());
+        }
         self.encoder
             .push(Command::SetBindGroup { index, bind_group })?;
         self.bind_groups[index as usize] = Some(bind_group);
@@ -515,6 +524,12 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         {
             return Err(Error::PipelineTargetMismatch);
         }
+        if self
+            .programmable_pipeline
+            .is_some_and(|current| current.id() == pipeline.id())
+        {
+            return Ok(());
+        }
         self.encoder
             .push(Command::SetProgrammablePipeline(pipeline))?;
         self.programmable_pipeline = Some(pipeline);
@@ -527,6 +542,9 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             return Err(Error::OutOfBounds);
         }
         self.encoder.resources.bind_group_shared(bind_group)?;
+        if self.bind_groups[index as usize].is_some_and(|current| current.id() == bind_group.id()) {
+            return Ok(());
+        }
         self.encoder
             .push(Command::SetBindGroup { index, bind_group })?;
         self.bind_groups[index as usize] = Some(bind_group);

@@ -808,6 +808,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             texture: None,
             sampler: None,
             uniforms: None,
+            scissor: None,
+            viewport: None,
         })
     }
 
@@ -924,6 +926,8 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
 }
 
 /// Encoder for commands within one active render pass.
+/// Repeated state settings are validated but only changes are recorded. Every
+/// pass starts with fresh state, including after a previous pass used the same resources.
 pub struct RenderPassEncoder<'encoder, 'r, 'data> {
     encoder: &'encoder mut CommandEncoder<'r, 'data>,
     target: TextureRef<'r>,
@@ -943,6 +947,8 @@ pub struct RenderPassEncoder<'encoder, 'r, 'data> {
     texture: Option<TextureRef<'r>>,
     sampler: Option<SamplerRef<'r>>,
     uniforms: Option<DrawUniforms>,
+    scissor: Option<Option<PixelRect>>,
+    viewport: Option<Viewport>,
 }
 
 impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
@@ -976,6 +982,12 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         {
             return Err(Error::PipelineTargetMismatch);
         }
+        if self
+            .pipeline
+            .is_some_and(|current| current.id() == pipeline.id())
+        {
+            return Ok(());
+        }
         self.encoder.push(Command::SetPipeline(pipeline))?;
         self.pipeline = Some(pipeline);
         self.programmable_pipeline = None;
@@ -996,6 +1008,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         CommandEncoder::require_buffer_usage(desc.usage(), BufferUsage::VERTEX)?;
         if offset > desc.size() {
             return Err(Error::OutOfBounds);
+        }
+        if self.vertex_buffers[0].is_some_and(|(current, current_offset)| {
+            current.id() == buffer.id() && current_offset == offset
+        }) {
+            return Ok(());
         }
         self.encoder
             .push(Command::SetVertexBuffer { buffer, offset })?;
@@ -1021,6 +1038,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         CommandEncoder::require_buffer_usage(desc.usage(), BufferUsage::VERTEX)?;
         if offset > desc.size() {
             return Err(Error::OutOfBounds);
+        }
+        if self.vertex_buffers[slot as usize].is_some_and(|(current, current_offset)| {
+            current.id() == buffer.id() && current_offset == offset
+        }) {
+            return Ok(());
         }
         self.encoder.push(Command::SetVertexBufferSlot {
             slot,
@@ -1055,6 +1077,14 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         if !offset.is_multiple_of(format.byte_size()) {
             return Err(Error::InvalidValue);
         }
+        if self
+            .index_buffer
+            .is_some_and(|(current, current_offset, current_format)| {
+                current.id() == buffer.id() && current_offset == offset && current_format == format
+            })
+        {
+            return Ok(());
+        }
         self.encoder.push(Command::SetIndexBuffer {
             buffer,
             offset,
@@ -1081,6 +1111,12 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         if self.encoder.resources.same_texture(texture, self.target)? {
             return Err(Error::AttachmentFeedback);
         }
+        if self
+            .texture
+            .is_some_and(|current| current.id() == texture.id())
+        {
+            return Ok(());
+        }
         self.encoder.push(Command::SetTexture(texture))?;
         self.texture = Some(texture);
         Ok(())
@@ -1098,6 +1134,12 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         if self.encoder.resources.sampler(sampler)?.compare().is_some() {
             return Err(Error::BindingLayoutMismatch);
         }
+        if self
+            .sampler
+            .is_some_and(|current| current.id() == sampler.id())
+        {
+            return Ok(());
+        }
         self.encoder.push(Command::SetSampler(sampler))?;
         self.sampler = Some(sampler);
         Ok(())
@@ -1112,6 +1154,14 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     /// # Returns
     /// Success, or an allocation/capacity error.
     pub fn set_uniforms(&mut self, uniforms: DrawUniforms) -> Result<()> {
+        if self.uniforms.is_some_and(|current| {
+            current.transform().columns().map(f32::to_bits)
+                == uniforms.transform().columns().map(f32::to_bits)
+                && current.color().components().map(f32::to_bits)
+                    == uniforms.color().components().map(f32::to_bits)
+        }) {
+            return Ok(());
+        }
         self.encoder.push(Command::SetUniforms(uniforms))?;
         self.uniforms = Some(uniforms);
         Ok(())
@@ -1134,7 +1184,12 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         {
             return Err(Error::OutOfBounds);
         }
-        self.encoder.push(Command::SetScissor(scissor))
+        if self.scissor == Some(scissor) {
+            return Ok(());
+        }
+        self.encoder.push(Command::SetScissor(scissor))?;
+        self.scissor = Some(scissor);
+        Ok(())
     }
 
     /// Set a viewport wholly within the color attachment.
@@ -1143,7 +1198,14 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         if !viewport.is_within(target) {
             return Err(Error::OutOfBounds);
         }
-        self.encoder.push(Command::SetViewport(viewport))
+        if self.viewport.is_some_and(|current| {
+            current.components().map(f32::to_bits) == viewport.components().map(f32::to_bits)
+        }) {
+            return Ok(());
+        }
+        self.encoder.push(Command::SetViewport(viewport))?;
+        self.viewport = Some(viewport);
+        Ok(())
     }
 
     /// Record a non-indexed draw using the selected pipeline's topology.
