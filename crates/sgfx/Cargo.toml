@@ -64,7 +64,7 @@ wgpu = { version = "24", features = ["spirv"], optional = true }
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "153ba86112ace49becf3d38a2ae34692b2149cb0", default-features = false, optional = true }
 scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "153ba86112ace49becf3d38a2ae34692b2149cb0", optional = true }
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "153ba86112ace49becf3d38a2ae34692b2149cb0", default-features = false, optional = true }
-sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "4ac9d7ec890a178d934324809b8c68c8445650a1", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
+sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "a3656c79cd24d4dd9c172489514c117f2abfc97f", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
 
 # Scarlet Linux-ABI clients use the native GPU transport on AArch64.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
