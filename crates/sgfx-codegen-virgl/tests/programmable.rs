@@ -1069,10 +1069,10 @@ fn skia_inverse_preserves_column_major_transform_and_determinant() {
         );
         let mut module = naga::front::wgsl::parse_str(&source).unwrap();
         for (_, expression) in module.entry_points[0].function.expressions.iter_mut() {
-            if let naga::Expression::Math { fun, .. } = expression {
-                if *fun == naga::MathFunction::Transpose {
-                    *fun = naga::MathFunction::Inverse;
-                }
+            if let naga::Expression::Math { fun, .. } = expression
+                && *fun == naga::MathFunction::Transpose
+            {
+                *fun = naga::MathFunction::Inverse;
             }
         }
         let shader = compile_shader(&module_spirv(&module), ShaderStage::Fragment, "main").unwrap();
@@ -1168,7 +1168,7 @@ fn push_constant_reads_require_root_members_but_not_explicit_unused_padding() {
                 return vec4<f32>(p + pc.adjust.x, 0, 1);
             }"#,
             48,
-            vec![16..32],
+            std::iter::once(16..32).collect(),
         ),
         (
             r#"struct Coordinates { transform:mat2x2<f32>, unused:vec4<u32> };
@@ -1178,7 +1178,7 @@ fn push_constant_reads_require_root_members_but_not_explicit_unused_padding() {
                     return vec4<f32>(p + pc.coords.transform[0][0], 0, 1);
                 }"#,
             64,
-            vec![16..32],
+            std::iter::once(16..32).collect(),
         ),
         (
             r#"struct Push { leading:vec4<f32>, values:array<vec4<f32>,3>, trailing:vec4<u32> };
@@ -1187,7 +1187,7 @@ fn push_constant_reads_require_root_members_but_not_explicit_unused_padding() {
                 return pc.values[u32(p.x) % 3u];
             }"#,
             80,
-            vec![16..64],
+            std::iter::once(16..64).collect(),
         ),
     ] {
         for module in [wgsl(source), spirv(source)] {

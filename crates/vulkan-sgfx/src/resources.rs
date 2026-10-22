@@ -55,7 +55,7 @@ impl AlignedBytes {
         self.len
     }
     fn materialize(&mut self) -> Result<(), vk::Result> {
-        let word_count = (self.len + 7) / 8;
+        let word_count = self.len.div_ceil(8);
         if self.words.len() == word_count {
             return Ok(());
         }
@@ -71,7 +71,7 @@ impl std::ops::Deref for AlignedBytes {
     fn deref(&self) -> &[u8] {
         assert_eq!(
             self.words.len(),
-            (self.len + 7) / 8,
+            self.len.div_ceil(8),
             "CPU mirror must be materialized before access"
         );
         unsafe { slice::from_raw_parts(self.words.as_ptr().cast(), self.len) }
@@ -81,7 +81,7 @@ impl std::ops::DerefMut for AlignedBytes {
     fn deref_mut(&mut self) -> &mut [u8] {
         assert_eq!(
             self.words.len(),
-            (self.len + 7) / 8,
+            self.len.div_ceil(8),
             "CPU mirror must be materialized before access"
         );
         unsafe { slice::from_raw_parts_mut(self.words.as_mut_ptr().cast(), self.len) }

@@ -419,8 +419,7 @@ pub(crate) unsafe extern "system" fn create_instance(
         .as_ref()
         .map_or(vk::API_VERSION_1_0, |info| {
             info.api_version
-                .max(vk::API_VERSION_1_0)
-                .min(vk::API_VERSION_1_1)
+                .clamp(vk::API_VERSION_1_0, vk::API_VERSION_1_1)
         });
     let record = InstanceRecord {
         api_version,

@@ -1489,9 +1489,8 @@ unsafe extern "system" fn create_graphics_pipelines(
                     .get_mut(&vertex_module)
                     .ok_or(INVALID)?
                     .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)
-                    .map_err(|error| {
+                    .inspect_err(|error| {
                         eprintln!("[SGFX Vulkan] vertex specialization: {error:?}");
-                        error
                     })?;
                 let input_bindings = runtime
                     .resources
@@ -1510,9 +1509,8 @@ unsafe extern "system" fn create_graphics_pipelines(
                         &input_depths,
                         &binding_maps,
                     )
-                    .map_err(|error| {
+                    .inspect_err(|error| {
                         eprintln!("[SGFX Vulkan] fragment specialization: {error:?}");
-                        error
                     })?;
                 let vertex = ir::ShaderEntryPoint::new(
                     runtime

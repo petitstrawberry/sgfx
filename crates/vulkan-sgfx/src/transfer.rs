@@ -243,14 +243,13 @@ pub(crate) fn copy_image(
         // roles on one canonical texture. Do not silently ignore that contract.
         return Err(unsupported);
     }
-    if let (Some((a, offset_a)), Some((b, offset_b))) = (src.bound, dst.bound) {
-        if a == b
-            && offset_a < offset_b.saturating_add(dst.byte_size())
-            && offset_b < offset_a.saturating_add(src.byte_size())
-        {
-            // Distinct aliased images do not yet share physical SGFX storage.
-            return Err(unsupported);
-        }
+    if let (Some((a, offset_a)), Some((b, offset_b))) = (src.bound, dst.bound)
+        && a == b
+        && offset_a < offset_b.saturating_add(dst.byte_size())
+        && offset_b < offset_a.saturating_add(src.byte_size())
+    {
+        // Distinct aliased images do not yet share physical SGFX storage.
+        return Err(unsupported);
     }
     Ok(rectangles
         .into_iter()
