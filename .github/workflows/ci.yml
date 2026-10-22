@@ -156,12 +156,15 @@ jobs:
         # The pinned native toolchain supports cdylibs and DSO-safe std TLS.
         run: cargo-clippy clippy --locked -p sgfx -p sgfx-backend-scarlet-virgl-plugin --target '${{ matrix.target }}' --no-default-features --features sgfx/std,sgfx/backend-dynamic --no-deps -- -D warnings
       - name: Link the native VirGL plugin and verify its Scarlet OSABI
+        # Rebuild std with bitcode for ThinLTO, as the native packaging script
+        # does. Prebuilt target libraries may omit their LLVM bitcode sections.
         env:
           RUSTFLAGS: -Zdefault-visibility=hidden
           CARGO_PROFILE_RELEASE_LTO: thin
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
         run: |
-          cargo rustc --locked --release -p sgfx-backend-scarlet-virgl-plugin --lib --target '${{ matrix.target }}' -- \
+          cargo rustc --locked --release -p sgfx-backend-scarlet-virgl-plugin --lib --target '${{ matrix.target }}' \
+            -Zbuild-std=std,panic_abort -Zbuild-std-features=compiler-builtins-mem -- \
             -C link-arg=--hash-style=both -C link-arg=--entry=0 -C link-arg=--exclude-libs=ALL \
             -C link-arg=-soname -C link-arg=libsgfx_scarlet_virgl.so -C link-arg=-z -C link-arg=defs
           python3 - <<'PY'
