@@ -40,7 +40,9 @@ fn transparent_border_sampling_and_disabled_feature_are_checked_on_gpu() {
     let mut cache = disabled_context.create_resources(Rc::clone(&table));
     assert!(matches!(
         cache.sampler(sampler),
-        Err(crate::Error::Unsupported(UnsupportedFeature::SamplerBorderColor))
+        Err(crate::Error::Unsupported(
+            UnsupportedFeature::SamplerBorderColor
+        ))
     ));
     drop(cache);
 

@@ -63,7 +63,8 @@ impl Packets {
         if u64::from(start) + u64::from(length) > self.limit as u64 {
             std::eprintln!(
                 "[SGFX VirGL] upload exceeds arena: offset={start} bytes={length} commands={} limit={}",
-                self.current.bytes.len(), self.limit
+                self.current.bytes.len(),
+                self.limit
             );
         }
         let end = start
@@ -81,7 +82,9 @@ impl Packets {
         if self.bytes.saturating_add(commands.len()) > MAX_STREAM_BYTES {
             std::eprintln!(
                 "[SGFX VirGL] stream exceeds admission: staged={} packet={} chunks={} limit={MAX_STREAM_BYTES}",
-                self.bytes, commands.len(), self.chunks.len()
+                self.bytes,
+                commands.len(),
+                self.chunks.len()
             );
         }
         let bytes = self

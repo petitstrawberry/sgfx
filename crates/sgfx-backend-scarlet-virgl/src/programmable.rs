@@ -327,7 +327,9 @@ fn compile_pipeline(
         #[cfg(feature = "std")]
         std::eprintln!(
             "[SGFX VirGL] shader exceeds source limit: vertex={} fragment={} limit={}",
-            vertex.tgsi.len(), fragment.tgsi.len(), 256 * 1024
+            vertex.tgsi.len(),
+            fragment.tgsi.len(),
+            256 * 1024
         );
         return Err(IrSubmitError::SubmissionTooLarge);
     }
