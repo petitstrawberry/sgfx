@@ -154,6 +154,7 @@ pub struct IrResources {
     buffer_revisions: Vec<u64>,
     canonical_buffer_revisions: Vec<Option<u64>>,
     submission_failed: bool,
+    cleanup_complete: bool,
     #[cfg(feature = "programmable")]
     programmable_pipelines: RefCell<
         Vec<(
@@ -169,7 +170,71 @@ struct ImageMapping {
     backend_registered: bool,
 }
 
+impl Drop for IrResources {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            self.abandon_cleanup();
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX teardown] stage=ir_resources error={error:?}");
+        }
+    }
+}
+
 impl IrResources {
+    pub(crate) fn abandon_cleanup(&mut self) {
+        self.submission_failed = true;
+        self.context.abandon_cleanup();
+    }
+
+    pub(crate) fn cleanup(&mut self) -> Result<(), IrSubmitError> {
+        if self.cleanup_complete {
+            return Ok(());
+        }
+        self.ensure_usable()?;
+        while let Some(mapping) = self.images.first() {
+            self.unmap_image(mapping.texture)?;
+        }
+        let result = run_retirement(&mut self.submission_failed, || {
+            self.context.retire_ir_resources(&mut self.backend)
+        });
+        if result.is_err() {
+            self.context.abandon_cleanup();
+        }
+        result?;
+        self.cleanup_complete = true;
+        Ok(())
+    }
+
+    pub(crate) fn retire_owned_image(
+        &mut self,
+        context: &Context,
+        image: Image,
+    ) -> Result<(), IrSubmitError> {
+        let result = run_retirement(&mut self.submission_failed, || context.release_image(image));
+        if result.is_err() {
+            self.context.abandon_cleanup();
+        }
+        result
+    }
+
+    pub(crate) fn ensure_usable(&self) -> Result<(), IrSubmitError> {
+        ensure_submission_usable(self.submission_failed || self.context.cleanup_failed())
+    }
+
+    pub(crate) fn retire_imported_texture(
+        &mut self,
+        context: &Context,
+        image: Texture,
+    ) -> Result<(), IrSubmitError> {
+        let result = run_retirement(&mut self.submission_failed, || {
+            context.release_texture(image)
+        });
+        if result.is_err() {
+            self.context.abandon_cleanup();
+        }
+        result
+    }
+
     pub(crate) fn new(
         resources: Rc<ResourceTable>,
         context: &driver::Context,
@@ -205,6 +270,7 @@ impl IrResources {
             buffer_revisions,
             canonical_buffer_revisions,
             submission_failed: false,
+            cleanup_complete: false,
             #[cfg(feature = "programmable")]
             programmable_pipelines: RefCell::new(Vec::new()),
         })
@@ -222,19 +288,27 @@ impl IrResources {
     /// Release an unmapped texture after all submissions using it complete.
     /// The caller separately retires the logical identity in its table.
     pub fn release_texture(&mut self, id: TextureId) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let slot = self.resources.texture_ref(id)?.slot();
         if self.images.iter().any(|mapping| mapping.texture == id) {
             return Err(ir::Error::InvalidDescriptor.into());
         }
-        self.backend.release_texture(&self.context, slot)?;
+        run_retirement(&mut self.submission_failed, || {
+            self.backend.release_texture(&self.context, slot)
+        })
+        .inspect_err(|_| self.context.abandon_cleanup())?;
         Ok(())
     }
 
     /// Forget a retired logical buffer and its physical VirGL allocation.
     /// Callers must ensure previously submitted work has completed first.
     pub fn release_buffer(&mut self, id: ir::BufferId) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let slot = self.resources.buffer_ref(id)?.slot();
-        self.backend.release_buffer(&self.context, slot)?;
+        run_retirement(&mut self.submission_failed, || {
+            self.backend.release_buffer(&self.context, slot)
+        })
+        .inspect_err(|_| self.context.abandon_cleanup())?;
         // A mirrored table can append and retire a buffer before its first
         // submission has grown these materialization caches.
         if let Some(shadow) = self.buffer_shadows.get_mut(slot) {
@@ -246,6 +320,43 @@ impl IrResources {
         if let Some(revision) = self.canonical_buffer_revisions.get_mut(slot) {
             *revision = None;
         }
+        Ok(())
+    }
+
+    /// Remove a shader's cached validation metadata before retiring its table ID.
+    pub fn release_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
+        self.resources.shader_module_ref(id)?;
+        // Native stages belong to compiled pipelines, not standalone modules.
+        Ok(())
+    }
+
+    /// Remove a compute pipeline cache (native compute execution is unsupported).
+    pub fn release_compute_pipeline(
+        &mut self,
+        id: ir::ComputePipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
+        self.resources.compute_pipeline_ref(id)?;
+        Ok(())
+    }
+
+    /// Retire native pipeline objects only after all accepted submissions finish.
+    pub fn release_programmable_render_pipeline(
+        &mut self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
+        let slot = self.resources.programmable_render_pipeline_ref(id)?.slot();
+        run_retirement(&mut self.submission_failed, || {
+            self.backend
+                .release_programmable_render_pipeline(&self.context, slot)
+        })
+        .inspect_err(|_| self.context.abandon_cleanup())?;
+        #[cfg(feature = "programmable")]
+        self.programmable_pipelines
+            .borrow_mut()
+            .retain(|(candidate, _)| *candidate != id);
         Ok(())
     }
 
@@ -318,6 +429,7 @@ impl IrResources {
 
     /// Remove a logical presentation mapping and release the cache's image owner.
     pub fn unmap_image(&mut self, texture: TextureId) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let index = self
             .images
             .iter()
@@ -327,10 +439,12 @@ impl IrResources {
         let descriptor = self.resources.texture(texture_ref)?;
         let image = Rc::clone(&self.images[index].image);
         if self.images[index].backend_registered {
-            self.backend.unmap_ir_image(
-                texture_spec(texture_ref, descriptor)?,
-                &image.as_ref().backend,
-            )?;
+            let spec = texture_spec(texture_ref, descriptor)?;
+            run_retirement(&mut self.submission_failed, || {
+                self.backend
+                    .unmap_ir_image(&self.context, spec, &image.as_ref().backend)
+            })
+            .inspect_err(|_| self.context.abandon_cleanup())?;
         }
         self.images.remove(index);
         Ok(())
@@ -342,12 +456,17 @@ impl IrResources {
         texture: TextureId,
         image: &Texture,
     ) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let texture_ref = self.resources.texture_ref(texture)?;
         let descriptor = self.resources.texture(texture_ref)?;
         if descriptor.format() != TextureFormat::Bgra8Unorm
             || !descriptor.usage().contains(TextureUsage::SAMPLED)
             || descriptor.usage().contains(TextureUsage::PRESENT)
         {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX import] stage=map_logical_texture texture={texture:?} descriptor={descriptor:?}"
+            );
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::TargetUsage,
             ));
@@ -370,13 +489,16 @@ impl IrResources {
         texture: TextureId,
         image: &Texture,
     ) -> Result<(), IrSubmitError> {
+        self.ensure_usable()?;
         let texture_ref = self.resources.texture_ref(texture)?;
         let descriptor = self.resources.texture(texture_ref)?;
-        context.backend.unmap_ir_texture(
-            &mut self.backend,
-            texture_spec(texture_ref, descriptor)?,
-            &image.backend,
-        )?;
+        let spec = texture_spec(texture_ref, descriptor)?;
+        run_retirement(&mut self.submission_failed, || {
+            context
+                .backend
+                .unmap_ir_texture(&mut self.backend, spec, &image.backend)
+        })
+        .inspect_err(|_| self.context.abandon_cleanup())?;
         Ok(())
     }
 
@@ -429,6 +551,27 @@ impl IrResources {
             }
         }
     }
+}
+
+fn ensure_submission_usable(failed: bool) -> Result<(), IrSubmitError> {
+    if failed {
+        Err(IrSubmitError::SubmissionFailed)
+    } else {
+        Ok(())
+    }
+}
+
+// A failed fenced cleanup may have destroyed an accepted prefix. Never
+// restore cached CREATE flags or retry its object ids in the same resources.
+fn run_retirement(
+    failed: &mut bool,
+    retire: impl FnOnce() -> Result<(), HandleError>,
+) -> Result<(), IrSubmitError> {
+    ensure_submission_usable(*failed)?;
+    retire().map_err(|error| {
+        *failed = true;
+        IrSubmitError::Backend(error)
+    })
 }
 
 struct BufferShadowUpdate {
@@ -692,6 +835,7 @@ impl PendingBuffers {
 }
 
 struct ExecutionPlan {
+    has_content_preserving_pass: bool,
     events: Vec<ExecutionEvent>,
     buffer_updates: Vec<BufferShadowUpdate>,
     canonical_validations: Vec<(usize, u64)>,
@@ -715,6 +859,7 @@ enum ExecutionTarget {
 }
 
 struct ActivePass<'r> {
+    preserves_contents: bool,
     attachment: TextureRef<'r>,
     additional_attachments: Vec<TextureRef<'r>>,
     target: ExecutionTarget,
@@ -974,9 +1119,7 @@ impl Queue {
         commands: &CommandBuffer<'r, 'data>,
         mode: &mut SubmitMode,
     ) -> Result<(), IrSubmitError> {
-        if resources.submission_failed {
-            return Err(IrSubmitError::SubmissionFailed);
-        }
+        resources.ensure_usable()?;
         if !core::ptr::eq(resources.resources(), commands.resources()) {
             return Err(IrSubmitError::ResourceTableMismatch);
         }
@@ -985,8 +1128,15 @@ impl Queue {
         {
             return Err(IrSubmitError::ContextMismatch);
         }
-        let plan = ExecutionPlan::from_commands(resources, commands)?;
-        if !mode.is_tracked() && plan.events.is_empty() {
+        let plan = ExecutionPlan::from_commands(
+            resources,
+            commands,
+            context
+                .backend
+                .capabilities()
+                .supports_native_narrow_color(),
+        )?;
+        if !mode.is_tracked() && plan.events.is_empty() && !plan.has_content_preserving_pass {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::CommandSequence,
             ));
@@ -1093,6 +1243,7 @@ impl Queue {
         // only on full acceptance; Busy/Rejected must not change the logical
         // contents. An accepted partial failure invalidates the entire cache.
         let ExecutionPlan {
+            has_content_preserving_pass: _,
             events,
             mut buffer_updates,
             mut canonical_validations,
@@ -1223,6 +1374,7 @@ impl ExecutionPlan {
     fn from_commands<'r, 'data>(
         resources: &IrResources,
         commands: &CommandBuffer<'r, 'data>,
+        native_narrow: bool,
     ) -> Result<Self, IrSubmitError> {
         // Reject the complete unsupported stream before resolving images,
         // building buffer shadows, materializing resources, or submitting work.
@@ -1249,6 +1401,7 @@ impl ExecutionPlan {
         let mut events = Vec::new();
         let mut active = None;
         let mut seen_pass = false;
+        let mut has_content_preserving_pass = false;
 
         #[cfg(feature = "backend-abi")]
         let mut sequence = commands.command_reader();
@@ -1395,7 +1548,7 @@ impl ExecutionPlan {
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
                     events.push(ExecutionEvent::Upload(
                         spec,
-                        convert_texture_upload(spec, *write)?,
+                        convert_texture_upload(spec, *write, native_narrow)?,
                     ));
                 }
                 Command::BeginRenderPass(desc) if active.is_none() => {
@@ -1468,6 +1621,7 @@ impl ExecutionPlan {
                         None
                     };
                     active = Some(ActivePass {
+                        preserves_contents: pass_preserves_contents(*desc),
                         attachment: desc.target(),
                         additional_attachments,
                         target,
@@ -1519,15 +1673,14 @@ impl ExecutionPlan {
                     let pass = active.take().ok_or(IrSubmitError::Unsupported(
                         UnsupportedIrFeature::CommandSequence,
                     ))?;
-                    if pass.submission.draws.is_empty() && !submission_has_clear(&pass.submission) {
-                        return Err(IrSubmitError::Unsupported(
-                            UnsupportedIrFeature::CommandSequence,
-                        ));
-                    }
-                    let chunks = split_pass(ExecutionPass {
-                        target: pass.target,
-                        submission: pass.submission,
-                    })?;
+                    let chunks = finish_pass(
+                        ExecutionPass {
+                            target: pass.target,
+                            submission: pass.submission,
+                        },
+                        pass.preserves_contents,
+                    )?;
+                    has_content_preserving_pass |= chunks.is_empty();
                     events
                         .try_reserve(chunks.len())
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
@@ -1759,11 +1912,39 @@ impl ExecutionPlan {
             ));
         }
         Ok(Self {
+            has_content_preserving_pass,
             events,
             buffer_updates: pending_buffers.updates,
             canonical_validations: pending_buffers.canonical_validations,
         })
     }
+}
+
+// Elide only a validated LOAD/STORE pass with no draws or clears. Its barriers
+// still go through the command resolver, and tracked submission still publishes
+// the normal queue checkpoint even when this leaves no native packets.
+fn pass_preserves_contents(desc: ir::RenderPassDesc<'_>) -> bool {
+    desc.color_attachments().all(|attachment| {
+        attachment.load() == LoadOp::Load && attachment.store() == ir::StoreOp::Store
+    }) && desc.depth_attachment().is_none_or(|attachment| {
+        attachment.load() == DepthLoadOp::Load && attachment.store() == ir::StoreOp::Store
+    })
+}
+
+fn finish_pass(
+    pass: ExecutionPass,
+    preserves_contents: bool,
+) -> Result<Vec<ExecutionPass>, IrSubmitError> {
+    if pass.submission.draws.is_empty() && !submission_has_clear(&pass.submission) {
+        return if preserves_contents {
+            Ok(Vec::new())
+        } else {
+            Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::CommandSequence,
+            ))
+        };
+    }
+    split_pass(pass)
 }
 
 /// Return whether a draw-free pass still changes an attachment.
@@ -2482,11 +2663,19 @@ fn pipeline_info(
             tertiary,
         )
     };
-    if target != TextureFormat::Bgra8Unorm {
+    if !matches!(
+        target,
+        TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm | TextureFormat::Rg8Unorm
+    ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PipelineTargetFormat,
         ));
     }
+    let (blend, color_write_mask) = color_target_blend(ir::ColorTargetState::new(
+        target,
+        blend,
+        ir::ColorWriteMask::ALL,
+    )?);
     if topology != PrimitiveTopology::TriangleList {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PrimitiveTopology,
@@ -2532,8 +2721,8 @@ fn pipeline_info(
         state: IrPipelineState {
             slot: reference.slot(),
             fragment: fragment_program(fragment),
-            blend: blend_state(blend),
-            color_write_mask: 0xf,
+            blend,
+            color_write_mask,
             additional_color_blends: [None; 7],
             cull_mode: match raster.cull_mode() {
                 ir::CullMode::None => IrCullMode::None,
@@ -2627,11 +2816,13 @@ fn sampler_state(descriptor: SamplerDesc, slot: usize) -> IrSamplerState {
             AddressMode::ClampToEdge => IrAddressMode::ClampToEdge,
             AddressMode::Repeat => IrAddressMode::Repeat,
             AddressMode::MirrorRepeat => IrAddressMode::MirrorRepeat,
+            AddressMode::ClampToBorder => IrAddressMode::ClampToBorder,
         },
         address_v: match descriptor.address_v() {
             AddressMode::ClampToEdge => IrAddressMode::ClampToEdge,
             AddressMode::Repeat => IrAddressMode::Repeat,
             AddressMode::MirrorRepeat => IrAddressMode::MirrorRepeat,
+            AddressMode::ClampToBorder => IrAddressMode::ClampToBorder,
         },
     }
 }
@@ -2910,6 +3101,7 @@ fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, IrSubmitError> {
 fn convert_texture_upload(
     texture: driver::IrTextureSpec,
     write: TextureWrite<'_>,
+    native_narrow: bool,
 ) -> Result<IrTextureUpload, IrSubmitError> {
     if matches!(texture.format, IrTextureFormat::Depth32Float) {
         return Err(IrSubmitError::Unsupported(
@@ -2952,10 +3144,11 @@ fn convert_texture_upload(
     if write.data().len() < required || source_stride < tight {
         return Err(IrSubmitError::InvalidVertexData);
     }
+    let storage_format = texture.format.storage_format(native_narrow);
     let output_len = usize::try_from(destination.width())
         .ok()
         .and_then(|width| width.checked_mul(height))
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(storage_format.bytes_per_texel()))
         .ok_or(IrSubmitError::OutOfMemory)?;
     let mut pixels = Vec::new();
     pixels
@@ -2976,6 +3169,8 @@ fn convert_texture_upload(
                     pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
                 }
             }
+            IrTextureFormat::R8 if native_narrow => pixels.extend_from_slice(source),
+            IrTextureFormat::Rg8 if native_narrow => pixels.extend_from_slice(source),
             IrTextureFormat::R8 => {
                 for value in source {
                     pixels.extend_from_slice(&[0, 0, *value, 255]);
@@ -3000,6 +3195,7 @@ fn convert_texture_upload(
             height: destination.height(),
         },
         pixels,
+        storage_format,
     })
 }
 
@@ -3033,6 +3229,31 @@ fn fragment_program(fragment: FragmentProgram) -> IrFragmentProgram {
     }
 }
 
+fn color_target_blend(target: ir::ColorTargetState) -> (driver::IrBlendState, u8) {
+    let mut blend = blend_state(target.blend());
+    let mut mask = target.write_mask().bits();
+    if matches!(
+        target.format(),
+        TextureFormat::R8Unorm | TextureFormat::Rg8Unorm
+    ) {
+        // Missing destination alpha is one, for native narrow storage as well
+        // as BGRA transport emulation. Do not write nonexistent channels.
+        let factor = |factor| match factor {
+            driver::IrBlendFactor::DestinationAlpha => driver::IrBlendFactor::One,
+            driver::IrBlendFactor::OneMinusDestinationAlpha => driver::IrBlendFactor::Zero,
+            other => other,
+        };
+        blend.color.source_factor = factor(blend.color.source_factor);
+        blend.color.destination_factor = factor(blend.color.destination_factor);
+        mask &= if target.format() == TextureFormat::R8Unorm {
+            1
+        } else {
+            3
+        };
+    }
+    (blend, mask)
+}
+
 fn blend_state(state: BlendState) -> IrBlendState {
     IrBlendState {
         color: blend_component(state.color()),
@@ -3049,6 +3270,10 @@ fn blend_component(component: BlendComponent) -> IrBlendComponent {
             BlendFactor::OneMinusSourceAlpha => IrBlendFactor::OneMinusSourceAlpha,
             BlendFactor::DestinationAlpha => IrBlendFactor::DestinationAlpha,
             BlendFactor::OneMinusDestinationAlpha => IrBlendFactor::OneMinusDestinationAlpha,
+            BlendFactor::SourceColor => IrBlendFactor::SourceColor,
+            BlendFactor::OneMinusSourceColor => IrBlendFactor::OneMinusSourceColor,
+            BlendFactor::DestinationColor => IrBlendFactor::DestinationColor,
+            BlendFactor::OneMinusDestinationColor => IrBlendFactor::OneMinusDestinationColor,
         },
         destination_factor: match component.destination_factor() {
             BlendFactor::Zero => IrBlendFactor::Zero,
@@ -3057,6 +3282,10 @@ fn blend_component(component: BlendComponent) -> IrBlendComponent {
             BlendFactor::OneMinusSourceAlpha => IrBlendFactor::OneMinusSourceAlpha,
             BlendFactor::DestinationAlpha => IrBlendFactor::DestinationAlpha,
             BlendFactor::OneMinusDestinationAlpha => IrBlendFactor::OneMinusDestinationAlpha,
+            BlendFactor::SourceColor => IrBlendFactor::SourceColor,
+            BlendFactor::OneMinusSourceColor => IrBlendFactor::OneMinusSourceColor,
+            BlendFactor::DestinationColor => IrBlendFactor::DestinationColor,
+            BlendFactor::OneMinusDestinationColor => IrBlendFactor::OneMinusDestinationColor,
         },
         operation: match component.operation() {
             BlendOp::Add => IrBlendOp::Add,
@@ -3140,6 +3369,188 @@ mod tests {
         IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrCullMode, IrFragmentProgram,
         IrFrontFace,
     };
+
+    #[test]
+    fn cleanup_failure_after_a_destroy_prefix_blocks_retry_and_submission() {
+        let destroyed = core::cell::Cell::new(0);
+        let mut failed = false;
+        let result = run_retirement(&mut failed, || {
+            // The transport can execute DESTROY then fail its fence/response.
+            destroyed.set(destroyed.get() + 1);
+            Err(HandleError::SystemError(-1))
+        });
+        assert!(matches!(result, Err(IrSubmitError::Backend(_))));
+        assert!(failed);
+        assert_eq!(destroyed.get(), 1);
+        assert!(matches!(
+            ensure_submission_usable(failed),
+            Err(IrSubmitError::SubmissionFailed)
+        ));
+        assert!(matches!(
+            run_retirement(&mut failed, || {
+                destroyed.set(destroyed.get() + 1);
+                Ok(())
+            }),
+            Err(IrSubmitError::SubmissionFailed)
+        ));
+        assert_eq!(
+            destroyed.get(),
+            1,
+            "an uncertain destroyed id must never be retired again"
+        );
+    }
+
+    #[test]
+    fn successful_retirement_preserves_a_usable_resource_cache() {
+        let mut failed = false;
+        run_retirement(&mut failed, || Ok(())).unwrap();
+        ensure_submission_usable(failed).unwrap();
+        run_retirement(&mut failed, || Ok(())).unwrap();
+        assert!(!failed);
+    }
+
+    #[test]
+    fn narrow_upload_preserves_padded_rows_mip_layer_and_logical_channels() {
+        for format in [IrTextureFormat::R8, IrTextureFormat::Rg8] {
+            let bpp = format.bytes_per_texel();
+            let spec = driver::IrTextureSpec {
+                slot: 0,
+                width: 16,
+                height: 16,
+                mip_levels: 2,
+                array_layers: 2,
+                cube: false,
+                sampled: true,
+                render_attachment: true,
+                copy_destination: true,
+                present: false,
+                format,
+            };
+            let row_bytes = 3 * bpp;
+            let stride = row_bytes + 5;
+            let mut source = alloc::vec![0xa5; stride + row_bytes];
+            let mut tight = Vec::new();
+            for row in 0..2 {
+                for byte in 0..row_bytes {
+                    let value = (row * 41 + byte * 17 + 3) as u8;
+                    source[row * stride + byte] = value;
+                    tight.push(value);
+                }
+            }
+            let write = TextureWrite::new(
+                ir::PixelRect::new(2, 3, 3, 2).unwrap(),
+                stride as u32,
+                &source,
+            )
+            .unwrap()
+            .with_mip_level(1)
+            .with_array_layer(1);
+            let native = convert_texture_upload(spec, write, true).unwrap();
+            assert!(native.storage_format == format);
+            assert_eq!(native.pixels, tight);
+            assert_eq!((native.mip_level, native.array_layer), (1, 1));
+            assert_eq!((native.destination.x, native.destination.y), (2, 3));
+            let emulated = convert_texture_upload(spec, write, false).unwrap();
+            assert!(emulated.storage_format == IrTextureFormat::Bgra8);
+            for (pixel, logical) in emulated.pixels.chunks_exact(4).zip(tight.chunks_exact(bpp)) {
+                assert_eq!(
+                    pixel,
+                    &[0, if bpp == 2 { logical[1] } else { 0 }, logical[0], 255]
+                );
+            }
+            let invalid =
+                TextureWrite::new(write.destination(), row_bytes as u32 - 1, &source).unwrap();
+            assert!(convert_texture_upload(spec, invalid, true).is_err());
+        }
+    }
+
+    #[test]
+    fn fixed_narrow_render_pipeline_lowers_implicit_alpha_and_channel_masks() {
+        for (format, mask) in [
+            (TextureFormat::R8Unorm, 1),
+            (TextureFormat::Rg8Unorm, 3),
+            (TextureFormat::Bgra8Unorm, 15),
+        ] {
+            let table = ResourceTable::new();
+            let component = BlendComponent::new(
+                BlendFactor::DestinationAlpha,
+                BlendFactor::OneMinusDestinationAlpha,
+                BlendOp::Add,
+            );
+            let pipeline = table
+                .define_render_pipeline(
+                    ir::RenderPipelineDesc::new(
+                        format,
+                        PrimitiveTopology::TriangleList,
+                        ir::VertexBufferLayout::new(
+                            8,
+                            alloc::vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+                        )
+                        .unwrap(),
+                        FragmentProgram::Solid,
+                        BlendState::new(component, component),
+                        ir::RasterState::new(ir::CullMode::None, ir::FrontFace::CounterClockwise),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            // Exercise the actual fixed pipeline lowering, beyond core IR validation.
+            let lowered = pipeline_info(&table, pipeline).unwrap();
+            assert_eq!(lowered.state.color_write_mask, mask);
+            if format == TextureFormat::Bgra8Unorm {
+                assert!(matches!(
+                    lowered.state.blend.color.source_factor,
+                    IrBlendFactor::DestinationAlpha
+                ));
+                assert!(matches!(
+                    lowered.state.blend.color.destination_factor,
+                    IrBlendFactor::OneMinusDestinationAlpha
+                ));
+            } else {
+                assert!(matches!(
+                    lowered.state.blend.color.source_factor,
+                    IrBlendFactor::One
+                ));
+                assert!(matches!(
+                    lowered.state.blend.color.destination_factor,
+                    IrBlendFactor::Zero
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn independent_color_factors_survive_ir_bridge_in_both_components() {
+        for (factor, native) in [
+            (BlendFactor::SourceColor, IrBlendFactor::SourceColor),
+            (
+                BlendFactor::OneMinusSourceColor,
+                IrBlendFactor::OneMinusSourceColor,
+            ),
+            (
+                BlendFactor::DestinationColor,
+                IrBlendFactor::DestinationColor,
+            ),
+            (
+                BlendFactor::OneMinusDestinationColor,
+                IrBlendFactor::OneMinusDestinationColor,
+            ),
+        ] {
+            let component = BlendComponent::new(factor, factor, BlendOp::ReverseSubtract);
+            let lowered = blend_state(BlendState::new(component, component));
+            for value in [lowered.color, lowered.alpha] {
+                assert_eq!(
+                    core::mem::discriminant(&value.source_factor),
+                    core::mem::discriminant(&native)
+                );
+                assert_eq!(
+                    core::mem::discriminant(&value.destination_factor),
+                    core::mem::discriminant(&native)
+                );
+                assert!(matches!(value.operation, IrBlendOp::ReverseSubtract));
+            }
+        }
+    }
 
     #[test]
     fn full_buffer_flush_tracks_only_changed_bytes_and_merges_later_writes() {
@@ -3339,6 +3750,7 @@ mod tests {
 
     fn plan_with_pass(pass: ExecutionPass) -> ExecutionPlan {
         ExecutionPlan {
+            has_content_preserving_pass: false,
             events: vec![ExecutionEvent::Pass(pass)],
             buffer_updates: Vec::new(),
             canonical_validations: Vec::new(),
@@ -3375,6 +3787,74 @@ mod tests {
                 .validate_transport_chunks()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn pass_elision_requires_load_store_on_every_color_and_depth_attachment() {
+        let table = ResourceTable::new();
+        let texture = |format| {
+            table
+                .define_texture(
+                    TextureDesc::new(
+                        format,
+                        ir::Extent2D::new(8, 8).unwrap(),
+                        TextureUsage::RENDER_ATTACHMENT,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let first = texture(TextureFormat::Rgba8Unorm);
+        let second = texture(TextureFormat::Rgba8Unorm);
+        let depth = texture(TextureFormat::Depth32Float);
+        let area = ir::PixelRect::new(2, 3, 4, 2).unwrap();
+        let pass =
+            ir::RenderPassDesc::new(&table, first, area, LoadOp::Load, ir::StoreOp::Store).unwrap();
+        assert!(pass_preserves_contents(pass));
+        for load in [LoadOp::Load, LoadOp::DontCare] {
+            for store in [ir::StoreOp::Store, ir::StoreOp::DontCare] {
+                let mrt = pass
+                    .with_color_attachment(&table, second, load, store)
+                    .unwrap();
+                assert_eq!(
+                    pass_preserves_contents(mrt),
+                    load == LoadOp::Load && store == ir::StoreOp::Store
+                );
+            }
+        }
+        for load in [
+            DepthLoadOp::Load,
+            DepthLoadOp::DontCare,
+            DepthLoadOp::Clear(1.0),
+        ] {
+            for store in [ir::StoreOp::Store, ir::StoreOp::DontCare] {
+                let pass = pass
+                    .with_depth_attachment(&table, depth, load, store)
+                    .unwrap();
+                assert_eq!(
+                    pass_preserves_contents(pass),
+                    load == DepthLoadOp::Load && store == ir::StoreOp::Store
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draw_free_load_store_pass_is_elided_without_a_fake_clear() {
+        let mut pass = execution_pass(Vec::new(), Vec::new());
+        pass.submission.clear_color = None;
+        assert!(finish_pass(pass, true).unwrap().is_empty());
+        let mut pass = execution_pass(Vec::new(), Vec::new());
+        pass.submission.clear_color = None;
+        assert!(matches!(
+            finish_pass(pass, false),
+            Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::CommandSequence
+            ))
+        ));
+        let chunks = finish_pass(execution_pass(Vec::new(), Vec::new()), false).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].submission.clear_color.is_some());
     }
 
     #[test]

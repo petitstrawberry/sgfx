@@ -396,71 +396,82 @@ fn indexed_strips_are_rejected_before_gpu_acceptance() {
     let Some(device) = headless_device() else {
         return;
     };
-    let context = device.create_context();
-    let table = Rc::new(ResourceTable::new());
-    let module = shader(
-        &table,
-        &format!(
-            "{FULLSCREEN_VERTEX}\n@fragment fn fragment() -> @location(0) vec4<f32> {{ return vec4<f32>(0.0, 1.0, 0.0, 1.0); }}"
+    for (topology, expected) in [
+        (
+            PrimitiveTopology::TriangleStrip,
+            crate::UnsupportedFeature::IndexedTriangleStrip,
         ),
-    );
-    let pipeline = table
-        .define_programmable_render_pipeline(
-            ProgrammableRenderPipelineDesc::new(
-                entry(module, ShaderStage::Vertex, "vertex"),
-                entry(module, ShaderStage::Fragment, "fragment"),
-                PipelineLayoutDesc::new(vec![]).unwrap(),
-                TextureFormat::Rgba8Unorm,
-                None,
-                PrimitiveTopology::TriangleStrip,
-                BlendState::REPLACE,
-                RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        (
+            PrimitiveTopology::LineStrip,
+            crate::UnsupportedFeature::IndexedLineStrip,
+        ),
+    ] {
+        let context = device.create_context();
+        let table = Rc::new(ResourceTable::new());
+        let module = shader(
+            &table,
+            &format!(
+                "{FULLSCREEN_VERTEX}\n@fragment fn fragment() -> @location(0) vec4<f32> {{ return vec4<f32>(0.0, 1.0, 0.0, 1.0); }}"
+            ),
+        );
+        let pipeline = table
+            .define_programmable_render_pipeline(
+                ProgrammableRenderPipelineDesc::new(
+                    entry(module, ShaderStage::Vertex, "vertex"),
+                    entry(module, ShaderStage::Fragment, "fragment"),
+                    PipelineLayoutDesc::new(vec![]).unwrap(),
+                    TextureFormat::Rgba8Unorm,
+                    None,
+                    topology,
+                    BlendState::REPLACE,
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
-    let indices = table
-        .define_buffer(BufferDesc::new(8, BufferUsage::INDEX | BufferUsage::COPY_DST).unwrap())
-        .unwrap();
-    let target = table
-        .define_texture(
-            TextureDesc::new(
-                TextureFormat::Rgba8Unorm,
-                Extent2D::new(4, 4).unwrap(),
-                TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+            .unwrap();
+        let indices = table
+            .define_buffer(BufferDesc::new(8, BufferUsage::INDEX | BufferUsage::COPY_DST).unwrap())
+            .unwrap();
+        let target = table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Rgba8Unorm,
+                    Extent2D::new(4, 4).unwrap(),
+                    TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
-    let mut encoder = CommandEncoder::new(&table);
-    encoder.write_buffer(indices, 0, &[0; 8]).unwrap();
-    let mut pass = encoder
-        .begin_render_pass(
-            RenderPassDesc::new(
-                &table,
-                target,
-                PixelRect::new(0, 0, 4, 4).unwrap(),
-                LoadOp::Clear(Color::rgba(1.0, 0.0, 0.0, 1.0).unwrap()),
-                StoreOp::Store,
+            .unwrap();
+        let mut encoder = CommandEncoder::new(&table);
+        encoder.write_buffer(indices, 0, &[0; 8]).unwrap();
+        let mut pass = encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    &table,
+                    target,
+                    PixelRect::new(0, 0, 4, 4).unwrap(),
+                    LoadOp::Clear(Color::rgba(1.0, 0.0, 0.0, 1.0).unwrap()),
+                    StoreOp::Store,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
-    pass.set_programmable_pipeline(pipeline).unwrap();
-    pass.set_index_buffer(indices, 0, IndexFormat::Uint16)
-        .unwrap();
-    pass.draw_indexed(4, 0, 0).unwrap();
-    pass.end().unwrap();
-    let commands = encoder.finish().unwrap();
-    let mut cache = context.create_resources(Rc::clone(&table));
-    let result = context.create_queue().submit_tracked(&mut cache, &commands);
-    assert!(matches!(
-        result,
-        Err(sgfx_core::backend::SubmitError::Rejected(
-            Error::Unsupported(crate::UnsupportedFeature::IndexedTriangleStrip)
-        ))
-    ));
-    assert_eq!(cache.read_texture(target.id()).unwrap(), vec![0; 4 * 4 * 4]);
+            .unwrap();
+        pass.set_programmable_pipeline(pipeline).unwrap();
+        pass.set_index_buffer(indices, 0, IndexFormat::Uint16)
+            .unwrap();
+        pass.draw_indexed(4, 0, 0).unwrap();
+        pass.end().unwrap();
+        let commands = encoder.finish().unwrap();
+        let mut cache = context.create_resources(Rc::clone(&table));
+        let result = context.create_queue().submit_tracked(&mut cache, &commands);
+        assert!(matches!(
+            result,
+            Err(sgfx_core::backend::SubmitError::Rejected(
+                Error::Unsupported(error)
+            )) if error == expected
+        ));
+        assert_eq!(cache.read_texture(target.id()).unwrap(), vec![0; 4 * 4 * 4]);
+    }
 }
 
 #[test]
@@ -1270,13 +1281,15 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
             @location(1) normal: vec4<f32>,
             @location(2) material: i32,
             @location(3) uv: vec2<f32>,
+            @location(4) glyph: vec2<u32>,
         };
         struct Output { @builtin(position) position: vec4<f32>, @location(0) color: vec4<f32> };
         @vertex fn vertex(input: Input) -> Output {
             var output: Output;
             output.position = vec4<f32>(input.position, 0, 1);
             output.color = vec4<f32>(input.normal.xyz * 0.5 + 0.5, input.normal.w);
-            if input.material != -17 || any(input.uv != vec2<f32>(0.5, 1.0)) {
+            if input.material != -17 || any(input.uv != vec2<f32>(0.5, 1.0))
+                || any(input.glyph != vec2<u32>(65535, 32768)) {
                 output.color = vec4<f32>(1,0,0,0);
             }
             return output;
@@ -1301,6 +1314,9 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
         .define_buffer(BufferDesc::new(24, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap())
         .unwrap();
     let uvs = table
+        .define_buffer(BufferDesc::new(12, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap())
+        .unwrap();
+    let glyphs = table
         .define_buffer(BufferDesc::new(12, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap())
         .unwrap();
     let pipeline = table
@@ -1335,6 +1351,11 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
                     vec![VertexAttribute::new(3, VertexFormat::Float16x2, 0)],
                 )
                 .unwrap(),
+                VertexBufferLayout::new(
+                    4,
+                    vec![VertexAttribute::new(4, VertexFormat::Uint16x2, 0)],
+                )
+                .unwrap(),
             ])
             .unwrap(),
         )
@@ -1343,6 +1364,7 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
     let packed = 512u32 | (511 << 10) | (768 << 20) | (1 << 30);
     let data = [packed, (-17i32) as u32].repeat(3);
     let half = [0x3800u16, 0x3c00].repeat(3);
+    let glyph = [65535u16, 32768].repeat(3);
     let pos = [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0];
     let mut encoder = CommandEncoder::new(&table);
     encoder
@@ -1353,6 +1375,9 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
         .unwrap();
     encoder
         .write_buffer(uvs, 0, bytemuck::cast_slice(&half))
+        .unwrap();
+    encoder
+        .write_buffer(glyphs, 0, bytemuck::cast_slice(&glyph))
         .unwrap();
     let mut pass = encoder
         .begin_render_pass(
@@ -1370,6 +1395,7 @@ fn packed_normals_integer_and_half_attributes_use_multiple_gpu_vertex_streams() 
     pass.set_vertex_buffer(positions, 0).unwrap();
     pass.set_vertex_buffer_slot(1, attributes, 0).unwrap();
     pass.set_vertex_buffer_slot(2, uvs, 0).unwrap();
+    pass.set_vertex_buffer_slot(3, glyphs, 0).unwrap();
     pass.draw(3, 0).unwrap();
     pass.end().unwrap();
     let mut cache = context.create_resources(Rc::clone(&table));
@@ -1527,5 +1553,137 @@ fn comparison_sampler_reads_depth_produced_by_a_render_pass_on_gpu() {
     assert_eq!(
         cache.read_buffer(output.id(), 0, 8).unwrap(),
         bytemuck::cast_slice::<f32, u8>(&[1.0, 0.0])
+    );
+}
+
+#[test]
+fn generational_program_cache_churn_preserves_already_submitted_pixels() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().unwrap();
+    let Some(device) = headless_device() else {
+        return;
+    };
+    let context = device.create_context();
+    let table = Rc::new(ResourceTable::new());
+    let mut cache = context.create_resources(Rc::clone(&table));
+    let queue = context.create_queue();
+    let mut targets = Vec::new();
+    for _ in 0..2 {
+        targets.push(
+            table
+                .define_texture(
+                    TextureDesc::new(
+                        TextureFormat::Rgba8Unorm,
+                        Extent2D::new(4, 4).unwrap(),
+                        TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id(),
+        );
+    }
+    let mut previous: Option<(crate::Submission, TextureId, u8)> = None;
+    let mut retired = None;
+    for iteration in 0..300u32 {
+        let red = if iteration % 2 == 0 { 1.0 } else { 0.0 };
+        let module = shader(
+            &table,
+            &format!(
+                "{FULLSCREEN_VERTEX}\n@fragment fn fragment() -> @location(0) vec4<f32> {{ return vec4<f32>({red}, 0.0, 0.0, 1.0); }}\n@compute @workgroup_size(1) fn compute() {{}}"
+            ),
+        );
+        let graphics = table
+            .define_programmable_render_pipeline(
+                ProgrammableRenderPipelineDesc::new(
+                    entry(module, ShaderStage::Vertex, "vertex"),
+                    entry(module, ShaderStage::Fragment, "fragment"),
+                    PipelineLayoutDesc::new(vec![]).unwrap(),
+                    TextureFormat::Rgba8Unorm,
+                    None,
+                    PrimitiveTopology::TriangleList,
+                    BlendState::REPLACE,
+                    RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let compute = table
+            .define_compute_pipeline(
+                ComputePipelineDesc::new(
+                    entry(module, ShaderStage::Compute, "compute"),
+                    PipelineLayoutDesc::new(vec![]).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        cache.validate_shader_module(module.id()).unwrap();
+        cache.validate_compute_pipeline(compute.id()).unwrap();
+        cache
+            .validate_programmable_render_pipeline(graphics.id())
+            .unwrap();
+        if let Some((shader, graphics, compute)) = retired {
+            assert!(cache.validate_shader_module(shader).is_err());
+            assert!(
+                cache
+                    .validate_programmable_render_pipeline(graphics)
+                    .is_err()
+            );
+            assert!(cache.validate_compute_pipeline(compute).is_err());
+        }
+        let mut encoder = CommandEncoder::new(&table);
+        let mut pass = encoder.begin_compute_pass().unwrap();
+        pass.set_pipeline(compute).unwrap();
+        pass.dispatch(1, 1, 1).unwrap();
+        pass.end().unwrap();
+        let target = table.texture_ref(targets[iteration as usize % 2]).unwrap();
+        let mut pass = encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    &table,
+                    target,
+                    PixelRect::new(0, 0, 4, 4).unwrap(),
+                    LoadOp::Load,
+                    StoreOp::Store,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        pass.set_programmable_pipeline(graphics).unwrap();
+        pass.draw(3, 0).unwrap();
+        pass.end().unwrap();
+        let commands = encoder.finish().unwrap();
+        let receipt = queue.submit_tracked(&mut cache, &commands).unwrap();
+        // WGPU submissions own GPU references independently of this cache. Drop
+        // its old generation immediately and recreate the same slots next time.
+        cache
+            .release_programmable_render_pipeline(graphics.id())
+            .unwrap();
+        table
+            .release_programmable_render_pipeline(graphics.id())
+            .unwrap();
+        cache.release_compute_pipeline(compute.id()).unwrap();
+        table.release_compute_pipeline(compute.id()).unwrap();
+        cache.release_shader_module(module.id()).unwrap();
+        table.release_shader_module(module.id()).unwrap();
+        assert_eq!(cache.programmable.cached_program_counts(), (0, 0, 0, 0));
+        if let Some((old_receipt, old_target, red)) = previous.take() {
+            assert_eq!(old_receipt.wait(None), Ok(CompletionStatus::Complete));
+            assert_eq!(
+                cache.read_texture(old_target).unwrap(),
+                [red, 0, 0, 255].repeat(16)
+            );
+        }
+        previous = Some((
+            receipt,
+            target.id(),
+            if iteration % 2 == 0 { 255 } else { 0 },
+        ));
+        retired = Some((module.id(), graphics.id(), compute.id()));
+    }
+    let (receipt, target, red) = previous.unwrap();
+    assert_eq!(receipt.wait(None), Ok(CompletionStatus::Complete));
+    assert_eq!(
+        cache.read_texture(target).unwrap(),
+        [red, 0, 0, 255].repeat(16)
     );
 }

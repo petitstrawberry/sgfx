@@ -27,6 +27,45 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 #[test]
+fn resource_metadata_updates_do_not_allocate_per_unchanged_slot() {
+    let host = ResourceTable::new();
+    let buffers: Vec<_> = (0..64)
+        .map(|_| {
+            host.define_buffer(BufferDesc::new(16, BufferUsage::COPY_DST).unwrap())
+                .unwrap()
+        })
+        .collect();
+    let mirror = ResourceTable::new();
+    mirror
+        .sync_abi_snapshot(&host.abi_snapshot().unwrap())
+        .unwrap();
+
+    // A single changed resource still traverses the immutable rows. Import
+    // overhead must stay bounded rather than allocating for all 64 slots.
+    host.release_buffer(buffers[0].id()).unwrap();
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let snapshot = host.abi_snapshot().unwrap();
+    let snapshot_allocations = ALLOCATIONS.with(|count| count.replace(None)).unwrap();
+    assert_eq!(
+        snapshot_allocations, 0,
+        "same-size metadata update allocated"
+    );
+
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    mirror.sync_abi_snapshot(&snapshot).unwrap();
+    let import_allocations = ALLOCATIONS.with(|count| count.replace(None)).unwrap();
+    assert!(
+        import_allocations <= 8,
+        "unchanged slot validation allocated {import_allocations} times"
+    );
+    assert!(mirror.abi_buffer(buffers[0].slot() as u32).is_err());
+    for buffer in &buffers[1..] {
+        let imported = mirror.abi_buffer(buffer.slot() as u32).unwrap();
+        assert_eq!(mirror.buffer(imported).unwrap().size(), 16);
+    }
+}
+
+#[test]
 fn plugin_boundary_borrows_the_original_command_storage_and_upload_bytes() {
     let host = ResourceTable::new();
     host.enable_abi_commands();

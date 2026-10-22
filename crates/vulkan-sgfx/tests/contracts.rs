@@ -9,12 +9,39 @@
 use ash::{Entry, vk};
 use std::path::PathBuf;
 
+#[path = "contracts/scalar_vertex.rs"]
+mod scalar_vertex;
+
+#[path = "contracts/line_primitives.rs"]
+mod line_primitives;
+
+#[path = "contracts/blend_color.rs"]
+mod blend_color;
+
+#[path = "contracts/copy_image.rs"]
+mod copy_image;
+
+#[path = "contracts/clear_attachments.rs"]
+mod clear_attachments;
+
+#[path = "contracts/render_area.rs"]
+mod render_area;
+
 #[path = "contracts/errors.rs"]
 mod errors;
 #[path = "contracts/subpasses.rs"]
 mod subpasses;
 #[path = "contracts/textures.rs"]
 mod textures;
+
+#[path = "contracts/memory2.rs"]
+mod memory2;
+
+#[path = "contracts/shader_lifecycle.rs"]
+mod shader_lifecycle;
+
+#[path = "contracts/resource_limits.rs"]
+mod resource_limits;
 
 const WORDS: usize = 256;
 const BYTES: u64 = (WORDS * size_of::<u32>()) as u64;
@@ -128,6 +155,35 @@ impl Context {
                 &[vk::SubmitInfo::default().command_buffers(&commands)],
                 fence,
             )
+        }
+    }
+
+    fn submit_expect_device_loss(&self) {
+        unsafe {
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            // Queue acceptance precedes worker-side object validation. Failure
+            // must wake waiters without publishing a successful completion.
+            self.submit(fence).unwrap();
+            assert_eq!(
+                self.device.wait_for_fences(&[fence], true, 5_000_000_000),
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            );
+            assert_eq!(
+                self.device.get_fence_status(fence),
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            );
+            assert_eq!(
+                self.device.device_wait_idle(),
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            );
+            assert_eq!(
+                self.submit(vk::Fence::null()),
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            );
+            self.device.destroy_fence(fence, None);
         }
     }
 }
@@ -472,29 +528,14 @@ fn descriptor_updates_before_binding_and_both_binding_orders_execute() {
 
 #[test]
 #[ignore = "requires a built SGFX ICD and a native GPU adapter"]
-fn destroying_a_recorded_storage_buffer_rejects_submit_without_signaling_fence() {
+fn destroying_a_recorded_storage_buffer_reports_loss_without_signaling_fence() {
     let context = Context::new();
     let storage = Storage::new(&context);
     let compute = Compute::new(&context);
     compute.update(&storage);
     compute.record(false);
     drop(storage);
-    unsafe {
-        let fence = context
-            .device
-            .create_fence(&vk::FenceCreateInfo::default(), None)
-            .unwrap();
-        assert_eq!(
-            context.submit(fence),
-            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
-        );
-        assert_eq!(context.device.get_fence_status(fence), Ok(false));
-        assert_eq!(
-            context.device.wait_for_fences(&[fence], true, 0),
-            Err(vk::Result::TIMEOUT)
-        );
-        context.device.destroy_fence(fence, None);
-    }
+    context.submit_expect_device_loss();
 }
 
 #[test]

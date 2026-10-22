@@ -905,3 +905,326 @@ fn cube_array_depth_comparison_and_texel_loads_preserve_binding_types() {
         }
     }
 }
+
+// Execute the straight-line scalar TGSI emitted by the math fixtures. The
+// oracle uses IEEE f32 arithmetic and bit masks, independently of Naga's
+// matrix layout and expression lowering. Host-driver acceptance is separate.
+fn evaluate_math_tgsi(tgsi: &str, inputs: &[[f32; 4]]) -> [f32; 4] {
+    use std::collections::HashMap;
+    let mut registers: HashMap<String, [u32; 4]> = HashMap::new();
+    for (index, input) in inputs.iter().enumerate() {
+        registers.insert(format!("IN[{index}]"), input.map(f32::to_bits));
+    }
+    fn components(registers: &HashMap<String, [u32; 4]>, operand: &str) -> [u32; 4] {
+        let (register, swizzle) = operand.split_once('.').unwrap_or((operand, "xyzw"));
+        let value = registers.get(register).copied().unwrap_or([0; 4]);
+        let indices: Vec<_> = swizzle.chars().map(|c| "xyzw".find(c).unwrap()).collect();
+        std::array::from_fn(|i| value[indices[i % indices.len()]])
+    }
+    for line in tgsi.lines() {
+        if let Some(immediate) = line.strip_prefix("IMM[") {
+            let (index, body) = immediate.split_once(']').unwrap();
+            let (kind, values) = body.trim().split_once(" {").unwrap();
+            let values: Vec<_> = values
+                .trim_end_matches('}')
+                .split(',')
+                .map(|v| match kind {
+                    "FLT32" => v.trim().parse::<f32>().unwrap().to_bits(),
+                    "UINT32" => v.trim().parse::<u32>().unwrap(),
+                    "INT32" => v.trim().parse::<i32>().unwrap() as u32,
+                    _ => panic!("unexpected immediate {line}"),
+                })
+                .collect();
+            registers.insert(format!("IMM[{index}]"), values.try_into().unwrap());
+            continue;
+        }
+        let Some((_, instruction)) = line.trim().split_once(": ") else {
+            continue;
+        };
+        if instruction == "END" {
+            break;
+        }
+        let (opcode, operands) = instruction.split_once(' ').unwrap();
+        let operands: Vec<_> = operands.split(", ").collect();
+        let source: Vec<_> = operands
+            .iter()
+            .skip(1)
+            .map(|op| components(&registers, op))
+            .collect();
+        let (register, mask) = operands[0].split_once('.').unwrap_or((operands[0], "xyzw"));
+        let output = registers.entry(register.into()).or_insert([0; 4]);
+        for component in mask.chars().map(|c| "xyzw".find(c).unwrap()) {
+            let f = |arg: usize| f32::from_bits(source[arg][component]);
+            let bits = match opcode {
+                "MOV" => source[0][component],
+                "ADD" => (f(0) + f(1)).to_bits(),
+                "SUB" => (f(0) - f(1)).to_bits(),
+                "MUL" => (f(0) * f(1)).to_bits(),
+                "DIV" => (f(0) / f(1)).to_bits(),
+                "FMA" => f(0).mul_add(f(1), f(2)).to_bits(),
+                "EX2" => f(0).exp2().to_bits(),
+                "LG2" => f(0).log2().to_bits(),
+                "AND" => source[0][component] & source[1][component],
+                "USEQ" => {
+                    if source[0][component] == source[1][component] {
+                        u32::MAX
+                    } else {
+                        0
+                    }
+                }
+                "USLT" => {
+                    if source[0][component] < source[1][component] {
+                        u32::MAX
+                    } else {
+                        0
+                    }
+                }
+                "UCMP" => {
+                    if source[0][component] != 0 {
+                        source[1][component]
+                    } else {
+                        source[2][component]
+                    }
+                }
+                _ => panic!("unsupported test instruction {instruction}"),
+            };
+            output[component] = bits;
+        }
+    }
+    registers["OUT[0]"].map(f32::from_bits)
+}
+
+fn module_spirv(module: &naga::Module) -> ShaderModuleDesc {
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(module)
+    .unwrap();
+    let mut options = naga::back::spv::Options::default();
+    options
+        .flags
+        .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
+    ShaderModuleDesc::spirv(naga::back::spv::write_vec(module, &info, &options, None).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn fused_multiply_add_is_not_replaced_with_unfused_mad() {
+    for source in [
+        r#"@fragment fn main(@location(0) a:vec4<f32>, @location(1) b:vec4<f32>, @location(2) c:vec4<f32>) -> @location(0) vec4<f32> {
+            return fma(a,b,c);
+        }"#,
+        r#"@fragment fn main(@location(0) a:vec4<f32>, @location(1) b:vec4<f32>, @location(2) c:vec4<f32>) -> @location(0) vec4<f32> {
+            return vec4<f32>(fma(a.x,b.x,c.x), fma(a.y,b.y,c.y), fma(a.z,b.z,c.z), fma(a.w,b.w,c.w));
+        }"#,
+    ] {
+        let a = [1.0 + f32::EPSILON, -3.25, 8.0, 0.125];
+        let b = [1.0 - f32::EPSILON, 2.0, -0.25, 16.0];
+        let c = [-1.0, 0.125, 1.0, 0.5];
+        let expected = std::array::from_fn(|i| a[i].mul_add(b[i], c[i]));
+        assert_ne!(expected[0], a[0] * b[0] + c[0]);
+        for module in [wgsl(source), spirv(source)] {
+            let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+            assert!(shader.tgsi.contains("FMA "));
+            assert!(!shader.tgsi.contains("MAD "));
+            assert_eq!(evaluate_math_tgsi(&shader.tgsi, &[a, b, c]), expected);
+        }
+    }
+}
+
+#[test]
+fn skia_color_transfer_exp_log_preserve_lanes() {
+    let source = r#"@fragment fn main(@location(0) a:vec4<f32>) -> @location(0) vec4<f32> {
+        return vec4<f32>(exp(a.xy), log(a.zw));
+    }"#;
+    let a = [-1.5_f32, 0.75, 2.5, 0.5];
+    let expected = [a[0].exp(), a[1].exp(), a[2].ln(), a[3].ln()];
+    for module in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+        let result = evaluate_math_tgsi(&shader.tgsi, &[a]);
+        for i in 0..4 {
+            assert!((result[i] - expected[i]).abs() < 1e-6, "{result:?}");
+        }
+    }
+}
+
+#[test]
+fn skia_inverse_preserves_column_major_transform_and_determinant() {
+    // WGSL has no inverse builtin. Emit the actual SPIR-V MatrixInverse op
+    // after replacing its shape-compatible transpose node in validated IR.
+    for size in 2..=4 {
+        let args = (0..size)
+            .map(|i| format!("@location({i}) c{i}:vec{size}<f32>"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let columns = (0..size)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            "@fragment fn main({args}) -> @location(0) vec4<f32> {{
+            let m = mat{size}x{size}<f32>({columns}); let n = transpose(m);
+            return vec4<f32>(n[0][0], n[0][1], n[1][0], determinant(m)); }}"
+        );
+        let mut module = naga::front::wgsl::parse_str(&source).unwrap();
+        for (_, expression) in module.entry_points[0].function.expressions.iter_mut() {
+            if let naga::Expression::Math { fun, .. } = expression
+                && *fun == naga::MathFunction::Transpose
+            {
+                *fun = naga::MathFunction::Inverse;
+            }
+        }
+        let shader = compile_shader(&module_spirv(&module), ShaderStage::Fragment, "main").unwrap();
+        // A nonsymmetric upper-triangular block exposes accidental transpose.
+        let mut columns = vec![[0.0; 4]; size];
+        for (i, column) in columns.iter_mut().enumerate() {
+            column[i] = if i == 0 { 2.0 } else { 4.0 };
+        }
+        columns[1][0] = 3.0;
+        columns[0][1] = 1.0;
+        let expected = if size == 4 {
+            // All cofactors contribute; reference inverse from exact rational
+            // elimination of [[2,3,1,1],[1,4,2,0],[0,1,3,2],[2,0,1,5]].
+            columns = vec![
+                [2.0, 1.0, 0.0, 2.0],
+                [3.0, 4.0, 1.0, 0.0],
+                [1.0, 2.0, 3.0, 1.0],
+                [1.0, 0.0, 2.0, 5.0],
+            ];
+            [2.0, -1.0, -5.0 / 3.0, 21.0]
+        } else {
+            [0.8, -0.2, -0.6, 5.0 * 4.0_f32.powi(size as i32 - 2)]
+        };
+        let result = evaluate_math_tgsi(&shader.tgsi, &columns);
+        for i in 0..4 {
+            assert!(
+                (result[i] - expected[i]).abs() < 1e-6,
+                "size={size}, {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn skia_infinity_tags_distinguish_nan_finite_and_signed_infinity() {
+    for fun in [
+        naga::RelationalFunction::IsInf,
+        naga::RelationalFunction::IsNan,
+    ] {
+        let mut module = naga::front::wgsl::parse_str(
+            r#"
+            @fragment fn main(@location(0) value: vec4<f32>) -> @location(0) vec4<f32> {
+                let classified = value == value;
+                return select(vec4<f32>(0.0), vec4<f32>(1.0), classified);
+            }"#,
+        )
+        .unwrap();
+        for (_, expression) in module.entry_points[0].function.expressions.iter_mut() {
+            if let naga::Expression::Binary {
+                op: naga::BinaryOperator::Equal,
+                left,
+                ..
+            } = *expression
+            {
+                *expression = naga::Expression::Relational {
+                    fun,
+                    argument: left,
+                };
+            }
+        }
+        let shader = compile_shader(&module_spirv(&module), ShaderStage::Fragment, "main").unwrap();
+        let value = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc0_1234),
+            -1.5,
+        ];
+        let expected = if fun == naga::RelationalFunction::IsInf {
+            [1.0, 1.0, 0.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0, 0.0]
+        };
+        assert_eq!(evaluate_math_tgsi(&shader.tgsi, &[value]), expected);
+    }
+}
+
+#[test]
+fn push_constant_reads_require_root_members_but_not_explicit_unused_padding() {
+    for (source, size, ranges) in [
+        (
+            r#"struct Push { adjust:vec4<f32>, atlas:vec2<f32>, spare:vec2<u32> };
+            var<push_constant> pc:Push;
+            @vertex fn main(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {
+                return vec4<f32>(p * pc.atlas + pc.adjust.xy, 0, 1);
+            }"#,
+            32,
+            vec![0..16, 16..24],
+        ),
+        (
+            r#"struct Push { leading:vec4<f32>, adjust:vec4<f32>, trailing:vec4<u32> };
+            var<push_constant> pc:Push;
+            @vertex fn main(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {
+                return vec4<f32>(p + pc.adjust.x, 0, 1);
+            }"#,
+            48,
+            std::iter::once(16..32).collect(),
+        ),
+        (
+            r#"struct Coordinates { transform:mat2x2<f32>, unused:vec4<u32> };
+                struct Push { leading:vec4<f32>, coords:Coordinates, trailing:vec4<u32> };
+                var<push_constant> pc:Push;
+                @vertex fn main(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {
+                    return vec4<f32>(p + pc.coords.transform[0][0], 0, 1);
+                }"#,
+            64,
+            std::iter::once(16..32).collect(),
+        ),
+        (
+            r#"struct Push { leading:vec4<f32>, values:array<vec4<f32>,3>, trailing:vec4<u32> };
+            var<push_constant> pc:Push;
+            @vertex fn main(@location(0) p:vec2<f32>)->@builtin(position) vec4<f32> {
+                return pc.values[u32(p.x) % 3u];
+            }"#,
+            80,
+            std::iter::once(16..64).collect(),
+        ),
+    ] {
+        for module in [wgsl(source), spirv(source)] {
+            let shader = compile_shader(&module, ShaderStage::Vertex, "main").unwrap();
+            let push = shader.push_constants.unwrap();
+            assert_eq!(push.size, size);
+            assert_eq!(
+                push.required_size,
+                ranges.iter().map(|range| range.end).max().unwrap()
+            );
+            assert_eq!(push.required_ranges, ranges);
+        }
+    }
+}
+
+#[test]
+fn scalar_float_vertex_input_keeps_one_lane_and_float_reflection() {
+    use sgfx_codegen_virgl::programmable::IoScalar;
+    use sgfx_core::ir::VertexFormat;
+    let source = r#"
+    struct Output { @builtin(position) position: vec4<f32>, @location(0) coverage: f32 };
+    @vertex fn vs(@location(0) position: vec2<f32>, @location(1) coverage: f32) -> Output {
+        return Output(vec4<f32>(position, 0.0, 1.0), coverage);
+    }
+    @fragment fn fs(@location(0) coverage: f32) -> @location(0) vec4<f32> {
+        return vec4<f32>(coverage, 0.0, 0.0, 1.0);
+    }
+    "#;
+    for module in [wgsl(source), spirv(source)] {
+        let shader = compile_shader(&module, ShaderStage::Vertex, "vs").unwrap();
+        assert_eq!(
+            shader.vertex_inputs,
+            [(0, VertexFormat::Float32x2), (1, VertexFormat::Float32)]
+        );
+        let input = shader.inputs.iter().find(|i| i.location == 1).unwrap();
+        assert_eq!(input.components, 1);
+        assert_eq!(input.scalar, IoScalar::Float);
+        assert!(shader.tgsi.contains("DCL IN[1]"));
+    }
+}

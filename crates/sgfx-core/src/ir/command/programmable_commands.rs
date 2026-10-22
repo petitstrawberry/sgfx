@@ -427,6 +427,12 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
     /// Select a compute pipeline from this command buffer's resource table.
     pub fn set_pipeline(&mut self, pipeline: ComputePipelineRef<'r>) -> Result<()> {
         self.encoder.resources.compute_pipeline(pipeline)?;
+        if self
+            .pipeline
+            .is_some_and(|current| current.id() == pipeline.id())
+        {
+            return Ok(());
+        }
         self.encoder.push(Command::SetComputePipeline(pipeline))?;
         self.pipeline = Some(pipeline);
         Ok(())
@@ -437,6 +443,9 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
             return Err(Error::OutOfBounds);
         }
         self.encoder.resources.bind_group_shared(bind_group)?;
+        if self.bind_groups[index as usize].is_some_and(|current| current.id() == bind_group.id()) {
+            return Ok(());
+        }
         self.encoder
             .push(Command::SetBindGroup { index, bind_group })?;
         self.bind_groups[index as usize] = Some(bind_group);
@@ -515,6 +524,12 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
         {
             return Err(Error::PipelineTargetMismatch);
         }
+        if self
+            .programmable_pipeline
+            .is_some_and(|current| current.id() == pipeline.id())
+        {
+            return Ok(());
+        }
         self.encoder
             .push(Command::SetProgrammablePipeline(pipeline))?;
         self.programmable_pipeline = Some(pipeline);
@@ -527,6 +542,9 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             return Err(Error::OutOfBounds);
         }
         self.encoder.resources.bind_group_shared(bind_group)?;
+        if self.bind_groups[index as usize].is_some_and(|current| current.id() == bind_group.id()) {
+            return Ok(());
+        }
         self.encoder
             .push(Command::SetBindGroup { index, bind_group })?;
         self.bind_groups[index as usize] = Some(bind_group);
@@ -619,6 +637,10 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .checked_add(instances)
             .ok_or(Error::Overflow)?;
         let desc = self.validate_programmable_count(count)?;
+        let last_instance = first_instance
+            .checked_add(instances)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or(Error::Overflow)?;
         let last_vertex = first
             .checked_add(count)
             .and_then(|end| end.checked_sub(1))
@@ -643,7 +665,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
                 })
                 .max()
                 .unwrap_or(0);
-            let bytes = u64::from(last_vertex)
+            let last = match layout.step_mode() {
+                crate::ir::VertexStepMode::Vertex => last_vertex,
+                crate::ir::VertexStepMode::Instance => last_instance,
+            };
+            let bytes = u64::from(last)
                 .checked_mul(u64::from(layout.stride()))
                 .and_then(|start| start.checked_add(attribute_end))
                 .ok_or(Error::Overflow)?;
@@ -704,7 +730,18 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
                 })
                 .max()
                 .unwrap_or(0);
-            CommandEncoder::validate_byte_range(offset, attribute_end, buffer_desc.size())?;
+            let last = match layout.step_mode() {
+                crate::ir::VertexStepMode::Vertex => 0, // Opaque indices are validated by the backend.
+                crate::ir::VertexStepMode::Instance => first_instance
+                    .checked_add(instances)
+                    .and_then(|end| end.checked_sub(1))
+                    .ok_or(Error::Overflow)?,
+            };
+            let bytes = u64::from(last)
+                .checked_mul(u64::from(layout.stride()))
+                .and_then(|start| start.checked_add(attribute_end))
+                .ok_or(Error::Overflow)?;
+            CommandEncoder::validate_byte_range(offset, bytes, buffer_desc.size())?;
         }
         let (buffer, offset, format) = self.index_buffer.ok_or(Error::IndexBufferNotSet)?;
         let buffer_desc = self.encoder.resources.buffer(buffer)?;

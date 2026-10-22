@@ -71,9 +71,7 @@ fn native_status(completion: &GpuCompletion) -> Result<bool, Failure> {
 
 fn trace_failure(operation: &str, error: impl core::fmt::Debug) {
     #[cfg(feature = "std")]
-    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-        std::eprintln!("[SGFX native] {operation} failed: {error:?}");
-    }
+    std::eprintln!("[SGFX native] {operation} failed: {error:?}");
     #[cfg(not(feature = "std"))]
     let _ = (operation, error);
 }

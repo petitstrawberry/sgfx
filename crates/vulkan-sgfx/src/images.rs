@@ -465,7 +465,7 @@ unsafe extern "system" fn destroy_image(
     }
 }
 
-unsafe extern "system" fn get_image_memory_requirements(
+pub(crate) unsafe extern "system" fn get_image_memory_requirements(
     device: vk::Device,
     image: vk::Image,
     output: *mut vk::MemoryRequirements,
@@ -486,7 +486,7 @@ unsafe extern "system" fn get_image_memory_requirements(
     }
 }
 
-unsafe extern "system" fn bind_image_memory(
+pub(crate) unsafe extern "system" fn bind_image_memory(
     device: vk::Device,
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -1030,11 +1030,17 @@ unsafe fn vertex_layout(
         vertex.vertex_binding_description_count as usize,
     ) {
         if binding.binding >= ir::MAX_VERTEX_BUFFERS as u32
-            || binding.input_rate != vk::VertexInputRate::VERTEX
+            || !matches!(
+                binding.input_rate,
+                vk::VertexInputRate::VERTEX | vk::VertexInputRate::INSTANCE
+            )
             || binding.stride > 2048
             || !binding.stride.is_multiple_of(4)
             || buffers
-                .insert(binding.binding, (binding.stride, Vec::new()))
+                .insert(
+                    binding.binding,
+                    (binding.stride, binding.input_rate, Vec::new()),
+                )
                 .is_some()
         {
             return Err(UNSUPPORTED);
@@ -1051,6 +1057,7 @@ unsafe fn vertex_layout(
             return Err(UNSUPPORTED);
         }
         let format = match attribute.format {
+            vk::Format::R32_SFLOAT => ir::VertexFormat::Float32,
             vk::Format::R32G32_SFLOAT => ir::VertexFormat::Float32x2,
             vk::Format::R32G32B32_SFLOAT => ir::VertexFormat::Float32x3,
             vk::Format::R32G32B32A32_SFLOAT => ir::VertexFormat::Float32x4,
@@ -1060,13 +1067,14 @@ unsafe fn vertex_layout(
             vk::Format::R32_SINT => ir::VertexFormat::Sint32,
             vk::Format::R32_UINT => ir::VertexFormat::Uint32,
             vk::Format::R16G16_SFLOAT => ir::VertexFormat::Float16x2,
+            vk::Format::R16G16_UINT => ir::VertexFormat::Uint16x2,
             vk::Format::R16G16B16A16_SFLOAT => ir::VertexFormat::Float16x4,
             vk::Format::R16G16B16A16_SINT => ir::VertexFormat::Sint16x4,
             vk::Format::A2B10G10R10_SNORM_PACK32 => ir::VertexFormat::Snorm10_10_10_2,
             _ => return Err(UNSUPPORTED),
         };
 
-        let (_, attributes) = buffers.get_mut(&attribute.binding).ok_or(UNSUPPORTED)?;
+        let (_, _, attributes) = buffers.get_mut(&attribute.binding).ok_or(UNSUPPORTED)?;
         attributes.push(ir::VertexAttribute::new(
             attribute.location,
             format,
@@ -1076,13 +1084,43 @@ unsafe fn vertex_layout(
     buffers
         .into_iter()
         .enumerate()
-        .map(|(index, (slot, (stride, attributes)))| {
+        .map(|(index, (slot, (stride, rate, attributes)))| {
             if slot != index as u32 {
                 return Err(UNSUPPORTED);
             }
-            ir::VertexBufferLayout::new(stride, attributes).map_err(|_| UNSUPPORTED)
+            ir::VertexBufferLayout::new(stride, attributes)
+                .map(|layout| {
+                    layout.with_step_mode(match rate {
+                        vk::VertexInputRate::VERTEX => ir::VertexStepMode::Vertex,
+                        vk::VertexInputRate::INSTANCE => ir::VertexStepMode::Instance,
+                        _ => unreachable!("input rates are validated above"),
+                    })
+                })
+                .map_err(|_| UNSUPPORTED)
         })
         .collect()
+}
+
+// Vulkan's color factors use As/Ad for the alpha component. Normalize those
+// aliases before passing independent RGB/alpha factors to SGFX backends.
+fn blend_factor(value: vk::BlendFactor, alpha: bool) -> Result<ir::BlendFactor, vk::Result> {
+    Ok(match value {
+        vk::BlendFactor::ZERO => ir::BlendFactor::Zero,
+        vk::BlendFactor::ONE => ir::BlendFactor::One,
+        vk::BlendFactor::SRC_ALPHA => ir::BlendFactor::SourceAlpha,
+        vk::BlendFactor::ONE_MINUS_SRC_ALPHA => ir::BlendFactor::OneMinusSourceAlpha,
+        vk::BlendFactor::DST_ALPHA => ir::BlendFactor::DestinationAlpha,
+        vk::BlendFactor::ONE_MINUS_DST_ALPHA => ir::BlendFactor::OneMinusDestinationAlpha,
+        vk::BlendFactor::SRC_COLOR if alpha => ir::BlendFactor::SourceAlpha,
+        vk::BlendFactor::ONE_MINUS_SRC_COLOR if alpha => ir::BlendFactor::OneMinusSourceAlpha,
+        vk::BlendFactor::DST_COLOR if alpha => ir::BlendFactor::DestinationAlpha,
+        vk::BlendFactor::ONE_MINUS_DST_COLOR if alpha => ir::BlendFactor::OneMinusDestinationAlpha,
+        vk::BlendFactor::SRC_COLOR => ir::BlendFactor::SourceColor,
+        vk::BlendFactor::ONE_MINUS_SRC_COLOR => ir::BlendFactor::OneMinusSourceColor,
+        vk::BlendFactor::DST_COLOR => ir::BlendFactor::DestinationColor,
+        vk::BlendFactor::ONE_MINUS_DST_COLOR => ir::BlendFactor::OneMinusDestinationColor,
+        _ => return Err(UNSUPPORTED),
+    })
 }
 
 unsafe fn graphics_state(
@@ -1148,6 +1186,8 @@ unsafe fn graphics_state(
             vk::PrimitiveTopology::TRIANGLE_LIST
                 | vk::PrimitiveTopology::TRIANGLE_STRIP
                 | vk::PrimitiveTopology::TRIANGLE_FAN
+                | vk::PrimitiveTopology::LINE_LIST
+                | vk::PrimitiveTopology::LINE_STRIP
         )
         || assembly.primitive_restart_enable != vk::FALSE
         || !viewport.p_next.is_null()
@@ -1246,17 +1286,6 @@ unsafe fn graphics_state(
     if scissor.is_some_and(|s| s.offset.x < 0 || s.offset.y < 0) {
         return Err(UNSUPPORTED);
     }
-    let factor = |v| {
-        Ok(match v {
-            vk::BlendFactor::ZERO => ir::BlendFactor::Zero,
-            vk::BlendFactor::ONE => ir::BlendFactor::One,
-            vk::BlendFactor::SRC_ALPHA => ir::BlendFactor::SourceAlpha,
-            vk::BlendFactor::ONE_MINUS_SRC_ALPHA => ir::BlendFactor::OneMinusSourceAlpha,
-            vk::BlendFactor::DST_ALPHA => ir::BlendFactor::DestinationAlpha,
-            vk::BlendFactor::ONE_MINUS_DST_ALPHA => ir::BlendFactor::OneMinusDestinationAlpha,
-            _ => return Err(UNSUPPORTED),
-        })
-    };
     let op = |v| {
         Ok(match v {
             vk::BlendOp::ADD => ir::BlendOp::Add,
@@ -1277,13 +1306,13 @@ unsafe fn graphics_state(
         } else {
             ir::BlendState::new(
                 ir::BlendComponent::new(
-                    factor(color.src_color_blend_factor)?,
-                    factor(color.dst_color_blend_factor)?,
+                    blend_factor(color.src_color_blend_factor, false)?,
+                    blend_factor(color.dst_color_blend_factor, false)?,
                     op(color.color_blend_op)?,
                 ),
                 ir::BlendComponent::new(
-                    factor(color.src_alpha_blend_factor)?,
-                    factor(color.dst_alpha_blend_factor)?,
+                    blend_factor(color.src_alpha_blend_factor, true)?,
+                    blend_factor(color.dst_alpha_blend_factor, true)?,
                     op(color.alpha_blend_op)?,
                 ),
             )
@@ -1317,7 +1346,10 @@ unsafe fn graphics_state(
         topology: match assembly.topology {
             vk::PrimitiveTopology::TRIANGLE_STRIP => ir::PrimitiveTopology::TriangleStrip,
             vk::PrimitiveTopology::TRIANGLE_FAN => ir::PrimitiveTopology::TriangleFan,
-            _ => ir::PrimitiveTopology::TriangleList,
+            vk::PrimitiveTopology::TRIANGLE_LIST => ir::PrimitiveTopology::TriangleList,
+            vk::PrimitiveTopology::LINE_LIST => ir::PrimitiveTopology::LineList,
+            vk::PrimitiveTopology::LINE_STRIP => ir::PrimitiveTopology::LineStrip,
+            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
         },
     })
 }
@@ -1355,7 +1387,7 @@ unsafe extern "system" fn create_graphics_pipelines(
         ) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                {
                     eprintln!(
                         "[SGFX Vulkan] graphics parse: flags={:?} pnext={:?} raster={:?} depth={:?} vertex={:?}",
                         info.flags,
@@ -1408,147 +1440,171 @@ unsafe extern "system" fn create_graphics_pipelines(
         // Shader-module normalization already compensates for Vulkan's positive
         // viewport height. Framebuffer winding therefore maps without reversal.
         match with_device(device, move |runtime| {
-            crate::api::bootstrap::validate_cache(&runtime.resources, cache)?;
-            let pass = runtime
-                .resources
-                .render_passes
-                .get(&render_pass)
-                .ok_or(INVALID)?;
-            let pass = pass.clone();
-            let subpass = pass.subpasses.get(subpass_index).ok_or(INVALID)?;
-            if subpass.colors.len() != state.colors.len() {
-                return Err(INVALID);
-            }
-            let targets = subpass
-                .colors
-                .iter()
-                .zip(&state.colors)
-                .map(|(&i, &(blend, mask))| {
-                    ir::ColorTargetState::new(
-                        texture_format(pass.attachments[i].format).ok_or(UNSUPPORTED)?,
-                        blend,
-                        mask,
+            let checkpoints = crate::resources::shader_checkpoints(
+                &runtime.resources,
+                &[vertex_module, fragment_module],
+            );
+            let result = (|| {
+                crate::api::bootstrap::validate_cache(&runtime.resources, cache)?;
+                let pass = runtime
+                    .resources
+                    .render_passes
+                    .get(&render_pass)
+                    .ok_or(INVALID)?;
+                let pass = pass.clone();
+                let subpass = pass.subpasses.get(subpass_index).ok_or(INVALID)?;
+                if subpass.colors.len() != state.colors.len() {
+                    return Err(INVALID);
+                }
+                let targets = subpass
+                    .colors
+                    .iter()
+                    .zip(&state.colors)
+                    .map(|(&i, &(blend, mask))| {
+                        ir::ColorTargetState::new(
+                            texture_format(pass.attachments[i].format).ok_or(UNSUPPORTED)?,
+                            blend,
+                            mask,
+                        )
+                        .map_err(|_| INVALID)
+                    })
+                    .collect::<Result<Vec<_>, vk::Result>>()?;
+                let target_format = targets[0].format();
+                let input_depths = pass.input_depths(subpass_index);
+                let binding_maps = runtime
+                    .resources
+                    .pipeline_binding_maps
+                    .get(&layout)
+                    .ok_or(INVALID)?
+                    .clone();
+                let layout = runtime
+                    .resources
+                    .pipeline_layouts
+                    .get(&layout)
+                    .ok_or(INVALID)?
+                    .clone();
+                let vertex_id = runtime
+                    .resources
+                    .shaders
+                    .get_mut(&vertex_module)
+                    .ok_or(INVALID)?
+                    .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)
+                    .inspect_err(|error| {
+                        eprintln!("[SGFX Vulkan] vertex specialization: {error:?}");
+                    })?;
+                let input_bindings = runtime
+                    .resources
+                    .shaders
+                    .get(&fragment_module)
+                    .ok_or(INVALID)?
+                    .input_bindings()?;
+                let fragment_id = runtime
+                    .resources
+                    .shaders
+                    .get_mut(&fragment_module)
+                    .ok_or(INVALID)?
+                    .variant_for_layout(
+                        &runtime.table,
+                        &fragment_values,
+                        &input_depths,
+                        &binding_maps,
                     )
-                    .map_err(|_| INVALID)
-                })
-                .collect::<Result<Vec<_>, vk::Result>>()?;
-            let target_format = targets[0].format();
-            let input_depths = pass.input_depths(subpass_index);
-            let binding_maps = runtime
-                .resources
-                .pipeline_binding_maps
-                .get(&layout)
-                .ok_or(INVALID)?
-                .clone();
-            let layout = runtime
-                .resources
-                .pipeline_layouts
-                .get(&layout)
-                .ok_or(INVALID)?
-                .clone();
-            let vertex_id = runtime
-                .resources
-                .shaders
-                .get_mut(&vertex_module)
-                .ok_or(INVALID)?
-                .variant_for_layout(&runtime.table, &vertex_values, &[], &binding_maps)?;
-            let input_bindings = runtime
-                .resources
-                .shaders
-                .get(&fragment_module)
-                .ok_or(INVALID)?
-                .input_bindings()?;
-            let fragment_id = runtime
-                .resources
-                .shaders
-                .get_mut(&fragment_module)
-                .ok_or(INVALID)?
-                .variant_for_layout(
-                    &runtime.table,
-                    &fragment_values,
-                    &input_depths,
-                    &binding_maps,
-                )?;
-            let vertex = ir::ShaderEntryPoint::new(
-                runtime
+                    .inspect_err(|error| {
+                        eprintln!("[SGFX Vulkan] fragment specialization: {error:?}");
+                    })?;
+                let vertex = ir::ShaderEntryPoint::new(
+                    runtime
+                        .table
+                        .shader_module_ref(vertex_id)
+                        .map_err(|_| INVALID)?,
+                    ir::ShaderStage::Vertex,
+                    vertex_name,
+                )
+                .map_err(|_| INVALID)?;
+                let fragment = ir::ShaderEntryPoint::new(
+                    runtime
+                        .table
+                        .shader_module_ref(fragment_id)
+                        .map_err(|_| INVALID)?,
+                    ir::ShaderStage::Fragment,
+                    fragment_name,
+                )
+                .map_err(|_| INVALID)?;
+                let mut desc = ir::ProgrammableRenderPipelineDesc::new(
+                    vertex.clone(),
+                    fragment.clone(),
+                    crate::spirv::specialize_layout(
+                        &runtime.table,
+                        &layout,
+                        &[&vertex, &fragment],
+                    )?,
+                    target_format,
+                    None,
+                    state.topology,
+                    targets[0].blend(),
+                    state.raster,
+                )
+                .map_err(|_| INVALID)?
+                .with_vertex_buffers(state.vertex)
+                .map_err(|_| INVALID)?
+                .with_color_targets(targets)
+                .map_err(|_| INVALID)?;
+                if subpass.read_only_depth && state.depth.is_some_and(|d| d.write_enabled()) {
+                    return Err(INVALID);
+                }
+                if subpass.depth.is_some() {
+                    desc = desc
+                        .with_depth_state(state.depth.ok_or(UNSUPPORTED)?)
+                        .map_err(|_| INVALID)?;
+                } else if state.depth.is_some_and(|depth| {
+                    depth.write_enabled() || depth.compare() != ir::CompareFunction::Always
+                }) {
+                    return Err(UNSUPPORTED);
+                }
+                let id = runtime
                     .table
-                    .shader_module_ref(vertex_id)
-                    .map_err(|_| INVALID)?,
-                ir::ShaderStage::Vertex,
-                vertex_name,
-            )
-            .map_err(|_| INVALID)?;
-            let fragment = ir::ShaderEntryPoint::new(
+                    .define_programmable_render_pipeline(desc)
+                    .map_err(crate::resources::failure)?
+                    .id();
+                if let Err(error) = runtime.cache.validate_programmable_render_pipeline(id) {
+                    let error = crate::resources::backend_failure(error);
+                    crate::resources::retire_ir_pipeline(
+                        runtime,
+                        crate::resources::Pipeline::Graphics(id),
+                    )?;
+                    return Err(error);
+                }
+                let handle = vk::Pipeline::from_raw(next_id());
                 runtime
-                    .table
-                    .shader_module_ref(fragment_id)
-                    .map_err(|_| INVALID)?,
-                ir::ShaderStage::Fragment,
-                fragment_name,
-            )
-            .map_err(|_| INVALID)?;
-            let mut desc = ir::ProgrammableRenderPipelineDesc::new(
-                vertex.clone(),
-                fragment.clone(),
-                crate::spirv::specialize_layout(&runtime.table, &layout, &[&vertex, &fragment])?,
-                target_format,
-                None,
-                state.topology,
-                targets[0].blend(),
-                state.raster,
-            )
-            .map_err(|_| INVALID)?
-            .with_vertex_buffers(state.vertex)
-            .map_err(|_| INVALID)?
-            .with_color_targets(targets)
-            .map_err(|_| INVALID)?;
-            if subpass.read_only_depth && state.depth.is_some_and(|d| d.write_enabled()) {
-                return Err(INVALID);
+                    .resources
+                    .pipelines
+                    .insert(handle, crate::resources::Pipeline::Graphics(id));
+                runtime
+                    .resources
+                    .graphics_subpasses
+                    .insert(handle, (pass, subpass_index));
+                runtime
+                    .resources
+                    .graphics_inputs
+                    .insert(handle, input_bindings);
+                runtime
+                    .resources
+                    .graphics_extents
+                    .insert(handle, state.extent);
+                runtime
+                    .resources
+                    .graphics_state
+                    .insert(handle, state.dynamic);
+                Ok(handle)
+            })();
+            if result.is_err() {
+                crate::resources::rollback_shader_variants(runtime, &checkpoints)?;
             }
-            if subpass.depth.is_some() {
-                desc = desc
-                    .with_depth_state(state.depth.ok_or(UNSUPPORTED)?)
-                    .map_err(|_| INVALID)?;
-            } else if state.depth.is_some_and(|depth| {
-                depth.write_enabled() || depth.compare() != ir::CompareFunction::Always
-            }) {
-                return Err(UNSUPPORTED);
-            }
-            let id = runtime
-                .table
-                .define_programmable_render_pipeline(desc)
-                .map_err(crate::resources::failure)?
-                .id();
-            runtime
-                .cache
-                .validate_programmable_render_pipeline(id)
-                .map_err(crate::resources::backend_failure)?;
-            let handle = vk::Pipeline::from_raw(next_id());
-            runtime
-                .resources
-                .pipelines
-                .insert(handle, crate::resources::Pipeline::Graphics(id));
-            runtime
-                .resources
-                .graphics_subpasses
-                .insert(handle, (pass, subpass_index));
-            runtime
-                .resources
-                .graphics_inputs
-                .insert(handle, input_bindings);
-            runtime
-                .resources
-                .graphics_extents
-                .insert(handle, state.extent);
-            runtime
-                .resources
-                .graphics_state
-                .insert(handle, state.dynamic);
-            Ok(handle)
+            result
         }) {
             Ok(handle) => *output.add(index) = handle,
             Err(error) => {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                {
                     eprintln!("[SGFX Vulkan] graphics compilation: {error:?}");
                 }
                 first_error.get_or_insert(error);
@@ -1603,6 +1659,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn color_blend_factors_preserve_rgb_and_normalize_alpha_aliases() {
+        for (factor, rgb, alpha) in [
+            (
+                vk::BlendFactor::SRC_COLOR,
+                ir::BlendFactor::SourceColor,
+                ir::BlendFactor::SourceAlpha,
+            ),
+            (
+                vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+                ir::BlendFactor::OneMinusSourceColor,
+                ir::BlendFactor::OneMinusSourceAlpha,
+            ),
+            (
+                vk::BlendFactor::DST_COLOR,
+                ir::BlendFactor::DestinationColor,
+                ir::BlendFactor::DestinationAlpha,
+            ),
+            (
+                vk::BlendFactor::ONE_MINUS_DST_COLOR,
+                ir::BlendFactor::OneMinusDestinationColor,
+                ir::BlendFactor::OneMinusDestinationAlpha,
+            ),
+        ] {
+            assert_eq!(blend_factor(factor, false), Ok(rgb));
+            assert_eq!(blend_factor(factor, true), Ok(alpha));
+        }
+        for alpha in [false, true] {
+            assert_eq!(
+                blend_factor(vk::BlendFactor::CONSTANT_COLOR, alpha),
+                Err(UNSUPPORTED)
+            );
+            assert_eq!(
+                blend_factor(vk::BlendFactor::SRC1_COLOR, alpha),
+                Err(UNSUPPORTED)
+            );
+        }
+    }
+
+    #[test]
     fn narrow_srgb_format_list_metadata_does_not_enable_unsupported_views() {
         for (linear, srgb) in [
             (vk::Format::R8_UNORM, vk::Format::R8_SRGB),
@@ -1629,6 +1724,94 @@ mod tests {
             vk::Format::R8G8_UNORM,
             vk::Format::R8_SRGB
         ));
+    }
+
+    #[test]
+    fn skia_instance_layout_keeps_distinct_rates_and_all_packed_attributes() {
+        let bindings = [
+            vk::VertexInputBindingDescription {
+                binding: 0,
+                stride: 48,
+                input_rate: vk::VertexInputRate::VERTEX,
+            },
+            vk::VertexInputBindingDescription {
+                binding: 1,
+                stride: 60,
+                input_rate: vk::VertexInputRate::INSTANCE,
+            },
+        ];
+        let attributes = (0..8)
+            .map(|location| vk::VertexInputAttributeDescription {
+                location,
+                binding: u32::from(location >= 3),
+                format: match location {
+                    6 => vk::Format::R32G32_SFLOAT,
+                    7 => vk::Format::R8G8B8A8_UNORM,
+                    _ => vk::Format::R32G32B32A32_SFLOAT,
+                },
+                offset: match location {
+                    0..=2 => location * 16,
+                    3..=5 => (location - 3) * 16,
+                    6 => 48,
+                    _ => 56,
+                },
+            })
+            .collect::<Vec<_>>();
+        let info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        let layouts = unsafe { vertex_layout(&info) }.unwrap();
+        assert_eq!(layouts[0].step_mode(), ir::VertexStepMode::Vertex);
+        assert_eq!(layouts[1].step_mode(), ir::VertexStepMode::Instance);
+        assert_eq!(layouts[0].stride(), 48);
+        assert_eq!(layouts[1].stride(), 60);
+        assert_eq!(layouts[0].attributes().len(), 3);
+        assert_eq!(layouts[1].attributes().len(), 5);
+        assert_eq!(
+            layouts[1].attributes()[4],
+            ir::VertexAttribute::new(7, ir::VertexFormat::Unorm8x4, 56)
+        );
+    }
+
+    #[test]
+    fn skia_xy_plus_scalar_coverage_preserves_the_twelve_byte_stride() {
+        let bindings = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: 12,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }];
+        let mut attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32_SFLOAT,
+                offset: 8,
+            },
+        ];
+        let info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        let parsed = unsafe { vertex_layout(&info) }.unwrap().remove(0);
+        assert_eq!(parsed.stride(), 12);
+        assert_eq!(
+            parsed.attributes()[0],
+            ir::VertexAttribute::new(0, ir::VertexFormat::Float32x2, 0)
+        );
+        assert_eq!(
+            parsed.attributes()[1],
+            ir::VertexAttribute::new(1, ir::VertexFormat::Float32, 8)
+        );
+        attributes[1].offset = 12;
+        let info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        assert_eq!(unsafe { vertex_layout(&info) }, Err(UNSUPPORTED));
     }
 
     #[test]
@@ -1671,13 +1854,52 @@ mod tests {
             .vertex_attribute_descriptions(&attributes);
         assert_eq!(unsafe { vertex_layout(&overflow) }, Err(UNSUPPORTED));
         let bindings = [vk::VertexInputBindingDescription {
-            input_rate: vk::VertexInputRate::INSTANCE,
+            input_rate: vk::VertexInputRate::from_raw(99),
             ..bindings[0]
         }];
         let instanced = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings)
             .vertex_attribute_descriptions(&attributes);
         assert_eq!(unsafe { vertex_layout(&instanced) }, Err(UNSUPPORTED));
+    }
+
+    #[test]
+    fn skia_glyph_coordinates_keep_unsigned_16_bit_vertex_fetch() {
+        let bindings = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: 16,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }];
+        let attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                offset: 8,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R16G16_UINT,
+                offset: 12,
+            },
+        ];
+        let info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+        let parsed = unsafe { vertex_layout(&info) }.unwrap();
+        assert_eq!(
+            parsed[0].attributes()[2].format(),
+            ir::VertexFormat::Uint16x2
+        );
+        assert_eq!(parsed[0].attributes()[2].offset(), 12);
+        assert_eq!(parsed[0].stride(), 16);
     }
 
     #[test]
@@ -1824,5 +2046,30 @@ mod tests {
         }
         .unwrap();
         assert_eq!(parsed.topology, ir::PrimitiveTopology::TriangleFan);
+        for (topology, expected) in [
+            (
+                vk::PrimitiveTopology::LINE_LIST,
+                ir::PrimitiveTopology::LineList,
+            ),
+            (
+                vk::PrimitiveTopology::LINE_STRIP,
+                ir::PrimitiveTopology::LineStrip,
+            ),
+        ] {
+            let line_assembly = assembly.topology(topology);
+            let line_base = base
+                .input_assembly_state(&line_assembly)
+                .dynamic_state(&dynamic);
+            assert_eq!(
+                unsafe { graphics_state(&line_base) }.unwrap().topology,
+                expected
+            );
+            let wide = raster.line_width(2.0);
+            assert!(unsafe { graphics_state(&line_base.rasterization_state(&wide)) }.is_err());
+            let restarted = line_assembly.primitive_restart_enable(true);
+            assert!(unsafe { graphics_state(&base.input_assembly_state(&restarted)) }.is_err());
+        }
+        let adjacency = assembly.topology(vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY);
+        assert!(unsafe { graphics_state(&base.input_assembly_state(&adjacency)) }.is_err());
     }
 }

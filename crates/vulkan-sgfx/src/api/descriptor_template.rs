@@ -185,13 +185,13 @@ pub(super) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
         }};
     }
     match name.to_bytes() {
-        b"vkCreateDescriptorUpdateTemplateKHR" => {
+        b"vkCreateDescriptorUpdateTemplate" | b"vkCreateDescriptorUpdateTemplateKHR" => {
             entry!(create, vk::PFN_vkCreateDescriptorUpdateTemplate)
         }
-        b"vkDestroyDescriptorUpdateTemplateKHR" => {
+        b"vkDestroyDescriptorUpdateTemplate" | b"vkDestroyDescriptorUpdateTemplateKHR" => {
             entry!(destroy, vk::PFN_vkDestroyDescriptorUpdateTemplate)
         }
-        b"vkUpdateDescriptorSetWithTemplateKHR" => {
+        b"vkUpdateDescriptorSetWithTemplate" | b"vkUpdateDescriptorSetWithTemplateKHR" => {
             entry!(update, vk::PFN_vkUpdateDescriptorSetWithTemplate)
         }
         _ => None,

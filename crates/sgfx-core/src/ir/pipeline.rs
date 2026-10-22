@@ -105,6 +105,10 @@ pub enum VertexFormat {
     Float32x4,
     /// Four normalized unsigned 8-bit components.
     Unorm8x4,
+    /// Two 16-bit unsigned integers, widened during vertex fetch.
+    Uint16x2,
+    /// One 32-bit floating-point component.
+    Float32,
 }
 
 impl VertexFormat {
@@ -118,11 +122,13 @@ impl VertexFormat {
             Self::Float32x2 => 8,
             Self::Float32x3 => 12,
             Self::Float32x4 => 16,
-            Self::Unorm8x4
+            Self::Float32
+            | Self::Unorm8x4
             | Self::Sint32
             | Self::Uint32
             | Self::Float16x2
-            | Self::Snorm10_10_10_2 => 4,
+            | Self::Snorm10_10_10_2
+            | Self::Uint16x2 => 4,
             Self::Float16x4 | Self::Sint16x4 => 8,
         }
     }
@@ -177,11 +183,21 @@ impl VertexAttribute {
     }
 }
 
+/// Advance an interleaved attribute record by vertex or by instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexStepMode {
+    /// Fetch using the draw's vertex index.
+    Vertex,
+    /// Fetch using the draw's instance index, with divisor one.
+    Instance,
+}
+
 /// Owned validated description of one interleaved vertex buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexBufferLayout {
     stride: u32,
     attributes: Vec<VertexAttribute>,
+    step_mode: VertexStepMode,
 }
 
 impl VertexBufferLayout {
@@ -212,7 +228,22 @@ impl VertexBufferLayout {
                 return Err(Error::InvalidDescriptor);
             }
         }
-        Ok(Self { stride, attributes })
+        Ok(Self {
+            stride,
+            attributes,
+            step_mode: VertexStepMode::Vertex,
+        })
+    }
+
+    /// Select per-vertex or per-instance fetch. Instance stepping uses divisor one.
+    pub fn with_step_mode(mut self, step_mode: VertexStepMode) -> Self {
+        self.step_mode = step_mode;
+        self
+    }
+
+    /// Return the index used to advance records in this binding.
+    pub const fn step_mode(&self) -> VertexStepMode {
+        self.step_mode
     }
 
     /// Return the interleaved byte stride.
@@ -240,6 +271,10 @@ pub enum PrimitiveTopology {
     TriangleStrip,
     /// Assemble triangles sharing the first vertex, in input order.
     TriangleFan,
+    /// Assemble independent pairs of vertices as one-pixel lines.
+    LineList,
+    /// Assemble connected one-pixel lines between consecutive vertices.
+    LineStrip,
 }
 
 impl PrimitiveTopology {
@@ -247,6 +282,8 @@ impl PrimitiveTopology {
         match self {
             Self::TriangleList => count != 0 && count.is_multiple_of(3),
             Self::TriangleStrip | Self::TriangleFan => count >= 3,
+            Self::LineList => count != 0 && count.is_multiple_of(2),
+            Self::LineStrip => count >= 2,
         }
     }
 }
@@ -351,6 +388,14 @@ pub enum BlendFactor {
     DestinationAlpha,
     /// One minus destination alpha factor.
     OneMinusDestinationAlpha,
+    /// Source color per channel, using source alpha for the alpha component.
+    SourceColor,
+    /// One minus source color per channel (including alpha).
+    OneMinusSourceColor,
+    /// Destination color per channel, using destination alpha for alpha.
+    DestinationColor,
+    /// One minus destination color per channel (including alpha).
+    OneMinusDestinationColor,
 }
 
 /// Arithmetic operation for a blend component.
@@ -576,7 +621,9 @@ impl RenderPipelineDesc {
         blend: BlendState,
         raster: RasterState,
     ) -> Result<Self> {
-        if target_format == TextureFormat::Depth32Float {
+        if target_format == TextureFormat::Depth32Float
+            || vertex_buffer.step_mode() != VertexStepMode::Vertex
+        {
             return Err(Error::InvalidDescriptor);
         }
         let position = vertex_buffer

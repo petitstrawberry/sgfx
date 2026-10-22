@@ -1,0 +1,23 @@
+# Native SGFX runtime. Cargo builds and tracks the library through the SDK.
+[[layers]]
+kind = "script"
+source = "prepare-config.sh"
+to = "/lib/sgfx"
+
+[[layers]]
+kind = "cargo"
+source = "../.."
+package = "sgfx-backend-scarlet-virgl-plugin"
+lib = "sgfx_scarlet_virgl"
+architectures = ["aarch64", "riscv64"]
+to = "/lib/sgfx/libsgfx_scarlet_virgl.so"
+
+[[layers]]
+kind = "script"
+source = "install-config.sh"
+to = "/lib/sgfx"
+
+[[layers]]
+kind = "copy"
+source = "../../LICENSE"
+to = "/share/licenses/sgfx/LICENSE"

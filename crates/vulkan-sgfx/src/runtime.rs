@@ -5,9 +5,7 @@ use std::rc::Rc;
 pub(crate) type BackendError = sgfx::Error;
 
 pub(crate) fn backend_failure(error: BackendError) -> ash::vk::Result {
-    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-        eprintln!("[SGFX Vulkan] backend failure: {error:?}");
-    }
+    eprintln!("[SGFX Vulkan] backend failure: {error:?}");
     match error.kind() {
         ErrorKind::InvalidInput | ErrorKind::Unsupported => {
             ash::vk::Result::ERROR_FEATURE_NOT_PRESENT

@@ -265,6 +265,8 @@ impl SubmitMode {
                 Err(HandleError::OutOfResources)
             }
             Err(AdmissionError::TooLarge) => {
+                #[cfg(feature = "std")]
+                std::eprintln!("[SGFX VirGL] scheduler rejected oversized stream");
                 *too_large = true;
                 Err(HandleError::OutOfResources)
             }

@@ -58,7 +58,15 @@ pub struct StorageBufferBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushConstantBinding {
     pub first_register: u32,
+    /// Rounded declaration span used for constant-register allocation.
     pub size: u32,
+    /// End of the highest statically used member; not a dense prefix.
+    pub required_size: u32,
+    /// Byte ranges of statically used declared members, relative to the block.
+    /// Struct containers are recursively expanded, including SPIR-V Block
+    /// wrappers. Scalar/vector/matrix/array members keep their whole declared
+    /// span (vec4.x requires 16 bytes); unused members/padding require none.
+    pub required_ranges: Vec<core::ops::Range<u32>>,
 }
 
 /// The number of mip levels in a bound image, supplied by the resource
@@ -376,6 +384,7 @@ struct Compiler<'a> {
     uniforms: Vec<UniformBufferBinding>,
     storage_buffers: Vec<StorageBufferBinding>,
     push_constants: Option<PushConstantBinding>,
+    push_constant_members: Vec<core::ops::Range<u32>>,
     image_query_levels: Vec<ImageQueryLevelsBinding>,
     srgb_view_flags_register: Option<u32>,
     first_instance_register: Option<u32>,
@@ -405,6 +414,7 @@ impl<'a> Compiler<'a> {
             uniforms: Vec::new(),
             storage_buffers: Vec::new(),
             push_constants: None,
+            push_constant_members: Vec::new(),
             image_query_levels: Vec::new(),
             srgb_view_flags_register: None,
             first_instance_register: None,
@@ -569,6 +579,24 @@ impl<'a> Compiler<'a> {
                         break;
                     }
                 }
+                if let Some(push) = &mut self.push_constants {
+                    let start = push.first_register * 16;
+                    if let Some(offset) = address.checked_sub(start).filter(|&n| n < push.size) {
+                        if let Some(member) = self
+                            .push_constant_members
+                            .iter()
+                            .find(|member| member.contains(&offset))
+                        {
+                            if !push.required_ranges.contains(member) {
+                                push.required_ranges.push(member.clone());
+                                push.required_ranges.sort_by_key(|range| range.start);
+                                push.required_size = push.required_size.max(member.end);
+                            }
+                        } else {
+                            return Err(unsupported("push-constant read outside root members"));
+                        }
+                    }
+                }
             }
             self.instruction("MOV", dst, &[src])?;
         }
@@ -619,6 +647,30 @@ impl<'a> Compiler<'a> {
                 })
             }
             _ => Err(unsupported("constant expression")),
+        }
+    }
+    fn push_constant_member_ranges(
+        &self,
+        ty: Handle<naga::Type>,
+        offset: u32,
+        layouter: &naga::proc::Layouter,
+        ranges: &mut Vec<core::ops::Range<u32>>,
+    ) {
+        match &self.module.types[ty].inner {
+            // Naga's SPIR-V writer wraps a global in a one-member Block
+            // struct. Layout semantics must not depend on that wrapper or
+            // debug names. Arrays, matrices and vectors remain whole members.
+            T::Struct { members, .. } => {
+                for member in members {
+                    self.push_constant_member_ranges(
+                        member.ty,
+                        offset + member.offset,
+                        layouter,
+                        ranges,
+                    );
+                }
+            }
+            _ => ranges.push(offset..offset + layouter[ty].size),
         }
     }
     fn uniform_value(&self, ty: Handle<naga::Type>, offset: u32) -> Result<Value> {
@@ -728,7 +780,9 @@ impl<'a> Compiler<'a> {
                     let format = match (scalar, shape.len()) {
                         (IoScalar::Sint, 1) => VertexFormat::Sint32,
                         (IoScalar::Uint, 1) => VertexFormat::Uint32,
+                        (IoScalar::Uint, 2) => VertexFormat::Uint16x2,
                         (IoScalar::Sint, 4) => VertexFormat::Sint16x4,
+                        (IoScalar::Float, 1) => VertexFormat::Float32,
                         (IoScalar::Float, 2) => VertexFormat::Float32x2,
                         (IoScalar::Float, 3) => VertexFormat::Float32x3,
                         (IoScalar::Float, 4) => VertexFormat::Float32x4,
@@ -996,9 +1050,14 @@ impl<'a> Compiler<'a> {
                 .checked_add(size.div_ceil(16))
                 .filter(|&register| register <= 1024)
                 .ok_or_else(|| unsupported("more than 1024 inline constant registers"))?;
+            let mut members = Vec::new();
+            self.push_constant_member_ranges(ty, 0, &layouter, &mut members);
+            self.push_constant_members = members;
             self.push_constants = Some(PushConstantBinding {
                 first_register,
                 size,
+                required_size: 0,
+                required_ranges: Vec::new(),
             });
             self.globals[handle.index()] = Some(self.uniform_value(ty, first_register * 16)?);
         }
@@ -1892,8 +1951,88 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
+            E::Derivative { axis, ctrl, expr } => {
+                if self.stage != ShaderStage::Fragment || ctrl != naga::DerivativeControl::None {
+                    return Err(unsupported(
+                        "non-default derivative control or non-fragment derivative",
+                    ));
+                }
+                let input = self.expression(frame, expr)?;
+                if input.shape.kind()? != K::Float {
+                    return Err(unsupported("non-floating derivative"));
+                }
+                let result = self.allocate(shape.clone(), false)?;
+                match axis {
+                    naga::DerivativeAxis::X | naga::DerivativeAxis::Y => {
+                        let opcode = if axis == naga::DerivativeAxis::X {
+                            "DDX"
+                        } else {
+                            "DDY"
+                        };
+                        let minus_one = self.immediate(Literal::F32(-1.0))?;
+                        for (dst, src) in result.lanes.iter().zip(&input.lanes) {
+                            self.instruction(opcode, dst, &[src])?;
+                            // SGFX fragment coordinates increase downwards, unlike
+                            // the host GL window-space Y derivative.
+                            if axis == naga::DerivativeAxis::Y {
+                                self.instruction("MUL", dst, &[dst, &minus_one.lanes[0]])?;
+                            }
+                        }
+                    }
+                    naga::DerivativeAxis::Width => {
+                        let dx = self.allocate(shape.clone(), false)?;
+                        let dy = self.allocate(shape, false)?;
+                        for ((dst, src), (x, y)) in result
+                            .lanes
+                            .iter()
+                            .zip(&input.lanes)
+                            .zip(dx.lanes.iter().zip(&dy.lanes))
+                        {
+                            self.instruction("DDX", x, &[src])?;
+                            self.instruction("DDY", y, &[src])?;
+                            self.instruction("ABS", x, &[x])?;
+                            self.instruction("ABS", y, &[y])?;
+                            self.instruction("ADD", dst, &[x, y])?;
+                        }
+                    }
+                }
+                result
+            }
             E::Relational { fun, argument } => {
                 let argument = self.expression(frame, argument)?;
+                if matches!(
+                    fun,
+                    naga::RelationalFunction::IsNan | naga::RelationalFunction::IsInf
+                ) {
+                    if argument.shape.kind()? != K::Float {
+                        return Err(unsupported("non-floating classification"));
+                    }
+                    // Classify IEEE-754 bits, rather than compare the value to itself.
+                    // Hosts may optimize floating comparisons under relaxed NaN rules.
+                    let mask = self.immediate(Literal::U32(0x7fff_ffff))?;
+                    let infinity = self.immediate(Literal::U32(0x7f80_0000))?;
+                    let magnitude = self.allocate(argument.shape.clone(), false)?;
+                    let result = self.allocate(shape, false)?;
+                    for ((dst, bits), src) in result
+                        .lanes
+                        .iter()
+                        .zip(&magnitude.lanes)
+                        .zip(&argument.lanes)
+                    {
+                        self.instruction("AND", bits, &[src, &mask.lanes[0]])?;
+                        match fun {
+                            naga::RelationalFunction::IsInf => {
+                                self.instruction("USEQ", dst, &[bits, &infinity.lanes[0]])?
+                            }
+                            naga::RelationalFunction::IsNan => {
+                                self.instruction("USLT", dst, &[&infinity.lanes[0], bits])?
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    frame.expressions[handle.index()] = Some(result.clone());
+                    return Ok(result);
+                }
                 let opcode = match fun {
                     naga::RelationalFunction::Any => "OR",
                     naga::RelationalFunction::All => "AND",
@@ -1922,10 +2061,10 @@ impl<'a> Compiler<'a> {
                 let c = arg2.map(|h| self.expression(frame, h)).transpose()?;
                 self.math(fun, a, b, c, shape)?
             }
-            _ => {
-                return Err(unsupported(
-                    "expression (texture, derivative, atomic, override and subgroup operations are not supported)",
-                ));
+            rejected => {
+                return Err(ShaderCompileError(format!(
+                    "unsupported TGSI expression: {rejected:?}"
+                )));
             }
         };
         frame.expressions[handle.index()] = Some(value.clone());
@@ -2285,6 +2424,48 @@ impl<'a> Compiler<'a> {
         }
         Ok(())
     }
+    fn matrix_minor(
+        lanes: &[Lane],
+        size: usize,
+        excluded_row: usize,
+        excluded_column: usize,
+    ) -> Vec<Lane> {
+        (0..size)
+            .filter(|&column| column != excluded_column)
+            .flat_map(|column| {
+                (0..size)
+                    .filter(move |&row| row != excluded_row)
+                    .map(move |row| lanes[column * size + row].clone())
+            })
+            .collect()
+    }
+    fn matrix_determinant(&mut self, lanes: &[Lane], size: usize) -> Result<Value> {
+        let result = self.allocate(Shape::Scalar(K::Float), false)?;
+        if size == 1 {
+            self.instruction("MOV", &result.lanes[0], &[&lanes[0]])?;
+        } else {
+            for column in 0..size {
+                let minor = Self::matrix_minor(lanes, size, 0, column);
+                let determinant = self.matrix_determinant(&minor, size - 1)?;
+                let product = self.allocate(Shape::Scalar(K::Float), false)?;
+                self.instruction(
+                    "MUL",
+                    &product.lanes[0],
+                    &[&lanes[column * size], &determinant.lanes[0]],
+                )?;
+                if column == 0 {
+                    self.instruction("MOV", &result.lanes[0], &[&product.lanes[0]])?;
+                } else {
+                    self.instruction(
+                        if column % 2 == 0 { "ADD" } else { "SUB" },
+                        &result.lanes[0],
+                        &[&result.lanes[0], &product.lanes[0]],
+                    )?;
+                }
+            }
+        }
+        Ok(result)
+    }
     fn math(
         &mut self,
         fun: naga::MathFunction,
@@ -2294,6 +2475,86 @@ impl<'a> Compiler<'a> {
         shape: Shape,
     ) -> Result<Value> {
         use naga::MathFunction as M;
+        if matches!(fun, M::Inverse | M::Determinant) {
+            let Shape::Matrix(columns, rows) = a.shape else {
+                return Err(unsupported("inverse/determinant matrix type"));
+            };
+            if columns != rows || !(2..=4).contains(&columns) {
+                return Err(unsupported("inverse/determinant matrix dimensions"));
+            }
+            let determinant = self.matrix_determinant(&a.lanes, columns)?;
+            if fun == M::Determinant {
+                return Ok(determinant);
+            }
+            let result = self.allocate(shape, false)?;
+            // Column-major inverse is the transposed cofactor matrix / det(A).
+            for column in 0..columns {
+                for row in 0..rows {
+                    let minor = Self::matrix_minor(&a.lanes, columns, column, row);
+                    let cofactor = self.matrix_determinant(&minor, columns - 1)?;
+                    let signed = if (column + row) % 2 == 0 {
+                        cofactor
+                    } else {
+                        let minus_one = self.immediate(Literal::F32(-1.0))?;
+                        self.binary(B::Multiply, &cofactor, &minus_one, Shape::Scalar(K::Float))?
+                    };
+                    self.instruction(
+                        "DIV",
+                        &result.lanes[column * rows + row],
+                        &[&signed.lanes[0], &determinant.lanes[0]],
+                    )?;
+                }
+            }
+            return Ok(result);
+        }
+        if fun == M::Fma {
+            let b = b.ok_or_else(|| unsupported("fma operands"))?;
+            let c = c.ok_or_else(|| unsupported("fma operands"))?;
+            if a.shape.kind()? != K::Float
+                || b.shape.kind()? != K::Float
+                || c.shape.kind()? != K::Float
+            {
+                return Err(unsupported("fma type"));
+            }
+            let result = self.allocate(shape, false)?;
+            if [&a, &b, &c]
+                .iter()
+                .any(|value| value.lanes.len() != 1 && value.lanes.len() != result.lanes.len())
+            {
+                return Err(unsupported("fma operand shape"));
+            }
+            for (i, dst) in result.lanes.iter().enumerate() {
+                // Requires the Scarlet host VirGL FMA transport with its
+                // GPUShader5 capability check; MAD loses intermediate precision.
+                self.instruction(
+                    "FMA",
+                    dst,
+                    &[
+                        &a.lanes[i % a.lanes.len()],
+                        &b.lanes[i % b.lanes.len()],
+                        &c.lanes[i % c.lanes.len()],
+                    ],
+                )?;
+            }
+            return Ok(result);
+        }
+        if matches!(fun, M::Exp | M::Log) {
+            if a.shape.kind()? != K::Float {
+                return Err(unsupported("exponential/logarithm type"));
+            }
+            let factor = self.immediate(Literal::F32(if fun == M::Exp {
+                core::f32::consts::LOG2_E
+            } else {
+                core::f32::consts::LN_2
+            }))?;
+            return if fun == M::Exp {
+                let exponent = self.binary(B::Multiply, &a, &factor, shape.clone())?;
+                self.unary_instruction("EX2", &exponent, shape)
+            } else {
+                let logarithm = self.unary_instruction("LG2", &a, shape.clone())?;
+                self.binary(B::Multiply, &logarithm, &factor, shape)
+            };
+        }
         if fun == M::Cross {
             let b = b.ok_or_else(|| unsupported("cross operands"))?;
             if a.lanes.len() != 3 || b.lanes.len() != 3 || a.shape.kind()? != K::Float {

@@ -157,6 +157,7 @@ pub struct LoadedBackend {
     pub api: abi::BackendApi,
     pub driver: Option<abi::DriverApi>,
     pub ycbcr: Option<abi::YcbcrApi>,
+    pub program_release: Option<abi::ProgramReleaseApi>,
     pub name: String,
     pub gpu_backend: String,
     /// Absolute path passed to the loader for this driver.
@@ -221,6 +222,48 @@ unsafe fn load_ycbcr(library: *mut c_void) -> Result<Option<abi::YcbcrApi>, Erro
     } else {
         let get: abi::GetYcbcrApi = unsafe { core::mem::transmute(address) };
         negotiate_ycbcr(get).map(Some)
+    }
+}
+
+#[cfg(any(unix, target_os = "scarlet"))]
+fn negotiate_program_release(
+    get: abi::GetProgramReleaseApi,
+) -> Result<abi::ProgramReleaseApi, Error> {
+    let mut table = core::mem::MaybeUninit::<abi::ProgramReleaseApi>::uninit();
+    let status = unsafe {
+        get(
+            abi::VERSION,
+            core::mem::size_of::<abi::ProgramReleaseApi>(),
+            table.as_mut_ptr(),
+        )
+    };
+    if status != abi::OK {
+        return Err(Error(format!(
+            "driver rejected program-release ABI negotiation: {status}"
+        )));
+    }
+    // A successful entry point initializes the complete extension table.
+    let table = unsafe { table.assume_init() };
+    if table.version != abi::VERSION
+        || (table.size as usize) < core::mem::size_of::<abi::ProgramReleaseApi>()
+    {
+        return Err(Error("incompatible program-release driver table".into()));
+    }
+    Ok(table)
+}
+
+#[cfg(any(unix, target_os = "scarlet"))]
+unsafe fn load_program_release(
+    library: *mut c_void,
+) -> Result<Option<abi::ProgramReleaseApi>, Error> {
+    let address = unsafe { dlsym(library, abi::PROGRAM_RELEASE_ENTRY.as_ptr().cast()) };
+    if address.is_null() {
+        // Optional absence must not leave a stale dynamic loader error.
+        let _ = unsafe { dlerror() };
+        Ok(None)
+    } else {
+        let get: abi::GetProgramReleaseApi = unsafe { core::mem::transmute(address) };
+        negotiate_program_release(get).map(Some)
     }
 }
 
@@ -339,10 +382,12 @@ impl LoadedBackend {
             Some(table)
         };
         let ycbcr = unsafe { load_ycbcr(library) }?;
+        let program_release = unsafe { load_program_release(library) }?;
         Ok(Self {
             api,
             driver,
             ycbcr,
+            program_release,
             name,
             gpu_backend,
             library: library_path,
@@ -515,5 +560,67 @@ mod tests {
         )
         .unwrap();
         assert!(LoadedBackend::load(&missing).is_err());
+    }
+
+    unsafe extern "C" fn release_test_program(_: abi::Object, slot: u32, generation: u64) -> i32 {
+        if slot == 7 && generation == 13 {
+            abi::OK
+        } else {
+            abi::INVALID
+        }
+    }
+    unsafe extern "C" fn program_release_table<const VERSION: u32, const SIZE: u32>(
+        version: u32,
+        size: usize,
+        out: *mut abi::ProgramReleaseApi,
+    ) -> i32 {
+        if version != abi::VERSION || size != core::mem::size_of::<abi::ProgramReleaseApi>() {
+            return abi::ABI_MISMATCH;
+        }
+        unsafe {
+            out.write(abi::ProgramReleaseApi {
+                version: VERSION,
+                size: SIZE,
+                release_shader_module: release_test_program,
+                release_compute_pipeline: release_test_program,
+                release_programmable_render_pipeline: release_test_program,
+            });
+        }
+        abi::OK
+    }
+    #[cfg(any(unix, target_os = "scarlet"))]
+    #[test]
+    fn program_retirement_extension_negotiates_separately_from_legacy_driver() {
+        assert_eq!(core::mem::size_of::<abi::DriverApi>(), 144);
+        let table = negotiate_program_release(program_release_table::<2, 32>).unwrap();
+        for release in [
+            table.release_shader_module,
+            table.release_compute_pipeline,
+            table.release_programmable_render_pipeline,
+        ] {
+            assert_eq!(unsafe { release(core::ptr::null_mut(), 7, 13) }, abi::OK);
+            assert_eq!(
+                unsafe { release(core::ptr::null_mut(), 7, 12) },
+                abi::INVALID
+            );
+        }
+        for get in [
+            program_release_table::<1, 32> as abi::GetProgramReleaseApi,
+            program_release_table::<2, 31> as abi::GetProgramReleaseApi,
+        ] {
+            assert!(negotiate_program_release(get).is_err());
+        }
+        unsafe extern "C" fn reject(_: u32, _: usize, _: *mut abi::ProgramReleaseApi) -> i32 {
+            abi::ABI_MISMATCH
+        }
+        assert!(negotiate_program_release(reject).is_err());
+    }
+    #[cfg(any(unix, target_os = "scarlet"))]
+    #[test]
+    fn absent_program_retirement_extension_remains_optional() {
+        let process = unsafe { dlopen(core::ptr::null(), 2) };
+        assert!(!process.is_null());
+        assert!(unsafe { load_program_release(process) }.unwrap().is_none());
+        assert!(unsafe { dlerror() }.is_null());
     }
 }

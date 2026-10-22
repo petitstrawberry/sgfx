@@ -220,7 +220,7 @@ pub(super) unsafe fn submit(
         run(task_driver, packets, task_fence)
     })));
     if sent.is_err() {
-        d.lost.store(true, Ordering::Release);
+        d.mark_lost();
         for (s, v) in reserved {
             s.cancel(v);
         }
@@ -255,33 +255,34 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
             let recordings = packet.recordings.clone();
             let submissions = call(&d, move |rt| {
                 let result = (|| {
-                    let recordings = recordings
-                        .iter()
-                        .map(|r| {
-                            resolve_recording(rt, r).inspect_err(|error| {
-                                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    let recordings = profile_work("queue::resolve_recordings", || {
+                        recordings
+                            .iter()
+                            .map(|r| {
+                                resolve_recording(rt, r).inspect_err(|error| {
                                     eprintln!(
                                         "[SGFX Vulkan] queue command resolution failed: {error:?}"
                                     );
-                                }
+                                })
                             })
-                        })
-                        .collect::<VkResult<Vec<_>>>()?;
-                    for r in &recordings {
-                        validate_objects(rt, r).inspect_err(|error| {
-                            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                            .collect::<VkResult<Vec<_>>>()
+                    })?;
+                    profile_work("queue::validate_recordings", || {
+                        for r in &recordings {
+                            validate_objects(rt, r).inspect_err(|error| {
                                 eprintln!(
                                     "[SGFX Vulkan] queue object validation failed: {error:?}"
                                 );
-                            }
-                        })?;
-                    }
+                            })?;
+                        }
+                        Ok(())
+                    })?;
                     let mut submissions = Vec::new();
-                    for r in &recordings {
-                        match execute(rt, r) {
+                    for r in recordings {
+                        match profile_work("queue::execute", || execute(rt, r)) {
                             Ok(mut receipts) => submissions.append(&mut receipts),
                             Err(error) => {
-                                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                                {
                                     eprintln!("[SGFX Vulkan] queue execution failed: {error:?}");
                                 }
                                 for s in &submissions {
@@ -299,10 +300,12 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                 // consumed. Backends retain native bindings for submitted
                 // commands, so these immutable descriptor snapshots no longer
                 // need logical table slots or materialization-cache entries.
-                let cleanup = rt.resources.release_descriptor_groups(&rt.table, |id| {
-                    rt.cache
-                        .release_bind_group(id)
-                        .map_err(crate::runtime::backend_failure)
+                let cleanup = profile_work("queue::release_descriptors", || {
+                    rt.resources.release_descriptor_groups(&rt.table, |id| {
+                        rt.cache
+                            .release_bind_group(id)
+                            .map_err(crate::runtime::backend_failure)
+                    })
                 });
                 let submissions = result?;
                 if let Err(error) = cleanup {
@@ -352,10 +355,8 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
             Ok(())
         })();
         if let Err(error) = result {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!("[SGFX Vulkan] queue packet {index} failed: {error:?}");
-            }
-            d.lost.store(true, Ordering::Release);
+            eprintln!("[SGFX Vulkan] queue packet {index} failed: {error:?}");
+            d.mark_lost();
             cancel(&packets[index..]);
             if let Some(s) = &fence {
                 s.store(0, Ordering::Release);

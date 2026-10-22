@@ -71,6 +71,7 @@ pub struct Capabilities {
     image_mips: bool,
     texture_arrays: bool,
     depth_sampling: bool,
+    native_narrow_color: bool,
 }
 
 impl Capabilities {
@@ -99,7 +100,15 @@ impl Capabilities {
                 && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_DEPTH_SAMPLING != 0,
             image_mips: rendering
                 && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_IMAGE_MIPS != 0,
+            native_narrow_color: rendering
+                && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_NATIVE_NARROW_COLOR != 0,
         }
+    }
+
+    /// Return whether R8/RG8 storage and typed transfers are native.
+    /// Older kernels retain the equivalent BGRA transport representation.
+    pub const fn supports_native_narrow_color(&self) -> bool {
+        self.native_narrow_color
     }
 
     /// Return whether the device can execute the built-in rendering pipeline.
@@ -251,7 +260,7 @@ impl Context {
     /// Poll all accepted work without waiting, for resource retirement at ABI boundaries.
     #[cfg(feature = "backend-abi")]
     pub fn is_idle(&self) -> HandleResult<bool> {
-        self.create_queue()?.backend.is_idle()
+        self.backend.is_idle()
     }
 
     /// Create an empty persistent cache for one logical IR resource table.
@@ -291,18 +300,30 @@ impl Context {
         resources: Rc<ir::ResourceTable>,
         targets: &[ir::TextureId],
     ) -> Result<MappedTargetSession, IrSubmitError> {
-        let mut cache = self.create_ir_resources(Rc::clone(&resources))?;
-        let queue = self.create_queue()?;
-        let mut images = Vec::new();
-        images
+        // Construct the owner before fallible target materialization so a
+        // partially built session follows the same non-panicking teardown.
+        let mut session = MappedTargetSession {
+            imported_textures: Vec::new(),
+            context: Context {
+                backend: Rc::clone(&self.backend),
+            },
+            queue: self.create_queue()?,
+            resources: self.create_ir_resources(Rc::clone(&resources))?,
+            images: Vec::new(),
+        };
+        session
+            .images
             .try_reserve_exact(targets.len())
             .map_err(|_| IrSubmitError::OutOfMemory)?;
         for &target in targets {
-            if images.iter().any(|(candidate, _)| *candidate == target) {
+            if session
+                .images
+                .iter()
+                .any(|(candidate, _)| *candidate == target)
+            {
                 return Err(IrSubmitError::TextureAlreadyMapped);
             }
-            let reference = resources.texture_ref(target)?;
-            let descriptor = resources.texture(reference)?;
+            let descriptor = resources.texture(resources.texture_ref(target)?)?;
             let required = ir::TextureUsage::RENDER_ATTACHMENT | ir::TextureUsage::PRESENT;
             if !descriptor.usage().contains(required) {
                 return Err(IrSubmitError::Unsupported(
@@ -314,18 +335,19 @@ impl Context {
                     descriptor.extent().width(),
                     descriptor.extent().height(),
                 )?);
-            cache.map_image(target, Rc::clone(&image))?;
-            images.push((target, image));
+            if let Err(error) = session.resources.map_image(target, Rc::clone(&image)) {
+                if let Ok(image) = Rc::try_unwrap(image) {
+                    let _ = session
+                        .resources
+                        .retire_owned_image(&session.context, image);
+                } else {
+                    session.resources.abandon_cleanup();
+                }
+                return Err(error);
+            }
+            session.images.push((target, image));
         }
-        Ok(MappedTargetSession {
-            imported_textures: Vec::new(),
-            context: Context {
-                backend: Rc::clone(&self.backend),
-            },
-            queue,
-            resources: cache,
-            images,
-        })
+        Ok(session)
     }
 
     /// Create a presentation-capable render-target image.
@@ -593,6 +615,34 @@ pub struct MappedTargetSession {
     context: Context,
 }
 
+impl Drop for MappedTargetSession {
+    fn drop(&mut self) {
+        let result = (|| -> Result<(), IrSubmitError> {
+            self.resources.ensure_usable()?;
+            self.queue.backend.wait_idle()?;
+            while let Some((texture, _)) = self.imported_textures.first() {
+                self.release_imported_texture(*texture)?;
+            }
+            for (texture, _) in &self.images {
+                self.resources.unmap_image(*texture)?;
+            }
+            // Borrowed surfaces are returned to their image owners before the
+            // private cache is destroyed. Keep image owners until afterwards.
+            self.resources.cleanup()?;
+            while let Some((_, image)) = self.images.pop() {
+                let image = Rc::try_unwrap(image).map_err(|_| IrSubmitError::ImageAlreadyMapped)?;
+                self.resources.retire_owned_image(&self.context, image)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.resources.abandon_cleanup();
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX teardown] stage=mapped_session error={error:?}");
+        }
+    }
+}
+
 impl MappedTargetSession {
     /// Observe whether all accepted work in this context has retired, without
     /// waiting or retaining an extra completion receipt on the submission path.
@@ -613,12 +663,34 @@ impl MappedTargetSession {
         self.resources.release_buffer(id)
     }
 
+    /// Release retired programmable-resource materialization before updating table metadata.
+    pub fn release_shader_module(&mut self, id: ir::ShaderModuleId) -> Result<(), IrSubmitError> {
+        self.resources.release_shader_module(id)
+    }
+
+    /// Release retired programmable-resource materialization before updating table metadata.
+    pub fn release_compute_pipeline(
+        &mut self,
+        id: ir::ComputePipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.resources.release_compute_pipeline(id)
+    }
+
+    /// Release retired programmable-resource materialization before updating table metadata.
+    pub fn release_programmable_render_pipeline(
+        &mut self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<(), IrSubmitError> {
+        self.resources.release_programmable_render_pipeline(id)
+    }
+
     /// Import a transferred shared BGRA image into a logical sampled texture.
     pub fn import_shared_bgra_texture(
         &mut self,
         texture: ir::TextureId,
         handle: Handle,
     ) -> Result<(), IrSubmitError> {
+        self.resources.ensure_usable()?;
         if self
             .imported_textures
             .iter()
@@ -631,7 +703,9 @@ impl MappedTargetSession {
             .resources
             .map_texture(&self.context, texture, &imported)
         {
-            let _ = self.context.release_texture(imported);
+            let _ = self
+                .resources
+                .retire_imported_texture(&self.context, imported);
             return Err(error);
         }
         self.imported_textures.push((texture, imported));
@@ -643,6 +717,7 @@ impl MappedTargetSession {
         &mut self,
         texture: ir::TextureId,
     ) -> Result<(), IrSubmitError> {
+        self.resources.ensure_usable()?;
         let index = self
             .imported_textures
             .iter()
@@ -652,7 +727,8 @@ impl MappedTargetSession {
         self.resources
             .unmap_texture(&self.context, texture, imported)?;
         let (_, imported) = self.imported_textures.remove(index);
-        self.context.release_texture(imported)?;
+        self.resources
+            .retire_imported_texture(&self.context, imported)?;
         Ok(())
     }
 
@@ -1433,5 +1509,28 @@ impl<'a> RenderPass<'a> {
             pipeline: Rc::clone(&pipeline.backend),
             vertices: Vec::from(vertices),
         });
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn native_narrow_storage_requires_an_explicit_ready_kernel_capability() {
+        let mut info = GpuQueryInfo::new();
+        info.result = GPU_RESULT_SUCCESS;
+        info.device_state = GPU_DEVICE_STATE_READY;
+        info.execution_support = GPU_EXECUTION_SUPPORT_QUEUE;
+        info.backend_id_len = BACKEND_ID.len() as u32;
+        info.backend_id[..BACKEND_ID.len()].copy_from_slice(BACKEND_ID);
+        assert!(!Capabilities::from_query_info(&info).supports_native_narrow_color());
+        info.execution_support |= gpu_raw::GPU_EXECUTION_SUPPORT_NATIVE_NARROW_COLOR;
+        assert!(Capabilities::from_query_info(&info).supports_native_narrow_color());
+        info.execution_support &= !GPU_EXECUTION_SUPPORT_QUEUE;
+        assert!(!Capabilities::from_query_info(&info).supports_native_narrow_color());
+        info.execution_support |= GPU_EXECUTION_SUPPORT_QUEUE;
+        info.device_state = gpu_raw::GPU_DEVICE_STATE_LOST;
+        assert!(!Capabilities::from_query_info(&info).supports_native_narrow_color());
     }
 }

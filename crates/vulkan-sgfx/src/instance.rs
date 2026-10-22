@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const LOADER_MAGIC: usize = 0x01cd_c0de;
-const MEMORY_HEAP_SIZE: u64 = 256 * 1024 * 1024;
+const MEMORY_HEAP_SIZE: u64 = crate::resources::MAX_ALLOCATED as u64;
 
 // The loader replaces this first word with its own dispatch table pointer.
 #[repr(C)]
@@ -26,6 +26,7 @@ struct PhysicalObject {
 }
 
 struct InstanceRecord {
+    api_version: u32,
     _instance: Box<InstanceObject>,
     physical_devices: Vec<PhysicalRecord>,
 }
@@ -162,6 +163,12 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
     let name = unsafe { CStr::from_ptr(name) };
     // Only global commands are visible before instance creation.
     match name.to_bytes() {
+        b"vkEnumerateInstanceVersion" => {
+            return procedure!(
+                enumerate_instance_version,
+                vk::PFN_vkEnumerateInstanceVersion
+            );
+        }
         b"vkCreateInstance" => return procedure!(create_instance, vk::PFN_vkCreateInstance),
         b"vkEnumerateInstanceExtensionProperties" => {
             return procedure!(
@@ -187,6 +194,17 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
         return None;
     }
     match name.to_bytes() {
+        b"vkEnumeratePhysicalDeviceGroups" => {
+            if instances().instances[&(instance.as_raw() as usize)].api_version
+                < vk::API_VERSION_1_1
+            {
+                return None;
+            }
+            procedure!(
+                enumerate_physical_device_groups,
+                vk::PFN_vkEnumeratePhysicalDeviceGroups
+            )
+        }
         b"vkDestroyInstance" => procedure!(destroy_instance, vk::PFN_vkDestroyInstance),
         b"vkEnumeratePhysicalDevices" => {
             procedure!(
@@ -267,6 +285,12 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
         ),
         _ => {
+            if crate::properties2::is_core(name)
+                && instances().instances[&(instance.as_raw() as usize)].api_version
+                    < vk::API_VERSION_1_1
+            {
+                return None;
+            }
             if let Some(function) = crate::properties2::lookup(name) {
                 return Some(function);
             }
@@ -281,6 +305,52 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             crate::api::lookup_device(name)
         }
     }
+}
+
+unsafe extern "system" fn enumerate_physical_device_groups(
+    instance: vk::Instance,
+    count: *mut u32,
+    output: *mut vk::PhysicalDeviceGroupProperties<'_>,
+) -> vk::Result {
+    if count.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let registry = instances();
+    let Some(record) = registry.instances.get(&(instance.as_raw() as usize)) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let total = record.physical_devices.len() as u32;
+    if output.is_null() {
+        *count = total;
+        return vk::Result::SUCCESS;
+    }
+    let capacity = *count;
+    for (index, physical) in record
+        .physical_devices
+        .iter()
+        .take(capacity as usize)
+        .enumerate()
+    {
+        let out = &mut *output.add(index);
+        out.physical_device_count = 1;
+        out.physical_devices = [vk::PhysicalDevice::null(); vk::MAX_DEVICE_GROUP_SIZE];
+        out.physical_devices[0] = vk::PhysicalDevice::from_raw(physical.id() as u64);
+        out.subset_allocation = vk::FALSE;
+    }
+    *count = capacity.min(total);
+    if capacity < total {
+        vk::Result::INCOMPLETE
+    } else {
+        vk::Result::SUCCESS
+    }
+}
+
+unsafe extern "system" fn enumerate_instance_version(out: *mut u32) -> vk::Result {
+    let Some(out) = out.as_mut() else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    *out = vk::API_VERSION_1_1;
+    vk::Result::SUCCESS
 }
 
 pub(crate) unsafe extern "system" fn create_instance(
@@ -322,7 +392,7 @@ pub(crate) unsafe extern "system" fn create_instance(
         if version != 0
             && (vk::api_version_variant(version) != 0
                 || vk::api_version_major(version) != 1
-                || vk::api_version_minor(version) != 0)
+                || vk::api_version_minor(version) > 1)
         {
             return vk::Result::ERROR_INCOMPATIBLE_DRIVER;
         }
@@ -344,7 +414,15 @@ pub(crate) unsafe extern "system" fn create_instance(
             }),
         })
         .collect();
+    let api_version = info
+        .p_application_info
+        .as_ref()
+        .map_or(vk::API_VERSION_1_0, |info| {
+            info.api_version
+                .clamp(vk::API_VERSION_1_0, vk::API_VERSION_1_1)
+        });
     let record = InstanceRecord {
+        api_version,
         _instance: instance,
         physical_devices,
     };
@@ -726,7 +804,12 @@ pub(crate) unsafe extern "system" fn get_physical_device_properties(
         let info = adapter.info();
         let capabilities = adapter.capabilities();
         let limits = capabilities.limits();
-        properties.api_version = vk::API_VERSION_1_0;
+        properties.api_version =
+            if cfg!(target_os = "scarlet") && info.backend() == sgfx::BackendKind::ScarletVirgl {
+                vk::API_VERSION_1_1
+            } else {
+                vk::API_VERSION_1_0
+            };
         properties.driver_version = vk::make_api_version(0, 0, 1, 0);
         properties.vendor_id = info.vendor_id();
         properties.device_id = info.device_id();
@@ -779,7 +862,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_properties(
             } else {
                 0
             },
-            max_memory_allocation_count: 1024,
+            max_memory_allocation_count: crate::resources::MAX_MEMORY_ALLOCATIONS as u32,
             buffer_image_granularity: 256,
             max_bound_descriptor_sets: limits.max_bound_descriptor_sets,
             max_per_stage_descriptor_input_attachments: if capabilities
@@ -1075,6 +1158,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
             vk::Format::R32_SINT
                 | vk::Format::R32_UINT
                 | vk::Format::R16G16_SFLOAT
+                | vk::Format::R16G16_UINT
                 | vk::Format::R16G16B16A16_SFLOAT
                 | vk::Format::R16G16B16A16_SINT
                 | vk::Format::A2B10G10R10_SNORM_PACK32
@@ -1086,7 +1170,8 @@ pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
     if capabilities.supports_vertex_buffers()
         && matches!(
             format,
-            vk::Format::R32G32_SFLOAT
+            vk::Format::R32_SFLOAT
+                | vk::Format::R32G32_SFLOAT
                 | vk::Format::R32G32B32_SFLOAT
                 | vk::Format::R32G32B32A32_SFLOAT
                 | vk::Format::R8G8B8A8_UNORM
@@ -1320,6 +1405,52 @@ mod tests {
     }
 
     #[test]
+    fn core11_instance_queries_have_version_scope_and_single_device_groups() {
+        unsafe {
+            let mut version = 0;
+            assert_eq!(
+                enumerate_instance_version(&mut version),
+                vk::Result::SUCCESS
+            );
+            assert_eq!(version, vk::API_VERSION_1_1);
+            let application = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+            let mut instance = vk::Instance::null();
+            assert_eq!(
+                create_instance(
+                    &vk::InstanceCreateInfo::default().application_info(&application),
+                    ptr::null(),
+                    &mut instance
+                ),
+                vk::Result::SUCCESS
+            );
+            assert!(
+                get_instance_proc_addr(instance, c"vkGetPhysicalDeviceFeatures2".as_ptr())
+                    .is_some()
+            );
+            assert!(
+                get_instance_proc_addr(instance, c"vkEnumeratePhysicalDeviceGroups".as_ptr())
+                    .is_some()
+            );
+            let mut count = 0;
+            assert_eq!(
+                enumerate_physical_device_groups(instance, &mut count, ptr::null_mut()),
+                vk::Result::SUCCESS
+            );
+            let mut groups = vec![vk::PhysicalDeviceGroupProperties::default(); count as usize];
+            assert_eq!(
+                enumerate_physical_device_groups(instance, &mut count, groups.as_mut_ptr()),
+                vk::Result::SUCCESS
+            );
+            for group in groups {
+                assert_eq!(group.physical_device_count, 1);
+                assert!(physical_valid(group.physical_devices[0]));
+                assert_eq!(group.subset_allocation, vk::FALSE);
+            }
+            destroy_instance(instance, ptr::null());
+        }
+    }
+
+    #[test]
     fn enumeration_obeys_capacity_and_physical_lifetime() {
         unsafe {
             let instance = new_instance();
@@ -1463,6 +1594,13 @@ mod tests {
                 vk::FormatFeatureFlags::VERTEX_BUFFER
             );
             assert!(formats.optimal_tiling_features.is_empty());
+            get_physical_device_format_properties(physical, vk::Format::R32_SFLOAT, &mut formats);
+            assert_eq!(
+                formats.buffer_features,
+                vk::FormatFeatureFlags::VERTEX_BUFFER
+            );
+            assert!(formats.optimal_tiling_features.is_empty());
+
             count = 10;
             assert_eq!(
                 enumerate_device_extension_properties(

@@ -1,6 +1,7 @@
 pub(crate) mod bootstrap;
 mod buffer_operations;
 mod buffer_views;
+mod core11;
 pub(crate) mod descriptor_template;
 mod dynamic_states;
 mod maintenance1;
@@ -82,6 +83,39 @@ impl InFlight {
         self.changed.notify_all();
     }
 
+    // State stores happen before acquiring this mutex. Sharing the mutex with
+    // wait_until closes the check-to-sleep race without holding runtime locks.
+    fn notify(&self) {
+        let _count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
+    }
+
+    fn wait_until(&self, timeout: u64, mut ready: impl FnMut() -> VkResult<bool>) -> VkResult<()> {
+        let started = std::time::Instant::now();
+        let mut guard = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            // This predicate must inspect only pre-resolved atomic state. In
+            // particular, never resolve handles or enter the device worker here.
+            if ready()? {
+                return Ok(());
+            }
+            if timeout == u64::MAX {
+                guard = self.changed.wait(guard).unwrap_or_else(|e| e.into_inner());
+            } else {
+                let remaining =
+                    std::time::Duration::from_nanos(timeout).saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(vk::Result::TIMEOUT);
+                }
+                let (next, _) = self
+                    .changed
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next;
+            }
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         *self
             .count
@@ -120,6 +154,12 @@ struct Driver {
     in_flight: Arc<InFlight>,
     pending: Arc<InFlight>,
     lost: Arc<AtomicBool>,
+}
+impl Driver {
+    fn mark_lost(&self) {
+        self.lost.store(true, Ordering::Release);
+        self.in_flight.notify();
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -169,51 +209,302 @@ fn driver(id: u64, kind: Kind) -> VkResult<Arc<Driver>> {
         .map(|(_, d)| Arc::clone(d))
         .ok_or(vk::Result::ERROR_DEVICE_LOST)
 }
+
+fn call_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // Loaded Scarlet Rust DSOs have their own uninitialized std environment.
+        // Read the process envp published by scarlet-ld without requiring a
+        // libc getenv export from the application.
+        #[cfg(target_os = "scarlet")]
+        unsafe {
+            unsafe extern "C" {
+                // extern_weak contains the symbol's ADDRESS. The C data at
+                // that address is itself the char ** environment pointer.
+                #[linkage = "extern_weak"]
+                static environ: *const *const *const c_char;
+            }
+            let address = environ;
+            if address.is_null() {
+                return false;
+            }
+            let mut cursor = *address;
+            if cursor.is_null() {
+                return false;
+            }
+            while !(*cursor).is_null() {
+                let entry = CStr::from_ptr(*cursor).to_bytes();
+                if let Some(value) = entry.strip_prefix(b"SGFX_VULKAN_CALL_PROFILE=") {
+                    return value == b"1";
+                }
+                cursor = cursor.add(1);
+            }
+            false
+        }
+        #[cfg(not(target_os = "scarlet"))]
+        {
+            std::env::var("SGFX_VULKAN_CALL_PROFILE").is_ok_and(|v| v == "1")
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+struct CallServiceTiming {
+    queued_ns: u128,
+    service_ns: u128,
+}
+
+#[derive(Default)]
+struct CallProfileCounters {
+    calls: u64,
+    errors: u64,
+    services: u64,
+    roundtrip_ns: u128,
+    queued_ns: u128,
+    service_ns: u128,
+    max_roundtrip_ns: u128,
+    max_service_ns: u128,
+}
+
+impl CallProfileCounters {
+    fn observe(&mut self, roundtrip_ns: u128, service: Option<CallServiceTiming>, failed: bool) {
+        self.calls += 1;
+        self.errors += u64::from(failed);
+        self.roundtrip_ns += roundtrip_ns;
+        self.max_roundtrip_ns = self.max_roundtrip_ns.max(roundtrip_ns);
+        if let Some(service) = service {
+            self.services += 1;
+            self.queued_ns += service.queued_ns;
+            self.service_ns += service.service_ns;
+            self.max_service_ns = self.max_service_ns.max(service.service_ns);
+        }
+    }
+}
+
+fn call_profile_label(operation: &str) -> &str {
+    let operation = operation.strip_prefix("vulkan_sgfx::").unwrap_or(operation);
+    let operation = operation.split("::{{closure}}").next().unwrap_or(operation);
+    let mut start = operation.len().saturating_sub(120);
+    while !operation.is_char_boundary(start) {
+        start += 1;
+    }
+    &operation[start..]
+}
+
+fn record_call_profile(
+    operation: &'static str,
+    started: std::time::Instant,
+    service: Option<CallServiceTiming>,
+    failed: bool,
+) {
+    struct Profile {
+        period: std::time::Instant,
+        operations: HashMap<&'static str, CallProfileCounters>,
+    }
+    static PROFILE: OnceLock<Mutex<Profile>> = OnceLock::new();
+    let finished = std::time::Instant::now();
+    let mut profile = PROFILE
+        .get_or_init(|| {
+            Mutex::new(Profile {
+                period: started,
+                operations: HashMap::new(),
+            })
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    profile.operations.entry(operation).or_default().observe(
+        finished.duration_since(started).as_nanos(),
+        service,
+        failed,
+    );
+    let period = finished.duration_since(profile.period);
+    if period.as_secs() == 0 {
+        return;
+    }
+    let mut top: Vec<_> = profile.operations.iter().collect();
+    top.sort_unstable_by(|(a_name, a), (b_name, b)| {
+        b.roundtrip_ns
+            .cmp(&a.roundtrip_ns)
+            .then_with(|| a_name.cmp(b_name))
+    });
+    let calls: u64 = top.iter().map(|(_, c)| c.calls).sum();
+    let errors: u64 = top.iter().map(|(_, c)| c.errors).sum();
+    eprintln!(
+        "SGFX_VULKAN_CALL_PROFILE period_us={} calls={calls} errors={errors} operations={} top={}",
+        period.as_micros(),
+        top.len(),
+        top.len().min(6),
+    );
+    for (operation, c) in top.iter().take(6) {
+        // Service includes the operation, idle-cache reclamation, and lost-state
+        // publication. Queue/wake delays are host thread/channel scheduling,
+        // not evidence of GPU execution time. Missing service means channel loss.
+        let wake_ns = c.roundtrip_ns.saturating_sub(c.queued_ns + c.service_ns);
+        eprintln!(
+            "SGFX_VULKAN_CALL_TOP op={} calls={} errors={} missing_service={} roundtrip_us={} queued_us={} service_us={} wake_us={} max_roundtrip_us={} max_service_us={}",
+            call_profile_label(operation),
+            c.calls,
+            c.errors,
+            c.calls - c.services,
+            c.roundtrip_ns / 1000,
+            c.queued_ns / 1000,
+            c.service_ns / 1000,
+            wake_ns / 1000,
+            c.max_roundtrip_ns / 1000,
+            c.max_service_ns / 1000,
+        );
+    }
+    profile.operations.clear();
+    profile.period = finished;
+}
+
+// Nested worker phases share the existing opt-in profiler. Their durations
+// overlap the enclosing API call and must not be summed as separate GPU time.
+fn profile_work<T>(operation: &'static str, work: impl FnOnce() -> VkResult<T>) -> VkResult<T> {
+    let started = call_profile_enabled().then(std::time::Instant::now);
+    let result = work();
+    if let Some(started) = started {
+        record_call_profile(
+            operation,
+            started,
+            Some(CallServiceTiming {
+                queued_ns: 0,
+                service_ns: started.elapsed().as_nanos(),
+            }),
+            result.is_err(),
+        );
+    }
+    result
+}
+
+// Both synchronous requests and owned void requests use the same panic/lost
+// publication path. A void operation has no result channel, so its errors must
+// become device loss instead of silently preserving stale state.
+fn run_device_operation<T>(
+    runtime: &mut Runtime,
+    op: impl FnOnce(&mut Runtime) -> VkResult<T>,
+    void: bool,
+) -> VkResult<T> {
+    let result = if runtime.device_lost.load(Ordering::Acquire) {
+        runtime.lost = true;
+        Err(vk::Result::ERROR_DEVICE_LOST)
+    } else {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime))).unwrap_or_else(
+            |_| {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
+                }
+                runtime.lost = true;
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            },
+        )
+    };
+    if void && result.is_err() {
+        runtime.lost = true;
+    }
+    let _ = profile_work("worker::reclaim_idle_resources", || {
+        runtime.reclaim_idle_resources();
+        Ok(())
+    });
+    if runtime.lost {
+        runtime.device_lost.store(true, Ordering::Release);
+        runtime.in_flight.notify();
+    }
+    result
+}
+
 fn call<T: Send + 'static>(
     driver: &Driver,
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
 ) -> VkResult<T> {
-    let (tx, rx) = mpsc::sync_channel(1);
-    driver
-        .sender
-        .send(Request::Run(Box::new(move |runtime| {
-            let result = if runtime.device_lost.load(Ordering::Acquire) {
-                runtime.lost = true;
-                Err(vk::Result::ERROR_DEVICE_LOST)
-            } else {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime)))
-                    .unwrap_or_else(|_| {
-                        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                            eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
-                        }
-                        runtime.lost = true;
-                        Err(vk::Result::ERROR_DEVICE_LOST)
-                    })
-            };
-            runtime.reclaim_idle_resources();
-            if runtime.lost {
-                runtime.device_lost.store(true, Ordering::Release);
-            }
-            let _ = tx.send(result);
-        })))
-        .map_err(|_| {
+    // The disabled path performs no clock reads, type-name formatting, or
+    // statistics-map access. The opt-in flag is sampled once per process.
+    let profile_start = call_profile_enabled().then(std::time::Instant::now);
+    let operation = profile_start.map(|_| std::any::type_name_of_val(&op));
+    let mut service = None;
+    let result = (|| {
+        let (tx, rx) = mpsc::sync_channel(1);
+        driver
+            .sender
+            .send(Request::Run(Box::new(move |runtime| {
+                let service_start = profile_start.map(|_| std::time::Instant::now());
+                let result = run_device_operation(runtime, op, false);
+                let service =
+                    profile_start
+                        .zip(service_start)
+                        .map(|(queued, start)| CallServiceTiming {
+                            queued_ns: start.duration_since(queued).as_nanos(),
+                            service_ns: start.elapsed().as_nanos(),
+                        });
+                let _ = tx.send((result, service));
+            })))
+            .map_err(|_| {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!("[SGFX Vulkan] device worker request channel closed");
+                }
+                driver.mark_lost();
+                vk::Result::ERROR_DEVICE_LOST
+            })?;
+        let (result, timing) = rx.recv().map_err(|_| {
             if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!("[SGFX Vulkan] device worker request channel closed");
+                eprintln!("[SGFX Vulkan] device worker response channel closed");
             }
+            driver.mark_lost();
             vk::Result::ERROR_DEVICE_LOST
         })?;
-    rx.recv().map_err(|_| {
-        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-            eprintln!("[SGFX Vulkan] device worker response channel closed");
-        }
-        vk::Result::ERROR_DEVICE_LOST
-    })?
+        service = timing;
+        result
+    })();
+    if let (Some(started), Some(operation)) = (profile_start, operation) {
+        record_call_profile(operation, started, service, result.is_err());
+    }
+    result
 }
 pub(crate) fn with_device<T: Send + 'static>(
     device: vk::Device,
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
 ) -> VkResult<T> {
     call(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
+}
+
+/// Publish fully owned descriptor metadata on the device FIFO without waiting
+/// for a reply. Invalidation belongs to the API invocation, before a subsequent
+/// command recording can bind the newly updated set. Doing it in the worker
+/// would incorrectly invalidate recordings made after this call returns.
+pub(crate) fn update_descriptors_owned(
+    device: vk::Device,
+    sets: &[vk::DescriptorSet],
+    op: impl FnOnce(&mut Runtime) -> VkResult<()> + Send + 'static,
+) -> VkResult<()> {
+    let driver = driver(device.as_raw(), Kind::Device)?;
+    invalidate_recorded_descriptor_sets(&driver.recordings, sets);
+    // The synchronous call profiler intentionally excludes this one-way job:
+    // enqueue-to-completion is not an API round trip or response wake delay.
+    driver
+        .sender
+        .send(Request::Run(Box::new(move |runtime| {
+            // There is no response receiver to notice a worker unwind. Also
+            // publish loss if post-operation reclamation itself panics.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_device_operation(runtime, op, true)
+            }))
+            .is_err()
+            {
+                runtime.lost = true;
+                runtime.device_lost.store(true, Ordering::Release);
+                runtime.in_flight.notify();
+            }
+        })))
+        .map_err(|_| {
+            driver.mark_lost();
+            vk::Result::ERROR_DEVICE_LOST
+        })
+}
+
+pub(crate) fn mark_device_lost(device: vk::Device) {
+    if let Ok(driver) = driver(device.as_raw(), Kind::Device) {
+        driver.mark_lost();
+    }
 }
 
 #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
@@ -319,6 +610,49 @@ unsafe fn device_chain_supported(
                 ]
                 .into_iter()
                 .all(|feature| feature == vk::FALSE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_1_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceVulkan11Features<'_>>();
+                [
+                    f.storage_buffer16_bit_access,
+                    f.uniform_and_storage_buffer16_bit_access,
+                    f.storage_push_constant16,
+                    f.storage_input_output16,
+                    f.multiview,
+                    f.multiview_geometry_shader,
+                    f.multiview_tessellation_shader,
+                    f.variable_pointers_storage_buffer,
+                    f.variable_pointers,
+                    f.protected_memory,
+                    f.sampler_ycbcr_conversion,
+                    f.shader_draw_parameters,
+                ]
+                .into_iter()
+                .all(|value| value == vk::FALSE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDevice16BitStorageFeatures<'_>>();
+                [
+                    f.storage_buffer16_bit_access,
+                    f.uniform_and_storage_buffer16_bit_access,
+                    f.storage_push_constant16,
+                    f.storage_input_output16,
+                ]
+                .into_iter()
+                .all(|value| value == vk::FALSE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceVariablePointersFeatures<'_>>();
+                f.variable_pointers == vk::FALSE && f.variable_pointers_storage_buffer == vk::FALSE
+            }
+            vk::StructureType::PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES => {
+                (&*next.cast::<vk::PhysicalDeviceProtectedMemoryFeatures<'_>>()).protected_memory
+                    == vk::FALSE
+            }
+            vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES => {
+                (&*next.cast::<vk::PhysicalDeviceSamplerYcbcrConversionFeatures<'_>>())
+                    .sampler_ycbcr_conversion
+                    == vk::FALSE
             }
             vk::StructureType::PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES => {
                 let features = &*next.cast::<vk::PhysicalDeviceShaderDrawParametersFeatures<'_>>();
@@ -606,7 +940,7 @@ pub(crate) unsafe extern "system" fn destroy_device(
     {
         let _ = thread.join();
     }
-    driver.lost.store(true, Ordering::Release);
+    driver.mark_lost();
     let _ = driver.sender.send(Request::Stop);
     if let Some(thread) = driver
         .thread
@@ -763,6 +1097,13 @@ pub(crate) fn set_pipeline_layout_metadata(
 #[derive(Clone)]
 enum RecordedCommand {
     InertDynamicState,
+    CopyImage {
+        source: vk::Image,
+        source_layout: vk::ImageLayout,
+        destination: vk::Image,
+        destination_layout: vk::ImageLayout,
+        regions: Vec<vk::ImageCopy>,
+    },
     BlitImage {
         source: vk::Image,
         source_layout: vk::ImageLayout,
@@ -833,6 +1174,10 @@ enum RecordedCommand {
         layout: vk::ImageLayout,
         buffer: vk::Buffer,
         regions: Vec<vk::BufferImageCopy>,
+    },
+    ClearAttachments {
+        attachments: Vec<vk::ClearAttachment>,
+        rects: Vec<vk::ClearRect>,
     },
     ClearColorImage {
         image: vk::Image,
@@ -964,7 +1309,9 @@ impl Recording {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
             RecordedCommand::EndRenderPass => self.render_active = false,
-            RecordedCommand::Draw { .. } | RecordedCommand::DrawIndexed { .. }
+            RecordedCommand::Draw { .. }
+            | RecordedCommand::DrawIndexed { .. }
+            | RecordedCommand::ClearAttachments { .. }
                 if !self.render_active =>
             {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -979,6 +1326,7 @@ impl Recording {
             RecordedCommand::CopyImageToBuffer { .. }
             | RecordedCommand::ClearColorImage { .. }
             | RecordedCommand::BlitImage { .. }
+            | RecordedCommand::CopyImage { .. }
             | RecordedCommand::CopyBuffer { .. }
             | RecordedCommand::CopyBufferToImage { .. }
             | RecordedCommand::UpdateBuffer { .. }
@@ -1033,6 +1381,26 @@ impl RecordedCommand {
     fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
         match self {
             Self::InertDynamicState => (),
+            Self::CopyImage {
+                source,
+                source_layout,
+                destination,
+                destination_layout,
+                regions,
+            } => {
+                if rec.render.is_some() {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                rec.ops.extend(crate::transfer::copy_image(
+                    &rt.resources,
+                    *source,
+                    *source_layout,
+                    *destination,
+                    *destination_layout,
+                    regions,
+                )?);
+                rec.used_images.extend([*source, *destination]);
+            }
             Self::BlitImage {
                 source,
                 source_layout,
@@ -1242,6 +1610,9 @@ impl RecordedCommand {
                 )?;
             }
             Self::NextSubpass => render_passes::next(rec)?,
+            Self::ClearAttachments { attachments, rects } => {
+                render_passes::clear_attachments(rec, attachments, rects)?;
+            }
             Self::ClearColorImage {
                 image,
                 layout,
@@ -1412,6 +1783,10 @@ impl RecordedCommand {
                         image_data.format,
                         vk::Format::R8G8B8A8_UNORM
                             | vk::Format::B8G8R8A8_UNORM
+                            | vk::Format::A8B8G8R8_UNORM_PACK32
+                            | vk::Format::R8G8B8A8_SRGB
+                            | vk::Format::B8G8R8A8_SRGB
+                            | vk::Format::A8B8G8R8_SRGB_PACK32
                             | vk::Format::R8_UNORM
                             | vk::Format::R8G8_UNORM
                     )
@@ -1572,10 +1947,7 @@ impl RecordedCommand {
                     size,
                 ) in buffers
                 {
-                    if *extended
-                        || !(*source_queue == vk::QUEUE_FAMILY_IGNORED
-                            && *destination_queue == vk::QUEUE_FAMILY_IGNORED)
-                    {
+                    if *extended || !same_queue_family(*source_queue, *destination_queue) {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
                     let buffer_data = rt
@@ -1607,10 +1979,7 @@ impl RecordedCommand {
                     range,
                 ) in images
                 {
-                    if *extended
-                        || !(*source_queue == vk::QUEUE_FAMILY_IGNORED
-                            && *destination_queue == vk::QUEUE_FAMILY_IGNORED)
-                    {
+                    if *extended || !same_queue_family(*source_queue, *destination_queue) {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
                     let image_data = rt
@@ -1715,12 +2084,33 @@ fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedR
     let mut resolved = ResolvedRecording::new();
     for (index, command) in source.commands.iter().enumerate() {
         if let Err(error) = command.apply(rt, &mut resolved) {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            {
                 eprintln!(
                     "[SGFX Vulkan] resolve command {index} {:?}: {error:?}",
                     std::mem::discriminant(command)
                 );
                 match command {
+                    RecordedCommand::CopyImage {
+                        source,
+                        source_layout,
+                        destination,
+                        destination_layout,
+                        regions,
+                    } => eprintln!(
+                        "[SGFX Vulkan] raw image copy: {source:?}/{source_layout:?} {:?} -> {destination:?}/{destination_layout:?} {:?} regions={regions:?}",
+                        rt.resources.images.get(source).map(|i| (
+                            i.format,
+                            i.extent,
+                            i.mip_levels,
+                            i.array_layers
+                        )),
+                        rt.resources.images.get(destination).map(|i| (
+                            i.format,
+                            i.extent,
+                            i.mip_levels,
+                            i.array_layers
+                        ))
+                    ),
                     RecordedCommand::BlitImage {
                         source,
                         destination,
@@ -2304,6 +2694,28 @@ unsafe extern "system" fn cmd_next_subpass(
     record(command, RecordedCommand::NextSubpass)
 }
 
+unsafe extern "system" fn cmd_clear_attachments(
+    command: vk::CommandBuffer,
+    attachment_count: u32,
+    attachments: *const vk::ClearAttachment,
+    rect_count: u32,
+    rects: *const vk::ClearRect,
+) {
+    let result = (|| {
+        if attachment_count > 16 || rect_count > 1024 {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        Ok(RecordedCommand::ClearAttachments {
+            attachments: slice(attachments, attachment_count)?.to_vec(),
+            rects: slice(rects, rect_count)?.to_vec(),
+        })
+    })();
+    match result {
+        Ok(command_data) => record(command, command_data),
+        Err(error) => record_error(command, error),
+    }
+}
+
 unsafe extern "system" fn cmd_clear_color_image(
     command: vk::CommandBuffer,
     image: vk::Image,
@@ -2468,15 +2880,12 @@ fn graphics_bindings(
         .scissor
         .or(rec.scissor)
         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-    if scissor.offset.x < 0 || scissor.offset.y < 0 {
-        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-    }
-    let left = (scissor.offset.x as u32).min(extent.0);
-    let top = (scissor.offset.y as u32).min(extent.1);
-    let right = (u64::from(left) + u64::from(scissor.extent.width)).min(u64::from(extent.0)) as u32;
-    let bottom =
-        (u64::from(top) + u64::from(scissor.extent.height)).min(u64::from(extent.1)) as u32;
-    let visible = left < right && top < bottom;
+    let area = rec.active_render_pass.as_ref().map_or_else(
+        || ir::PixelRect::new(0, 0, extent.0, extent.1).map_err(crate::resources::failure),
+        |pass| Ok(pass.area),
+    )?;
+    let scissor = render_passes::clip_scissor(scissor, area)?;
+    let visible = scissor.is_some();
     let desc = table
         .programmable_render_pipeline_shared(
             table
@@ -2491,9 +2900,7 @@ fn graphics_bindings(
         &mut rec.ops,
         ir::OwnedCommand::SetViewport,
     );
-    if visible {
-        let scissor = ir::PixelRect::new(left, top, right - left, bottom - top)
-            .map_err(crate::resources::failure)?;
+    if let Some(scissor) = scissor {
         emit_changed(
             &mut rec.emitted_graphics.scissor,
             scissor,
@@ -2752,6 +3159,38 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
     );
 }
 
+unsafe extern "system" fn cmd_copy_image(
+    command: vk::CommandBuffer,
+    source: vk::Image,
+    source_layout: vk::ImageLayout,
+    destination: vk::Image,
+    destination_layout: vk::ImageLayout,
+    count: u32,
+    regions: *const vk::ImageCopy,
+) {
+    if count == 0 || count > 4000 {
+        record_error(command, vk::Result::ERROR_INITIALIZATION_FAILED);
+        return;
+    }
+    let regions = match slice(regions, count) {
+        Ok(regions) => regions.to_vec(),
+        Err(error) => {
+            record_error(command, error);
+            return;
+        }
+    };
+    record(
+        command,
+        RecordedCommand::CopyImage {
+            source,
+            source_layout,
+            destination,
+            destination_layout,
+            regions,
+        },
+    );
+}
+
 unsafe extern "system" fn cmd_blit_image(
     command: vk::CommandBuffer,
     source: vk::Image,
@@ -2866,6 +3305,12 @@ unsafe extern "system" fn cmd_pipeline_barrier(
             images: i,
         },
     )
+}
+
+// This ICD exposes queue family 0 only. Equal family indices do not transfer
+// ownership; Vulkan treats them like two QUEUE_FAMILY_IGNORED indices.
+fn same_queue_family(source: u32, destination: u32) -> bool {
+    source == destination && matches!(source, 0 | vk::QUEUE_FAMILY_IGNORED)
 }
 
 fn validate_pipeline_barrier_header(
@@ -3063,24 +3508,19 @@ unsafe extern "system" fn wait_for_fences(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let start = std::time::Instant::now();
-    loop {
+    // Resolve the selected fence Arcs before taking the notification mutex.
+    // Completion updates the atomics and then notifies under the same mutex.
+    // The predicate deliberately does not depend on all device work retiring.
+    status(d.in_flight.wait_until(timeout, || {
         if d.lost.load(Ordering::Acquire) {
-            return vk::Result::ERROR_DEVICE_LOST;
+            return Err(vk::Result::ERROR_DEVICE_LOST);
         }
-        let ready = if all != 0 {
+        Ok(if all != 0 {
             fs.iter().all(|f| f.load(Ordering::Acquire) == 1)
         } else {
             fs.iter().any(|f| f.load(Ordering::Acquire) == 1)
-        };
-        if ready {
-            return vk::Result::SUCCESS;
-        }
-        if timeout != u64::MAX && start.elapsed().as_nanos() >= timeout as u128 {
-            return vk::Result::TIMEOUT;
-        }
-        std::thread::sleep(std::time::Duration::from_micros(50));
-    }
+        })
+    }))
 }
 
 unsafe extern "system" fn create_semaphore(
@@ -3217,6 +3657,7 @@ pub(crate) fn signal_acquire_sync(
     if let Some(state) = fence {
         state.store(1, Ordering::Release);
     }
+    d.in_flight.notify();
     Ok(())
 }
 
@@ -3253,7 +3694,7 @@ fn finish_submissions(
     let complete = submissions.iter().enumerate().fold(true, |complete, (index, submission)| {
         let result = submission.wait(None);
         let finished = matches!(result, Ok(CompletionStatus::Complete));
-        if !finished && std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        if !finished {
             eprintln!("[SGFX Vulkan] asynchronous submission completion failed: receipt={index}/{} result={result:?}", submissions.len());
         }
         finished & complete
@@ -3358,43 +3799,125 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
     }
     Ok(())
 }
+// Vulkan's queue worker may wait for backend capacity. Busy guarantees that
+// nothing was accepted, so only that result is safe to retry. The backend's
+// completion thread returns capacity independently of this runtime worker.
+fn submit_with_backpressure<E, S>(
+    mut submit: impl FnMut() -> Result<S, SubmitError<E, S>>,
+) -> Result<S, SubmitError<E, S>> {
+    loop {
+        match submit() {
+            Err(SubmitError::Busy) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            result => return result,
+        }
+    }
+}
+
 fn submit_owned(
     rt: &mut Runtime,
     ops: Vec<ir::OwnedCommand>,
+) -> VkResult<Vec<sgfx::driver::Submission>> {
+    let owned = ir::OwnedCommandBuffer::new(ops);
+    let batches = if crate::upload_batches::needs_batches(
+        owned.commands(),
+        crate::upload_batches::UPLOAD_BATCH_BYTES,
+    ) {
+        crate::upload_batches::split(owned, &rt.table, crate::upload_batches::UPLOAD_BATCH_BYTES)
+            .map_err(crate::resources::failure)?
+    } else {
+        vec![owned]
+    };
+    let mut submissions = Vec::new();
+    for batch in batches {
+        match submit_owned_batch(rt, batch) {
+            Ok(Some(receipt)) => submissions.push(receipt),
+            Ok(None) => {}
+            Err(error) => {
+                // Earlier batches are accepted work: retain and drain every
+                // receipt, and never make their prefix eligible for replay.
+                if !submissions.is_empty() {
+                    for receipt in &submissions {
+                        let _ = wait_submission(rt, receipt);
+                    }
+                    rt.lost = true;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(submissions)
+}
+
+fn submit_owned_batch(
+    rt: &mut Runtime,
+    owned: ir::OwnedCommandBuffer,
 ) -> VkResult<Option<sgfx::driver::Submission>> {
-    if ops.is_empty() {
+    if owned.is_empty() {
         return Ok(None);
     }
-    let owned = ir::OwnedCommandBuffer::new(ops);
-    let commands = owned.record(&rt.table).map_err(|error| {
-        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-            trace_owned_recording_failure(&rt.table, &owned, error);
-        }
-        crate::resources::failure(error)
+    let commands = profile_work("submit::record_ir", || {
+        owned.record(&rt.table).map_err(|error| {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                trace_owned_recording_failure(&rt.table, &owned, error);
+            }
+            crate::resources::failure(error)
+        })
     })?;
-    match rt.queue.submit(&mut rt.cache, &commands) {
-        Ok(receipt) => Ok(Some(receipt)),
-        Err(SubmitError::Busy) => Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
-        Err(SubmitError::Rejected(error)) => Err(crate::runtime::backend_failure(error)),
-        Err(SubmitError::Failed { error, completion }) => {
-            let result = completion.wait(None);
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+    profile_work("submit::backend", || {
+        match submit_with_backpressure(|| rt.queue.submit(&mut rt.cache, &commands)) {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(SubmitError::Rejected(error)) => {
+                let mut buffer_bytes = 0usize;
+                let mut texture_bytes = 0usize;
+                let mut draws = 0usize;
+                let mut passes = 0usize;
+                let mut largest_buffer = 0usize;
+                for command in owned.commands() {
+                    match command {
+                        ir::OwnedCommand::WriteBuffer { data, .. } => {
+                            buffer_bytes = buffer_bytes.saturating_add(data.len());
+                            largest_buffer = largest_buffer.max(data.len());
+                        }
+                        ir::OwnedCommand::WriteTexture { data, .. }
+                        | ir::OwnedCommand::WriteTextureMip { data, .. }
+                        | ir::OwnedCommand::WriteTextureLayer { data, .. } => {
+                            texture_bytes = texture_bytes.saturating_add(data.len());
+                        }
+                        ir::OwnedCommand::BeginRenderPass(_)
+                        | ir::OwnedCommand::BeginRenderPassWithAttachments { .. } => passes += 1,
+                        ir::OwnedCommand::Draw { .. }
+                        | ir::OwnedCommand::DrawIndexed { .. }
+                        | ir::OwnedCommand::DrawInstanced { .. }
+                        | ir::OwnedCommand::DrawIndexedInstanced { .. } => draws += 1,
+                        _ => {}
+                    }
+                }
                 eprintln!(
-                    "[SGFX Vulkan] submission failed after execution began: error={error:?} completion={result:?}"
+                    "[SGFX Vulkan] rejected stream: operations={} buffer_bytes={buffer_bytes} texture_bytes={texture_bytes} largest_buffer={largest_buffer} passes={passes} draws={draws}",
+                    owned.command_count()
                 );
+                Err(crate::runtime::backend_failure(error))
             }
-            rt.lost = true;
-            Err(vk::Result::ERROR_DEVICE_LOST)
-        }
-        Err(_) => {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!(
-                    "[SGFX Vulkan] submission returned an unrecognized error; reporting device lost"
-                );
+            Err(SubmitError::Failed { error, completion }) => {
+                let result = completion.wait(None);
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] submission failed after execution began: error={error:?} completion={result:?}"
+                    );
+                }
+                rt.lost = true;
+                Err(vk::Result::ERROR_DEVICE_LOST)
             }
-            Err(vk::Result::ERROR_DEVICE_LOST)
+            Err(_) => {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] submission returned an unrecognized error; reporting device lost"
+                    );
+                }
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            }
         }
-    }
+    })
 }
 
 /// Failure-only metadata: never print upload or push-constant payloads.
@@ -3593,8 +4116,8 @@ fn snapshot_buffer_uploads(
     Ok((ops, fresh_uploads))
 }
 
-fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
-    let mut used = rec.used_buffers.clone();
+fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
+    let mut used = rec.used_buffers;
     for insertion in &rec.descriptors {
         let set = rt
             .resources
@@ -3605,23 +4128,28 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
             let crate::resources::DescriptorBinding::Buffer { buffer, .. } = binding else {
                 continue;
             };
-            if !used.contains(buffer) {
-                used.push(*buffer);
-            }
+            used.push(*buffer);
         }
     }
     used.sort_unstable_by_key(|b| b.as_raw());
     used.dedup();
-    let (mut ops, fresh_uploads) =
-        snapshot_buffer_uploads(&rt.resources, &used).inspect_err(|error| {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                eprintln!("[SGFX Vulkan] buffer snapshot failed: {error:?} used={used:?}");
-            }
-        })?;
+    let (mut ops, fresh_uploads) = profile_work("execute::snapshot_buffers", || {
+        snapshot_buffer_uploads(&rt.resources, &used)
+    })
+    .inspect_err(|error| {
+        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            eprintln!("[SGFX Vulkan] buffer snapshot failed: {error:?} used={used:?}");
+        }
+    })?;
     let mut descriptors = rec.descriptors.as_slice();
     let mut barriers = rec.barriers.as_slice();
     let mut copies = rec.copies.as_slice();
-    for position in 0..=rec.ops.len() {
+    // Resolution already owns upload payloads. Transfer them to the final
+    // stream instead of cloning every texture/buffer byte a second time.
+    // Include the final insertion position after the last recorded command.
+    let command_count = rec.ops.len();
+    let mut commands = rec.ops.into_iter();
+    for position in 0..=command_count {
         for d in take_positioned(&mut descriptors, position, |d| d.position) {
             let group = rt.resources.descriptor_group_with_layout(
                 &rt.table,
@@ -3672,62 +4200,71 @@ fn execute(rt: &mut Runtime, rec: &ResolvedRecording) -> VkResult<Vec<sgfx::driv
             }
         }
         for copy in take_positioned(&mut copies, position, |c| c.position) {
-            if let Some(submission) = submit_owned(rt, std::mem::take(&mut ops))? {
-                wait_submission(rt, &submission)?;
-            }
-            let image_id = rt
-                .resources
-                .images
-                .get(&copy.image)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
-                .id;
-            let bytes = rt
-                .queue
-                .read_texture_mip(&mut rt.cache, image_id, copy.mip_level)
-                .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-            let buffer = rt
-                .resources
-                .buffers
-                .get(&copy.buffer)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            ops.extend(copy.region.writes(&bytes, buffer.id)?);
+            profile_work("execute::texture_readback", || {
+                for submission in submit_owned(rt, std::mem::take(&mut ops))? {
+                    wait_submission(rt, &submission)?;
+                }
+                let image_id = rt
+                    .resources
+                    .images
+                    .get(&copy.image)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                    .id;
+                let bytes = rt
+                    .queue
+                    .read_texture_mip(&mut rt.cache, image_id, copy.mip_level)
+                    .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+                let buffer = rt
+                    .resources
+                    .buffers
+                    .get(&copy.buffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                ops.extend(copy.region.writes(&bytes, buffer.id)?);
+                Ok(())
+            })?;
         }
-        if let Some(op) = rec.ops.get(position) {
-            ops.push(op.clone());
+        if let Some(op) = commands.next() {
+            ops.push(op);
         }
     }
-    let mut submissions = submit_owned(rt, ops)?.into_iter().collect::<Vec<_>>();
-    let mut readback = rec.readback_buffers.clone();
+    let mut submissions = submit_owned(rt, ops)?;
+    let mut readback = rec.readback_buffers;
     readback.sort_unstable_by_key(|buffer| buffer.as_raw());
     readback.dedup();
     if !readback.is_empty() {
-        for submission in &submissions {
-            wait_submission(rt, submission)?;
-        }
+        profile_work("execute::readback_wait", || {
+            for submission in &submissions {
+                wait_submission(rt, submission)?;
+            }
+            Ok(())
+        })?;
         submissions.clear();
     }
     // Stage only GPU-written bytes back into allocations returned by MapMemory.
     let mut dirty_memories = Vec::new();
     for handle in &readback {
-        let buffer = rt
-            .resources
-            .buffers
-            .get(handle)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if let Some((memory_handle, offset)) = buffer.bound {
-            let bytes = rt
-                .cache
-                .read_buffer(buffer.id, 0, buffer.size)
-                .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-            let allocation = rt
+        profile_work("execute::buffer_readback", || {
+            let buffer = rt
                 .resources
-                .memories
-                .get_mut(&memory_handle)
+                .buffers
+                .get(handle)
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            allocation.bytes[offset as usize..(offset + buffer.size) as usize]
-                .copy_from_slice(&bytes);
-            dirty_memories.push(memory_handle);
-        }
+            if let Some((memory_handle, offset)) = buffer.bound {
+                let bytes = rt
+                    .cache
+                    .read_buffer(buffer.id, 0, buffer.size)
+                    .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+                let allocation = rt
+                    .resources
+                    .memories
+                    .get_mut(&memory_handle)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                allocation.bytes[offset as usize..(offset + buffer.size) as usize]
+                    .copy_from_slice(&bytes);
+                dirty_memories.push(memory_handle);
+            }
+            Ok(())
+        })?;
     }
     for memory in &dirty_memories {
         rt.resources.forget_uploads_for_memory(*memory);
@@ -3757,6 +4294,9 @@ pub(crate) unsafe extern "system" fn get_device_proc_addr(
     lookup_device(name)
 }
 pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
+    if let Some(function) = core11::lookup(name) {
+        return Some(function);
+    }
     macro_rules! entry {
         ($function:path) => {
             Some(unsafe {
@@ -3787,6 +4327,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdBindDescriptorSets" => entry!(cmd_bind_descriptor_sets),
         b"vkCmdPushConstants" => entry!(cmd_push_constants),
         b"vkCmdBlitImage" => entry!(cmd_blit_image),
+        b"vkCmdCopyImage" => entry!(cmd_copy_image),
         b"vkCmdDispatch" => entry!(cmd_dispatch),
         b"vkCmdDraw" => entry!(cmd_draw),
         b"vkCmdDrawIndexed" => entry!(cmd_draw_indexed),
@@ -3797,6 +4338,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdEndRenderPass" => entry!(cmd_end_render_pass),
         b"vkCmdCopyImageToBuffer" => entry!(cmd_copy_image_to_buffer),
         b"vkCmdClearColorImage" => entry!(cmd_clear_color_image),
+        b"vkCmdClearAttachments" => entry!(cmd_clear_attachments),
         b"vkCmdCopyBuffer" => entry!(cmd_copy_buffer),
         b"vkCmdCopyBufferToImage" => entry!(cmd_copy_buffer_to_image),
         b"vkCmdSetViewport" => entry!(cmd_set_viewport),
@@ -3838,9 +4380,8 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
 
 /// Descriptor indexing is not exposed. Updating a referenced set invalidates
 /// every recording or executable command buffer under Vulkan 1.0 rules.
-pub(crate) fn invalidate_descriptor_sets(rt: &mut Runtime, sets: &[vk::DescriptorSet]) {
-    let recordings = rt
-        .recordings
+fn invalidate_recorded_descriptor_sets(recordings: &Recordings, sets: &[vk::DescriptorSet]) {
+    let recordings = recordings
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .commands
@@ -3913,6 +4454,165 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_backpressure_waits_for_independent_completion_capacity() {
+        let (entered, started) = mpsc::sync_channel(1);
+        let (credit, available) = mpsc::sync_channel(1);
+        let (finished, result) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut first = true;
+            let outcome: Result<usize, SubmitError<&str, usize>> = submit_with_backpressure(|| {
+                if first {
+                    entered.send(()).unwrap();
+                    first = false;
+                }
+                match available.try_recv() {
+                    Ok(receipt) => Ok(receipt),
+                    Err(mpsc::TryRecvError::Empty) => Err(SubmitError::Busy),
+                    Err(mpsc::TryRecvError::Disconnected) => Err(SubmitError::Rejected("closed")),
+                }
+            });
+            finished.send(outcome).unwrap();
+        });
+        let timeout = std::time::Duration::from_secs(2);
+        started.recv_timeout(timeout).unwrap();
+        assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        credit.send(17).unwrap();
+        assert!(matches!(result.recv_timeout(timeout).unwrap(), Ok(17)));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn queue_backpressure_never_replays_rejected_or_partially_accepted_work() {
+        let mut calls = 0;
+        let result = submit_with_backpressure(|| {
+            calls += 1;
+            Err::<usize, _>(SubmitError::Failed {
+                error: "failed prefix",
+                completion: 19,
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(SubmitError::Failed {
+                error: "failed prefix",
+                completion: 19
+            })
+        ));
+        assert_eq!(calls, 1);
+        calls = 0;
+        let result = submit_with_backpressure(|| {
+            calls += 1;
+            Err::<usize, SubmitError<_, usize>>(SubmitError::Rejected("invalid"))
+        });
+        assert!(matches!(result, Err(SubmitError::Rejected("invalid"))));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn call_profile_counts_worker_errors_and_missing_channel_responses_separately() {
+        let mut counters = CallProfileCounters::default();
+        counters.observe(
+            30_500,
+            Some(CallServiceTiming {
+                queued_ns: 4_000,
+                service_ns: 10_500,
+            }),
+            false,
+        );
+        counters.observe(
+            50_500,
+            Some(CallServiceTiming {
+                queued_ns: 5_000,
+                service_ns: 20_500,
+            }),
+            true,
+        );
+        counters.observe(7_500, None, true);
+        assert_eq!(
+            (counters.calls, counters.errors, counters.services),
+            (3, 2, 2)
+        );
+        assert_eq!(counters.roundtrip_ns, 88_500);
+        assert_eq!(counters.queued_ns, 9_000);
+        assert_eq!(counters.service_ns, 31_000);
+        assert_eq!(counters.max_roundtrip_ns, 50_500);
+        assert_eq!(counters.max_service_ns, 20_500);
+    }
+
+    #[test]
+    fn call_profile_labels_keep_api_names_and_bound_multibyte_type_names() {
+        assert_eq!(
+            call_profile_label(
+                "vulkan_sgfx::resources::update_descriptor_sets::{{closure}}::{{closure}}"
+            ),
+            "resources::update_descriptor_sets"
+        );
+        let long_name = "あ".repeat(100);
+        let label = call_profile_label(&long_name);
+        assert!(label.len() <= 120);
+        assert!(long_name.ends_with(label));
+    }
+
+    #[test]
+    fn copy_image_is_a_transfer_and_cannot_be_recorded_inside_render_pass() {
+        let mut recording = Recording::new(0);
+        recording.state = RecordingState::Recording;
+        recording.render_active = true;
+        assert_eq!(
+            recording.push(RecordedCommand::CopyImage {
+                source: vk::Image::null(),
+                source_layout: vk::ImageLayout::GENERAL,
+                destination: vk::Image::null(),
+                destination_layout: vk::ImageLayout::GENERAL,
+                regions: Vec::new(),
+            }),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        assert!(recording.commands.is_empty());
+    }
+
+    #[test]
+    fn clear_attachments_requires_recording_inside_render_pass() {
+        let clear = || RecordedCommand::ClearAttachments {
+            attachments: Vec::new(),
+            rects: Vec::new(),
+        };
+        let mut outside = Recording::new(0);
+        outside.state = RecordingState::Recording;
+        assert_eq!(
+            outside.push(clear()),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        assert!(outside.commands.is_empty());
+        let mut inside = Recording::new(0);
+        inside.state = RecordingState::Recording;
+        inside.render_active = true;
+        inside.push(clear()).unwrap();
+        assert_eq!(inside.commands.len(), 1);
+        assert!(inside.render_active);
+        assert!(inside.error.is_none());
+    }
+
+    #[test]
+    fn barriers_accept_explicit_same_family_without_ownership_transfer() {
+        assert!(same_queue_family(0, 0));
+        assert!(same_queue_family(
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::QUEUE_FAMILY_IGNORED
+        ));
+        for (source, destination) in [
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (0, vk::QUEUE_FAMILY_IGNORED),
+            (vk::QUEUE_FAMILY_EXTERNAL, 0),
+            (vk::QUEUE_FAMILY_EXTERNAL, vk::QUEUE_FAMILY_EXTERNAL),
+        ] {
+            assert!(!same_queue_family(source, destination));
+        }
+    }
 
     #[test]
     fn unmapped_buffer_uploads_are_reused_until_host_mapping_changes_them() {
@@ -4686,6 +5386,614 @@ mod tests {
                 (&requested as *const vk::PhysicalDeviceFeatures2<'_>).cast(),
                 &supported,
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod fence_notification_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    fn fixture() -> (Arc<Driver>, vk::Device, [vk::Fence; 2], [Arc<AtomicU8>; 2]) {
+        // Unserviced/closed channels prove that waiting never enters Runtime.
+        let d = Arc::new(Driver {
+            sender: mpsc::channel().0,
+            thread: Mutex::new(None),
+            completion_sender: mpsc::channel().0,
+            completion_thread: Mutex::new(None),
+            queue: AtomicU64::new(0),
+            queue_sender: mpsc::channel().0,
+            queue_thread: Mutex::new(None),
+            timeline_enabled: true,
+            timelines: Default::default(),
+            events: Default::default(),
+            fences: Default::default(),
+            semaphores: Default::default(),
+            recordings: Default::default(),
+            in_flight: Default::default(),
+            pending: Default::default(),
+            lost: Arc::new(AtomicBool::new(false)),
+        });
+        let states = [Arc::new(AtomicU8::new(0)), Arc::new(AtomicU8::new(0))];
+        let fences = states.each_ref().map(|state| {
+            let fence = vk::Fence::from_raw(next_id());
+            d.fences
+                .lock()
+                .unwrap()
+                .insert(fence.as_raw(), Arc::clone(state));
+            fence
+        });
+        let device = vk::Device::from_raw(add_handle(Kind::Device, &d));
+        (d, device, fences, states)
+    }
+
+    fn waiter(
+        device: vk::Device,
+        fences: Vec<vk::Fence>,
+        all: bool,
+    ) -> std::thread::JoinHandle<vk::Result> {
+        std::thread::spawn(move || unsafe {
+            wait_for_fences(
+                device,
+                fences.len() as u32,
+                fences.as_ptr(),
+                u32::from(all),
+                5_000_000_000,
+            )
+        })
+    }
+
+    #[test]
+    fn selected_fences_preserve_all_any_zero_timeout_and_presignaled_semantics() {
+        let (d, device, fences, states) = fixture();
+        unsafe {
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::FALSE, 0),
+                vk::Result::TIMEOUT
+            );
+            states[0].store(1, Ordering::Release);
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::FALSE, 0),
+                vk::Result::SUCCESS
+            );
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::TRUE, 0),
+                vk::Result::TIMEOUT
+            );
+            states[1].store(1, Ordering::Release);
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::TRUE, 0),
+                vk::Result::SUCCESS
+            );
+            d.mark_lost();
+            assert_eq!(
+                wait_for_fences(device, 2, fences.as_ptr(), vk::TRUE, 0),
+                vk::Result::ERROR_DEVICE_LOST
+            );
+        }
+        remove_handle(device.as_raw());
+    }
+
+    #[test]
+    fn selected_fence_wakes_before_unrelated_work_retires() {
+        let (d, device, fences, states) = fixture();
+        d.in_flight.begin();
+        d.in_flight.begin();
+        d.pending.begin();
+        let thread = waiter(device, vec![fences[0]], true);
+        finish_submissions(
+            &[],
+            Some(&states[0]),
+            &[],
+            &[],
+            &d.in_flight,
+            &d.pending,
+            &d.lost,
+        );
+        assert_eq!(thread.join().unwrap(), vk::Result::SUCCESS);
+        assert!(!d.in_flight.is_empty());
+        assert_eq!(states[1].load(Ordering::Acquire), 0);
+        d.in_flight.finish();
+        remove_handle(device.as_raw());
+    }
+
+    #[test]
+    fn notification_before_and_after_wait_cannot_be_lost() {
+        for notify_before_wait in [true, false] {
+            let state = Arc::new(AtomicBool::new(false));
+            let signal = Arc::new(InFlight::default());
+            let (checked, first_check) = mpsc::channel();
+            if notify_before_wait {
+                state.store(true, Ordering::Release);
+                signal.notify();
+            }
+            let worker_state = Arc::clone(&state);
+            let worker_signal = Arc::clone(&signal);
+            let thread = std::thread::spawn(move || {
+                worker_signal.wait_until(u64::MAX, || {
+                    let ready = worker_state.load(Ordering::Acquire);
+                    checked.send(()).unwrap(); // Executed under the actual wait mutex.
+                    Ok(ready)
+                })
+            });
+            first_check.recv().unwrap();
+            if !notify_before_wait {
+                // notify() cannot pass the waiter's mutex until it atomically
+                // enters Condvar::wait. This exercises the check-to-sleep race.
+                state.store(true, Ordering::Release);
+                signal.notify();
+            }
+            assert_eq!(thread.join().unwrap(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn spurious_notifications_recheck_predicate_without_restarting_timeout() {
+        let signal = Arc::new(InFlight::default());
+        let checks = Arc::new(AtomicUsize::new(0));
+        let worker_signal = Arc::clone(&signal);
+        let worker_checks = Arc::clone(&checks);
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(worker_signal.wait_until(50_000_000, || {
+                worker_checks.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }))
+            .unwrap();
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let notifier = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                signal.notify();
+                std::thread::yield_now();
+            }
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        stop.store(true, Ordering::Release);
+        notifier.join().unwrap();
+        waiter.join().unwrap();
+        assert_eq!(result.unwrap(), Err(vk::Result::TIMEOUT));
+        assert!(checks.load(Ordering::Relaxed) > 1);
+    }
+
+    #[test]
+    fn acquire_sync_wakes_selected_fence_waiter() {
+        let (_d, device, fences, _states) = fixture();
+        let thread = waiter(device, fences.to_vec(), false);
+        signal_acquire_sync(device, vk::Semaphore::null(), fences[1]).unwrap();
+        assert_eq!(thread.join().unwrap(), vk::Result::SUCCESS);
+        remove_handle(device.as_raw());
+    }
+
+    #[test]
+    fn queue_failure_worker_channel_loss_and_destroy_wake_fence_waiters() {
+        for path in 0..4 {
+            let (d, device, fences, _states) = fixture();
+            let thread = waiter(device, fences.to_vec(), true);
+            match path {
+                0 => d.mark_lost(),
+                1 => {
+                    let queue = vk::Queue::from_raw(add_handle(Kind::Queue, &d));
+                    assert_eq!(
+                        unsafe { queue::submit(queue, 0, core::ptr::null(), vk::Fence::null()) },
+                        Err(vk::Result::ERROR_DEVICE_LOST)
+                    );
+                    remove_handle(queue.as_raw());
+                }
+                2 => {
+                    let result: VkResult<()> = call(&d, |_| Ok(()));
+                    assert_eq!(result, Err(vk::Result::ERROR_DEVICE_LOST));
+                }
+                3 => unsafe { destroy_device(device, core::ptr::null()) },
+                _ => unreachable!(),
+            }
+            assert_eq!(thread.join().unwrap(), vk::Result::ERROR_DEVICE_LOST);
+            remove_handle(device.as_raw());
+        }
+    }
+
+    #[test]
+    fn fence_notifications_are_scoped_to_their_device() {
+        let (a, a_device, a_fences, _a_states) = fixture();
+        let (b, b_device, _b_fences, b_states) = fixture();
+        let thread = waiter(a_device, a_fences.to_vec(), false);
+        b.in_flight.begin();
+        b.pending.begin();
+        finish_submissions(
+            &[],
+            Some(&b_states[0]),
+            &[],
+            &[],
+            &b.in_flight,
+            &b.pending,
+            &b.lost,
+        );
+        unsafe {
+            assert_eq!(
+                wait_for_fences(a_device, 2, a_fences.as_ptr(), vk::FALSE, 0),
+                vk::Result::TIMEOUT
+            );
+        }
+        a.mark_lost();
+        assert_eq!(thread.join().unwrap(), vk::Result::ERROR_DEVICE_LOST);
+        remove_handle(a_device.as_raw());
+        remove_handle(b_device.as_raw());
+    }
+}
+
+#[cfg(test)]
+mod owned_descriptor_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Fixture {
+        driver: Arc<Driver>,
+        device: vk::Device,
+        requests: mpsc::Receiver<Request>,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let (sender, requests) = mpsc::channel();
+            let driver = Arc::new(Driver {
+                sender,
+                thread: Mutex::new(None),
+                completion_sender: mpsc::channel().0,
+                completion_thread: Mutex::new(None),
+                queue: AtomicU64::new(0),
+                queue_sender: mpsc::channel().0,
+                queue_thread: Mutex::new(None),
+                timeline_enabled: false,
+                timelines: Default::default(),
+                events: Default::default(),
+                fences: Default::default(),
+                semaphores: Default::default(),
+                recordings: Default::default(),
+                in_flight: Default::default(),
+                pending: Default::default(),
+                lost: Arc::new(AtomicBool::new(false)),
+            });
+            let device = vk::Device::from_raw(add_handle(Kind::Device, &driver));
+            Self {
+                driver,
+                device,
+                requests,
+            }
+        }
+        fn recording(&self, sets: Vec<vk::DescriptorSet>) -> RecordingCell {
+            let mut recording = Recording::new(0);
+            recording.state = RecordingState::Recording;
+            if !sets.is_empty() {
+                recording.push(binding(sets)).unwrap();
+            }
+            let recording = Arc::new(Mutex::new(recording));
+            self.driver
+                .recordings
+                .lock()
+                .unwrap()
+                .commands
+                .insert(next_id(), recording.clone());
+            recording
+        }
+        #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+        fn runtime(&self) -> Runtime {
+            let instance = sgfx::driver::Instance::new().unwrap();
+            Runtime::new(
+                instance.adapters()[0].clone(),
+                self.driver.recordings.clone(),
+                self.driver.in_flight.clone(),
+                self.driver.lost.clone(),
+            )
+            .unwrap()
+        }
+        fn service(&self, runtime: &mut Runtime) {
+            match self.requests.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Request::Run(job) => job(runtime),
+                Request::Stop => panic!("unexpected stop"),
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            remove_handle(self.device.as_raw());
+        }
+    }
+    fn binding(sets: Vec<vk::DescriptorSet>) -> RecordedCommand {
+        RecordedCommand::BindDescriptorSets {
+            point: vk::PipelineBindPoint::GRAPHICS,
+            layout: vk::PipelineLayout::null(),
+            first: 0,
+            sets,
+            dynamic_offsets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn owned_update_returns_without_worker_and_invalidates_only_prior_bindings() {
+        let fixture = Fixture::new();
+        let set = vk::DescriptorSet::from_raw(1);
+        let old = fixture.recording(vec![set]);
+        old.lock().unwrap().state = RecordingState::Executable;
+        let recording = fixture.recording(vec![set]);
+        let new = fixture.recording(Vec::new());
+        let unrelated = fixture.recording(vec![vk::DescriptorSet::from_raw(2)]);
+        let device = fixture.device;
+        let (done, received) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            // No worker is running. A synchronous implementation cannot finish.
+            let image = [vk::DescriptorImageInfo::default().sampler(vk::Sampler::from_raw(7))];
+            let writes = [vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&image)];
+            unsafe {
+                crate::resources::update_descriptor_sets(
+                    device,
+                    1,
+                    writes.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                );
+            }
+            done.send(()).unwrap();
+        });
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        caller.join().unwrap();
+        assert!(old.lock().unwrap().state == RecordingState::Invalid);
+        assert!(old.lock().unwrap().error.is_some());
+        assert!(recording.lock().unwrap().error.is_some());
+        new.lock().unwrap().push(binding(vec![set])).unwrap();
+        assert!(new.lock().unwrap().error.is_none());
+        assert!(unrelated.lock().unwrap().error.is_none());
+        assert!(matches!(fixture.requests.try_recv(), Ok(Request::Run(_))));
+        assert!(fixture.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn closed_owned_update_channel_and_malformed_void_batch_mark_device_lost() {
+        let mut fixture = Fixture::new();
+        drop(std::mem::replace(&mut fixture.requests, mpsc::channel().1));
+        assert_eq!(
+            update_descriptors_owned(fixture.device, &[], |_| Ok(())),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert!(fixture.driver.lost.load(Ordering::Acquire));
+        let fixture = Fixture::new();
+        unsafe {
+            crate::resources::update_descriptor_sets(
+                fixture.device,
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+            );
+        }
+        assert!(fixture.driver.lost.load(Ordering::Acquire));
+        assert!(fixture.requests.try_recv().is_err());
+    }
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    fn descriptors(
+        runtime: &mut Runtime,
+    ) -> (vk::DescriptorPool, [vk::DescriptorSet; 2], vk::Buffer) {
+        use crate::resources::{Buffer, DescriptorPool, DescriptorSet};
+        let pool = vk::DescriptorPool::from_raw(1);
+        let sets = [
+            vk::DescriptorSet::from_raw(2),
+            vk::DescriptorSet::from_raw(3),
+        ];
+        let buffer = vk::Buffer::from_raw(4);
+        let id = runtime
+            .table
+            .define_buffer(ir::BufferDesc::new(1024, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        runtime.resources.buffers.insert(
+            buffer,
+            Buffer {
+                id,
+                size: 1024,
+                usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+                bound: Some((vk::DeviceMemory::from_raw(5), 0)),
+            },
+        );
+        runtime.resources.descriptor_pools.insert(
+            pool,
+            DescriptorPool {
+                max_sets: 2,
+                free_sets: true,
+                capacity: HashMap::from([(vk::DescriptorType::UNIFORM_BUFFER, 2)]),
+                remaining: HashMap::from([(vk::DescriptorType::UNIFORM_BUFFER, 0)]),
+            },
+        );
+        for set in sets {
+            runtime.resources.descriptor_sets.insert(
+                set,
+                DescriptorSet {
+                    pool,
+                    layout: ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+                        0,
+                        ir::ShaderStages::VERTEX,
+                        ir::BindingType::UniformBuffer,
+                    )])
+                    .unwrap(),
+                    types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                    stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                    bindings: HashMap::new(),
+                    cached_group: None,
+                    invalid: false,
+                },
+            );
+        }
+        (pool, sets, buffer)
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU to construct the actual Runtime"]
+    fn owned_update_fifo_preserves_copied_input_later_resolution_free_and_pool_destroy() {
+        let fixture = Fixture::new();
+        let mut runtime = fixture.runtime();
+        let (pool, sets, buffer) = descriptors(&mut runtime);
+        let after = fixture.recording(Vec::new());
+        let mut info = [vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(256)
+            .range(16)];
+        {
+            let writes = [vk::WriteDescriptorSet::default()
+                .dst_set(sets[0])
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&info)];
+            unsafe {
+                crate::resources::update_descriptor_sets(
+                    fixture.device,
+                    1,
+                    writes.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                );
+            }
+        }
+        // Application input need only live through vkUpdateDescriptorSets.
+        info[0].offset = 512;
+        assert_eq!(info[0].offset, 512);
+        let copies = [vk::CopyDescriptorSet::default()
+            .src_set(sets[0])
+            .src_binding(0)
+            .dst_set(sets[1])
+            .dst_binding(0)
+            .descriptor_count(1)];
+        unsafe {
+            crate::resources::update_descriptor_sets(
+                fixture.device,
+                0,
+                std::ptr::null(),
+                1,
+                copies.as_ptr(),
+            );
+        }
+        after.lock().unwrap().push(binding(vec![sets[1]])).unwrap();
+        let device = fixture.device;
+        let resolved = std::thread::spawn(move || {
+            with_device(device, move |r| {
+                // Descriptor resolution uses the same worker/FIFO as queue submit.
+                let group = r.resources.descriptor_group(&r.table, sets[1], &[])?;
+                let group = r
+                    .table
+                    .bind_group(r.table.bind_group_ref(group).unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    group.entries()[0].resource(),
+                    ir::BindingResource::Buffer {
+                        offset: 256,
+                        size: 16,
+                        ..
+                    }
+                ));
+                Ok(())
+            })
+        });
+        fixture.service(&mut runtime); // write
+        fixture.service(&mut runtime); // copy, seeing preceding write
+        fixture.service(&mut runtime); // later descriptor resolution
+        resolved.join().unwrap().unwrap();
+        assert!(after.lock().unwrap().error.is_none());
+
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(sets[0])
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&info)];
+        unsafe {
+            crate::resources::update_descriptor_sets(
+                fixture.device,
+                1,
+                writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+        let free: vk::PFN_vkFreeDescriptorSets = unsafe {
+            std::mem::transmute(crate::resources::lookup(c"vkFreeDescriptorSets").unwrap())
+        };
+        let freed = std::thread::spawn(move || unsafe { free(device, pool, 1, sets.as_ptr()) });
+        fixture.service(&mut runtime); // update before free
+        fixture.service(&mut runtime);
+        assert_eq!(freed.join().unwrap(), vk::Result::SUCCESS);
+        assert!(!runtime.resources.descriptor_sets.contains_key(&sets[0]));
+        assert!(runtime.resources.descriptor_sets.contains_key(&sets[1]));
+
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(sets[1])
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&info)];
+        unsafe {
+            crate::resources::update_descriptor_sets(
+                fixture.device,
+                1,
+                writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+        let destroy: vk::PFN_vkDestroyDescriptorPool = unsafe {
+            std::mem::transmute(crate::resources::lookup(c"vkDestroyDescriptorPool").unwrap())
+        };
+        let destroyed =
+            std::thread::spawn(move || unsafe { destroy(device, pool, std::ptr::null()) });
+        fixture.service(&mut runtime); // update before destroy
+        fixture.service(&mut runtime);
+        destroyed.join().unwrap();
+        assert!(runtime.resources.descriptor_sets.is_empty());
+        assert!(!runtime.resources.descriptor_pools.contains_key(&pool));
+        assert!(!runtime.lost);
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU to construct the actual Runtime"]
+    fn owned_worker_errors_and_panics_publish_loss_and_reject_later_jobs() {
+        for panic in [false, true] {
+            let fixture = Fixture::new();
+            let mut runtime = fixture.runtime();
+            let _ = descriptors(&mut runtime);
+            // A normal synchronous validation error still does not lose device.
+            assert_eq!(
+                run_device_operation(
+                    &mut runtime,
+                    |_| Err::<(), _>(vk::Result::ERROR_UNKNOWN),
+                    false
+                ),
+                Err(vk::Result::ERROR_UNKNOWN)
+            );
+            assert!(!runtime.lost);
+            update_descriptors_owned(fixture.device, &[], move |_| {
+                if panic {
+                    panic!("injected owned metadata panic");
+                }
+                Err(vk::Result::ERROR_UNKNOWN)
+            })
+            .unwrap();
+            fixture.service(&mut runtime);
+            assert!(runtime.lost && fixture.driver.lost.load(Ordering::Acquire));
+            update_descriptors_owned(fixture.device, &[], |_| {
+                panic!("lost device must reject job")
+            })
+            .unwrap();
+            fixture.service(&mut runtime);
+            assert_eq!(
+                run_device_operation(
+                    &mut runtime,
+                    |_| panic!("lost device must reject sync call"),
+                    false
+                ),
+                Err::<(), _>(vk::Result::ERROR_DEVICE_LOST)
+            );
         }
     }
 }

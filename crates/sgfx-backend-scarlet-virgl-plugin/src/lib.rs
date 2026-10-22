@@ -47,7 +47,7 @@ fn core_batch(batch: abi::Batch) -> ir::abi::Batch {
 fn error(e: virgl::IrSubmitError) -> i32 {
     use virgl::IrSubmitError as E;
     match e {
-        E::OutOfMemory => abi::OUT_OF_MEMORY,
+        E::OutOfMemory | E::SubmissionTooLarge => abi::OUT_OF_MEMORY,
         E::Unsupported(_) | E::ShaderCompile(_) => abi::UNSUPPORTED,
         E::InvalidIr(_)
         | E::ResourceTableMismatch
@@ -58,7 +58,10 @@ fn error(e: virgl::IrSubmitError) -> i32 {
         | E::ImageAlreadyMapped
         | E::InvalidVertexData => abi::INVALID,
         E::Backend(e) => handle_error(e),
-        _ => abi::DEVICE_LOST,
+        cause => {
+            eprintln!("[SGFX VirGL] operation failed: {cause:?}");
+            abi::DEVICE_LOST
+        }
     }
 }
 fn handle_error(e: virgl::HandleError) -> i32 {
@@ -68,7 +71,10 @@ fn handle_error(e: virgl::HandleError) -> i32 {
         E::Unsupported => abi::UNSUPPORTED,
         E::OutOfResources => abi::OUT_OF_MEMORY,
         E::NotFound => abi::INITIALIZATION_FAILED,
-        _ => abi::DEVICE_LOST,
+        cause => {
+            eprintln!("[SGFX VirGL] native operation failed: {cause:?}");
+            abi::DEVICE_LOST
+        }
     }
 }
 fn status(result: Result<(), i32>) -> i32 {
@@ -271,7 +277,17 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
             .abi_retired_resources(words)
             .map_err(|_| abi::INVALID)?;
         // Never turn resource retirement into a hidden GPU wait in submit.
-        if (!textures.is_empty() || !buffers.is_empty()) && !s.inner.is_idle().map_err(error)? {
+        let (shaders, compute, render) = s
+            .table
+            .abi_retired_programs(words)
+            .map_err(|_| abi::INVALID)?;
+        if (!textures.is_empty()
+            || !buffers.is_empty()
+            || !shaders.is_empty()
+            || !compute.is_empty()
+            || !render.is_empty())
+            && !s.inner.is_idle().map_err(error)?
+        {
             return Err(abi::BUSY);
         }
         for id in textures {
@@ -279,6 +295,17 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         }
         for id in buffers {
             s.inner.release_buffer(id).map_err(error)?;
+        }
+        for id in render {
+            s.inner
+                .release_programmable_render_pipeline(id)
+                .map_err(error)?;
+        }
+        for id in compute {
+            s.inner.release_compute_pipeline(id).map_err(error)?;
+        }
+        for id in shaders {
+            s.inner.release_shader_module(id).map_err(error)?;
         }
         match s.table.sync_abi_snapshot(words) {
             Ok((_, revision)) => s.revision = revision,
@@ -350,8 +377,13 @@ unsafe extern "C" fn import_bgra(p: Object, slot: u32, raw: i32) -> i32 {
         let handle = unsafe { virgl::Handle::from_raw(raw) }.map_err(handle_error)?;
         let s = unsafe { object::<Session>(p) }?;
         let id = s.table.abi_texture(slot).map_err(|_| abi::INVALID)?.id();
+        let descriptor = s
+            .table
+            .texture(s.table.texture_ref(id).map_err(|_| abi::INVALID)?)
+            .map_err(|_| abi::INVALID)?;
         s.inner
             .import_shared_bgra_texture(id, handle)
+            .inspect_err(|error| std::eprintln!("[SGFX import] stage=native_session slot={slot} transferred_handle={raw} source={} revision={} descriptor={descriptor:?} error={error:?}", s.source, s.revision))
             .map_err(error)
     })())
 }

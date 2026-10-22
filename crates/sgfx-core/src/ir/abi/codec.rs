@@ -1,4 +1,4 @@
-//! Frozen v2 scalar/descriptor encoding. Enum numbers here are ABI numbers,
+//! Scalar/descriptor encoding for R2 and R3 snapshots. Enum numbers here are ABI numbers,
 //! independent of Rust discriminants. Existing numbers must never be reordered.
 
 use super::*;
@@ -159,13 +159,14 @@ macro_rules! enumeration {
 }
 enumeration!(TextureFormat {Bgra8Unorm=0,Bgra8UnormSrgb=1,Rgba8Unorm=2,Rgba8UnormSrgb=3,R8Unorm=4,Nv12=5,Depth32Float=6,Rg8Unorm=7});
 enumeration!(FilterMode {Nearest=0,Linear=1});
-enumeration!(AddressMode {ClampToEdge=0,Repeat=1,MirrorRepeat=2});
+enumeration!(AddressMode {ClampToEdge=0,Repeat=1,MirrorRepeat=2,ClampToBorder=3});
 enumeration!(CompareFunction {Never=0,Less=1,Equal=2,LessEqual=3,Greater=4,NotEqual=5,GreaterEqual=6,Always=7});
-enumeration!(VertexFormat {Sint32=0,Uint32=1,Float16x2=2,Float16x4=3,Sint16x4=4,Snorm10_10_10_2=5,Float32x2=6,Float32x3=7,Float32x4=8,Unorm8x4=9});
-enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1,TriangleFan=2});
+enumeration!(VertexFormat {Sint32=0,Uint32=1,Float16x2=2,Float16x4=3,Sint16x4=4,Snorm10_10_10_2=5,Float32x2=6,Float32x3=7,Float32x4=8,Unorm8x4=9,Uint16x2=10,Float32=11});
+enumeration!(VertexStepMode {Vertex=0,Instance=1});
+enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1,TriangleFan=2,LineList=3,LineStrip=4});
 enumeration!(IndexFormat {Uint16=0,Uint32=1});
 enumeration!(TextureSampleMode {Rgba=0,RgbIgnoreAlpha=1,AlphaMask=2});
-enumeration!(BlendFactor {Zero=0,One=1,SourceAlpha=2,OneMinusSourceAlpha=3,DestinationAlpha=4,OneMinusDestinationAlpha=5});
+enumeration!(BlendFactor {Zero=0,One=1,SourceAlpha=2,OneMinusSourceAlpha=3,DestinationAlpha=4,OneMinusDestinationAlpha=5,SourceColor=6,OneMinusSourceColor=7,DestinationColor=8,OneMinusDestinationColor=9});
 enumeration!(BlendOp {Add=0,Subtract=1,ReverseSubtract=2});
 enumeration!(CullMode {None=0,Front=1,Back=2});
 enumeration!(FrontFace {Clockwise=0,CounterClockwise=1});
@@ -447,12 +448,36 @@ macro_rules! identity {
     };
 }
 
+macro_rules! program_identity {
+    ($id:ident, $resolve:ident) => {
+        impl Codec for $id {
+            fn put(&self, w: &mut Vec<u64>) {
+                self.index.put(w);
+                self.generation.put(w);
+            }
+            fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
+                let id = Self {
+                    owner: t.id,
+                    index: r.value(t)?,
+                    generation: if t.abi.legacy_program_ids.get() {
+                        0
+                    } else {
+                        r.value(t)?
+                    },
+                };
+                t.$resolve(id)?;
+                Ok(id)
+            }
+        }
+    };
+}
+
 identity!(SamplerId, sampler_ref);
 identity!(RenderPipelineId, render_pipeline_ref);
-identity!(ShaderModuleId, shader_module_ref);
+program_identity!(ShaderModuleId, shader_module_ref);
 
-identity!(ComputePipelineId, compute_pipeline_ref);
-identity!(
+program_identity!(ComputePipelineId, compute_pipeline_ref);
+program_identity!(
     ProgrammableRenderPipelineId,
     programmable_render_pipeline_ref
 );
@@ -693,6 +718,20 @@ impl Codec for ProgrammableRenderPipelineDesc {
         for target in self.color_targets() {
             target.put(w)
         }
+        if self
+            .vertex_buffers()
+            .iter()
+            .any(|layout| layout.step_mode() != VertexStepMode::Vertex)
+        {
+            // Preserve old per-vertex byte streams. Resource rows are framed;
+            // older consumers reject the additional tail rather than misfetch.
+            w.push(0x5354_4550); // STEP
+            self.vertex_buffers()
+                .iter()
+                .map(|layout| layout.step_mode())
+                .collect::<Vec<_>>()
+                .put(w);
+        }
     }
     fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
         let mut d = Self::new(
@@ -709,6 +748,264 @@ impl Codec for ProgrammableRenderPipelineDesc {
         if let Some(depth) = r.value(t)? {
             d = d.with_depth_state(depth)?;
         }
-        d.with_color_targets(r.value(t)?)
+        d = d.with_color_targets(r.value(t)?)?;
+        if !r.words.is_empty() {
+            if r.word()? != 0x5354_4550 {
+                return Err(Error::InvalidDescriptor);
+            }
+            let modes: Vec<VertexStepMode> = r.value(t)?;
+            if modes.len() != d.vertex_buffers().len() {
+                return Err(Error::InvalidDescriptor);
+            }
+            let layouts = d
+                .vertex_buffers()
+                .iter()
+                .cloned()
+                .zip(modes)
+                .map(|(layout, mode)| layout.with_step_mode(mode))
+                .collect();
+            d = d.with_vertex_buffers(layouts)?;
+        }
+        r.end()?;
+        Ok(d)
+    }
+}
+
+#[cfg(test)]
+mod vertex_format_tests {
+    use super::*;
+
+    #[test]
+    fn instance_modes_append_without_changing_legacy_pipeline_words() {
+        let table = ResourceTable::new();
+        let shader = table.define_shader_module(ShaderModuleDesc::wgsl("@vertex fn vs()->@builtin(position) vec4<f32>{return vec4<f32>(0.0);} @fragment fn fs()->@location(0) vec4<f32>{return vec4<f32>(1.0);}".into()).unwrap()).unwrap();
+        let layouts = alloc::vec![
+            VertexBufferLayout::new(
+                8,
+                alloc::vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)]
+            )
+            .unwrap(),
+            VertexBufferLayout::new(
+                4,
+                alloc::vec![VertexAttribute::new(1, VertexFormat::Float32, 0)]
+            )
+            .unwrap(),
+        ];
+        let legacy = ProgrammableRenderPipelineDesc::new(
+            ShaderEntryPoint::new(shader, ShaderStage::Vertex, "vs".into()).unwrap(),
+            ShaderEntryPoint::new(shader, ShaderStage::Fragment, "fs".into()).unwrap(),
+            PipelineLayoutDesc::new(Vec::new()).unwrap(),
+            TextureFormat::Rgba8Unorm,
+            None,
+            PrimitiveTopology::TriangleList,
+            BlendState::REPLACE,
+            RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+        )
+        .unwrap()
+        .with_vertex_buffers(layouts.clone())
+        .unwrap();
+        let mut original = Vec::new();
+        legacy.put(&mut original);
+        let mut layouts = layouts;
+        layouts[1] = layouts[1].clone().with_step_mode(VertexStepMode::Instance);
+        let instance = legacy.clone().with_vertex_buffers(layouts).unwrap();
+        let mut extended = Vec::new();
+        instance.put(&mut extended);
+        assert_eq!(&extended[..original.len()], original);
+        assert_eq!(&extended[original.len()..], &[0x5354_4550, 2, 0, 1]);
+        let decoded =
+            ProgrammableRenderPipelineDesc::get(&mut Reader { words: &original }, &table).unwrap();
+        assert_eq!(
+            decoded.vertex_buffers()[1].step_mode(),
+            VertexStepMode::Vertex
+        );
+        let decoded =
+            ProgrammableRenderPipelineDesc::get(&mut Reader { words: &extended }, &table).unwrap();
+        assert_eq!(
+            decoded.vertex_buffers()[0].step_mode(),
+            VertexStepMode::Vertex
+        );
+        assert_eq!(
+            decoded.vertex_buffers()[1].step_mode(),
+            VertexStepMode::Instance
+        );
+        let mut truncated = original.clone();
+        truncated.extend([0x5354_4550, 1, 1]);
+        assert!(matches!(
+            ProgrammableRenderPipelineDesc::get(&mut Reader { words: &truncated }, &table),
+            Err(Error::InvalidDescriptor)
+        ));
+        let mut unknown = extended;
+        *unknown.last_mut().unwrap() = 2;
+        assert!(matches!(
+            ProgrammableRenderPipelineDesc::get(&mut Reader { words: &unknown }, &table),
+            Err(Error::InvalidValue)
+        ));
+    }
+
+    #[test]
+    fn scalar_float_appends_to_the_frozen_vertex_format_encoding() {
+        let table = ResourceTable::new();
+        for (format, tag) in [
+            (VertexFormat::Sint32, 0),
+            (VertexFormat::Uint32, 1),
+            (VertexFormat::Float16x2, 2),
+            (VertexFormat::Float16x4, 3),
+            (VertexFormat::Sint16x4, 4),
+            (VertexFormat::Snorm10_10_10_2, 5),
+            (VertexFormat::Float32x2, 6),
+            (VertexFormat::Float32x3, 7),
+            (VertexFormat::Float32x4, 8),
+            (VertexFormat::Unorm8x4, 9),
+            (VertexFormat::Uint16x2, 10),
+            (VertexFormat::Float32, 11),
+        ] {
+            let mut words = Vec::new();
+            format.put(&mut words);
+            assert_eq!(words, [tag]);
+            let mut reader = Reader { words: &words };
+            assert_eq!(VertexFormat::get(&mut reader, &table), Ok(format));
+            reader.end().unwrap();
+        }
+        assert_eq!(VertexFormat::Float32.byte_size(), 4);
+        assert_eq!(
+            VertexFormat::get(&mut Reader { words: &[12] }, &table),
+            Err(Error::InvalidValue)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sampler_border_tests {
+    use super::*;
+
+    #[test]
+    fn transparent_border_appends_without_changing_existing_address_tags() {
+        let table = ResourceTable::new();
+        for (mode, tag) in [
+            (AddressMode::ClampToEdge, 0),
+            (AddressMode::Repeat, 1),
+            (AddressMode::MirrorRepeat, 2),
+            (AddressMode::ClampToBorder, 3),
+        ] {
+            let mut words = Vec::new();
+            mode.put(&mut words);
+            assert_eq!(words, [tag]);
+            let mut reader = Reader { words: &words };
+            assert_eq!(AddressMode::get(&mut reader, &table), Ok(mode));
+            reader.end().unwrap();
+        }
+        assert_eq!(
+            AddressMode::get(&mut Reader { words: &[4] }, &table),
+            Err(Error::InvalidValue)
+        );
+        let descriptor = SamplerDesc::new(
+            FilterMode::Linear,
+            FilterMode::Linear,
+            AddressMode::ClampToBorder,
+            AddressMode::ClampToBorder,
+        )
+        .with_mip_filter(FilterMode::Nearest, 0.0, 1000.0)
+        .unwrap();
+        let mut words = Vec::new();
+        descriptor.put(&mut words);
+        let mut reader = Reader { words: &words };
+        assert_eq!(SamplerDesc::get(&mut reader, &table), Ok(descriptor));
+        reader.end().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod color_blend_tests {
+    use super::*;
+
+    #[test]
+    fn color_factors_append_stable_tags_and_round_trip_blend_state() {
+        let table = ResourceTable::new();
+        for (factor, tag) in [
+            (BlendFactor::Zero, 0),
+            (BlendFactor::One, 1),
+            (BlendFactor::SourceAlpha, 2),
+            (BlendFactor::OneMinusSourceAlpha, 3),
+            (BlendFactor::DestinationAlpha, 4),
+            (BlendFactor::OneMinusDestinationAlpha, 5),
+            (BlendFactor::SourceColor, 6),
+            (BlendFactor::OneMinusSourceColor, 7),
+            (BlendFactor::DestinationColor, 8),
+            (BlendFactor::OneMinusDestinationColor, 9),
+        ] {
+            let mut words = Vec::new();
+            factor.put(&mut words);
+            assert_eq!(words, [tag]);
+            let mut reader = Reader { words: &words };
+            assert_eq!(BlendFactor::get(&mut reader, &table), Ok(factor));
+            reader.end().unwrap();
+            let component = BlendComponent::new(factor, BlendFactor::One, BlendOp::ReverseSubtract);
+            let blend = BlendState::new(component, component);
+            words.clear();
+            blend.put(&mut words);
+            let mut reader = Reader { words: &words };
+            assert_eq!(BlendState::get(&mut reader, &table), Ok(blend));
+            reader.end().unwrap();
+        }
+        assert_eq!(
+            BlendFactor::get(&mut Reader { words: &[10] }, &table),
+            Err(Error::InvalidValue),
+        );
+    }
+}
+
+#[cfg(test)]
+mod line_topology_tests {
+    use super::*;
+
+    #[test]
+    fn line_topologies_append_stable_tags_and_preserve_primitive_counts() {
+        let table = ResourceTable::new();
+        for (topology, tag, counts) in [
+            (
+                PrimitiveTopology::TriangleList,
+                0,
+                [false, false, false, true, false, false, true],
+            ),
+            (
+                PrimitiveTopology::TriangleStrip,
+                1,
+                [false, false, false, true, true, true, true],
+            ),
+            (
+                PrimitiveTopology::TriangleFan,
+                2,
+                [false, false, false, true, true, true, true],
+            ),
+            (
+                PrimitiveTopology::LineList,
+                3,
+                [false, false, true, false, true, false, true],
+            ),
+            (
+                PrimitiveTopology::LineStrip,
+                4,
+                [false, false, true, true, true, true, true],
+            ),
+        ] {
+            let mut words = Vec::new();
+            topology.put(&mut words);
+            assert_eq!(words, [tag]);
+            let mut reader = Reader { words: &words };
+            assert_eq!(PrimitiveTopology::get(&mut reader, &table), Ok(topology));
+            reader.end().unwrap();
+            for (count, expected) in counts.into_iter().enumerate() {
+                assert_eq!(
+                    topology.accepts_count(count as u32),
+                    expected,
+                    "{topology:?} count {count}"
+                );
+            }
+        }
+        assert_eq!(
+            PrimitiveTopology::get(&mut Reader { words: &[5] }, &table),
+            Err(Error::InvalidValue)
+        );
     }
 }

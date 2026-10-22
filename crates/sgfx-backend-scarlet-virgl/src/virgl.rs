@@ -72,14 +72,20 @@ const VIRGL_OBJECT_SURFACE: u32 = 8;
 const VIRGL_FORMAT_B8G8R8A8_UNORM: u32 = 1;
 const VIRGL_FORMAT_Z32_FLOAT: u32 = 18;
 const VIRGL_FORMAT_R32G32B32A32_FLOAT: u32 = 31;
+#[cfg(feature = "programmable")]
+const VIRGL_FORMAT_R32_FLOAT: u32 = 28;
 const VIRGL_FORMAT_R32G32_FLOAT: u32 = 29;
 #[cfg(feature = "programmable")]
 const VIRGL_FORMAT_R32G32B32_FLOAT: u32 = 30;
+const VIRGL_FORMAT_R8_UNORM: u32 = 64;
+const VIRGL_FORMAT_R8G8_UNORM: u32 = 65;
 #[cfg(feature = "programmable")]
 const VIRGL_FORMAT_R8G8B8A8_UNORM: u32 = 67;
 const PIPE_SHADER_VERTEX: u32 = 0;
 const PIPE_SHADER_FRAGMENT: u32 = 1;
 const VIRGL_SHADER_TOKEN_COUNT_HINT: u32 = 300;
+const PIPE_PRIM_LINES: u32 = 1;
+const PIPE_PRIM_LINE_STRIP: u32 = 3;
 const PIPE_PRIM_TRIANGLES: u32 = 4;
 const PIPE_PRIM_TRIANGLE_STRIP: u32 = 5;
 const PIPE_PRIM_TRIANGLE_FAN: u32 = 6;
@@ -112,6 +118,10 @@ const VIRGL_BLEND_ALPHA_SRC_FACTOR_SHIFT: u32 = 17;
 const VIRGL_BLEND_ALPHA_DST_FACTOR_SHIFT: u32 = 22;
 const VIRGL_BLEND_COLORMASK_SHIFT: u32 = 27;
 const PIPE_BLENDFACTOR_ONE: u32 = 1;
+const PIPE_BLENDFACTOR_SRC_COLOR: u32 = 2;
+const PIPE_BLENDFACTOR_DST_COLOR: u32 = 5;
+const PIPE_BLENDFACTOR_INV_SRC_COLOR: u32 = 18;
+const PIPE_BLENDFACTOR_INV_DST_COLOR: u32 = 21;
 const PIPE_BLENDFACTOR_SRC_ALPHA: u32 = 3;
 const PIPE_BLENDFACTOR_DST_ALPHA: u32 = 4;
 const PIPE_BLENDFACTOR_ZERO: u32 = 0x11;
@@ -122,6 +132,7 @@ const PIPE_BLEND_SUBTRACT: u32 = 1;
 const PIPE_BLEND_REVERSE_SUBTRACT: u32 = 2;
 const PIPE_TEX_WRAP_REPEAT: u32 = 0;
 const PIPE_TEX_WRAP_CLAMP_TO_EDGE: u32 = 2;
+const PIPE_TEX_WRAP_CLAMP_TO_BORDER: u32 = 3;
 const PIPE_TEX_WRAP_MIRROR_REPEAT: u32 = 4;
 const PIPE_TEX_FILTER_NEAREST: u32 = 0;
 const PIPE_TEX_FILTER_LINEAR: u32 = 1;
@@ -131,7 +142,7 @@ const PIPE_SWIZZLE_Y: u32 = 1;
 const PIPE_SWIZZLE_Z: u32 = 2;
 const PIPE_SWIZZLE_W: u32 = 3;
 const IR_VERTEX_BUFFER_BYTES: usize = MAX_IR_VERTICES * 10 * core::mem::size_of::<f32>();
-const IR_BUFFER_SLOTS: usize = 1_024;
+const IR_BUFFER_SLOTS: usize = crate::ir::MAX_BUFFERS;
 const IR_TEXTURE_SLOTS: usize = 1_024;
 const IR_SAMPLER_SLOTS: usize = 256;
 const IR_PIPELINE_SLOTS: usize = 512;
@@ -147,6 +158,17 @@ fn wait_scheduled(scheduler: &SharedScheduler) -> HandleResult<()> {
     scheduler
         .as_ref()
         .map_or(Ok(()), |scheduler| scheduler.wait_idle())
+}
+
+#[cfg(feature = "backend-abi")]
+fn poll_scheduled(scheduler: &SharedScheduler, cleanup_failed: &Cell<bool>) -> HandleResult<bool> {
+    if cleanup_failed.get() {
+        return Err(HandleError::SystemError(-1));
+    }
+    scheduler
+        .borrow()
+        .as_ref()
+        .map_or(Ok(true), |scheduler| scheduler.is_idle())
 }
 
 #[derive(Clone, Copy)]
@@ -390,7 +412,8 @@ impl Device {
     pub(crate) fn create_context(self: &Rc<Self>) -> HandleResult<Context> {
         Ok(Context {
             device: Rc::clone(self),
-            raw: self.raw.create_context(&self.dialect)?,
+            raw: Rc::new(self.raw.create_context(&self.dialect)?),
+            cleanup_failed: Rc::new(Cell::new(false)),
             next_object_handle: Cell::new(FIRST_DYNAMIC_OBJECT_HANDLE),
             scheduler: Rc::new(RefCell::new(None)),
         })
@@ -399,12 +422,40 @@ impl Device {
 
 pub(crate) struct Context {
     device: Rc<Device>,
-    raw: RawContext,
+    raw: Rc<RawContext>,
+    cleanup_failed: Rc<Cell<bool>>,
     next_object_handle: Cell<u32>,
     scheduler: SharedScheduler,
 }
 
 impl Context {
+    #[cfg(feature = "backend-abi")]
+    pub(crate) fn is_idle(&self) -> HandleResult<bool> {
+        // Poll the existing dispatch state directly. Creating a temporary
+        // rendering queue here allocates/attaches a private VBO, and dropping
+        // that queue must wait for GPU retirement before detaching it.
+        poll_scheduled(&self.scheduler, &self.cleanup_failed)
+    }
+
+    pub(crate) fn cleanup_failed(&self) -> bool {
+        self.cleanup_failed.get()
+    }
+    pub(crate) fn abandon_cleanup(&self) {
+        self.cleanup_failed.set(true);
+    }
+
+    pub(crate) fn retire_ir_resources(&self, resources: &mut IrResources) -> HandleResult<()> {
+        let result = resources.retire(self);
+        if result.is_err() {
+            self.abandon_cleanup();
+        }
+        result
+    }
+
+    pub(crate) fn capabilities(&self) -> Capabilities {
+        self.device.capabilities
+    }
+
     pub(crate) fn create_image(&self, width: u32, height: u32) -> HandleResult<Image> {
         if width == 0 || height == 0 {
             return Err(HandleError::InvalidParameter);
@@ -524,16 +575,31 @@ impl Context {
         &self,
         handle: Handle,
     ) -> HandleResult<(Texture, u32, u32)> {
-        let raw = RawImage::from_handle(handle)?;
-        let info = raw.query()?;
+        let transferred_handle = handle.as_raw();
+        let raw = RawImage::from_handle(handle).inspect_err(|error| {
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX import] stage=adopt_image context={} transferred_handle={transferred_handle} error={error:?}", self.handle_id());
+        })?;
+        let info = raw.query().inspect_err(|error| {
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX import] stage=query_image context={} transferred_handle={transferred_handle} error={error:?}", self.handle_id());
+        })?;
         if info.format != gpu_raw::GPU_IMAGE_FORMAT_BGRA8_UNORM
             || info.usage & GPU_IMAGE_USAGE_SAMPLED == 0
             || info.width == 0
             || info.height == 0
         {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX import] stage=validate_image context={} transferred_handle={transferred_handle} info={info:?}",
+                self.handle_id()
+            );
             return Err(HandleError::InvalidParameter);
         }
-        let resource_id = resource_id_from_token(self.raw.attach_image(&raw)?)?;
+        let resource_id = resource_id_from_token(self.raw.attach_image(&raw).inspect_err(|error| {
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX import] stage=attach_image context={} transferred_handle={transferred_handle} info={info:?} error={error:?}", self.handle_id());
+        })?)?;
         let texture = Texture {
             raw,
             resource_id,
@@ -593,10 +659,14 @@ impl Context {
         if usage == 0 {
             return Err(HandleError::InvalidParameter);
         }
-        let format = if matches!(spec.format, IrTextureFormat::Depth32Float) {
-            GPU_IMAGE_FORMAT_DEPTH32_FLOAT
-        } else {
-            GPU_IMAGE_FORMAT_BGRA8_UNORM
+        let storage_format = spec
+            .format
+            .storage_format(self.capabilities().supports_native_narrow_color());
+        let format = match storage_format {
+            IrTextureFormat::R8 => gpu_raw::GPU_IMAGE_FORMAT_R8_UNORM,
+            IrTextureFormat::Rg8 => gpu_raw::GPU_IMAGE_FORMAT_RG8_UNORM,
+            IrTextureFormat::Depth32Float => GPU_IMAGE_FORMAT_DEPTH32_FLOAT,
+            _ => GPU_IMAGE_FORMAT_BGRA8_UNORM,
         };
         let raw = self.device.raw.create_layered_image_with_format_and_usage(
             format,
@@ -719,9 +789,11 @@ impl Context {
         let IrTexture::Internal(texture) = texture else {
             return Err(HandleError::InvalidParameter);
         };
+        let native_narrow = self.capabilities().supports_native_narrow_color()
+            && matches!(spec.format, IrTextureFormat::R8 | IrTextureFormat::Rg8);
         let stride = spec
             .width
-            .checked_mul(4)
+            .checked_mul(spec.format.storage_format(native_narrow).bytes_per_texel() as u32)
             .ok_or(HandleError::InvalidParameter)?;
         let length = usize::try_from(stride)
             .ok()
@@ -737,48 +809,63 @@ impl Context {
         let mut y = 0;
         while y < spec.height {
             let height = (spec.height - y).min(rows);
-            self.raw.readback_image_bgra(
-                &texture.raw,
-                pixels,
-                stride,
-                GpuImageBgraRect::new(0, y, spec.width, height),
-            )?;
+            let rect = GpuImageBgraRect::new(0, y, spec.width, height);
+            if native_narrow {
+                self.raw
+                    .readback_image(&texture.raw, pixels, stride, rect)?;
+            } else {
+                self.raw
+                    .readback_image_bgra(&texture.raw, pixels, stride, rect)?;
+            }
             y += height;
         }
         Ok(())
     }
 
     fn retire_texture(&self, texture: &Texture) -> HandleResult<()> {
+        if self.cleanup_failed.get() {
+            return Err(HandleError::Unsupported);
+        }
+        let result = self.retire_texture_inner(texture);
+        if result.is_err() {
+            self.abandon_cleanup();
+        }
+        result
+    }
+
+    fn retire_texture_inner(&self, texture: &Texture) -> HandleResult<()> {
         if texture.context_handle != self.handle_id() {
             return Err(HandleError::InvalidParameter);
         }
         wait_scheduled(&self.scheduler)?;
-        let mut commands = Vec::new();
-        push_retirement_unbinds(&mut commands);
-        if texture.sampler_view_initialized.get() {
-            push_destroy_object(
-                &mut commands,
-                VIRGL_OBJECT_SAMPLER_VIEW,
-                texture.sampler_view_handle,
-            );
-            if texture.r8_sampler_view_handle != 0 {
+        if texture.sampler_view_initialized.get() || texture.ir_surface_initialized.get() {
+            let mut commands = Vec::new();
+            push_retirement_unbinds(&mut commands);
+            if texture.sampler_view_initialized.get() {
                 push_destroy_object(
                     &mut commands,
                     VIRGL_OBJECT_SAMPLER_VIEW,
-                    texture.r8_sampler_view_handle,
+                    texture.sampler_view_handle,
+                );
+                if texture.r8_sampler_view_handle != 0 {
+                    push_destroy_object(
+                        &mut commands,
+                        VIRGL_OBJECT_SAMPLER_VIEW,
+                        texture.r8_sampler_view_handle,
+                    );
+                }
+            }
+            if texture.ir_surface_initialized.get() {
+                push_destroy_object(
+                    &mut commands,
+                    VIRGL_OBJECT_SURFACE,
+                    texture.ir_surface_handle,
                 );
             }
+            // Views and surfaces hold renderer references after resource detach.
+            // Complete their destruction before closing the image capability.
+            self.raw.create_queue()?.submit(&commands)?;
         }
-        if texture.ir_surface_initialized.get() {
-            push_destroy_object(
-                &mut commands,
-                VIRGL_OBJECT_SURFACE,
-                texture.ir_surface_handle,
-            );
-        }
-        // Views and surfaces hold renderer references even after resource detach.
-        // Synchronous completion makes it safe to detach and close the owned FD.
-        self.raw.create_queue()?.submit(&commands)?;
         texture.sampler_view_initialized.set(false);
         texture.ir_surface_initialized.set(false);
         self.raw.detach_image(&texture.raw)
@@ -792,8 +879,29 @@ impl Context {
         if image.context_handle != self.handle_id() {
             return Err(HandleError::InvalidParameter);
         }
-        wait_scheduled(&self.scheduler)?;
-        self.raw.detach_image(&image.raw)
+        let result = (|| {
+            let objects = [
+                image
+                    .composition_surface_initialized
+                    .get()
+                    .then_some((VIRGL_OBJECT_SURFACE, image.composition_surface_handle)),
+                image
+                    .ir_surface_initialized
+                    .get()
+                    .then_some((VIRGL_OBJECT_SURFACE, image.ir_surface_handle)),
+            ];
+            retire_native_objects(
+                &self.raw,
+                &self.scheduler,
+                &self.cleanup_failed,
+                objects.into_iter().flatten(),
+            )?;
+            self.raw.detach_image(&image.raw)
+        })();
+        if result.is_err() {
+            self.abandon_cleanup();
+        }
+        result
     }
 
     pub(crate) fn create_pipeline(
@@ -840,6 +948,8 @@ impl Context {
         let composition_vertex_resource_id =
             resource_id_from_token(self.raw.attach_buffer(&raw_vertex_buffer)?)?;
         Ok(Queue {
+            context: Rc::clone(&self.raw),
+            cleanup_failed: Rc::clone(&self.cleanup_failed),
             raw: Arc::new(self.raw.create_queue()?),
             scheduler: Rc::clone(&self.scheduler),
             context_handle: self.handle_id(),
@@ -984,6 +1094,18 @@ impl Context {
         if mapped.resource_id != image.resource_id {
             return Err(HandleError::InvalidParameter);
         }
+        // map_ir_texture owns a distinct IR sampler view. Closing the original
+        // Texture destroys only its legacy view, so retire this view while its
+        // mapping and image are still alive. Otherwise each imported frame
+        // leaves a renderer reference to the full GPU image until context exit.
+        if let Some(commands) = mapped_texture_retirement_commands(mapped)? {
+            wait_scheduled(&self.scheduler)?;
+            self.raw.create_queue()?.submit(&commands)?;
+        }
+        // The surface is borrowed from Texture, unlike the IR sampler view.
+        image
+            .ir_surface_initialized
+            .set(mapped.surface_initialized.get());
         *slot = None;
         if let Some(spec) = resources.texture_specs.get_mut(texture.slot) {
             *spec = None;
@@ -1011,6 +1133,8 @@ impl Context {
 }
 
 pub(crate) struct Queue {
+    context: Rc<RawContext>,
+    cleanup_failed: Rc<Cell<bool>>,
     raw: Arc<RawQueue>,
     scheduler: SharedScheduler,
     context_handle: i32,
@@ -1091,6 +1215,109 @@ pub(crate) struct IrStateSnapshot {
 }
 
 impl IrResources {
+    fn retire(&mut self, context: &Context) -> HandleResult<()> {
+        if context.cleanup_failed.get() {
+            return Err(HandleError::Unsupported);
+        }
+        wait_scheduled(&context.scheduler)?;
+        for slot in 0..self.textures.len() {
+            if matches!(self.textures[slot], Some(IrTexture::Mapped(_))) {
+                return Err(HandleError::InvalidParameter);
+            }
+            self.release_texture(context, slot)?;
+        }
+        for slot in 0..self.buffers.len() {
+            self.release_buffer(context, slot)?;
+        }
+        let globals = [
+            (VIRGL_OBJECT_SHADER, self.vertex_shader_handle),
+            (VIRGL_OBJECT_SHADER, self.solid_fragment_shader_handle),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.vertex_color_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_rgba_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_rgb_ignore_alpha_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_alpha_mask_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_vertex_color_rgba_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_vertex_color_rgb_ignore_alpha_fragment_shader_handle,
+            ),
+            (
+                VIRGL_OBJECT_SHADER,
+                self.texture_vertex_color_alpha_mask_fragment_shader_handle,
+            ),
+            (VIRGL_OBJECT_VERTEX_ELEMENTS, self.vertex_elements_handle),
+        ];
+        let objects = globals
+            .into_iter()
+            .filter(|_| self.initialized.get())
+            .chain(
+                self.samplers
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.initialized.get())
+                    .map(|p| (VIRGL_OBJECT_SAMPLER_STATE, p.handle)),
+            )
+            .chain(
+                self.pipelines
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.initialized.get())
+                    .flat_map(|p| {
+                        [
+                            Some((VIRGL_OBJECT_BLEND, p.blend_handle)),
+                            Some((VIRGL_OBJECT_RASTERIZER, p.rasterizer_handle)),
+                            p.dsa_handle.map(|id| (VIRGL_OBJECT_DSA, id)),
+                        ]
+                        .into_iter()
+                        .flatten()
+                    }),
+            )
+            .chain(
+                self.programmable_pipelines
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.initialized.get())
+                    .flat_map(|p| {
+                        [
+                            (VIRGL_OBJECT_SHADER, p.vertex_shader_handle),
+                            (VIRGL_OBJECT_SHADER, p.fragment_shader_handle),
+                            (VIRGL_OBJECT_VERTEX_ELEMENTS, p.vertex_elements_handle),
+                        ]
+                    }),
+            );
+        retire_native_objects(
+            &context.raw,
+            &context.scheduler,
+            &context.cleanup_failed,
+            objects,
+        )?;
+        context.raw.detach_buffer(&self.vertex_buffer)?;
+        for arena in &self.upload_arenas {
+            context.raw.detach_buffer(&arena._raw)?;
+        }
+        self.upload_arenas.clear();
+        self.samplers.clear();
+        self.pipelines.clear();
+        self.programmable_pipelines.clear();
+        self.initialized.set(false);
+        Ok(())
+    }
+
     pub(crate) fn release_texture(&mut self, context: &Context, slot: usize) -> HandleResult<()> {
         if self.context_handle != context.handle_id() || slot >= self.textures.len() {
             return Err(HandleError::InvalidParameter);
@@ -1133,8 +1360,38 @@ impl IrResources {
         Ok(())
     }
 
+    pub(crate) fn release_programmable_render_pipeline(
+        &mut self,
+        context: &Context,
+        slot: usize,
+    ) -> HandleResult<()> {
+        if self.context_handle != context.handle_id() || slot >= self.programmable_pipelines.len() {
+            return Err(HandleError::InvalidParameter);
+        }
+        let fixed_slot = slot + IR_PROGRAMMABLE_PIPELINE_SLOTS;
+        if self.programmable_pipelines[slot].is_none() && self.pipelines[fixed_slot].is_none() {
+            return Ok(());
+        }
+        let objects = programmable_retirement_objects(
+            self.programmable_pipelines[slot].as_ref(),
+            self.pipelines[fixed_slot].as_ref(),
+        );
+        // Keep both old descriptions/handle sets until retirement succeeds. An
+        // accepted asynchronous packet may still reference these object handles.
+        retire_native_objects(
+            &context.raw,
+            &context.scheduler,
+            &context.cleanup_failed,
+            objects.into_iter().flatten(),
+        )?;
+        self.programmable_pipelines[slot] = None;
+        self.pipelines[fixed_slot] = None;
+        Ok(())
+    }
+
     pub(crate) fn unmap_ir_image(
         &mut self,
+        context: &Context,
         texture: IrTextureSpec,
         image: &Image,
     ) -> HandleResult<()> {
@@ -1153,6 +1410,10 @@ impl IrResources {
             || mapped.height != image.height
         {
             return Err(HandleError::InvalidParameter);
+        }
+        if let Some(commands) = mapped_texture_retirement_commands(mapped)? {
+            wait_scheduled(&context.scheduler)?;
+            context.raw.create_queue()?.submit(&commands)?;
         }
         image
             .ir_surface_initialized
@@ -1335,6 +1596,115 @@ struct MappedIrTexture {
     surface_initialized: Cell<bool>,
 }
 
+fn programmable_retirement_objects(
+    stages: Option<&IrNativeProgrammablePipeline>,
+    state: Option<&IrPipeline>,
+) -> [Option<(u32, u32)>; 6] {
+    let stages = stages.filter(|pipeline| pipeline.initialized.get());
+    let state = state.filter(|pipeline| pipeline.initialized.get());
+    [
+        stages.map(|pipeline| (VIRGL_OBJECT_SHADER, pipeline.vertex_shader_handle)),
+        stages.map(|pipeline| (VIRGL_OBJECT_SHADER, pipeline.fragment_shader_handle)),
+        stages.map(|pipeline| {
+            (
+                VIRGL_OBJECT_VERTEX_ELEMENTS,
+                pipeline.vertex_elements_handle,
+            )
+        }),
+        state.map(|pipeline| (VIRGL_OBJECT_BLEND, pipeline.blend_handle)),
+        state.map(|pipeline| (VIRGL_OBJECT_RASTERIZER, pipeline.rasterizer_handle)),
+        state.and_then(|pipeline| pipeline.dsa_handle.map(|handle| (VIRGL_OBJECT_DSA, handle))),
+    ]
+}
+
+fn encode_retirement_objects(
+    limit: usize,
+    objects: impl IntoIterator<Item = (u32, u32)>,
+    mut submit: impl FnMut(&[u8]) -> HandleResult<()>,
+) -> HandleResult<()> {
+    let limit = limit.min(64 * 1024);
+    let mut commands = Vec::new();
+    commands
+        .try_reserve_exact(limit)
+        .map_err(|_| HandleError::OutOfResources)?;
+    push_retirement_unbinds(&mut commands);
+    for stage in [PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT] {
+        push_bind_shader(&mut commands, stage, 0);
+        push_dword(
+            &mut commands,
+            command_header(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 34),
+        );
+        push_dword(&mut commands, stage);
+        push_dword(&mut commands, 0);
+        for _ in 0..32 {
+            push_dword(&mut commands, 0);
+        }
+    }
+    for object in [
+        VIRGL_OBJECT_BLEND,
+        VIRGL_OBJECT_RASTERIZER,
+        VIRGL_OBJECT_DSA,
+        VIRGL_OBJECT_VERTEX_ELEMENTS,
+    ] {
+        push_bind_object(&mut commands, object, 0);
+    }
+    if commands.len() > limit || limit < 8 {
+        return Err(HandleError::InvalidParameter);
+    }
+    for (object, handle) in objects {
+        if commands.len() + 8 > limit {
+            submit(&commands)?;
+            commands.clear();
+        }
+        push_destroy_object(&mut commands, object, handle);
+    }
+    if !commands.is_empty() {
+        submit(&commands)?;
+    }
+    Ok(())
+}
+
+fn retire_native_objects(
+    context: &RawContext,
+    scheduler: &SharedScheduler,
+    failed: &Cell<bool>,
+    objects: impl IntoIterator<Item = (u32, u32)>,
+) -> HandleResult<()> {
+    if failed.get() {
+        return Err(HandleError::Unsupported);
+    }
+    let result = (|| {
+        wait_scheduled(scheduler)?;
+        let queue = context.create_queue()?;
+        encode_retirement_objects(
+            queue.max_opaque_command_size() as usize,
+            objects,
+            |commands| queue.submit(commands).map(|_| ()),
+        )
+    })();
+    if result.is_err() {
+        failed.set(true);
+    }
+    result
+}
+
+fn mapped_texture_retirement_commands(mapped: &MappedIrTexture) -> HandleResult<Option<Vec<u8>>> {
+    if !mapped.sampler_view_initialized.get() {
+        return Ok(None);
+    }
+    let mut commands = Vec::new();
+    commands
+        .try_reserve_exact(512)
+        .map_err(|_| HandleError::OutOfResources)?;
+    push_retirement_unbinds(&mut commands);
+    push_destroy_object(
+        &mut commands,
+        VIRGL_OBJECT_SAMPLER_VIEW,
+        mapped.sampler_view_handle,
+    );
+    Ok(Some(commands))
+}
+
 struct IrPassTarget {
     resource_id: u32,
     surface_handle: u32,
@@ -1342,6 +1712,7 @@ struct IrPassTarget {
     width: u32,
     height: u32,
     orientation: FramebufferOrientation,
+    format: u32,
 }
 
 struct IrPassDepthTarget {
@@ -1350,6 +1721,7 @@ struct IrPassDepthTarget {
 }
 
 struct IrPassColorTarget {
+    format: u32,
     surface_handle: u32,
     resource_id: u32,
     surface_initialized: bool,
@@ -1582,10 +1954,7 @@ impl Queue {
 
     #[cfg(feature = "backend-abi")]
     pub(crate) fn is_idle(&self) -> HandleResult<bool> {
-        self.scheduler
-            .borrow()
-            .as_ref()
-            .map_or(Ok(true), |s| s.is_idle())
+        poll_scheduled(&self.scheduler, &self.cleanup_failed)
     }
 
     fn max_command_size(&self) -> usize {
@@ -1696,7 +2065,18 @@ impl Queue {
         let IrTexture::Internal(texture) = texture else {
             return Err(HandleError::InvalidParameter);
         };
-        if !mode.is_tracked() && upload.mip_level == 0 && upload.texture.array_layers == 1 {
+        if upload.storage_format
+            != spec
+                .format
+                .storage_format(context.capabilities().supports_native_narrow_color())
+        {
+            return Err(HandleError::InvalidParameter);
+        }
+        if !mode.is_tracked()
+            && upload.storage_format == IrTextureFormat::Bgra8
+            && upload.mip_level == 0
+            && upload.texture.array_layers == 1
+        {
             return context.upload_texture_bgra(
                 texture,
                 &upload.pixels,
@@ -1784,6 +2164,14 @@ impl Queue {
                 copy.source_rect,
                 filter,
                 copy.flips,
+                ir_storage_pipe_format(
+                    copy.source.format,
+                    context.capabilities().supports_native_narrow_color(),
+                ),
+                ir_storage_pipe_format(
+                    copy.destination.format,
+                    context.capabilities().supports_native_narrow_color(),
+                ),
             );
         } else {
             push_resource_copy(
@@ -1827,6 +2215,10 @@ impl Queue {
                 width,
                 height,
                 orientation: FramebufferOrientation::UPPER_LEFT,
+                format: ir_storage_pipe_format(
+                    target.format,
+                    context.capabilities().supports_native_narrow_color(),
+                ),
             }
         };
         self.submit_ir_target(context, resources, pass_target, submission, mode)?;
@@ -1857,6 +2249,7 @@ impl Queue {
                 width: image.width,
                 height: image.height,
                 orientation: image.orientation,
+                format: VIRGL_FORMAT_B8G8R8A8_UNORM,
             },
             submission,
             mode,
@@ -1917,6 +2310,10 @@ impl Queue {
             }
             let texture = ir_texture(context, resources, spec)?;
             additional_colors.push(IrPassColorTarget {
+                format: ir_storage_pipe_format(
+                    spec.format,
+                    context.capabilities().supports_native_narrow_color(),
+                ),
                 surface_handle: texture.surface_handle(),
                 resource_id: texture.resource_id(),
                 surface_initialized: texture.surface_initialized(),
@@ -2025,11 +2422,21 @@ impl Queue {
             push_ir_setup(&mut commands, resources);
         }
         if !target.surface_initialized {
-            push_surface(&mut commands, target.surface_handle, target.resource_id);
+            push_surface_with_format(
+                &mut commands,
+                target.surface_handle,
+                target.resource_id,
+                target.format,
+            );
         }
         for color in &additional_colors {
             if !color.surface_initialized {
-                push_surface(&mut commands, color.surface_handle, color.resource_id);
+                push_surface_with_format(
+                    &mut commands,
+                    color.surface_handle,
+                    color.resource_id,
+                    color.format,
+                );
             }
         }
         if let (Some(depth_spec), Some(depth_target)) =
@@ -2059,14 +2466,25 @@ impl Queue {
             // original and bind a copy of its contents for shader reads.
             push_depth_blit(&mut commands, destination, rect, source, rect);
             if !view_initialized {
-                push_ir_sampler_view(&mut commands, view, destination, spec);
+                push_ir_sampler_view(
+                    &mut commands,
+                    view,
+                    destination,
+                    spec,
+                    context.capabilities().supports_native_narrow_color(),
+                );
             }
         }
         for upload in &submission.texture_uploads {
             let texture = ir_texture(context, resources, IrTextureSpec { ..upload.texture })?;
             let view_is_pending = initialized_views.contains(&upload.texture.slot);
             if !texture.sampler_view_initialized() && !view_is_pending {
-                push_ir_sampler_views(&mut commands, texture, upload.texture);
+                push_ir_sampler_views(
+                    &mut commands,
+                    texture,
+                    upload.texture,
+                    context.capabilities().supports_native_narrow_color(),
+                );
                 initialized_views.push(upload.texture.slot);
             }
         }
@@ -2109,7 +2527,12 @@ impl Queue {
                     if !texture.sampler_view_initialized()
                         && !initialized_views.contains(&binding.texture.slot)
                     {
-                        push_ir_sampler_views(&mut commands, texture, binding.texture);
+                        push_ir_sampler_views(
+                            &mut commands,
+                            texture,
+                            binding.texture,
+                            context.capabilities().supports_native_narrow_color(),
+                        );
                         initialized_views.push(binding.texture.slot);
                     }
                     if let Some(state) = binding.sampler {
@@ -2126,7 +2549,12 @@ impl Queue {
                 let texture = ir_texture(context, resources, texture_spec)?;
                 let view_is_pending = initialized_views.contains(&texture_spec.slot);
                 if !texture.sampler_view_initialized() && !view_is_pending {
-                    push_ir_sampler_views(&mut commands, texture, texture_spec);
+                    push_ir_sampler_views(
+                        &mut commands,
+                        texture,
+                        texture_spec,
+                        context.capabilities().supports_native_narrow_color(),
+                    );
                     initialized_views.push(texture_spec.slot);
                 }
                 let sampler = ir_sampler(context, resources, sampler)?;
@@ -2685,7 +3113,23 @@ pub(crate) struct Texture {
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        let _ = &self.composition_vertex_buffer;
+        if self.cleanup_failed.get() {
+            return;
+        }
+        let result = (|| {
+            retire_native_objects(
+                &self.context,
+                &self.scheduler,
+                &self.cleanup_failed,
+                core::iter::empty(),
+            )?;
+            self.context.detach_buffer(&self.composition_vertex_buffer)
+        })();
+        if let Err(error) = result {
+            self.cleanup_failed.set(true);
+            #[cfg(feature = "std")]
+            std::eprintln!("[SGFX teardown] stage=queue error={error:?}");
+        }
     }
 }
 
@@ -3421,14 +3865,27 @@ fn push_bind_shader(commands: &mut Vec<u8>, stage: u32, handle: u32) {
     push_dword(commands, stage);
 }
 
+fn ir_storage_pipe_format(format: IrTextureFormat, native_narrow: bool) -> u32 {
+    match format.storage_format(native_narrow) {
+        IrTextureFormat::R8 => VIRGL_FORMAT_R8_UNORM,
+        IrTextureFormat::Rg8 => VIRGL_FORMAT_R8G8_UNORM,
+        IrTextureFormat::Depth32Float => VIRGL_FORMAT_Z32_FLOAT,
+        _ => VIRGL_FORMAT_B8G8R8A8_UNORM,
+    }
+}
+
 fn push_surface(commands: &mut Vec<u8>, handle: u32, resource_id: u32) {
+    push_surface_with_format(commands, handle, resource_id, VIRGL_FORMAT_B8G8R8A8_UNORM);
+}
+
+fn push_surface_with_format(commands: &mut Vec<u8>, handle: u32, resource_id: u32, format: u32) {
     push_dword(
         commands,
         command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5),
     );
     push_dword(commands, handle);
     push_dword(commands, resource_id);
-    push_dword(commands, VIRGL_FORMAT_B8G8R8A8_UNORM);
+    push_dword(commands, format);
     push_dword(commands, 0);
     push_dword(commands, 0);
 }
@@ -3638,7 +4095,12 @@ fn push_sampler_mip_view(commands: &mut Vec<u8>, handle: u32, resource_id: u32, 
     );
 }
 
-fn push_ir_sampler_views(commands: &mut Vec<u8>, texture: &IrTexture, spec: IrTextureSpec) {
+fn push_ir_sampler_views(
+    commands: &mut Vec<u8>,
+    texture: &IrTexture,
+    spec: IrTextureSpec,
+    native_narrow: bool,
+) {
     if spec.format == IrTextureFormat::R8 {
         // Keep the fixed alpha-mask sampler contract while storing the logical
         // red channel in physical red, matching render-target writes and clears.
@@ -3647,6 +4109,7 @@ fn push_ir_sampler_views(commands: &mut Vec<u8>, texture: &IrTexture, spec: IrTe
             texture.sampler_view_handle(),
             texture.resource_id(),
             spec,
+            native_narrow,
             (4 << 3) | (4 << 6) | (PIPE_SWIZZLE_X << 9),
         );
         // Programmable R8 sampling returns (r, 0, 0, 1).
@@ -3655,6 +4118,7 @@ fn push_ir_sampler_views(commands: &mut Vec<u8>, texture: &IrTexture, spec: IrTe
             texture.programmable_sampler_view_handle(),
             texture.resource_id(),
             spec,
+            native_narrow,
             PIPE_SWIZZLE_X | (4 << 3) | (4 << 6) | (5 << 9),
         );
     } else if spec.format == IrTextureFormat::Rg8 {
@@ -3663,6 +4127,7 @@ fn push_ir_sampler_views(commands: &mut Vec<u8>, texture: &IrTexture, spec: IrTe
             texture.sampler_view_handle(),
             texture.resource_id(),
             spec,
+            native_narrow,
             PIPE_SWIZZLE_X | (PIPE_SWIZZLE_Y << 3) | (4 << 6) | (5 << 9),
         );
     } else {
@@ -3671,6 +4136,7 @@ fn push_ir_sampler_views(commands: &mut Vec<u8>, texture: &IrTexture, spec: IrTe
             texture.sampler_view_handle(),
             texture.resource_id(),
             spec,
+            native_narrow,
         );
     }
 }
@@ -3680,12 +4146,14 @@ fn push_ir_sampler_view(
     handle: u32,
     resource_id: u32,
     spec: IrTextureSpec,
+    native_narrow: bool,
 ) {
     push_ir_sampler_view_swizzled(
         commands,
         handle,
         resource_id,
         spec,
+        native_narrow,
         PIPE_SWIZZLE_X | (PIPE_SWIZZLE_Y << 3) | (PIPE_SWIZZLE_Z << 6) | (PIPE_SWIZZLE_W << 9),
     );
 }
@@ -3695,13 +4163,10 @@ fn push_ir_sampler_view_swizzled(
     handle: u32,
     resource_id: u32,
     spec: IrTextureSpec,
+    native_narrow: bool,
     swizzle: u32,
 ) {
-    let format = if spec.format == IrTextureFormat::Depth32Float {
-        VIRGL_FORMAT_Z32_FLOAT
-    } else {
-        VIRGL_FORMAT_B8G8R8A8_UNORM
-    };
+    let format = ir_storage_pipe_format(spec.format, native_narrow);
     let target = if spec.cube {
         4
     } else if spec.array_layers > 1 {
@@ -3838,6 +4303,8 @@ fn push_mip_blit(
     source: crate::driver::IrRect,
     filter: IrFilterMode,
     flips: [bool; 2],
+    source_format: u32,
+    destination_format: u32,
 ) {
     push_dword(commands, command_header(VIRGL_CCMD_BLIT, 0, 21));
     // PIPE_MASK_RGBA (not PIPE_CLEAR_COLOR0), image filter, no scissor.
@@ -3847,7 +4314,7 @@ fn push_mip_blit(
     for word in [
         destination_resource,
         destination_level,
-        VIRGL_FORMAT_B8G8R8A8_UNORM,
+        destination_format,
         destination.x,
         destination.y,
         0,
@@ -3856,7 +4323,7 @@ fn push_mip_blit(
         1,
         source_resource,
         source_level,
-        VIRGL_FORMAT_B8G8R8A8_UNORM,
+        source_format,
         source.x + if flips[0] { source.width } else { 0 },
         source.y + if flips[1] { source.height } else { 0 },
         0,
@@ -4163,23 +4630,29 @@ fn push_programmable_vertex_elements(
     for location in 0..count {
         // Shader IN numbers correspond to locations, independently of the
         // application's attribute order. Fill unused holes with a valid fetch.
-        let (slot, _layout, attribute) = attributes
+        let (slot, layout, attribute) = attributes
             .iter()
             .find(|(_, _, attribute)| attribute.location() == location)
             .or_else(|| attributes.first())
             .ok_or(HandleError::InvalidParameter)?;
         push_dword(commands, attribute.offset());
-        push_dword(commands, 0);
+        push_dword(
+            commands,
+            u32::from(layout.step_mode() == crate::ir::VertexStepMode::Instance),
+        );
         push_dword(commands, *slot as u32);
         push_dword(
             commands,
             match attribute.format() {
+                crate::ir::VertexFormat::Float32 => VIRGL_FORMAT_R32_FLOAT,
                 crate::ir::VertexFormat::Float32x2 => VIRGL_FORMAT_R32G32_FLOAT,
                 crate::ir::VertexFormat::Float32x3 => VIRGL_FORMAT_R32G32B32_FLOAT,
                 crate::ir::VertexFormat::Float32x4 => VIRGL_FORMAT_R32G32B32A32_FLOAT,
                 crate::ir::VertexFormat::Unorm8x4 => VIRGL_FORMAT_R8G8B8A8_UNORM,
                 crate::ir::VertexFormat::Sint32 => 197,
                 crate::ir::VertexFormat::Uint32 => 193,
+                // VIRGL_FORMAT_R16G16_UINT from the shared VirGL protocol.
+                crate::ir::VertexFormat::Uint16x2 => 186,
                 crate::ir::VertexFormat::Sint16x4 => 192,
                 crate::ir::VertexFormat::Float16x2 => 92,
                 crate::ir::VertexFormat::Float16x4 => 94,
@@ -4634,6 +5107,8 @@ fn push_ir_sampler(commands: &mut Vec<u8>, sampler: &IrSampler) {
     push_float(commands, 0.0);
     push_float(commands, state.min_lod);
     push_float(commands, state.max_lod);
+    // The portable ClampToBorder mode means transparent black. VirGL's
+    // four border-color words are the IEEE float/integer zero components.
     for _ in 0..4 {
         push_dword(commands, 0);
     }
@@ -4919,9 +5394,10 @@ fn submit_ir_texture_inline_write(
         .filter(|bytes| *bytes >= 4)
         .ok_or(HandleError::InvalidParameter)?;
     let rect = upload.destination;
+    let bytes_per_texel = upload.storage_format.bytes_per_texel();
     let row_bytes = usize::try_from(rect.width)
         .ok()
-        .and_then(|width| width.checked_mul(4))
+        .and_then(|width| width.checked_mul(bytes_per_texel))
         .ok_or(HandleError::InvalidParameter)?;
     let byte_len = row_bytes
         .checked_mul(rect.height as usize)
@@ -4936,6 +5412,12 @@ fn submit_ir_texture_inline_write(
             (upload.texture.height >> upload.mip_level).max(1),
         )
         || upload.texture.format == IrTextureFormat::Depth32Float
+        || !matches!(
+            upload.storage_format,
+            IrTextureFormat::Bgra8 | IrTextureFormat::R8 | IrTextureFormat::Rg8
+        )
+        || upload.storage_format != IrTextureFormat::Bgra8
+            && upload.storage_format != upload.texture.format
         || upload.pixels.len() != byte_len
     {
         return Err(HandleError::InvalidParameter);
@@ -4943,7 +5425,7 @@ fn submit_ir_texture_inline_write(
 
     let mut commands = Vec::new();
     commands
-        .try_reserve_exact(FIXED_BYTES + max_payload.min(byte_len))
+        .try_reserve_exact(FIXED_BYTES + ((max_payload.min(byte_len) + 3) & !3))
         .map_err(|_| HandleError::OutOfResources)?;
     let mut y = 0;
     while y < rect.height {
@@ -4956,10 +5438,11 @@ fn submit_ir_texture_inline_write(
         };
         let mut x = 0;
         while x < rect.width {
-            let width = (rect.width - x).min((max_payload / 4) as u32);
-            let stride = width * 4;
+            let width = (rect.width - x).min((max_payload / bytes_per_texel) as u32);
+            let stride = width * bytes_per_texel as u32;
             let length = stride as usize * rows as usize;
-            let start = y as usize * row_bytes + x as usize * 4;
+            let padded_length = (length + 3) & !3;
+            let start = y as usize * row_bytes + x as usize * bytes_per_texel;
             let pixels = upload
                 .pixels
                 .get(start..start + length)
@@ -4970,7 +5453,7 @@ fn submit_ir_texture_inline_write(
                 command_header(
                     VIRGL_CCMD_RESOURCE_INLINE_WRITE,
                     0,
-                    11 + (length / 4) as u32,
+                    11 + (padded_length / 4) as u32,
                 ),
             );
             push_dword(&mut commands, resource_id);
@@ -4985,6 +5468,9 @@ fn submit_ir_texture_inline_write(
             push_dword(&mut commands, rows);
             push_dword(&mut commands, 1);
             commands.extend_from_slice(pixels);
+            // VirGL packet lengths are dwords; the transfer's row/layer
+            // strides remain bytes. Only the packet tail is padded.
+            commands.resize(FIXED_BYTES + padded_length, 0);
             submit(&commands)?;
             x += width;
         }
@@ -5022,6 +5508,10 @@ fn ir_blend_factor(factor: IrBlendFactor) -> u32 {
         IrBlendFactor::OneMinusSourceAlpha => PIPE_BLENDFACTOR_INV_SRC_ALPHA,
         IrBlendFactor::DestinationAlpha => PIPE_BLENDFACTOR_DST_ALPHA,
         IrBlendFactor::OneMinusDestinationAlpha => PIPE_BLENDFACTOR_INV_DST_ALPHA,
+        IrBlendFactor::SourceColor => PIPE_BLENDFACTOR_SRC_COLOR,
+        IrBlendFactor::OneMinusSourceColor => PIPE_BLENDFACTOR_INV_SRC_COLOR,
+        IrBlendFactor::DestinationColor => PIPE_BLENDFACTOR_DST_COLOR,
+        IrBlendFactor::OneMinusDestinationColor => PIPE_BLENDFACTOR_INV_DST_COLOR,
     }
 }
 
@@ -5058,6 +5548,7 @@ fn ir_address_mode(address: IrAddressMode) -> u32 {
         IrAddressMode::ClampToEdge => PIPE_TEX_WRAP_CLAMP_TO_EDGE,
         IrAddressMode::Repeat => PIPE_TEX_WRAP_REPEAT,
         IrAddressMode::MirrorRepeat => PIPE_TEX_WRAP_MIRROR_REPEAT,
+        IrAddressMode::ClampToBorder => PIPE_TEX_WRAP_CLAMP_TO_BORDER,
     }
 }
 
@@ -5248,6 +5739,10 @@ fn push_instanced_draw_parameters(
             PIPE_PRIM_TRIANGLE_STRIP
         }
         crate::ir::PrimitiveTopology::TriangleFan if vertex_count >= 3 => PIPE_PRIM_TRIANGLE_FAN,
+        crate::ir::PrimitiveTopology::LineList if vertex_count > 0 && vertex_count % 2 == 0 => {
+            PIPE_PRIM_LINES
+        }
+        crate::ir::PrimitiveTopology::LineStrip if vertex_count >= 2 => PIPE_PRIM_LINE_STRIP,
         _ => return Err(HandleError::InvalidParameter),
     };
     push_dword(commands, command_header(VIRGL_CCMD_DRAW_VBO, 0, 12));
@@ -5403,6 +5898,203 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 mod tests {
     use super::*;
 
+    #[cfg(feature = "backend-abi")]
+    #[test]
+    fn idle_poll_without_dispatch_state_rejects_uncertain_cleanup() {
+        let scheduler = Rc::new(RefCell::new(None));
+        let cleanup_failed = Cell::new(false);
+        assert!(poll_scheduled(&scheduler, &cleanup_failed).unwrap());
+        cleanup_failed.set(true);
+        assert!(matches!(
+            poll_scheduled(&scheduler, &cleanup_failed),
+            Err(HandleError::SystemError(-1))
+        ));
+        assert!(scheduler.borrow().is_none());
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn programmable_retirement_destroys_both_stage_and_fixed_state_objects_once() {
+        let module = crate::ir::ShaderModuleDesc::wgsl("@vertex fn v() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0,0.0,0.0,1.0); } @fragment fn f() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }".into()).unwrap();
+        let description = Rc::new(IrProgrammablePipeline {
+            slot: 17,
+            vertex: sgfx_codegen_virgl::programmable::compile_shader(
+                &module,
+                crate::ir::ShaderStage::Vertex,
+                "v",
+            )
+            .unwrap(),
+            fragment: sgfx_codegen_virgl::programmable::compile_shader(
+                &module,
+                crate::ir::ShaderStage::Fragment,
+                "f",
+            )
+            .unwrap(),
+            vertex_buffers: Vec::new(),
+            topology: crate::ir::PrimitiveTopology::TriangleList,
+        });
+        let pipeline = IrNativeProgrammablePipeline {
+            description,
+            vertex_shader_handle: 11,
+            fragment_shader_handle: 12,
+            vertex_elements_handle: 13,
+            initialized: Cell::new(false),
+        };
+        let replace = IrBlendComponent {
+            source_factor: IrBlendFactor::One,
+            destination_factor: IrBlendFactor::Zero,
+            operation: IrBlendOp::Add,
+        };
+        let state = IrPipeline {
+            blend_handle: 21,
+            rasterizer_handle: 22,
+            dsa_handle: Some(23),
+            initialized: Cell::new(false),
+            state: IrPipelineState {
+                slot: 17 + IR_PROGRAMMABLE_PIPELINE_SLOTS,
+                fragment: IrFragmentProgram::Solid,
+                blend: IrBlendState {
+                    color: replace,
+                    alpha: replace,
+                },
+                color_write_mask: 0xf,
+                additional_color_blends: [None; 7],
+                cull_mode: IrCullMode::None,
+                front_face: IrFrontFace::CounterClockwise,
+                depth: None,
+            },
+        };
+        assert!(
+            programmable_retirement_objects(Some(&pipeline), Some(&state))
+                .iter()
+                .all(Option::is_none)
+        );
+        pipeline.initialized.set(true);
+        state.initialized.set(true);
+        let expected = vec![
+            (VIRGL_OBJECT_SHADER, 11),
+            (VIRGL_OBJECT_SHADER, 12),
+            (VIRGL_OBJECT_VERTEX_ELEMENTS, 13),
+            (VIRGL_OBJECT_BLEND, 21),
+            (VIRGL_OBJECT_RASTERIZER, 22),
+            (VIRGL_OBJECT_DSA, 23),
+        ];
+        let objects = programmable_retirement_objects(Some(&pipeline), Some(&state));
+        assert_eq!(objects.into_iter().flatten().collect::<Vec<_>>(), expected);
+        let mut destroyed = Vec::new();
+        encode_retirement_objects(1024, objects.into_iter().flatten(), |commands| {
+            let words = dwords(commands);
+            let mut offset = 0;
+            while offset < words.len() {
+                let header = words[offset];
+                if header & 255 == VIRGL_CCMD_DESTROY_OBJECT {
+                    destroyed.push(((header >> 8) & 255, words[offset + 1]));
+                }
+                offset += 1 + (header >> 16) as usize;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(destroyed, expected);
+        // Preparing retirement does not discard ownership before the fenced
+        // caller succeeds; a submission failure must retain and poison it.
+        assert!(pipeline.initialized.get() && state.initialized.get());
+    }
+
+    #[test]
+    fn resource_teardown_packets_are_bounded_and_destroy_each_object_once() {
+        let mut destroyed = Vec::new();
+        let mut packets = 0;
+        encode_retirement_objects(
+            1024,
+            (100..10_100).map(|id| (VIRGL_OBJECT_SHADER, id)),
+            |commands| {
+                assert!(commands.len() <= 1024);
+                packets += 1;
+                let words = dwords(commands);
+                let mut offset = 0;
+                while offset < words.len() {
+                    let header = words[offset];
+                    if header & 255 == VIRGL_CCMD_DESTROY_OBJECT {
+                        assert_eq!((header >> 8) & 255, VIRGL_OBJECT_SHADER);
+                        destroyed.push(words[offset + 1]);
+                    }
+                    offset += 1 + (header >> 16) as usize;
+                }
+                assert_eq!(offset, words.len());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(packets > 1);
+        assert_eq!(destroyed, (100..10_100).collect::<Vec<_>>());
+        let mut calls = 0;
+        assert!(
+            encode_retirement_objects(
+                1024,
+                (100..10_100).map(|id| (VIRGL_OBJECT_SHADER, id)),
+                |_| {
+                    calls += 1;
+                    if calls == 2 {
+                        Err(HandleError::SystemError(-1))
+                    } else {
+                        Ok(())
+                    }
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            calls, 2,
+            "do not submit another cleanup packet after an uncertain failure"
+        );
+    }
+
+    #[test]
+    fn mapped_import_retirement_destroys_the_owned_ir_view_and_preserves_borrowed_surface() {
+        let mapped = MappedIrTexture {
+            resource_id: 77,
+            width: 2196,
+            height: 1282,
+            sampler_view_handle: 123,
+            sampler_view_initialized: Cell::new(false),
+            surface_handle: 124,
+            surface_initialized: Cell::new(true),
+        };
+        assert!(
+            mapped_texture_retirement_commands(&mapped)
+                .unwrap()
+                .is_none()
+        );
+        mapped.sampler_view_initialized.set(true);
+        let commands = mapped_texture_retirement_commands(&mapped)
+            .unwrap()
+            .unwrap();
+        let words = dwords(&commands);
+        let mut offset = 0;
+        let mut unbound_stages = Vec::new();
+        let mut destroyed = Vec::new();
+        while offset < words.len() {
+            let header = words[offset];
+            let payload = &words[offset + 1..offset + 1 + (header >> 16) as usize];
+            if header & 255 == VIRGL_CCMD_SET_SAMPLER_VIEWS {
+                assert!(destroyed.is_empty());
+                assert!(payload[2..].iter().all(|word| *word == 0));
+                unbound_stages.push(payload[0]);
+            } else if header & 255 == VIRGL_CCMD_DESTROY_OBJECT {
+                assert_eq!(unbound_stages, [PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT]);
+                destroyed.push(((header >> 8) & 255, payload[0]));
+            }
+            offset += 1 + (header >> 16) as usize;
+        }
+        assert_eq!(offset, words.len());
+        assert_eq!(destroyed, [(VIRGL_OBJECT_SAMPLER_VIEW, 123)]);
+        // Successful queue completion and mapping removal are performed by the
+        // caller; preparing a retirement must not lose ownership on failure.
+        assert!(mapped.sampler_view_initialized.get());
+        assert!(mapped.surface_initialized.get());
+    }
+
     #[test]
     fn retirement_unbinds_renderer_resource_references_before_destroying_views() {
         let mut commands = Vec::new();
@@ -5479,6 +6171,73 @@ mod tests {
             ir_buffer_upload_range(Some(8), 9, 4096, None).unwrap(),
             0..4096
         );
+    }
+
+    #[test]
+    fn transparent_border_sampler_uses_native_wrap_and_zero_rgba() {
+        let sampler = IrSampler {
+            handle: 23,
+            initialized: Cell::new(false),
+            state: IrSamplerState {
+                slot: 0,
+                min_filter: IrFilterMode::Linear,
+                mag_filter: IrFilterMode::Linear,
+                mip_filter: IrFilterMode::Nearest,
+                address_u: IrAddressMode::ClampToBorder,
+                address_v: IrAddressMode::ClampToBorder,
+                min_lod: 0.0,
+                max_lod: 1000.0,
+                compare: None,
+            },
+        };
+        let mut bytes = Vec::new();
+        push_ir_sampler(&mut bytes, &sampler);
+        let words = dwords(&bytes);
+        assert_eq!(words.len(), 10);
+        assert_eq!(
+            words[0],
+            command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_STATE, 9)
+        );
+        assert_eq!(words[2] & 7, 3); // Gallium PIPE_TEX_WRAP_CLAMP_TO_BORDER.
+        assert_eq!((words[2] >> 3) & 7, 3);
+        assert_eq!(&words[6..10], &[0, 0, 0, 0]);
+        assert_eq!(f32::from_bits(words[5]), 1000.0);
+    }
+
+    #[test]
+    fn color_blend_factors_use_exact_gallium_tokens_and_reverse_subtract() {
+        // Protocol token values from Gallium p_defines.h, not IR enum ordinals.
+        for (factor, token) in [
+            (IrBlendFactor::SourceColor, 2),
+            (IrBlendFactor::OneMinusSourceColor, 18),
+            (IrBlendFactor::DestinationColor, 5),
+            (IrBlendFactor::OneMinusDestinationColor, 21),
+        ] {
+            let blend = IrBlendState {
+                color: crate::driver::IrBlendComponent {
+                    source_factor: factor,
+                    destination_factor: IrBlendFactor::One,
+                    operation: IrBlendOp::ReverseSubtract,
+                },
+                alpha: crate::driver::IrBlendComponent {
+                    source_factor: IrBlendFactor::DestinationAlpha,
+                    destination_factor: IrBlendFactor::One,
+                    operation: IrBlendOp::ReverseSubtract,
+                },
+            };
+            let word = ir_blend_target(blend, 0xf);
+            assert_eq!((word >> VIRGL_BLEND_RGB_SRC_FACTOR_SHIFT) & 0x1f, token);
+            assert_eq!((word >> VIRGL_BLEND_RGB_DST_FACTOR_SHIFT) & 0x1f, 1);
+            assert_eq!((word >> 1) & 7, 2);
+            assert_eq!((word >> 14) & 7, 2);
+            assert_eq!((word >> VIRGL_BLEND_ALPHA_SRC_FACTOR_SHIFT) & 0x1f, 4);
+            assert_eq!((word >> VIRGL_BLEND_ALPHA_DST_FACTOR_SHIFT) & 0x1f, 1);
+            assert_eq!((word >> VIRGL_BLEND_COLORMASK_SHIFT) & 0xf, 0xf);
+            assert!(!ir_blend_factors_equal(
+                factor,
+                IrBlendFactor::DestinationAlpha
+            ));
+        }
     }
 
     fn dwords(bytes: &[u8]) -> Vec<u32> {
@@ -5604,6 +6363,8 @@ mod tests {
             rect(7, 3),
             IrFilterMode::Linear,
             [false; 2],
+            VIRGL_FORMAT_B8G8R8A8_UNORM,
+            VIRGL_FORMAT_B8G8R8A8_UNORM,
         );
         let words = dwords(&commands);
         assert_eq!(
@@ -5636,6 +6397,46 @@ mod tests {
         commands.clear();
         push_sampler_mip_view(&mut commands, 9, 7, 4);
         assert_eq!(dwords(&commands)[5], 3 << 8);
+    }
+
+    #[test]
+    fn lines_use_native_primitive_tokens_with_exact_ranges() {
+        for (topology, token, valid, invalid) in [
+            (crate::ir::PrimitiveTopology::LineList, 1, 4, 3),
+            (crate::ir::PrimitiveTopology::LineStrip, 3, 3, 1),
+        ] {
+            for indexed in [false, true] {
+                let mut commands = Vec::new();
+                push_draw_topology_parameters(&mut commands, 2, valid, indexed, -3, topology)
+                    .unwrap();
+                assert_eq!(
+                    &dwords(&commands)[1..7],
+                    &[
+                        2,
+                        valid as u32,
+                        token,
+                        u32::from(indexed),
+                        1,
+                        (-3i32) as u32
+                    ]
+                );
+                for count in [0, invalid] {
+                    commands.clear();
+                    assert_eq!(
+                        push_draw_topology_parameters(
+                            &mut commands,
+                            0,
+                            count,
+                            indexed,
+                            0,
+                            topology
+                        ),
+                        Err(HandleError::InvalidParameter)
+                    );
+                    assert!(commands.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
@@ -6231,6 +7032,7 @@ mod tests {
     #[test]
     fn ir_mrt_packets_bind_two_surfaces_and_independent_color_masks() {
         let extra = [IrPassColorTarget {
+            format: VIRGL_FORMAT_B8G8R8A8_UNORM,
             surface_handle: 22,
             resource_id: 23,
             surface_initialized: false,
@@ -6433,12 +7235,12 @@ mod tests {
         upload.texture.mip_levels = 3;
         upload.array_layer = 5;
         let mut commands = Vec::new();
-        push_ir_sampler_view(&mut commands, 9, 7, upload.texture);
+        push_ir_sampler_view(&mut commands, 9, 7, upload.texture, false);
         assert_eq!(&dwords(&commands)[3..6], &[1 | (4 << 24), 5 << 16, 2 << 8]);
         upload.texture.cube = false;
         upload.texture.format = IrTextureFormat::Depth32Float;
         commands.clear();
-        push_ir_sampler_view(&mut commands, 9, 7, upload.texture);
+        push_ir_sampler_view(&mut commands, 9, 7, upload.texture, false);
         assert_eq!(dwords(&commands)[3], VIRGL_FORMAT_Z32_FLOAT | (7 << 24));
         upload.texture.format = IrTextureFormat::Bgra8;
         submit_ir_texture_inline_write(7, &upload, 128, |packet| {
@@ -6456,6 +7258,49 @@ mod tests {
     }
 
     #[test]
+    fn instance_vertex_elements_use_divisor_one_only_for_instance_bindings() {
+        use crate::ir::{VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
+        let layouts = [
+            VertexBufferLayout::new(
+                8,
+                alloc::vec![VertexAttribute::new(0, VertexFormat::Float32x2, 0)],
+            )
+            .unwrap(),
+            VertexBufferLayout::new(
+                12,
+                alloc::vec![
+                    VertexAttribute::new(1, VertexFormat::Float32x2, 0),
+                    VertexAttribute::new(2, VertexFormat::Float32, 8)
+                ],
+            )
+            .unwrap()
+            .with_step_mode(VertexStepMode::Instance),
+        ];
+        let mut commands = Vec::new();
+        push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
+        assert_eq!(
+            &dwords(&commands)[2..],
+            &[0, 0, 0, 29, 0, 1, 1, 29, 8, 1, 1, 28]
+        );
+    }
+
+    #[test]
+    fn programmable_scalar_coverage_keeps_r32_fetch_at_offset_eight() {
+        use crate::ir::{VertexAttribute, VertexBufferLayout, VertexFormat};
+        let layout = VertexBufferLayout::new(
+            12,
+            alloc::vec![
+                VertexAttribute::new(0, VertexFormat::Float32x2, 0),
+                VertexAttribute::new(1, VertexFormat::Float32, 8),
+            ],
+        )
+        .unwrap();
+        let mut commands = Vec::new();
+        push_programmable_vertex_elements(&mut commands, 9, &[layout]).unwrap();
+        assert_eq!(&dwords(&commands)[2..], &[0, 0, 0, 29, 8, 0, 0, 28]);
+    }
+
+    #[test]
     fn programmable_vertex_elements_keep_integer_and_half_inputs_in_separate_buffers() {
         use crate::ir::{VertexAttribute, VertexBufferLayout, VertexFormat};
         let layouts = [
@@ -6465,10 +7310,11 @@ mod tests {
             )
             .unwrap(),
             VertexBufferLayout::new(
-                12,
+                16,
                 alloc::vec![
                     VertexAttribute::new(1, VertexFormat::Sint16x4, 0),
                     VertexAttribute::new(2, VertexFormat::Float16x2, 8),
+                    VertexAttribute::new(3, VertexFormat::Uint16x2, 12),
                 ],
             )
             .unwrap(),
@@ -6477,7 +7323,7 @@ mod tests {
         push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
         assert_eq!(
             &dwords(&commands)[2..],
-            &[0, 0, 0, 193, 0, 0, 1, 192, 8, 0, 1, 92]
+            &[0, 0, 0, 193, 0, 0, 1, 192, 8, 0, 1, 92, 12, 0, 1, 186]
         );
     }
 
@@ -6531,6 +7377,7 @@ mod tests {
             },
             mip_level: 0,
             array_layer: 0,
+            storage_format: IrTextureFormat::Bgra8,
             destination: crate::driver::IrRect {
                 x: 3,
                 y: 5,
@@ -6542,7 +7389,8 @@ mod tests {
     }
 
     fn check_upload_chunks(upload: &IrTextureUpload, limit: usize) -> Vec<(u32, u32, u32, u32)> {
-        let mut covered = alloc::vec![false; upload.pixels.len() / 4];
+        let bpp = upload.storage_format.bytes_per_texel();
+        let mut covered = alloc::vec![false; upload.pixels.len() / bpp];
         let mut rectangles = Vec::new();
         submit_ir_texture_inline_write(17, upload, limit, |commands| {
             assert!(commands.len() <= limit);
@@ -6551,8 +7399,11 @@ mod tests {
             assert_eq!(words[0] >> 16, words.len() as u32 - 1);
             assert_eq!(words[1], 17);
             let (x, y, width, height) = (words[6] - 3, words[7] - 5, words[9], words[10]);
-            assert_eq!(words[4], width * 4);
-            assert_eq!(words[5], width * height * 4);
+            assert_eq!(words[4], width * bpp as u32);
+            assert_eq!(words[5], width * height * bpp as u32);
+            let data_end = 48 + words[5] as usize;
+            assert!(commands[data_end..].iter().all(|byte| *byte == 0));
+            assert_eq!(commands.len(), (data_end + 3) & !3);
             assert_eq!(words[8], 0);
             assert_eq!(words[11], 1);
             for row in 0..height {
@@ -6560,10 +7411,10 @@ mod tests {
                     let source = ((y + row) * upload.destination.width + x + column) as usize;
                     assert!(!covered[source], "a pixel must be uploaded exactly once");
                     covered[source] = true;
-                    let packet = 48 + ((row * width + column) * 4) as usize;
+                    let packet = 48 + (row * width + column) as usize * bpp;
                     assert_eq!(
-                        &commands[packet..packet + 4],
-                        &upload.pixels[source * 4..source * 4 + 4]
+                        &commands[packet..packet + bpp],
+                        &upload.pixels[source * bpp..source * bpp + bpp]
                     );
                 }
             }
@@ -6573,6 +7424,105 @@ mod tests {
         .unwrap();
         assert!(covered.into_iter().all(|pixel| pixel));
         rectangles
+    }
+
+    fn narrow_upload(format: IrTextureFormat, width: u32, height: u32) -> IrTextureUpload {
+        let mut upload = texture_upload(width, height);
+        upload.texture.format = format;
+        upload.storage_format = format;
+        upload.pixels = (0..width as usize * height as usize * format.bytes_per_texel())
+            .map(|index| (index * 37 + index / 251) as u8)
+            .collect();
+        upload
+    }
+
+    #[test]
+    fn native_narrow_inline_upload_uses_byte_strides_and_only_packet_tail_padding() {
+        for format in [IrTextureFormat::R8, IrTextureFormat::Rg8] {
+            for limit in [52, 55, 60, 64, 72] {
+                check_upload_chunks(&narrow_upload(format, 7, 5), limit);
+            }
+            let mut upload = narrow_upload(format, 7, 5);
+            upload.texture.mip_levels = 2;
+            upload.texture.width *= 2;
+            upload.texture.height *= 2;
+            upload.texture.array_layers = 3;
+            upload.mip_level = 1;
+            upload.array_layer = 2;
+            submit_ir_texture_inline_write(17, &upload, 128, |commands| {
+                let words = dwords(commands);
+                assert_eq!((words[2], words[8]), (1, 2));
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_nv12_planes_reduce_inline_transport_without_changing_any_byte() {
+        let y = narrow_upload(IrTextureFormat::R8, 854, 480);
+        let uv = narrow_upload(IrTextureFormat::Rg8, 427, 240);
+        assert_eq!(y.pixels.len() + uv.pixels.len(), 614_880);
+        assert_eq!(check_upload_chunks(&y, 65_536).len(), 7);
+        assert_eq!(check_upload_chunks(&uv, 65_536).len(), 4);
+        assert_eq!(
+            check_upload_chunks(&texture_upload(854, 480), 65_536).len(),
+            26
+        );
+        assert_eq!(
+            check_upload_chunks(&texture_upload(427, 240), 65_536).len(),
+            7
+        );
+    }
+
+    #[test]
+    fn native_narrow_views_surfaces_and_mip_blits_use_one_physical_format() {
+        for (logical, pipe_format) in [(IrTextureFormat::R8, 64), (IrTextureFormat::Rg8, 65)] {
+            let spec = narrow_upload(logical, 7, 5).texture;
+            for native in [false, true] {
+                let format = ir_storage_pipe_format(logical, native);
+                assert_eq!(format, if native { pipe_format } else { 1 });
+                let mut commands = Vec::new();
+                let swizzle = PIPE_SWIZZLE_X
+                    | (if logical == IrTextureFormat::Rg8 {
+                        PIPE_SWIZZLE_Y
+                    } else {
+                        4
+                    } << 3)
+                    | (4 << 6)
+                    | (5 << 9);
+                push_ir_sampler_view_swizzled(&mut commands, 9, 17, spec, native, swizzle);
+                assert_eq!(dwords(&commands)[3], format | (2 << 24));
+                assert_eq!(dwords(&commands)[6], swizzle);
+                commands.clear();
+                push_surface_with_format(&mut commands, 11, 17, format);
+                assert_eq!(dwords(&commands)[3], format);
+                commands.clear();
+                let rect = crate::driver::IrRect {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 1,
+                };
+                push_mip_blit(
+                    &mut commands,
+                    17,
+                    1,
+                    rect,
+                    19,
+                    0,
+                    rect,
+                    IrFilterMode::Linear,
+                    [false; 2],
+                    format,
+                    format,
+                );
+                assert_eq!(
+                    (dwords(&commands)[6], dwords(&commands)[15]),
+                    (format, format)
+                );
+            }
+        }
     }
 
     #[test]

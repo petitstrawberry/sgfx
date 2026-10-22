@@ -3,9 +3,12 @@
 `vulkan-sgfx` is a loader-discoverable, **non-conformant development ICD**. It
 implements a bounded executable subset to exercise Vulkan → SGFX portable IR →
 backend execution, macOS presentation through Metal, and Linux ABI presentation
-through Scarlet SWS with `VK_KHR_display` and `VK_KHR_wayland_surface`. Its manifest and
-physical device use the Vulkan 1.0 ABI version. This is not a claim of Vulkan
-1.0 conformance: substantial mandatory core functionality is absent. Do not
+through Scarlet SWS with `VK_KHR_display` and `VK_KHR_wayland_surface`. The native
+Scarlet VirGL adapter additionally exposes the Vulkan 1.1 entry-point ABI used
+by Ganesh: memory requirements2/bind memory2, maintenance queries, core
+properties2 aliases, single-device groups and queue2. Other adapters continue
+to report Vulkan 1.0. Neither version is a conformance claim: substantial
+mandatory core functionality is absent. Do not
 select it as a general application driver. Cross-platform WSI, resource
 reclamation with long-lived objects, broader API coverage and conformance work
 remain incomplete.
@@ -114,6 +117,14 @@ need to be replaced by a reusable canonical owned program and generational
 resource identities. Image-to-buffer copies currently split SGFX submissions
 and use backend image readback followed by an ordered buffer write.
 
+Resolved recordings are consumed when building the final submission stream.
+Texture and buffer upload vectors move into that stream without a second
+payload allocation/copy; application-owned staging memory is still snapshotted
+during resolution. Descriptor buffer references are collected and sorted once
+before deduplication, avoiding a growing linear search for each reference.
+Validation, positioned descriptor/barrier/readback insertions, and completion
+ownership are unchanged.
+
 All `Rc`-backed core/backend state stays on one dedicated device worker. Vulkan
 callers record commands without a worker round trip; resource creation,
 submit-time resolution, and backend queue access use the worker. No `unsafe
@@ -126,6 +137,15 @@ observer thread per Vulkan device waits on owned SGFX receipts, signals the
 fence, and retires in-flight work. GPU acceptance and retirement errors do not
 manufacture successful completion; uncertain backend failures mark the device
 lost.
+
+Texture-transfer-only recordings above 8 MiB are validated in full, then admitted
+as ordered batches with at most 8 MiB of source pixels each. Large individual
+uploads are divided at row boundaries, preserving subrectangles, mip levels,
+array layers and overwrite order. Texture barriers, copies and mip blits retain
+their position between uploads. Every batch receipt participates in fence
+completion and readback waits. A failure after an accepted prefix drains its
+receipts and marks the device lost; the prefix is never replayed. Mixed
+render/transfer recordings retain their existing whole-recording path.
 
 Commands that require the current CPU-shadow path remain synchronous. In
 particular, image-to-buffer copy waits for image completion and performs backend
@@ -297,7 +317,7 @@ and verify the chosen Mesa driver. The Linux check also used
   A test creates/destroys 1250 buffers on an otherwise idle device, then performs
   real compute work. With long-lived pipelines/resources, unique transient
   resources and descriptor configurations still consume that epoch's table
-  budget (including 1024 buffers and 4096 bind-group configurations). Identical
+  budget (including 4096 buffers, 4096 memory allocations and 4096 bind-group configurations). Identical
   descriptor configurations reuse definitions and physical groups; GPU image
   remapping invalidates physical groups. Exhaustion returns an allocation
   error. General reclamation requires generational core/backend slots or a safe
@@ -338,3 +358,65 @@ and [dispatchable-object layout](https://github.com/KhronosGroup/Vulkan-Headers/
 Descriptor invalidation is specified by
 [`vkUpdateDescriptorSets`](https://docs.vulkan.org/refpages/latest/refpages/source/vkUpdateDescriptorSets.html).
 The Vulkan API version alone does not define an optional arbitrary subset.
+
+## Skia Vulkan ABI work
+
+The memory2 entry points use the same allocation, ownership, range and alignment
+checks as the original API. Requirements queries preserve output chains and
+write false dedicated-allocation requirements. Sparse queries report zero;
+YCbCr creation returns `ERROR_FEATURE_NOT_PRESENT`. Disabled Vulkan 1.1 feature
+records can accompany device creation, but nonzero unsupported features are
+rejected. Layout-support queries share creation's pure validation and do not
+allocate temporary layouts. Core properties2 queries require a 1.1 instance;
+KHR names retain their earlier behavior.
+
+The memory2 GPU integration contract binds real buffer/image allocations,
+clears an RGBA image on the GPU, copies it to a mapped buffer and verifies all
+16 red pixels. It also checks matching legacy/new requirements and supported
+versus rejected descriptor layouts. Both ignored queue-family indices and
+explicit family `0 -> 0` are tested for image and buffer barriers. The latter
+must not be interpreted as an ownership transfer. Both GPU contracts passed
+on macOS Metal; all 80 release unit tests passed as well.
+
+On 2026-10-14 the normal Scarlet AArch64 release desktop image passed
+`myrica-vulkan-probe` with HVF, four guest CPUs and `virtio-gpu-gl-pci`. WebKit
+Skia Ganesh created an exported BGRA image, drew white/red/blue regions through
+Vulkan and the native SGFX VirGL backend, checked GPU readback pixels, and
+released the context, device, loader and image. All three independent lifecycle
+cycles passed with ICD revision `7a62d766818b205fc21a69aae0d72792d4b374aa`
+and WebKit revision `a666d28d0d4b46016bc9dd42edbfafd0ad81ad06`.
+The preceding initialized C++ TLS/Rust TLS/errno isolation check also passed
+across four native threads. The existing native cube's three GPU readback
+cycles passed in the same guest.
+
+These initial tests established Ganesh drawing through the native driver.
+Subsequent native Myrica integration uses WebCore's Skia Vulkan renderer and
+shared BGRA presentation, including native NV12/I420 video composition.
+
+## Queue worker diagnostics and descriptor retirement
+
+`SGFX_VULKAN_CALL_PROFILE=1` reports one-second API queue/service timings and
+the six most expensive operations. Nested worker phases distinguish command
+resolution, validation, buffer snapshots, IR recording, backend submission,
+readback and descriptor retirement. Nested durations overlap the enclosing
+API call; summing them double-counts work. The disabled path reads no clocks.
+
+Transient descriptor groups are retired at the end of a queue packet. Backend
+retirements now see one unchanged resource-table revision; logical identities
+are invalidated after that batch. Interleaving those steps previously caused
+the dynamic backend to resynchronize the entire table for every group.
+Failed groups remain available for retry, while successful groups retire and
+keep their generation checks. Native YouTube profiling identified 150-210ms
+per second in the old retirement path. Unit tests cover a failure between two
+successful releases, an unchanged revision throughout the backend batch,
+retry and repeated slot reuse with immutable submitted descriptor snapshots.
+
+Shader modules have a separate bounded table of 1,024 live entries; compute
+and programmable graphics pipelines each retain their existing 256-entry
+limits. A graphics pipeline can own two distinct shader stages. Several Skia
+contexts share the device table, so a 256-entry shader table could exhaust
+before the graphics-pipeline limit. The R3 metadata importer and retirement
+scanner use the same declared capacities. Released generations remain invalid
+and slots remain reusable. The simultaneous-pipeline contract test retains
+160 graphics pipelines (320 distinct shader modules) while rendering and
+validating their pixels, rather than testing only sequential create/destroy.

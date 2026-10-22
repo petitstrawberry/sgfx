@@ -116,6 +116,8 @@ pub enum UnsupportedFeature {
     /// Indexed strips need explicit restart semantics or a faithful index
     /// conversion. WGPU's implicit restart must not reinterpret ordinary indices.
     IndexedTriangleStrip,
+    /// Indexed line strips also require a faithful conversion of restart indices.
+    IndexedLineStrip,
     /// WGPU has no native triangle-fan topology; conversion is not implemented.
     TriangleFan,
     /// A sampled texture format is incompatible with the selected fragment
@@ -136,6 +138,8 @@ pub enum UnsupportedFeature {
     BindingLimits,
     /// WGPU cannot retain negative LOD clamps when they change min/mag selection.
     SamplerLod,
+    /// This device did not enable native transparent-black clamp-to-border.
+    SamplerBorderColor,
     /// Partial source or destination mip blits need a regional sampling pass.
     PartialBlit,
     /// Signed or zero-height viewports require a different WGPU lowering.
@@ -989,6 +993,18 @@ impl Resources {
         if descriptor.min_lod() < 0.0 && descriptor.min_filter() != descriptor.mag_filter() {
             return Err(Error::Unsupported(UnsupportedFeature::SamplerLod));
         }
+        let border = descriptor.address_u() == AddressMode::ClampToBorder
+            || descriptor.address_v() == AddressMode::ClampToBorder;
+        if border
+            && !self
+                .context
+                .device
+                .raw_device()
+                .features()
+                .contains(raw::Features::ADDRESS_MODE_CLAMP_TO_BORDER)
+        {
+            return Err(Error::Unsupported(UnsupportedFeature::SamplerBorderColor));
+        }
         let sampler = Arc::new(self.context.device.raw_device().create_sampler(
             &raw::SamplerDescriptor {
                 label: Some("sgfx wgpu sampler"),
@@ -1003,6 +1019,7 @@ impl Resources {
                 lod_min_clamp: descriptor.min_lod().clamp(0.0, 32.0),
                 lod_max_clamp: descriptor.max_lod().clamp(0.0, 32.0),
                 compare: descriptor.compare().map(compare_function),
+                border_color: border.then_some(raw::SamplerBorderColor::TransparentBlack),
                 ..raw::SamplerDescriptor::default()
             },
         ));
@@ -1105,6 +1122,11 @@ fn validate_indexed_topologies(commands: &CommandBuffer<'_, '_>) -> Result<()> {
                 if pipeline == Some(ir::PrimitiveTopology::TriangleStrip) =>
             {
                 return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
+            }
+            Command::DrawIndexed { .. } | Command::DrawIndexedInstanced { .. }
+                if pipeline == Some(ir::PrimitiveTopology::LineStrip) =>
+            {
+                return Err(Error::Unsupported(UnsupportedFeature::IndexedLineStrip));
             }
             _ => {}
         }
@@ -1820,6 +1842,9 @@ impl Queue {
             if pipeline.topology == ir::PrimitiveTopology::TriangleStrip {
                 return Err(Error::Unsupported(UnsupportedFeature::IndexedTriangleStrip));
             }
+            if pipeline.topology == ir::PrimitiveTopology::LineStrip {
+                return Err(Error::Unsupported(UnsupportedFeature::IndexedLineStrip));
+            }
             self.prepare_programmable_draw(render_pass, state, pipeline)?;
             let (buffer, offset, format) =
                 state.index_buffer.as_ref().ok_or(Error::InvalidState)?;
@@ -2403,6 +2428,7 @@ fn address_mode(address: AddressMode) -> raw::AddressMode {
         AddressMode::ClampToEdge => raw::AddressMode::ClampToEdge,
         AddressMode::Repeat => raw::AddressMode::Repeat,
         AddressMode::MirrorRepeat => raw::AddressMode::MirrorRepeat,
+        AddressMode::ClampToBorder => raw::AddressMode::ClampToBorder,
     }
 }
 
@@ -2678,6 +2704,7 @@ fn bind_group_entries(texture: bool) -> Vec<raw::BindGroupLayoutEntry> {
 fn raw_vertex_attribute(attribute: &VertexAttribute) -> raw::VertexAttribute {
     raw::VertexAttribute {
         format: match attribute.format() {
+            VertexFormat::Float32 => raw::VertexFormat::Float32,
             VertexFormat::Float32x2 => raw::VertexFormat::Float32x2,
             VertexFormat::Float32x3 => raw::VertexFormat::Float32x3,
             VertexFormat::Float32x4 => raw::VertexFormat::Float32x4,
@@ -2687,6 +2714,7 @@ fn raw_vertex_attribute(attribute: &VertexAttribute) -> raw::VertexAttribute {
             VertexFormat::Float16x2 => raw::VertexFormat::Float16x2,
             VertexFormat::Float16x4 => raw::VertexFormat::Float16x4,
             VertexFormat::Sint16x4 => raw::VertexFormat::Sint16x4,
+            VertexFormat::Uint16x2 => raw::VertexFormat::Uint16x2,
         },
         offset: u64::from(attribute.offset()),
         shader_location: attribute.location(),
@@ -2709,6 +2737,10 @@ fn blend_factor(factor: BlendFactor) -> raw::BlendFactor {
         BlendFactor::OneMinusSourceAlpha => raw::BlendFactor::OneMinusSrcAlpha,
         BlendFactor::DestinationAlpha => raw::BlendFactor::DstAlpha,
         BlendFactor::OneMinusDestinationAlpha => raw::BlendFactor::OneMinusDstAlpha,
+        BlendFactor::SourceColor => raw::BlendFactor::Src,
+        BlendFactor::OneMinusSourceColor => raw::BlendFactor::OneMinusSrc,
+        BlendFactor::DestinationColor => raw::BlendFactor::Dst,
+        BlendFactor::OneMinusDestinationColor => raw::BlendFactor::OneMinusDst,
     }
 }
 
@@ -2844,9 +2876,11 @@ fn find_attribute(attributes: &[VertexAttribute], location: u32) -> Option<Verte
 
 fn wgsl_vertex_type(format: VertexFormat) -> &'static str {
     match format {
+        VertexFormat::Float32 => "f32",
         VertexFormat::Sint32 => "i32",
         VertexFormat::Uint32 | VertexFormat::Snorm10_10_10_2 => "u32",
         VertexFormat::Sint16x4 => "vec4<i32>",
+        VertexFormat::Uint16x2 => "vec2<u32>",
         VertexFormat::Float16x2 | VertexFormat::Float32x2 => "vec2<f32>",
         VertexFormat::Float32x3 => "vec3<f32>",
         VertexFormat::Float16x4 | VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => "vec4<f32>",
@@ -2937,6 +2971,7 @@ mod tests {
     mod completion;
     mod execution;
     mod programmable;
+    mod sampler;
 
     use alloc::rc::Rc;
     use alloc::vec;

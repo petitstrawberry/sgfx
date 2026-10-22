@@ -66,7 +66,15 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
             .table
             .abi_retired_resources(words)
             .map_err(|_| abi::INVALID)?;
-        if (!textures.is_empty() || !buffers.is_empty())
+        let (shaders, compute, render) = r
+            .table
+            .abi_retired_programs(words)
+            .map_err(|_| abi::INVALID)?;
+        if (!textures.is_empty()
+            || !buffers.is_empty()
+            || !shaders.is_empty()
+            || !compute.is_empty()
+            || !render.is_empty())
             && !r.context.is_idle().map_err(handle_error)?
         {
             return Err(abi::BUSY);
@@ -76,6 +84,17 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         }
         for id in buffers {
             r.inner.release_buffer(id).map_err(error)?;
+        }
+        for id in render {
+            r.inner
+                .release_programmable_render_pipeline(id)
+                .map_err(error)?;
+        }
+        for id in compute {
+            r.inner.release_compute_pipeline(id).map_err(error)?;
+        }
+        for id in shaders {
+            r.inner.release_shader_module(id).map_err(error)?;
         }
         match r.table.sync_abi_snapshot(words) {
             Ok((_, revision)) => r.revision = revision,
@@ -124,6 +143,59 @@ unsafe extern "C" fn release_bind_group(p: Object, slot: u32) -> i32 {
         r.inner.release_bind_group(id).map_err(error)
     })())
 }
+unsafe extern "C" fn release_shader_module(p: Object, slot: u32, generation: u64) -> i32 {
+    status((|| {
+        let r = unsafe { object::<Resources>(p) }?;
+        if r.poisoned {
+            return Err(abi::DEVICE_LOST);
+        }
+        let reference = r.table.abi_shader_module(slot).map_err(|_| abi::INVALID)?;
+        if reference.generation() != generation {
+            return Err(abi::INVALID);
+        }
+        r.inner.release_shader_module(reference.id()).map_err(error)
+    })())
+}
+unsafe extern "C" fn release_compute_pipeline(p: Object, slot: u32, generation: u64) -> i32 {
+    status((|| {
+        let r = unsafe { object::<Resources>(p) }?;
+        if r.poisoned {
+            return Err(abi::DEVICE_LOST);
+        }
+        let reference = r
+            .table
+            .abi_compute_pipeline(slot)
+            .map_err(|_| abi::INVALID)?;
+        if reference.generation() != generation {
+            return Err(abi::INVALID);
+        }
+        r.inner
+            .release_compute_pipeline(reference.id())
+            .map_err(error)
+    })())
+}
+unsafe extern "C" fn release_programmable_render_pipeline(
+    p: Object,
+    slot: u32,
+    generation: u64,
+) -> i32 {
+    status((|| {
+        let r = unsafe { object::<Resources>(p) }?;
+        if r.poisoned {
+            return Err(abi::DEVICE_LOST);
+        }
+        let reference = r
+            .table
+            .abi_programmable_render_pipeline(slot)
+            .map_err(|_| abi::INVALID)?;
+        if reference.generation() != generation {
+            return Err(abi::INVALID);
+        }
+        r.inner
+            .release_programmable_render_pipeline(reference.id())
+            .map_err(error)
+    })())
+}
 unsafe extern "C" fn validate(p: Object, kind: u32, slot: u32) -> i32 {
     status((|| {
         let r = unsafe { object::<Resources>(p) }?;
@@ -151,7 +223,10 @@ unsafe extern "C" fn validate(p: Object, kind: u32, slot: u32) -> i32 {
             ),
             _ => return Err(abi::INVALID),
         }
-        .map_err(error)
+        .map_err(|cause| {
+            eprintln!("[SGFX VirGL] resource validation kind={kind} slot={slot}: {cause:?}");
+            error(cause)
+        })
     })())
 }
 unsafe fn output<'a>(ptr: *mut u8, len: usize) -> Result<&'a mut [u8], i32> {
@@ -389,6 +464,33 @@ pub unsafe extern "C" fn sgfx_backend_get_driver_api_v2(
             clone_receipt,
             release_texture,
             release_bind_group,
+        });
+    }
+    abi::OK
+}
+
+/// Negotiate the optional generational program-cache retirement extension.
+/// # Safety
+/// `out` is writable for `size` bytes and objects originate in this DSO.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sgfx_backend_get_program_release_api_v2(
+    version: u32,
+    size: usize,
+    out: *mut abi::ProgramReleaseApi,
+) -> i32 {
+    if version != abi::VERSION || size < core::mem::size_of::<abi::ProgramReleaseApi>() {
+        return abi::ABI_MISMATCH;
+    }
+    if out.is_null() {
+        return abi::INVALID;
+    }
+    unsafe {
+        out.write(abi::ProgramReleaseApi {
+            version: abi::VERSION,
+            size: core::mem::size_of::<abi::ProgramReleaseApi>() as u32,
+            release_shader_module,
+            release_compute_pipeline,
+            release_programmable_render_pipeline,
         });
     }
     abi::OK

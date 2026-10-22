@@ -450,3 +450,106 @@ fn image_creation_and_ir_textures_reject_excessive_dimensions() {
         .create_image(1, 1, TextureFormat::Bgra8Unorm)
         .expect("valid image after rejected dimensions");
 }
+
+#[test]
+fn reduced_state_keeps_draw_colors_clips_and_fresh_pass_bindings_on_gpu() {
+    let _guard = HEADLESS_WGPU_TEST_LOCK.lock().unwrap();
+    let Some(device) = headless_device() else {
+        return;
+    };
+    for abi in [false, true] {
+        let context = device.create_context();
+        let table = Rc::new(ResourceTable::new());
+        if abi {
+            table.enable_abi_commands();
+        }
+        let target = table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    Extent2D::new(4, 4).unwrap(),
+                    TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let buffer = table
+            .define_buffer(
+                BufferDesc::new(24, BufferUsage::VERTEX | BufferUsage::COPY_DST).unwrap(),
+            )
+            .unwrap();
+        let pipeline = table
+            .define_render_pipeline(
+                RenderPipelineDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    PrimitiveTopology::TriangleList,
+                    VertexBufferLayout::new(
+                        8,
+                        vec![ir::VertexAttribute::new(0, ir::VertexFormat::Float32x2, 0)],
+                    )
+                    .unwrap(),
+                    FragmentProgram::Solid,
+                    BlendState::REPLACE,
+                    RasterState::new(ir::CullMode::None, ir::FrontFace::CounterClockwise),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let vertices: Vec<u8> = [-1_f32, -1., 3., -1., -1., 3.]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let mut encoder = CommandEncoder::new(&table);
+        encoder.write_buffer(buffer, 0, &vertices).unwrap();
+        let red = Color::rgba(1., 0., 0., 1.).unwrap();
+        let green = Color::rgba(0., 1., 0., 1.).unwrap();
+        for (load, draws) in [
+            (
+                LoadOp::Clear(Color::rgba(0., 0., 0., 1.).unwrap()),
+                &[(red, 0), (red, 0), (green, 2), (green, 2)][..],
+            ),
+            (LoadOp::Load, &[(red, 0)][..]),
+        ] {
+            let mut pass = encoder
+                .begin_render_pass(
+                    RenderPassDesc::new(
+                        &table,
+                        target,
+                        PixelRect::new(0, 0, 4, 4).unwrap(),
+                        load,
+                        StoreOp::Store,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            for &(color, x) in draws {
+                pass.set_pipeline(pipeline).unwrap();
+                pass.set_vertex_buffer(buffer, 0).unwrap();
+                pass.set_uniforms(DrawUniforms::new(Transform::identity(), color))
+                    .unwrap();
+                pass.set_scissor(Some(PixelRect::new(x, 0, 2, 4).unwrap()))
+                    .unwrap();
+                pass.draw(3, 0).unwrap();
+            }
+            pass.end().unwrap();
+        }
+        let commands = encoder.finish().unwrap();
+        let mut cache = context.create_resources(Rc::clone(&table));
+        context
+            .create_queue()
+            .executor(&mut cache)
+            .execute(&commands)
+            .unwrap();
+        let pixels = cache.read_texture(target.id()).unwrap();
+        for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+            assert_eq!(
+                pixel,
+                if index % 4 < 2 {
+                    &[0, 0, 255, 255]
+                } else {
+                    &[0, 255, 0, 255]
+                }
+            );
+        }
+    }
+}

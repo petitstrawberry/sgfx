@@ -399,6 +399,11 @@ impl OwnedCommandBuffer {
         &self.commands
     }
 
+    /// Consume this recording, returning its unvalidated commands without copying payloads.
+    pub fn into_commands(self) -> Vec<OwnedCommand> {
+        self.commands
+    }
+
     /// Return the number of commands retained by this recording.
     pub const fn command_count(&self) -> usize {
         self.commands.len()

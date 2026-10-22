@@ -9,9 +9,12 @@ use std::{
 };
 
 const LIMIT: usize = 1024;
+// Skia keeps many small uniform/staging allocations alive alongside images.
+// Keep their count separate from metadata limits and from the byte budget.
+pub(crate) const MAX_MEMORY_ALLOCATIONS: usize = 4_096;
 const MAX_DESCRIPTOR_SETS: usize = 16_384;
 const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
-const MAX_ALLOCATED: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_ALLOCATED: usize = 512 * 1024 * 1024;
 pub(crate) struct Buffer {
     pub id: ir::BufferId,
     pub size: u64,
@@ -31,27 +34,56 @@ pub(crate) struct AlignedBytes {
     len: usize,
 }
 impl AlignedBytes {
+    /// GPU image storage lives in the backend. Reserve its logical byte range
+    /// without allocating and clearing a redundant CPU mirror for every image.
+    /// Buffers and explicit mappings materialize the mirror before access.
+    fn unbacked(len: usize) -> Result<Self, vk::Result> {
+        len.checked_add(7)
+            .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+        Ok(Self {
+            words: Vec::new(),
+            len,
+        })
+    }
+    #[cfg(test)]
     pub(crate) fn zeroed(len: usize) -> Result<Self, vk::Result> {
-        let word_count = len
-            .checked_add(7)
-            .ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?
-            / 8;
-        let mut words = Vec::new();
-        words
+        let mut bytes = Self::unbacked(len)?;
+        bytes.materialize()?;
+        Ok(bytes)
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn materialize(&mut self) -> Result<(), vk::Result> {
+        let word_count = self.len.div_ceil(8);
+        if self.words.len() == word_count {
+            return Ok(());
+        }
+        self.words
             .try_reserve_exact(word_count)
             .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
-        words.resize(word_count, 0);
-        Ok(Self { words, len })
+        self.words.resize(word_count, 0);
+        Ok(())
     }
 }
 impl std::ops::Deref for AlignedBytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
+        assert_eq!(
+            self.words.len(),
+            self.len.div_ceil(8),
+            "CPU mirror must be materialized before access"
+        );
         unsafe { slice::from_raw_parts(self.words.as_ptr().cast(), self.len) }
     }
 }
 impl std::ops::DerefMut for AlignedBytes {
     fn deref_mut(&mut self) -> &mut [u8] {
+        assert_eq!(
+            self.words.len(),
+            self.len.div_ceil(8),
+            "CPU mirror must be materialized before access"
+        );
         unsafe { slice::from_raw_parts_mut(self.words.as_mut_ptr().cast(), self.len) }
     }
 }
@@ -59,7 +91,7 @@ pub(crate) struct Memory {
     pub bytes: AlignedBytes,
     pub mapped: bool,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pipeline {
     Compute(ir::ComputePipelineId),
     Graphics(ir::ProgrammableRenderPipelineId),
@@ -207,6 +239,9 @@ pub(crate) struct Resources {
     /// Buffers whose unmapped host allocation has already been staged to SGFX.
     pub uploaded_unmapped_buffers: HashSet<vk::Buffer>,
     pub shaders: HashMap<vk::ShaderModule, Shader>,
+    // Destroying VkShaderModule must not retire modules still referenced by a
+    // live VkPipeline. View-swizzle modules have no VkShaderModule owner.
+    orphaned_shader_modules: HashSet<ir::ShaderModuleId>,
     pub set_layouts: HashMap<vk::DescriptorSetLayout, ir::BindGroupLayoutDesc>,
     pub set_layout_types: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::DescriptorType>>,
     pub set_layout_stages: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::ShaderStageFlags>>,
@@ -277,31 +312,39 @@ impl Resources {
         {
             return Ok(*id);
         }
-        let shader = |entry| swizzle_entry(table, entry, &maps);
-        let mut variant = ir::ProgrammableRenderPipelineDesc::new(
-            shader(desc.vertex())?,
-            shader(desc.fragment())?,
-            desc.layout().clone(),
-            desc.target_format(),
-            None,
-            desc.topology(),
-            desc.blend(),
-            desc.raster(),
-        )
-        .map_err(failure)?
-        .with_vertex_buffers(desc.vertex_buffers().to_vec())
-        .map_err(failure)?
-        .with_color_targets(desc.color_targets().collect())
-        .map_err(failure)?;
-        if let Some(depth) = desc.depth_state() {
-            variant = variant.with_depth_state(depth).map_err(failure)?;
-        }
-        let id = table
-            .define_programmable_render_pipeline(variant)
+        let previous_modules = self.orphaned_shader_modules.clone();
+        let result = (|| {
+            let mut shader =
+                |entry| swizzle_entry(table, entry, &maps, &mut self.orphaned_shader_modules);
+            let mut variant = ir::ProgrammableRenderPipelineDesc::new(
+                shader(desc.vertex())?,
+                shader(desc.fragment())?,
+                desc.layout().clone(),
+                desc.target_format(),
+                None,
+                desc.topology(),
+                desc.blend(),
+                desc.raster(),
+            )
             .map_err(failure)?
-            .id();
-        self.graphics_swizzles.insert((handle, maps), id);
-        Ok(id)
+            .with_vertex_buffers(desc.vertex_buffers().to_vec())
+            .map_err(failure)?
+            .with_color_targets(desc.color_targets().collect())
+            .map_err(failure)?;
+            if let Some(depth) = desc.depth_state() {
+                variant = variant.with_depth_state(depth).map_err(failure)?;
+            }
+            let id = table
+                .define_programmable_render_pipeline(variant)
+                .map_err(failure)?
+                .id();
+            self.graphics_swizzles.insert((handle, maps), id);
+            Ok(id)
+        })();
+        if result.is_err() {
+            self.rollback_swizzle_modules(table, &previous_modules)?;
+        }
+        result
     }
 
     pub(crate) fn compute_pipeline_for_views(
@@ -328,17 +371,48 @@ impl Resources {
         {
             return Ok(*id);
         }
-        let variant = ir::ComputePipelineDesc::new(
-            swizzle_entry(table, desc.shader(), &maps)?,
-            desc.layout().clone(),
-        )
-        .map_err(failure)?;
-        let id = table
-            .define_compute_pipeline(variant)
-            .map_err(failure)?
-            .id();
-        self.compute_swizzles.insert((handle, maps), id);
-        Ok(id)
+        let previous_modules = self.orphaned_shader_modules.clone();
+        let result = (|| {
+            let variant = ir::ComputePipelineDesc::new(
+                swizzle_entry(
+                    table,
+                    desc.shader(),
+                    &maps,
+                    &mut self.orphaned_shader_modules,
+                )?,
+                desc.layout().clone(),
+            )
+            .map_err(failure)?;
+            let id = table
+                .define_compute_pipeline(variant)
+                .map_err(failure)?
+                .id();
+            self.compute_swizzles.insert((handle, maps), id);
+            Ok(id)
+        })();
+        if result.is_err() {
+            self.rollback_swizzle_modules(table, &previous_modules)?;
+        }
+        result
+    }
+
+    fn rollback_swizzle_modules(
+        &mut self,
+        table: &ir::ResourceTable,
+        previous: &HashSet<ir::ShaderModuleId>,
+    ) -> Result<(), vk::Result> {
+        let created = self
+            .orphaned_shader_modules
+            .difference(previous)
+            .copied()
+            .collect::<Vec<_>>();
+        // These descriptors were never published to an executor/materialization
+        // cache: a failed view variant cannot retain just its first shader.
+        for id in created {
+            table.release_shader_module(id).map_err(failure)?;
+            self.orphaned_shader_modules.remove(&id);
+        }
+        Ok(())
     }
 
     fn texture_swizzles(
@@ -402,6 +476,7 @@ impl Resources {
         self.bind_group_cache.clear();
         self.graphics_swizzles.clear();
         self.compute_swizzles.clear();
+        self.orphaned_shader_modules.clear();
         for set in self.descriptor_sets.values_mut() {
             set.cached_group = None;
         }
@@ -420,14 +495,24 @@ impl Resources {
             set.cached_group = None;
         }
         let mut result = Ok(());
+        let mut retired = Vec::new();
         for (desc, id) in std::mem::take(&mut self.bind_group_cache) {
             if desc.layout().entries().is_empty() {
                 self.bind_group_cache.push((desc, id));
-            } else if let Err(error) =
-                release_backend(id).and_then(|()| table.release_bind_group(id).map_err(failure))
-            {
+            } else if let Err(error) = release_backend(id) {
                 // Preserve failed retirements for diagnosis or a retry, while
                 // still releasing the rest of this packet's snapshots.
+                self.bind_group_cache.push((desc, id));
+                result = Err(error);
+            } else {
+                retired.push((desc, id));
+            }
+        }
+        // Keep one table revision for the whole backend retirement batch.
+        // Each logical release changes the ABI revision; interleaving it with
+        // backend calls would serialize the entire resource table per group.
+        for (desc, id) in retired {
+            if let Err(error) = table.release_bind_group(id).map_err(failure) {
                 self.bind_group_cache.push((desc, id));
                 result = Err(error);
             }
@@ -646,6 +731,7 @@ fn swizzle_entry(
     table: &ir::ResourceTable,
     entry: &ir::ShaderEntryPoint,
     maps: &crate::spirv::TextureSwizzles,
+    orphaned: &mut HashSet<ir::ShaderModuleId>,
 ) -> Result<ir::ShaderEntryPoint, vk::Result> {
     let original = table
         .shader_module(table.shader_module_ref(entry.module()).map_err(failure)?)
@@ -660,6 +746,7 @@ fn swizzle_entry(
     let module = table
         .define_shader_module(ir::ShaderModuleDesc::spirv(changed).map_err(failure)?)
         .map_err(failure)?;
+    orphaned.insert(module.id());
     ir::ShaderEntryPoint::new(module, entry.stage(), entry.entry_point().into()).map_err(failure)
 }
 
@@ -861,7 +948,7 @@ unsafe extern "system" fn create_buffer(
             }
         }
         let handle = crate::api::with_device(device, move |r| {
-            if r.resources.buffers.len() >= LIMIT {
+            if r.resources.buffers.len() >= ir::MAX_BUFFERS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
             let id = r
@@ -912,7 +999,7 @@ unsafe extern "system" fn destroy_buffer(
         Ok(())
     });
 }
-unsafe extern "system" fn buffer_requirements(
+pub(crate) unsafe extern "system" fn buffer_requirements(
     device: vk::Device,
     buffer: vk::Buffer,
     out: *mut vk::MemoryRequirements,
@@ -963,7 +1050,7 @@ unsafe extern "system" fn allocate_memory(
         let size =
             usize::try_from(i.allocation_size).map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
         let handle = crate::api::with_device(device, move |r| {
-            if r.resources.memories.len() >= LIMIT {
+            if r.resources.memories.len() >= MAX_MEMORY_ALLOCATIONS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
             let allocated: usize = r.resources.memories.values().map(|m| m.bytes.len()).sum();
@@ -971,9 +1058,65 @@ unsafe extern "system" fn allocate_memory(
                 .checked_add(size)
                 .is_none_or(|v| v > MAX_ALLOCATED)
             {
+                // Allocation failures must identify the exhausted budget even
+                // in ordinary builds. Do not dump mapped application payloads.
+                let mut largest: Vec<_> = r
+                    .resources
+                    .memories
+                    .values()
+                    .map(|m| (m.bytes.len(), m.mapped))
+                    .collect();
+                largest.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                largest.truncate(12);
+                let mut image_groups = BTreeMap::<_, (usize, u64)>::new();
+                for image in r
+                    .resources
+                    .images
+                    .values()
+                    .filter(|image| image.bound.is_some())
+                {
+                    let key = (
+                        image.extent.width,
+                        image.extent.height,
+                        image.format.as_raw(),
+                        image.usage.as_raw(),
+                    );
+                    let group = image_groups.entry(key).or_default();
+                    group.0 += 1;
+                    group.1 = group.1.saturating_add(image.byte_size());
+                }
+                let mut image_groups: Vec<_> = image_groups.into_iter().collect();
+                image_groups.sort_unstable_by(|a, b| b.1.1.cmp(&a.1.1));
+                image_groups.truncate(12);
+                let mut buffer_groups = BTreeMap::<_, (usize, u64)>::new();
+                for buffer in r
+                    .resources
+                    .buffers
+                    .values()
+                    .filter(|buffer| buffer.bound.is_some())
+                {
+                    let group = buffer_groups.entry(buffer.usage.as_raw()).or_default();
+                    group.0 += 1;
+                    group.1 = group.1.saturating_add(buffer.size);
+                }
+                let cpu_bytes = r
+                    .resources
+                    .memories
+                    .values()
+                    .map(|memory| memory.bytes.words.len() * 8)
+                    .sum::<usize>();
+                eprintln!(
+                    "[SGFX Vulkan] allocation budget exhausted: requested={size} allocated={allocated} limit={MAX_ALLOCATED} allocations={} buffers={} images={} largest_bytes_mapped={largest:?}",
+                    r.resources.memories.len(),
+                    r.resources.buffers.len(),
+                    r.resources.images.len(),
+                );
+                eprintln!(
+                    "[SGFX Vulkan] allocation owners: cpu_mirror_bytes={cpu_bytes} image_groups=((width,height,format,usage),(count,bytes)) {image_groups:?} buffer_groups=(usage,(count,bytes)) {buffer_groups:?}"
+                );
                 return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
             }
-            let bytes = AlignedBytes::zeroed(size)?;
+            let bytes = AlignedBytes::unbacked(size)?;
             let handle = vk::DeviceMemory::from_raw(crate::api::next_id());
             r.resources.memories.insert(
                 handle,
@@ -1009,7 +1152,7 @@ unsafe extern "system" fn free_memory(
         Ok(())
     });
 }
-unsafe extern "system" fn bind_buffer_memory(
+pub(crate) unsafe extern "system" fn bind_buffer_memory(
     device: vk::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -1074,7 +1217,7 @@ unsafe extern "system" fn bind_buffer_memory(
             let mem = r
                 .resources
                 .memories
-                .get(&memory)
+                .get_mut(&memory)
                 .ok_or(vk::Result::ERROR_UNKNOWN)?;
             let buf = r
                 .resources
@@ -1097,6 +1240,9 @@ unsafe extern "system" fn bind_buffer_memory(
                 }
                 return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
             }
+            // Bound buffers can be snapshotted without an application mapping.
+            // Allocate their CPU storage before publishing a successful bind.
+            mem.bytes.materialize()?;
             buf.bound = Some((memory, offset));
             Ok(())
         })
@@ -1134,6 +1280,9 @@ unsafe extern "system" fn map_memory(
             if mem.mapped || size == 0 || offset.checked_add(size).is_none_or(|end| end > len) {
                 return Err(vk::Result::ERROR_MEMORY_MAP_FAILED);
             }
+            mem.bytes
+                .materialize()
+                .map_err(|_| vk::Result::ERROR_MEMORY_MAP_FAILED)?;
             mem.mapped = true;
             let address = mem.bytes.as_mut_ptr().add(offset as usize) as usize;
             r.resources.forget_uploads_for_memory(memory);
@@ -1363,11 +1512,131 @@ unsafe extern "system" fn destroy_shader_module(
     handle: vk::ShaderModule,
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
-    let _ = crate::api::with_device(device, move |r| {
-        r.resources.shaders.remove(&handle);
-        Ok(())
-    });
+    let _ = crate::api::with_device(device, move |r| retire_vk_shader_module(r, handle));
 }
+fn retire_vk_shader_module(
+    r: &mut crate::runtime::Runtime,
+    handle: vk::ShaderModule,
+) -> Result<(), vk::Result> {
+    if let Some(shader) = r.resources.shaders.remove(&handle) {
+        r.resources
+            .orphaned_shader_modules
+            .extend(shader.variants.into_iter().map(|variant| variant.3));
+        retire_unused_shader_modules(r)?;
+    }
+    Ok(())
+}
+type DescriptorLayoutParts = (
+    ir::BindGroupLayoutDesc,
+    BTreeMap<u32, vk::DescriptorType>,
+    BTreeMap<u32, vk::ShaderStageFlags>,
+);
+
+/// Pure validation shared by creation and maintenance3 support queries.
+pub(crate) unsafe fn descriptor_layout(
+    i: &vk::DescriptorSetLayoutCreateInfo<'_>,
+) -> Result<DescriptorLayoutParts, vk::Result> {
+    if i.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    if !i.flags.is_empty() {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    if !i.p_next.is_null() {
+        let flags = &*i
+            .p_next
+            .cast::<vk::DescriptorSetLayoutBindingFlagsCreateInfo<'_>>();
+        if flags.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
+            || !flags.p_next.is_null()
+            || (flags.binding_count != 0 && flags.binding_count != i.binding_count)
+            || copied(
+                flags.p_binding_flags,
+                flags.binding_count as usize,
+                ir::MAX_BINDINGS_PER_GROUP,
+            )?
+            .iter()
+            .any(|flag| !flag.is_empty())
+        {
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
+    }
+    let bindings = copied(
+        i.p_bindings,
+        i.binding_count as usize,
+        ir::MAX_BINDINGS_PER_GROUP,
+    )?;
+    let mut entries = Vec::with_capacity(bindings.len());
+    let mut types = BTreeMap::new();
+    let mut original_stages = BTreeMap::new();
+    for binding in &bindings {
+        if binding.descriptor_count != 1
+            || !binding.p_immutable_samplers.is_null()
+            || types
+                .insert(binding.binding, binding.descriptor_type)
+                .is_some()
+        {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!(
+                    "[SGFX Vulkan] descriptor layout binding={} count={} type={:?} stages={:?}",
+                    binding.binding,
+                    binding.descriptor_count,
+                    binding.descriptor_type,
+                    binding.stage_flags
+                );
+            }
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
+        original_stages.insert(binding.binding, binding.stage_flags);
+    }
+    let binding_map = descriptor_binding_map(&types)?;
+    for binding in bindings {
+        let ty = match binding.descriptor_type {
+            vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
+                ir::BindingType::UniformBuffer
+            }
+            vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
+                ir::BindingType::StorageBuffer { read_only: false }
+            }
+            vk::DescriptorType::SAMPLED_IMAGE
+            | vk::DescriptorType::INPUT_ATTACHMENT
+            | vk::DescriptorType::COMBINED_IMAGE_SAMPLER => ir::BindingType::SampledTexture,
+            vk::DescriptorType::SAMPLER => ir::BindingType::Sampler,
+            vk::DescriptorType::STORAGE_IMAGE => ir::BindingType::StorageTexture {
+                format: ir::TextureFormat::Rgba8Unorm,
+                access: ir::StorageTextureAccess::WriteOnly,
+            },
+            _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+        };
+        let supported = binding.stage_flags
+            & (vk::ShaderStageFlags::VERTEX
+                | vk::ShaderStageFlags::FRAGMENT
+                | vk::ShaderStageFlags::COMPUTE);
+        let visibility = if binding.stage_flags == vk::ShaderStageFlags::ALL
+            || binding.stage_flags == vk::ShaderStageFlags::ALL_GRAPHICS
+        {
+            stages(binding.stage_flags)?
+        } else if supported.is_empty() {
+            continue;
+        } else {
+            stages(supported)?
+        };
+        entries.push(ir::BindGroupLayoutEntry::new(
+            binding_map[&binding.binding],
+            visibility,
+            ty,
+        ));
+        if binding.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
+            entries.push(ir::BindGroupLayoutEntry::new(
+                binding_map[&binding.binding] + 1,
+                visibility,
+                ir::BindingType::Sampler,
+            ));
+        }
+    }
+    let desc = ir::BindGroupLayoutDesc::new(entries).map_err(failure)?;
+    Ok((desc, types, original_stages))
+}
+
 unsafe extern "system" fn create_descriptor_set_layout(
     device: vk::Device,
     info: *const vk::DescriptorSetLayoutCreateInfo<'_>,
@@ -1382,105 +1651,7 @@ unsafe extern "system" fn create_descriptor_set_layout(
         if info.is_null() || !allocator.is_null() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let i = &*info;
-        if i.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        if !i.flags.is_empty() {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        if !i.p_next.is_null() {
-            let flags = &*i
-                .p_next
-                .cast::<vk::DescriptorSetLayoutBindingFlagsCreateInfo<'_>>();
-            if flags.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
-                || !flags.p_next.is_null()
-                || (flags.binding_count != 0 && flags.binding_count != i.binding_count)
-                || copied(
-                    flags.p_binding_flags,
-                    flags.binding_count as usize,
-                    ir::MAX_BINDINGS_PER_GROUP,
-                )?
-                .iter()
-                .any(|flag| !flag.is_empty())
-            {
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-        }
-        let bindings = copied(
-            i.p_bindings,
-            i.binding_count as usize,
-            ir::MAX_BINDINGS_PER_GROUP,
-        )?;
-        let mut entries = Vec::with_capacity(bindings.len());
-        let mut types = BTreeMap::new();
-        let mut original_stages = BTreeMap::new();
-        for binding in &bindings {
-            if binding.descriptor_count != 1
-                || !binding.p_immutable_samplers.is_null()
-                || types
-                    .insert(binding.binding, binding.descriptor_type)
-                    .is_some()
-            {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                    eprintln!(
-                        "[SGFX Vulkan] descriptor layout binding={} count={} type={:?} stages={:?}",
-                        binding.binding,
-                        binding.descriptor_count,
-                        binding.descriptor_type,
-                        binding.stage_flags
-                    );
-                }
-                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-            }
-            original_stages.insert(binding.binding, binding.stage_flags);
-        }
-        let binding_map = descriptor_binding_map(&types)?;
-        for binding in bindings {
-            let ty = match binding.descriptor_type {
-                vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
-                    ir::BindingType::UniformBuffer
-                }
-                vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
-                    ir::BindingType::StorageBuffer { read_only: false }
-                }
-                vk::DescriptorType::SAMPLED_IMAGE
-                | vk::DescriptorType::INPUT_ATTACHMENT
-                | vk::DescriptorType::COMBINED_IMAGE_SAMPLER => ir::BindingType::SampledTexture,
-                vk::DescriptorType::SAMPLER => ir::BindingType::Sampler,
-                vk::DescriptorType::STORAGE_IMAGE => ir::BindingType::StorageTexture {
-                    format: ir::TextureFormat::Rgba8Unorm,
-                    access: ir::StorageTextureAccess::WriteOnly,
-                },
-                _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-            };
-            let supported = binding.stage_flags
-                & (vk::ShaderStageFlags::VERTEX
-                    | vk::ShaderStageFlags::FRAGMENT
-                    | vk::ShaderStageFlags::COMPUTE);
-            let visibility = if binding.stage_flags == vk::ShaderStageFlags::ALL
-                || binding.stage_flags == vk::ShaderStageFlags::ALL_GRAPHICS
-            {
-                stages(binding.stage_flags)?
-            } else if supported.is_empty() {
-                continue;
-            } else {
-                stages(supported)?
-            };
-            entries.push(ir::BindGroupLayoutEntry::new(
-                binding_map[&binding.binding],
-                visibility,
-                ty,
-            ));
-            if binding.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
-                entries.push(ir::BindGroupLayoutEntry::new(
-                    binding_map[&binding.binding] + 1,
-                    visibility,
-                    ir::BindingType::Sampler,
-                ));
-            }
-        }
-        let desc = ir::BindGroupLayoutDesc::new(entries).map_err(failure)?;
+        let (desc, types, original_stages) = descriptor_layout(&*info)?;
         let handle = crate::api::with_device(device, move |r| {
             if r.resources.set_layouts.len() >= LIMIT {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
@@ -1979,13 +2150,12 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
                 )
             })
             .collect::<Vec<_>>();
-        crate::api::with_device(device, move |r| {
-            let modified_sets = owned_writes
-                .iter()
-                .map(|w| w.set)
-                .chain(owned_copies.iter().map(|c| c.2))
-                .collect::<Vec<_>>();
-            crate::api::invalidate_descriptor_sets(r, &modified_sets);
+        let modified_sets = owned_writes
+            .iter()
+            .map(|w| w.set)
+            .chain(owned_copies.iter().map(|c| c.2))
+            .collect::<Vec<_>>();
+        crate::api::update_descriptors_owned(device, &modified_sets, move |r| {
             for write in owned_writes {
                 let valid = write.value.is_some_and(|v| match v {
                     DescriptorBinding::Buffer {
@@ -2132,10 +2302,7 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
                 "[SGFX Vulkan] descriptor update batch failed; marking device lost: writes={write_count} copies={copy_count} result={result:?}"
             );
         }
-        let _ = crate::api::with_device(device, |r| {
-            r.lost = true;
-            Ok(())
-        });
+        crate::api::mark_device_lost(device);
     }
 }
 unsafe extern "system" fn create_compute_pipelines(
@@ -2187,58 +2354,82 @@ unsafe extern "system" fn create_compute_pipelines(
         }
         let handles = crate::api::with_device(device, move |r| {
             crate::api::bootstrap::validate_cache(&r.resources, cache)?;
-            if r.resources
-                .pipelines
-                .len()
-                .checked_add(requests.len())
-                .is_none_or(|n| n > 256)
-            {
-                return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
+            let checkpoints =
+                shader_variant_checkpoints(&r.resources, requests.iter().map(|request| request.0));
+            let result = (|| {
+                if r.resources
+                    .pipelines
+                    .len()
+                    .checked_add(requests.len())
+                    .is_none_or(|n| n > 256)
+                {
+                    return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
+                }
+                let mut descriptors = Vec::with_capacity(requests.len());
+                for (module, name, layout, values) in requests {
+                    let bindings = r
+                        .resources
+                        .pipeline_binding_maps
+                        .get(&layout)
+                        .cloned()
+                        .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                    let module = r
+                        .resources
+                        .shaders
+                        .get_mut(&module)
+                        .ok_or(vk::Result::ERROR_UNKNOWN)?
+                        .variant_for_layout(&r.table, &values, &[], &bindings)?;
+                    let shader = ir::ShaderEntryPoint::new(
+                        r.table.shader_module_ref(module).map_err(failure)?,
+                        ir::ShaderStage::Compute,
+                        name,
+                    )
+                    .map_err(failure)?;
+                    let layout = r
+                        .resources
+                        .pipeline_layouts
+                        .get(&layout)
+                        .cloned()
+                        .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                    let layout = crate::spirv::specialize_layout(&r.table, &layout, &[&shader])?;
+                    descriptors
+                        .push(ir::ComputePipelineDesc::new(shader, layout).map_err(failure)?);
+                }
+                let mut ids = Vec::with_capacity(descriptors.len());
+                for desc in descriptors {
+                    let created = (|| {
+                        let id = r.table.define_compute_pipeline(desc).map_err(failure)?.id();
+                        if let Err(error) = r.cache.validate_compute_pipeline(id) {
+                            let error = backend_failure(error);
+                            retire_ir_pipeline(r, Pipeline::Compute(id))?;
+                            return Err(error);
+                        }
+                        Ok(id)
+                    })();
+                    match created {
+                        Ok(id) => ids.push(id),
+                        Err(error) => {
+                            // This frontend publishes compute handles only once the
+                            // whole batch succeeds. Retire every unpublished prefix.
+                            for id in ids {
+                                retire_ir_pipeline(r, Pipeline::Compute(id))?;
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                let mut result = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let handle = vk::Pipeline::from_raw(crate::api::next_id());
+                    r.resources.pipelines.insert(handle, Pipeline::Compute(id));
+                    result.push(handle);
+                }
+                Ok(result)
+            })();
+            if result.is_err() {
+                rollback_shader_variants(r, &checkpoints)?;
             }
-            let mut descriptors = Vec::with_capacity(requests.len());
-            for (module, name, layout, values) in requests {
-                let bindings = r
-                    .resources
-                    .pipeline_binding_maps
-                    .get(&layout)
-                    .cloned()
-                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
-                let module = r
-                    .resources
-                    .shaders
-                    .get_mut(&module)
-                    .ok_or(vk::Result::ERROR_UNKNOWN)?
-                    .variant_for_layout(&r.table, &values, &[], &bindings)?;
-                let shader = ir::ShaderEntryPoint::new(
-                    r.table.shader_module_ref(module).map_err(failure)?,
-                    ir::ShaderStage::Compute,
-                    name,
-                )
-                .map_err(failure)?;
-                let layout = r
-                    .resources
-                    .pipeline_layouts
-                    .get(&layout)
-                    .cloned()
-                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
-                let layout = crate::spirv::specialize_layout(&r.table, &layout, &[&shader])?;
-                descriptors.push(ir::ComputePipelineDesc::new(shader, layout).map_err(failure)?);
-            }
-            let mut ids = Vec::with_capacity(descriptors.len());
-            for desc in descriptors {
-                let id = r.table.define_compute_pipeline(desc).map_err(failure)?.id();
-                r.cache
-                    .validate_compute_pipeline(id)
-                    .map_err(backend_failure)?;
-                ids.push(id);
-            }
-            let mut result = Vec::with_capacity(ids.len());
-            for id in ids {
-                let handle = vk::Pipeline::from_raw(crate::api::next_id());
-                r.resources.pipelines.insert(handle, Pipeline::Compute(id));
-                result.push(handle);
-            }
-            Ok(result)
+            result
         })?;
         ptr::copy_nonoverlapping(handles.as_ptr(), out, handles.len());
         Ok(())
@@ -2249,20 +2440,274 @@ unsafe extern "system" fn destroy_pipeline(
     handle: vk::Pipeline,
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
-    let _ = crate::api::with_device(device, move |r| {
-        r.resources.pipelines.remove(&handle);
+    let _ = crate::api::with_device(device, move |r| retire_vk_pipeline(r, handle));
+}
+
+fn retire_vk_pipeline(
+    r: &mut crate::runtime::Runtime,
+    handle: vk::Pipeline,
+) -> Result<(), vk::Result> {
+    let mut pipelines = r
+        .resources
+        .pipelines
+        .get(&handle)
+        .copied()
+        .into_iter()
+        .collect::<Vec<_>>();
+    pipelines.extend(
         r.resources
             .graphics_swizzles
-            .retain(|(pipeline, _), _| *pipeline != handle);
+            .iter()
+            .filter_map(|((owner, _), id)| (*owner == handle).then_some(Pipeline::Graphics(*id))),
+    );
+    pipelines.extend(
         r.resources
             .compute_swizzles
-            .retain(|(pipeline, _), _| *pipeline != handle);
-        r.resources.graphics_extents.remove(&handle);
-        r.resources.graphics_state.remove(&handle);
-        r.resources.graphics_subpasses.remove(&handle);
-        r.resources.graphics_inputs.remove(&handle);
+            .iter()
+            .filter_map(|((owner, _), id)| (*owner == handle).then_some(Pipeline::Compute(*id))),
+    );
+    if !pipelines.is_empty() {
+        for pipeline in pipelines {
+            retire_ir_pipeline(r, pipeline)?;
+        }
+    }
+    r.resources.pipelines.remove(&handle);
+    r.resources
+        .graphics_swizzles
+        .retain(|(pipeline, _), _| *pipeline != handle);
+    r.resources
+        .compute_swizzles
+        .retain(|(pipeline, _), _| *pipeline != handle);
+    r.resources.graphics_extents.remove(&handle);
+    r.resources.graphics_state.remove(&handle);
+    r.resources.graphics_subpasses.remove(&handle);
+    r.resources.graphics_inputs.remove(&handle);
+    retire_unused_shader_modules(r)
+}
+
+/// Retire one logical pipeline only after its backend materialization. Used for
+/// normal destruction and for unpublished pipelines whose validation failed.
+pub(crate) fn retire_ir_pipeline(
+    r: &mut crate::runtime::Runtime,
+    pipeline: Pipeline,
+) -> Result<(), vk::Result> {
+    // Metadata synchronization also imports previous retirement tombstones.
+    // Its nonblocking ABI refuses them while accepted GPU work is pending.
+    // Do not turn an ordinary failed pipeline creation into device loss merely
+    // because unrelated accepted work is still running. Never wait on pending
+    // device requests from this worker itself.
+    r.in_flight.wait();
+    let result = (|| match pipeline {
+        Pipeline::Graphics(id) => {
+            r.cache
+                .release_programmable_render_pipeline(id)
+                .map_err(backend_failure)?;
+            r.table
+                .release_programmable_render_pipeline(id)
+                .map_err(failure)
+        }
+        Pipeline::Compute(id) => {
+            r.cache
+                .release_compute_pipeline(id)
+                .map_err(backend_failure)?;
+            r.table.release_compute_pipeline(id).map_err(failure)
+        }
+    })();
+    if result.is_err() {
+        r.lost = true;
+    }
+    result
+}
+
+fn shader_variant_checkpoints(
+    resources: &Resources,
+    modules: impl IntoIterator<Item = vk::ShaderModule>,
+) -> HashMap<vk::ShaderModule, usize> {
+    modules
+        .into_iter()
+        .filter_map(|module| {
+            resources
+                .shaders
+                .get(&module)
+                .map(|shader| (module, shader.variants.len()))
+        })
+        .collect()
+}
+
+pub(crate) fn rollback_shader_variants(
+    r: &mut crate::runtime::Runtime,
+    checkpoints: &HashMap<vk::ShaderModule, usize>,
+) -> Result<(), vk::Result> {
+    // An unsuccessful attempt must not pin new IR modules in its live Vulkan
+    // shader's specialization cache. Existing/shared variants precede the mark.
+    for (module, mark) in checkpoints {
+        if let Some(shader) = r.resources.shaders.get_mut(module) {
+            r.resources
+                .orphaned_shader_modules
+                .extend(shader.variants.drain(*mark..).map(|variant| variant.3));
+        }
+    }
+    if r.lost {
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    retire_unused_shader_modules(r)
+}
+
+pub(crate) fn shader_checkpoints(
+    resources: &Resources,
+    modules: &[vk::ShaderModule],
+) -> HashMap<vk::ShaderModule, usize> {
+    shader_variant_checkpoints(resources, modules.iter().copied())
+}
+
+fn retire_unused_shader_modules(r: &mut crate::runtime::Runtime) -> Result<(), vk::Result> {
+    let result = (|| {
+        let mut retained = HashSet::new();
+        for pipeline in r
+            .resources
+            .pipelines
+            .values()
+            .copied()
+            .chain(
+                r.resources
+                    .graphics_swizzles
+                    .values()
+                    .copied()
+                    .map(Pipeline::Graphics),
+            )
+            .chain(
+                r.resources
+                    .compute_swizzles
+                    .values()
+                    .copied()
+                    .map(Pipeline::Compute),
+            )
+        {
+            match pipeline {
+                Pipeline::Graphics(id) => {
+                    let desc = r
+                        .table
+                        .programmable_render_pipeline_shared(
+                            r.table
+                                .programmable_render_pipeline_ref(id)
+                                .map_err(failure)?,
+                        )
+                        .map_err(failure)?;
+                    retained.insert(desc.vertex().module());
+                    retained.insert(desc.fragment().module());
+                }
+                Pipeline::Compute(id) => {
+                    let desc = r
+                        .table
+                        .compute_pipeline(r.table.compute_pipeline_ref(id).map_err(failure)?)
+                        .map_err(failure)?;
+                    retained.insert(desc.shader().module());
+                }
+            }
+        }
+        // A Vulkan shader module owns source, not every specialization ever
+        // requested. Drop cache entries once no live pipeline uses them; a later
+        // pipeline can regenerate them from the original words.
+        for shader in r.resources.shaders.values_mut() {
+            shader.variants.retain(|variant| {
+                if retained.contains(&variant.3) {
+                    true
+                } else {
+                    r.resources.orphaned_shader_modules.insert(variant.3);
+                    false
+                }
+            });
+        }
+        let retired = r
+            .resources
+            .orphaned_shader_modules
+            .iter()
+            .copied()
+            .filter(|id| !retained.contains(id))
+            .collect::<Vec<_>>();
+        if !retired.is_empty() {
+            r.in_flight.wait();
+        }
+        for id in retired {
+            r.cache.release_shader_module(id).map_err(backend_failure)?;
+            r.table.release_shader_module(id).map_err(failure)?;
+            r.resources.orphaned_shader_modules.remove(&id);
+        }
         Ok(())
-    });
+    })();
+    if result.is_err() {
+        r.lost = true;
+    }
+    result
+}
+
+fn sampler_descriptor(
+    i: &vk::SamplerCreateInfo<'_>,
+    custom_allocator: bool,
+) -> Result<ir::SamplerDesc, vk::Result> {
+    if custom_allocator
+        || i.s_type != vk::StructureType::SAMPLER_CREATE_INFO
+        || !i.p_next.is_null()
+        || !i.flags.is_empty()
+        || i.anisotropy_enable != vk::FALSE
+        || i.unnormalized_coordinates != vk::FALSE
+        || !matches!(i.compare_enable, vk::FALSE | vk::TRUE)
+        || i.mip_lod_bias != 0.0
+        || !i.max_lod.is_finite()
+        || !i.min_lod.is_finite()
+        || i.max_lod < i.min_lod
+        || !matches!(
+            i.mipmap_mode,
+            vk::SamplerMipmapMode::NEAREST | vk::SamplerMipmapMode::LINEAR
+        )
+    {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    let border = [i.address_mode_u, i.address_mode_v, i.address_mode_w]
+        .contains(&vk::SamplerAddressMode::CLAMP_TO_BORDER);
+    if border
+        && !matches!(
+            i.border_color,
+            vk::BorderColor::FLOAT_TRANSPARENT_BLACK | vk::BorderColor::INT_TRANSPARENT_BLACK
+        )
+    {
+        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+    let filter = |v| match v {
+        vk::Filter::NEAREST => Ok(ir::FilterMode::Nearest),
+        vk::Filter::LINEAR => Ok(ir::FilterMode::Linear),
+        _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+    };
+    let address = |v| match v {
+        vk::SamplerAddressMode::REPEAT => Ok(ir::AddressMode::Repeat),
+        vk::SamplerAddressMode::CLAMP_TO_EDGE => Ok(ir::AddressMode::ClampToEdge),
+        vk::SamplerAddressMode::MIRRORED_REPEAT => Ok(ir::AddressMode::MirrorRepeat),
+        vk::SamplerAddressMode::CLAMP_TO_BORDER => Ok(ir::AddressMode::ClampToBorder),
+        _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+    };
+    // SGFX supports 1D/2D, array and cube textures; no 3D textures. W is
+    // unused for those images, but reject modes outside the enabled contract.
+    address(i.address_mode_w)?;
+    Ok(ir::SamplerDesc::new(
+        filter(i.min_filter)?,
+        filter(i.mag_filter)?,
+        address(i.address_mode_u)?,
+        address(i.address_mode_v)?,
+    )
+    .with_mip_filter(
+        match i.mipmap_mode {
+            vk::SamplerMipmapMode::LINEAR => ir::FilterMode::Linear,
+            _ => ir::FilterMode::Nearest,
+        },
+        i.min_lod,
+        i.max_lod,
+    )
+    .map_err(failure)?
+    .with_compare(if i.compare_enable != vk::FALSE {
+        Some(crate::images::compare(i.compare_op)?)
+    } else {
+        None
+    }))
 }
 
 unsafe extern "system" fn create_sampler(
@@ -2271,7 +2716,7 @@ unsafe extern "system" fn create_sampler(
     allocator: *const vk::AllocationCallbacks<'_>,
     out: *mut vk::Sampler,
 ) -> vk::Result {
-    ffi(|| {
+    let result = ffi(|| {
         if out.is_null() {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
@@ -2279,54 +2724,7 @@ unsafe extern "system" fn create_sampler(
         let i = info
             .as_ref()
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if !allocator.is_null()
-            || i.s_type != vk::StructureType::SAMPLER_CREATE_INFO
-            || !i.p_next.is_null()
-            || !i.flags.is_empty()
-            || i.anisotropy_enable != vk::FALSE
-            || i.unnormalized_coordinates != vk::FALSE
-            || i.mip_lod_bias != 0.0
-            || !i.max_lod.is_finite()
-            || !i.min_lod.is_finite()
-            || i.max_lod < i.min_lod
-            || !matches!(
-                i.mipmap_mode,
-                vk::SamplerMipmapMode::NEAREST | vk::SamplerMipmapMode::LINEAR
-            )
-        {
-            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
-        }
-        let filter = |v| match v {
-            vk::Filter::NEAREST => Ok(ir::FilterMode::Nearest),
-            vk::Filter::LINEAR => Ok(ir::FilterMode::Linear),
-            _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-        };
-        let address = |v| match v {
-            vk::SamplerAddressMode::REPEAT => Ok(ir::AddressMode::Repeat),
-            vk::SamplerAddressMode::CLAMP_TO_EDGE => Ok(ir::AddressMode::ClampToEdge),
-            vk::SamplerAddressMode::MIRRORED_REPEAT => Ok(ir::AddressMode::MirrorRepeat),
-            _ => Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
-        };
-        let desc = ir::SamplerDesc::new(
-            filter(i.min_filter)?,
-            filter(i.mag_filter)?,
-            address(i.address_mode_u)?,
-            address(i.address_mode_v)?,
-        )
-        .with_mip_filter(
-            match i.mipmap_mode {
-                vk::SamplerMipmapMode::LINEAR => ir::FilterMode::Linear,
-                _ => ir::FilterMode::Nearest,
-            },
-            i.min_lod,
-            i.max_lod,
-        )
-        .map_err(failure)?
-        .with_compare(if i.compare_enable != vk::FALSE {
-            Some(crate::images::compare(i.compare_op)?)
-        } else {
-            None
-        });
+        let desc = sampler_descriptor(i, !allocator.is_null())?;
         let handle = crate::api::with_device(device, move |r| {
             let id = r.table.define_sampler(desc).map_err(failure)?.id();
             let handle = vk::Sampler::from_raw(crate::api::next_id());
@@ -2335,7 +2733,15 @@ unsafe extern "system" fn create_sampler(
         })?;
         out.write(handle);
         Ok(())
-    })
+    });
+    if result != vk::Result::SUCCESS {
+        eprintln!(
+            "[SGFX Vulkan] CreateSampler failure={result:?} custom_allocator={} info={:?}",
+            !allocator.is_null(),
+            info.as_ref(),
+        );
+    }
+    result
 }
 unsafe extern "system" fn destroy_sampler(
     device: vk::Device,
@@ -2410,6 +2816,236 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    fn lifecycle_runtime() -> crate::runtime::Runtime {
+        let instance = sgfx::driver::Instance::new().unwrap();
+        crate::runtime::Runtime::new(
+            instance.adapters()[0].clone(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    fn compute_module(table: &ir::ResourceTable) -> ir::ShaderModuleId {
+        table
+            .define_shader_module(
+                ir::ShaderModuleDesc::wgsl("@compute @workgroup_size(1) fn main() {}".to_owned())
+                    .unwrap(),
+            )
+            .unwrap()
+            .id()
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU to construct the actual Runtime"]
+    fn long_lived_shader_evicts_unused_variants_across_more_than_256_pipelines() {
+        let mut runtime = lifecycle_runtime();
+        let module = vk::ShaderModule::from_raw(1);
+        runtime.resources.shaders.insert(
+            module,
+            Shader {
+                words: Vec::new(),
+                variants: Vec::new(),
+            },
+        );
+        for iteration in 0u32..1024 {
+            let id = compute_module(&runtime.table);
+            runtime
+                .resources
+                .shaders
+                .get_mut(&module)
+                .unwrap()
+                .variants
+                .push((
+                    vec![(0, iteration.to_le_bytes().to_vec())],
+                    Vec::new(),
+                    Vec::new(),
+                    id,
+                ));
+            let shader = ir::ShaderEntryPoint::new(
+                runtime.table.shader_module_ref(id).unwrap(),
+                ir::ShaderStage::Compute,
+                "main".to_owned(),
+            )
+            .unwrap();
+            let pipeline = runtime
+                .table
+                .define_compute_pipeline(
+                    ir::ComputePipelineDesc::new(
+                        shader,
+                        ir::PipelineLayoutDesc::new(Vec::new()).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id();
+            let handle = vk::Pipeline::from_raw(2);
+            runtime
+                .resources
+                .pipelines
+                .insert(handle, Pipeline::Compute(pipeline));
+            retire_vk_pipeline(&mut runtime, handle).unwrap();
+            assert!(
+                runtime.table.shader_module_ref(id).is_err(),
+                "iteration {iteration}"
+            );
+            assert!(runtime.table.compute_pipeline_ref(pipeline).is_err());
+            assert!(runtime.resources.shaders[&module].variants.is_empty());
+            assert!(runtime.resources.orphaned_shader_modules.is_empty());
+            assert!(!runtime.lost);
+        }
+    }
+
+    #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+    #[test]
+    #[ignore = "requires a native GPU to construct the actual Runtime"]
+    fn failed_shader_attempt_evicts_new_variant_but_preserves_shared_live_pipeline() {
+        let mut runtime = lifecycle_runtime();
+        let module = vk::ShaderModule::from_raw(1);
+        let existing = compute_module(&runtime.table);
+        runtime.resources.shaders.insert(
+            module,
+            Shader {
+                words: Vec::new(),
+                variants: vec![(Vec::new(), Vec::new(), Vec::new(), existing)],
+            },
+        );
+        let shader = ir::ShaderEntryPoint::new(
+            runtime.table.shader_module_ref(existing).unwrap(),
+            ir::ShaderStage::Compute,
+            "main".to_owned(),
+        )
+        .unwrap();
+        let pipeline = runtime
+            .table
+            .define_compute_pipeline(
+                ir::ComputePipelineDesc::new(
+                    shader,
+                    ir::PipelineLayoutDesc::new(Vec::new()).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let handle = vk::Pipeline::from_raw(2);
+        runtime
+            .resources
+            .pipelines
+            .insert(handle, Pipeline::Compute(pipeline));
+        let checkpoints = shader_checkpoints(&runtime.resources, &[module]);
+        let failed = compute_module(&runtime.table);
+        runtime
+            .resources
+            .shaders
+            .get_mut(&module)
+            .unwrap()
+            .variants
+            .push((vec![(0, vec![1, 0, 0, 0])], Vec::new(), Vec::new(), failed));
+        rollback_shader_variants(&mut runtime, &checkpoints).unwrap();
+        assert!(runtime.table.shader_module_ref(failed).is_err());
+        assert_eq!(runtime.resources.shaders[&module].variants.len(), 1);
+        assert!(runtime.table.shader_module_ref(existing).is_ok());
+        retire_vk_shader_module(&mut runtime, module).unwrap();
+        assert!(runtime.table.shader_module_ref(existing).is_ok());
+        assert!(
+            runtime
+                .resources
+                .orphaned_shader_modules
+                .contains(&existing)
+        );
+        retire_vk_pipeline(&mut runtime, handle).unwrap();
+        assert!(runtime.table.shader_module_ref(existing).is_err());
+        assert!(runtime.resources.orphaned_shader_modules.is_empty());
+        assert!(!runtime.lost);
+    }
+
+    fn decal_sampler() -> vk::SamplerCreateInfo<'static> {
+        vk::SamplerCreateInfo::default()
+            .min_filter(vk::Filter::LINEAR)
+            .mag_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK)
+            .min_lod(0.0)
+            .max_lod(1000.0)
+    }
+
+    #[test]
+    fn skia_decal_sampler_retains_transparent_border_and_lod() {
+        let desc = sampler_descriptor(&decal_sampler(), false).unwrap();
+        assert_eq!(desc.address_u(), ir::AddressMode::ClampToBorder);
+        assert_eq!(desc.address_v(), ir::AddressMode::ClampToBorder);
+        assert_eq!(desc.min_filter(), ir::FilterMode::Linear);
+        assert_eq!(desc.mag_filter(), ir::FilterMode::Linear);
+        assert_eq!(desc.max_lod(), 1000.0);
+        assert!(
+            sampler_descriptor(
+                &decal_sampler().border_color(vk::BorderColor::INT_TRANSPARENT_BLACK),
+                false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn nonzero_border_and_unimplemented_sampler_controls_are_rejected() {
+        for color in [
+            vk::BorderColor::FLOAT_OPAQUE_BLACK,
+            vk::BorderColor::INT_OPAQUE_BLACK,
+            vk::BorderColor::FLOAT_OPAQUE_WHITE,
+            vk::BorderColor::INT_OPAQUE_WHITE,
+        ] {
+            assert_eq!(
+                sampler_descriptor(&decal_sampler().border_color(color), false),
+                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+            );
+        }
+        for info in [
+            decal_sampler().anisotropy_enable(true).max_anisotropy(2.0),
+            decal_sampler().mip_lod_bias(0.5),
+            decal_sampler().unnormalized_coordinates(true),
+            decal_sampler().address_mode_w(vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE),
+        ] {
+            assert_eq!(
+                sampler_descriptor(&info, false),
+                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+            );
+        }
+        // Border color is ignored by Vulkan when no axis clamps to the border.
+        assert!(
+            sampler_descriptor(
+                &decal_sampler()
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE),
+                false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn sampler_failure_reports_info_and_clears_the_output_handle() {
+        let mut out = vk::Sampler::from_raw(123);
+        let result = unsafe {
+            create_sampler(
+                vk::Device::null(),
+                &decal_sampler().border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE),
+                ptr::null(),
+                &mut out,
+            )
+        };
+        assert_eq!(result, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        assert_eq!(out, vk::Sampler::null());
+    }
 
     #[test]
     fn sparse_descriptor_labels_use_distinct_bounded_slots() {
@@ -2776,7 +3412,7 @@ mod tests {
             ir::BindingType::UniformBuffer,
         )])
         .unwrap();
-        let groups = [0, 16].map(|offset| {
+        let groups = [0, 16, 32].map(|offset| {
             let desc = ir::BindGroupDesc::new(
                 &table,
                 layout.clone(),
@@ -2795,11 +3431,14 @@ mod tests {
             id
         });
         let empty = resources.empty_bind_group(&table).unwrap();
+        let revision = table.abi_revision();
         let mut attempted = Vec::new();
         assert_eq!(
             resources.release_descriptor_groups(&table, |id| {
+                assert_eq!(table.abi_revision(), revision);
+                assert!(groups.iter().all(|id| table.bind_group_ref(*id).is_ok()));
                 attempted.push(id);
-                if id == groups[0] {
+                if id == groups[1] {
                     Err(vk::Result::ERROR_DEVICE_LOST)
                 } else {
                     Ok(())
@@ -2808,14 +3447,15 @@ mod tests {
             Err(vk::Result::ERROR_DEVICE_LOST)
         );
         assert_eq!(attempted, groups);
-        assert!(table.bind_group_ref(groups[0]).is_ok());
-        assert!(table.bind_group_ref(groups[1]).is_err());
+        assert!(table.bind_group_ref(groups[0]).is_err());
+        assert!(table.bind_group_ref(groups[1]).is_ok());
+        assert!(table.bind_group_ref(groups[2]).is_err());
         assert_eq!(resources.bind_group_cache.len(), 2);
         assert_eq!(resources.empty_bind_group(&table).unwrap(), empty);
         resources
             .release_descriptor_groups(&table, |_| Ok(()))
             .unwrap();
-        assert!(table.bind_group_ref(groups[0]).is_err());
+        assert!(table.bind_group_ref(groups[1]).is_err());
         assert_eq!(resources.bind_group_cache.len(), 1);
     }
 
@@ -2996,6 +3636,25 @@ mod tests {
             failure(ir::Error::ResourceLimitExceeded),
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
         );
+    }
+
+    #[test]
+    fn image_cpu_mirrors_materialize_only_on_host_access_and_keep_mapping_stable() {
+        let mut bytes = AlignedBytes::unbacked(64 * 1024 * 1024 + 1).unwrap();
+        assert_eq!(bytes.len(), 64 * 1024 * 1024 + 1);
+        assert_eq!(bytes.words.capacity(), 0);
+        bytes.materialize().unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        let address = bytes.as_mut_ptr();
+        let last = bytes.len() - 1;
+        bytes[last] = 17;
+        bytes.materialize().unwrap();
+        assert_eq!(bytes.as_mut_ptr(), address);
+        assert_eq!(bytes[bytes.len() - 1], 17);
+        assert!(matches!(
+            AlignedBytes::unbacked(usize::MAX),
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        ));
     }
 
     #[test]
