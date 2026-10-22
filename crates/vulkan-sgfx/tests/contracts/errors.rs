@@ -165,8 +165,10 @@ fn fence_creation_timeout_reset_and_empty_submission() {
         device
             .queue_submit(context.queue, &[], unsignaled)
             .expect("an empty queue submission must signal its fence");
+        // Even an empty submission completes on the queue worker, after
+        // admission returns. Keep the unsignaled zero-timeout check above.
         device
-            .wait_for_fences(&[unsignaled], true, 0)
+            .wait_for_fences(&[unsignaled], true, 5_000_000_000)
             .expect("empty submission completion must satisfy its fence");
         assert_eq!(device.get_fence_status(unsignaled), Ok(true));
         device
@@ -243,7 +245,7 @@ fn one_time_submission_requires_reset_and_rerecording() {
 
 #[test]
 #[ignore = "requires a built SGFX ICD and a native GPU adapter"]
-fn vertex_and_index_bindings_reject_wrong_usage_alignment_and_dead_handles() {
+fn vertex_and_index_bindings_reject_misalignment_and_unsupported_slots() {
     use super::Storage;
     let context = Context::new();
     let vertex = Storage::with_usage(&context, vk::BufferUsageFlags::VERTEX_BUFFER);
@@ -252,16 +254,6 @@ fn vertex_and_index_bindings_reject_wrong_usage_alignment_and_dead_handles() {
     let command = context.command;
     let begin = vk::CommandBufferBeginInfo::default();
     unsafe {
-        for (buffer, offset) in [(index.buffer, 0), (vertex.buffer, super::BYTES)] {
-            context.reset();
-            device.begin_command_buffer(command, &begin).unwrap();
-            device.cmd_bind_vertex_buffers(command, 0, &[buffer], &[offset]);
-            device.end_command_buffer(command).unwrap();
-            assert_eq!(
-                context.submit(vk::Fence::null()),
-                Err(vk::Result::ERROR_INITIALIZATION_FAILED)
-            );
-        }
         context.reset();
         device.begin_command_buffer(command, &begin).unwrap();
         device.cmd_bind_vertex_buffers(command, 0, &[vertex.buffer], &[2]);
@@ -274,20 +266,13 @@ fn vertex_and_index_bindings_reject_wrong_usage_alignment_and_dead_handles() {
         device.cmd_bind_vertex_buffers(command, 1, &[vertex.buffer], &[0]);
         device.end_command_buffer(command).unwrap();
         context.submit(vk::Fence::null()).unwrap();
+        device.device_wait_idle().unwrap();
         context.reset();
         device.begin_command_buffer(command, &begin).unwrap();
         device.cmd_bind_vertex_buffers(command, 8, &[vertex.buffer], &[0]);
         assert_eq!(
             device.end_command_buffer(command),
             Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
-        );
-        context.reset();
-        device.begin_command_buffer(command, &begin).unwrap();
-        device.cmd_bind_index_buffer(command, vertex.buffer, 0, vk::IndexType::UINT16);
-        device.end_command_buffer(command).unwrap();
-        assert_eq!(
-            context.submit(vk::Fence::null()),
-            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
         );
         for (offset, format) in [(1, vk::IndexType::UINT16), (2, vk::IndexType::UINT32)] {
             context.reset();
@@ -304,10 +289,42 @@ fn vertex_and_index_bindings_reject_wrong_usage_alignment_and_dead_handles() {
         device.cmd_bind_index_buffer(command, index.buffer, 2, vk::IndexType::UINT16);
         device.end_command_buffer(command).unwrap();
         context.submit(vk::Fence::null()).unwrap();
-        drop(vertex);
-        assert_eq!(
-            context.submit(vk::Fence::null()),
-            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
-        );
+        device.device_wait_idle().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires a built SGFX ICD and a native GPU adapter"]
+fn vertex_and_index_bindings_report_loss_for_wrong_usage_bounds_and_dead_handles() {
+    use super::Storage;
+    // Worker-side validation failures lose the device. Each invalid case needs
+    // a fresh context so one rejection cannot hide failures in later cases.
+    for case in 0..4 {
+        let context = Context::new();
+        let vertex = Storage::with_usage(&context, vk::BufferUsageFlags::VERTEX_BUFFER);
+        let index = Storage::with_usage(&context, vk::BufferUsageFlags::INDEX_BUFFER);
+        let device = &context.device;
+        let command = context.command;
+        unsafe {
+            device
+                .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+            match case {
+                0 => device.cmd_bind_vertex_buffers(command, 0, &[index.buffer], &[0]),
+                1 => device.cmd_bind_vertex_buffers(command, 0, &[vertex.buffer], &[super::BYTES]),
+                2 => device.cmd_bind_index_buffer(command, vertex.buffer, 0, vk::IndexType::UINT16),
+                _ => {
+                    device.cmd_bind_vertex_buffers(command, 0, &[vertex.buffer], &[4]);
+                    device.cmd_bind_index_buffer(command, index.buffer, 2, vk::IndexType::UINT16);
+                }
+            }
+            device.end_command_buffer(command).unwrap();
+            if case == 3 {
+                context.submit(vk::Fence::null()).unwrap();
+                device.device_wait_idle().unwrap();
+                drop(vertex);
+            }
+            context.submit_expect_device_loss();
+        }
     }
 }
