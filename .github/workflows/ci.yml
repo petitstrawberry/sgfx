@@ -54,6 +54,8 @@ jobs:
         # An unqualified package name is ambiguous (and fails) if the graph
         # contains multiple sgfx-core sources, even at the same version/SHA.
         run: cargo tree --locked -p sgfx --invert sgfx-core
+      - name: Check external consumers without workspace patches
+        run: python3 scripts/test-external-consumer.py
       - name: Test portable crates
         run: |
           cargo test --locked -p sgfx-core
