@@ -3,8 +3,9 @@
 On native 64-bit Scarlet, SGFX discovers installed drivers from manifests and
 loads them through `scarlet-ld`. Driver names, GPU backend IDs and library names
 come from those manifests, so external driver distributions do not require
-hardware-specific code or Cargo dependencies in this repository. The built-in
-Adreno and host WGPU implementations remain available.
+hardware-specific Cargo dependencies in the application facade. Native Adreno
+and VirGL execution is provided only by installed drivers; WGPU remains the
+host backend.
 
 ## Application and installation
 
@@ -14,13 +15,12 @@ Use the generic loader for a standard-Rust client:
 sgfx = { git = "https://github.com/petitstrawberry/sgfx", default-features = false, features = ["std", "backend-dynamic"] }
 ```
 
-Default features already enable `backend-dynamic`. Existing applications can
-keep `backend-scarlet-virgl`, which enables native runtime discovery. Legacy
-native64 processes can use `legacy-scarlet-std`. Dynamic clients omit driver
-implementations and shader compilers; default features still include compiled
-Adreno. Native 64-bit VirGL clients always use the dynamic path. RV32 retains
-the compatibility backend through `backend-scarlet-virgl`, as do existing
-AArch64 Linux-ABI clients. This C ABI requires native 64-bit support.
+Default features enable `backend-dynamic`. Legacy native64 processes use
+`legacy-scarlet-std`; AArch64 Linux-ABI clients use `scarlet-native-api`.
+The facade has no static Adreno or VirGL dependency, including optional
+references. The former `backend-scarlet-adreno` and `backend-scarlet-virgl`
+features have been removed; applications use `backend-dynamic` instead.
+This C ABI requires native 64-bit support. ELF32 has no native GPU backend.
 
 Driver distributions install their library and an adjacent manifest such as
 `example-renderer.sgfx-driver` in `/lib/sgfx`:

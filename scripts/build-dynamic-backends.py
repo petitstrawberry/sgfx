@@ -179,7 +179,7 @@ def main():
     stage(release / "libsgfx_scarlet_virgl.so", drivers / "libsgfx_scarlet_virgl.so")
     (drivers / "scarlet-virgl.sgfx-driver").write_text("abi=2\nname=scarlet-virgl\ngpu_backend=virtio-gpu\nlibrary=libsgfx_scarlet_virgl.so\n")
     example = [cargo, "rustc", "-p", "sgfx", "--example", "dynamic_smoke", "--no-default-features"]
-    run([*example, "--features", "std,backend-dynamic,backend-scarlet-virgl", *common, "--", "-C", "link-arg=-pie",
+    run([*example, "--features", "std,backend-dynamic", *common, "--", "-C", "link-arg=-pie",
          "-C", "link-arg=--dynamic-linker=/bin/scarlet-ld",
          # LLD needs a shared input to emit imports supplied by the interpreter.
          # --as-needed drops this unreferenced driver: the frontend has no

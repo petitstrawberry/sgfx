@@ -206,10 +206,9 @@ impl Device {
 }
 fn backend_kind(name: &str) -> BackendKind {
     match name {
-        #[cfg(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl))]
         "scarlet-virgl" => BackendKind::ScarletVirgl,
-        #[cfg(feature = "backend-scarlet-adreno")]
         "scarlet-adreno" => BackendKind::ScarletAdreno,
+
         name => BackendKind::Other(crate::BackendName::new(name).expect("validated driver name")),
     }
 }
@@ -522,12 +521,15 @@ mod tests {
         }
     }
 
-    #[cfg(not(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)))]
     #[test]
-    fn uncompiled_backends_use_the_manifest_name() {
+    fn installed_native_drivers_keep_their_explicit_selection_identity() {
         assert_eq!(
             super::backend_kind("scarlet-virgl"),
-            crate::BackendKind::Other(crate::BackendName::new("scarlet-virgl").unwrap())
+            crate::BackendKind::ScarletVirgl
+        );
+        assert_eq!(
+            super::backend_kind("scarlet-adreno"),
+            crate::BackendKind::ScarletAdreno
         );
     }
 }

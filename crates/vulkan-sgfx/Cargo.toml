@@ -34,7 +34,7 @@ dlmalloc = { version = "0.2.14", features = ["global"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
 framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", default-features = false, features = ["std"], optional = true }
-sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-scarlet-virgl"] }
+sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-dynamic"] }
 
 [dev-dependencies]
 sgfx-codegen-virgl = { path = "../sgfx-codegen-virgl", features = ["programmable"] }

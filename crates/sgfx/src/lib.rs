@@ -34,33 +34,19 @@ pub use virgl::Handle;
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+        sgfx_dynamic_virgl
     )
 ))]
 pub mod driver;
 
 #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
 mod host;
-#[cfg(all(
-    target_os = "scarlet",
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-adreno",
-        sgfx_dynamic
-    )
-))]
+#[cfg(all(target_os = "scarlet", sgfx_dynamic))]
 mod scarlet;
 
 #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
 pub use host::{Executor, MappedTargetSession, Submission, WindowContext};
-#[cfg(all(
-    target_os = "scarlet",
-    any(
-        feature = "backend-scarlet-virgl",
-        feature = "backend-scarlet-adreno",
-        sgfx_dynamic
-    )
-))]
+#[cfg(all(target_os = "scarlet", sgfx_dynamic))]
 pub use scarlet::{
     Capabilities, Context, Device, Executor, Handle, ImageRef, MappedTargetSession, Submission,
 };
@@ -69,15 +55,6 @@ pub use scarlet::{
 pub mod dynamic;
 #[cfg(sgfx_dynamic_virgl)]
 use dynamic as virgl;
-#[cfg(all(
-    not(sgfx_dynamic_virgl),
-    any(
-        all(target_os = "scarlet", target_pointer_width = "32"),
-        all(target_os = "linux", feature = "scarlet-native-api")
-    ),
-    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-))]
-use sgfx_backend_scarlet_virgl_compat as virgl;
 
 /// Environment variable used to override automatic SGFX backend selection.
 pub const BACKEND_ENV: &str = "SGFX_BACKEND";
@@ -236,30 +213,17 @@ pub enum Error {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+        sgfx_dynamic_virgl
     ))]
     ScarletVirglHandle(virgl::HandleError),
-    /// A Scarlet/VirGL IR materialization or execution operation failed.
-    #[cfg(all(
-        any(
-            target_os = "scarlet",
-            all(target_os = "linux", feature = "scarlet-native-api")
-        ),
-        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-    ))]
-    #[cfg(not(sgfx_dynamic_virgl))]
-    ScarletVirglIr(virgl::IrSubmitError),
+
     /// A Scarlet GPU control connection could not be opened or queried.
     #[cfg(all(
         any(
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-adreno",
-            sgfx_dynamic
-        )
+        sgfx_dynamic
     ))]
     ScarletGpu,
 
@@ -269,11 +233,7 @@ pub enum Error {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-adreno",
-            sgfx_dynamic
-        )
+        sgfx_dynamic
     ))]
     BackendDeviceMismatch(BackendKind),
 
@@ -283,20 +243,9 @@ pub enum Error {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(
-            feature = "backend-scarlet-virgl",
-            feature = "backend-scarlet-adreno",
-            sgfx_dynamic
-        )
+        sgfx_dynamic
     ))]
     ScarletBackendUnsupported,
-
-    /// A Scarlet/Adreno device or context operation failed.
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
-    ScarletAdrenoHandle(sgfx_backend_scarlet_adreno::HandleError),
-    /// A Scarlet/Adreno IR materialization or execution operation failed.
-    #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
-    ScarletAdrenoIr(sgfx_backend_scarlet_adreno::IrSubmitError),
 }
 
 /// Backend-neutral failure category for API frontends.
@@ -361,47 +310,16 @@ impl Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+                sgfx_dynamic_virgl
             ))]
             Self::ScarletVirglHandle(error) => virgl_handle_error_kind(*error),
+
             #[cfg(all(
                 any(
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-            ))]
-            #[cfg(not(sgfx_dynamic_virgl))]
-            Self::ScarletVirglIr(error) => {
-                use virgl::IrSubmitError as E;
-                match error {
-                    E::InvalidIr(error) => ir_error_kind(*error),
-                    E::ResourceTableMismatch
-                    | E::ContextMismatch
-                    | E::TargetExtentMismatch
-                    | E::ImageNotMapped
-                    | E::TextureAlreadyMapped
-                    | E::ImageAlreadyMapped
-                    | E::InvalidVertexData => ErrorKind::InvalidInput,
-                    E::OutOfMemory => ErrorKind::OutOfHostMemory,
-                    E::SubmissionTooLarge => ErrorKind::OutOfDeviceMemory,
-                    E::Unsupported(_) | E::ShaderCompile(_) => ErrorKind::Unsupported,
-                    E::Backend(error) => virgl_handle_error_kind(*error),
-                    E::CompletionFailed(_) | E::CompletionUnavailable | E::SubmissionFailed => {
-                        ErrorKind::DeviceLost
-                    }
-                }
-            }
-            #[cfg(all(
-                any(
-                    target_os = "scarlet",
-                    all(target_os = "linux", feature = "scarlet-native-api")
-                ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    sgfx_dynamic
-                )
+                sgfx_dynamic
             ))]
             Self::ScarletGpu | Self::BackendDeviceMismatch(_) => ErrorKind::InitializationFailed,
 
@@ -410,36 +328,9 @@ impl Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    sgfx_dynamic
-                )
+                sgfx_dynamic
             ))]
             Self::ScarletBackendUnsupported => ErrorKind::Unsupported,
-
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
-            Self::ScarletAdrenoHandle(error) => adreno_handle_error_kind(*error),
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
-            Self::ScarletAdrenoIr(error) => {
-                use sgfx_backend_scarlet_adreno::IrSubmitError as E;
-                match error {
-                    E::InvalidIr(error) => ir_error_kind(*error),
-                    E::ResourceTableMismatch
-                    | E::ContextMismatch
-                    | E::TargetExtentMismatch
-                    | E::ImageNotMapped
-                    | E::TextureAlreadyMapped
-                    | E::ImageAlreadyMapped => ErrorKind::InvalidInput,
-                    E::OutOfMemory => ErrorKind::OutOfHostMemory,
-                    E::SubmissionTooLarge => ErrorKind::OutOfDeviceMemory,
-                    E::Unsupported(_) | E::Codegen(_) | E::SubmitWire(_) | E::AsyncUnsupported => {
-                        ErrorKind::Unsupported
-                    }
-                    E::Backend(error) => adreno_handle_error_kind(*error),
-                    E::CompletionUnavailable | E::CompletionFailed(_) => ErrorKind::DeviceLost,
-                }
-            }
         }
     }
 
@@ -475,59 +366,7 @@ impl Error {
                         | E::Unsupported(_)
                 )
             }
-            #[cfg(all(
-                any(
-                    target_os = "scarlet",
-                    all(target_os = "linux", feature = "scarlet-native-api")
-                ),
-                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-            ))]
-            #[cfg(not(sgfx_dynamic_virgl))]
-            Self::ScarletVirglIr(error) => {
-                use virgl::{HandleError, IrSubmitError as E};
-                matches!(
-                    error,
-                    E::InvalidIr(_)
-                        | E::ResourceTableMismatch
-                        | E::ContextMismatch
-                        | E::TargetExtentMismatch
-                        | E::ImageNotMapped
-                        | E::TextureAlreadyMapped
-                        | E::ImageAlreadyMapped
-                        | E::Unsupported(_)
-                        | E::InvalidVertexData
-                        | E::OutOfMemory
-                        | E::SubmissionTooLarge
-                        | E::Backend(
-                            HandleError::InvalidParameter
-                                | HandleError::Unsupported
-                                | HandleError::OutOfResources
-                        )
-                )
-            }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
-            Self::ScarletAdrenoIr(error) => {
-                use sgfx_backend_scarlet_adreno::{HandleError, IrSubmitError as E};
-                matches!(
-                    error,
-                    E::InvalidIr(_)
-                        | E::ResourceTableMismatch
-                        | E::ContextMismatch
-                        | E::TargetExtentMismatch
-                        | E::ImageNotMapped
-                        | E::TextureAlreadyMapped
-                        | E::ImageAlreadyMapped
-                        | E::Unsupported(_)
-                        | E::OutOfMemory
-                        | E::SubmissionTooLarge
-                        | E::AsyncUnsupported
-                        | E::Backend(
-                            HandleError::InvalidParameter
-                                | HandleError::Unsupported
-                                | HandleError::OutOfResources
-                        )
-                )
-            }
+
             _ => false,
         }
     }
@@ -540,9 +379,8 @@ impl Error {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-    ),
-    all(target_os = "scarlet", feature = "backend-scarlet-adreno")
+        sgfx_dynamic_virgl
+    )
 ))]
 #[allow(dead_code)]
 fn ir_error_kind(error: ir::Error) -> ErrorKind {
@@ -560,22 +398,10 @@ fn ir_error_kind(error: ir::Error) -> ErrorKind {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+    sgfx_dynamic_virgl
 ))]
 fn virgl_handle_error_kind(error: virgl::HandleError) -> ErrorKind {
     use virgl::HandleError as E;
-    match error {
-        E::InvalidParameter | E::InvalidHandle => ErrorKind::InvalidInput,
-        E::Unsupported => ErrorKind::Unsupported,
-        E::OutOfResources => ErrorKind::OutOfDeviceMemory,
-        E::NotFound => ErrorKind::InitializationFailed,
-        E::PermissionDenied | E::SystemError(_) => ErrorKind::DeviceLost,
-    }
-}
-
-#[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
-fn adreno_handle_error_kind(error: sgfx_backend_scarlet_adreno::HandleError) -> ErrorKind {
-    use sgfx_backend_scarlet_adreno::HandleError as E;
     match error {
         E::InvalidParameter | E::InvalidHandle => ErrorKind::InvalidInput,
         E::Unsupported => ErrorKind::Unsupported,
@@ -606,32 +432,18 @@ impl fmt::Display for Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+                sgfx_dynamic_virgl
             ))]
             Self::ScarletVirglHandle(error) => {
                 write!(formatter, "SGFX Scarlet/VirGL device failed: {error:?}")
             }
+
             #[cfg(all(
                 any(
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-            ))]
-            #[cfg(not(sgfx_dynamic_virgl))]
-            Self::ScarletVirglIr(error) => {
-                write!(formatter, "SGFX Scarlet/VirGL execution failed: {error:?}")
-            }
-            #[cfg(all(
-                any(
-                    target_os = "scarlet",
-                    all(target_os = "linux", feature = "scarlet-native-api")
-                ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    sgfx_dynamic
-                )
+                sgfx_dynamic
             ))]
             Self::ScarletGpu => formatter.write_str("SGFX Scarlet GPU control operation failed"),
 
@@ -640,11 +452,7 @@ impl fmt::Display for Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    sgfx_dynamic
-                )
+                sgfx_dynamic
             ))]
             Self::BackendDeviceMismatch(backend) => {
                 write!(
@@ -658,23 +466,10 @@ impl fmt::Display for Error {
                     target_os = "scarlet",
                     all(target_os = "linux", feature = "scarlet-native-api")
                 ),
-                any(
-                    feature = "backend-scarlet-virgl",
-                    feature = "backend-scarlet-adreno",
-                    sgfx_dynamic
-                )
+                sgfx_dynamic
             ))]
             Self::ScarletBackendUnsupported => {
                 formatter.write_str("no SGFX Scarlet backend supports the opened GPU")
-            }
-
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
-            Self::ScarletAdrenoHandle(error) => {
-                write!(formatter, "SGFX Scarlet/Adreno device failed: {error:?}")
-            }
-            #[cfg(all(target_os = "scarlet", feature = "backend-scarlet-adreno"))]
-            Self::ScarletAdrenoIr(error) => {
-                write!(formatter, "SGFX Scarlet/Adreno execution failed: {error:?}")
             }
         }
     }
@@ -763,19 +558,12 @@ fn default_backend() -> Result<BackendKind> {
             target_os = "scarlet",
             all(target_os = "linux", feature = "scarlet-native-api")
         ),
-        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+        sgfx_dynamic_virgl
     ))]
     {
         return Ok(BackendKind::ScarletVirgl);
     }
-    #[cfg(all(
-        target_os = "scarlet",
-        not(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)),
-        feature = "backend-scarlet-adreno"
-    ))]
-    {
-        return Ok(BackendKind::ScarletAdreno);
-    }
+
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     {
         return Ok(BackendKind::Wgpu);
@@ -785,13 +573,7 @@ fn default_backend() -> Result<BackendKind> {
 }
 
 const fn default_backend_kind() -> BackendKind {
-    if cfg!(all(
-        target_os = "scarlet",
-        not(any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)),
-        feature = "backend-scarlet-adreno"
-    )) {
-        BackendKind::ScarletAdreno
-    } else if cfg!(any(
+    if cfg!(any(
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     )) {
@@ -807,25 +589,9 @@ fn require_backend(backend: BackendKind) -> Result<BackendKind> {
         BackendKind::Other(_) => cfg!(sgfx_dynamic),
         BackendKind::Wgpu => cfg!(all(not(target_os = "scarlet"), feature = "backend-wgpu")),
         BackendKind::Metal => false,
-        BackendKind::ScarletVirgl => cfg!(all(
-            any(
-                target_os = "scarlet",
-                all(target_os = "linux", feature = "scarlet-native-api")
-            ),
-            any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-        )),
-        BackendKind::ScarletAdreno => cfg!(all(
-            target_os = "scarlet",
-            feature = "backend-scarlet-adreno"
-        )),
+        BackendKind::ScarletVirgl | BackendKind::ScarletAdreno => cfg!(sgfx_dynamic),
     };
-    if available
-        || (cfg!(sgfx_dynamic)
-            && matches!(
-                backend,
-                BackendKind::ScarletVirgl | BackendKind::ScarletAdreno
-            ))
-    {
+    if available {
         Ok(backend)
     } else {
         Err(Error::BackendUnavailable(backend))
@@ -874,34 +640,6 @@ mod tests {
         );
         for error in [E::DeviceLost, E::CompletionObservation, E::InvalidState] {
             assert!(!Error::Wgpu(error).is_recoverable_rejection());
-        }
-    }
-
-    #[cfg(all(
-        any(
-            target_os = "scarlet",
-            all(target_os = "linux", feature = "scarlet-native-api")
-        ),
-        any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-    ))]
-    #[cfg(not(sgfx_dynamic_virgl))]
-    #[test]
-    fn rejection_classification_separates_native_limits_from_device_failure() {
-        use virgl::{HandleError, IrSubmitError as E};
-        for error in [
-            E::SubmissionTooLarge,
-            E::OutOfMemory,
-            E::Backend(HandleError::OutOfResources),
-        ] {
-            assert!(Error::ScarletVirglIr(error).is_recoverable_rejection());
-        }
-        for error in [
-            E::SubmissionFailed,
-            E::CompletionUnavailable,
-            E::CompletionFailed(1),
-            E::Backend(HandleError::SystemError(-1)),
-        ] {
-            assert!(!Error::ScarletVirglIr(error).is_recoverable_rejection());
         }
     }
 
@@ -992,24 +730,11 @@ mod tests {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-native-api")
     ),
-    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
+    sgfx_dynamic_virgl
 ))]
 impl From<virgl::HandleError> for Error {
     fn from(error: virgl::HandleError) -> Self {
         Self::ScarletVirglHandle(error)
-    }
-}
-#[cfg(all(
-    not(sgfx_dynamic_virgl),
-    any(
-        target_os = "scarlet",
-        all(target_os = "linux", feature = "scarlet-native-api")
-    ),
-    any(feature = "backend-scarlet-virgl", sgfx_dynamic_virgl)
-))]
-impl From<virgl::IrSubmitError> for Error {
-    fn from(error: virgl::IrSubmitError) -> Self {
-        Self::ScarletVirglIr(error)
     }
 }
 

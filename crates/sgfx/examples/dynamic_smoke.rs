@@ -1,5 +1,4 @@
-//! Build this same scene with backend-dynamic and backend-scarlet-virgl to
-//! compare the dynamic boundary against the static implementation in one guest.
+//! Exercise installed native GPU drivers through the dynamic backend boundary.
 //! `--copy-only` runs the async vertex-copy pixel contract directly, skipping
 //! the parent coordinator, low-level fixture, and timing benchmarks.
 //! `--import-overlap-only` checks same-context resize/session lifetime with a retained old-size image.

@@ -17,8 +17,6 @@ std = [
     "sgfx-backend-loader?/std",
     "scarlet-os?/std",
     "gpu-raw?/std",
-    "sgfx-backend-scarlet-adreno?/std",
-    "sgfx-backend-scarlet-virgl-compat?/std",
 ]
 legacy-scarlet-std = [
     "backend-wgpu",
@@ -26,8 +24,6 @@ legacy-scarlet-std = [
     "dep:scarlet-std",
     "sgfx-backend-loader?/legacy-scarlet-std",
     "gpu-raw?/scarlet-std",
-    "sgfx-backend-scarlet-adreno?/scarlet-std",
-    "sgfx-backend-scarlet-virgl-compat?/scarlet-std",
 ]
 # Compatibility alias for consumers that previously selected Scarlet's
 # no_std support directly on the `sgfx` package.
@@ -38,9 +34,7 @@ backend-wgpu = [
     "dep:sgfx-backend-wgpu",
     "dep:wgpu",
 ]
-scarlet-native-api = ["std", "backend-scarlet-virgl"]
-backend-scarlet-virgl = ["backend-dynamic", "dep:gpu-raw", "dep:sgfx-backend-scarlet-virgl-compat"]
-backend-scarlet-adreno = ["dep:gpu-raw", "dep:sgfx-backend-scarlet-adreno"]
+scarlet-native-api = ["std", "backend-dynamic"]
 
 [dependencies]
 sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "77e64a81115d78fab7c63671c2a6c16aac060c05", default-features = false }
@@ -60,7 +54,6 @@ wgpu = { version = "24", features = ["spirv"], optional = true }
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", default-features = false, optional = true }
 scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", optional = true }
 gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", default-features = false, optional = true }
-sgfx-backend-scarlet-adreno = { git = "https://github.com/petitstrawberry/scarlet-project-chromebook.git", rev = "7fa1261dc19caae689598443a2666256f1d931e8", package = "sgfx-backend-scarlet-adreno", default-features = false, optional = true }
 
 # Scarlet Linux-ABI clients use the native GPU transport on AArch64.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
@@ -77,10 +70,6 @@ required-features = ["backend-wgpu"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
-
-# ELF32 and Linux-ABI clients retain their explicit compatibility backend.
-[target.'cfg(any(all(target_os = "scarlet", target_pointer_width = "32"), all(target_os = "linux", target_arch = "aarch64")))'.dependencies]
-sgfx-backend-scarlet-virgl-compat = { path = "../sgfx-backend-scarlet-virgl-compat", default-features = false, optional = true }
 
 [[example]]
 name = "legacy_dynamic_smoke"
