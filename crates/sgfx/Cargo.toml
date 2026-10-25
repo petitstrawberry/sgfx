@@ -10,8 +10,6 @@ backend-dynamic = [ "dep:sgfx-backend-abi", "dep:sgfx-backend-loader", "dep:scar
 default = [
     "std",
     "backend-wgpu",
-    "backend-scarlet-virgl",
-    "backend-scarlet-adreno",
     "backend-dynamic",
 ]
 std = [
@@ -24,8 +22,6 @@ std = [
 ]
 legacy-scarlet-std = [
     "backend-wgpu",
-    "backend-scarlet-virgl",
-    "backend-scarlet-adreno",
     "backend-dynamic",
     "dep:scarlet-std",
     "sgfx-backend-loader?/legacy-scarlet-std",

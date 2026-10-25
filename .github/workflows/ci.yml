@@ -128,14 +128,16 @@ jobs:
           cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-dynamic --prefix none > "$CARGO_TARGET_DIR/dynamic-tree.txt"
           cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-dynamic --edges normal --depth 1 --prefix none > "$CARGO_TARGET_DIR/dynamic-direct-tree.txt"
           cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-scarlet-virgl --prefix none > "$CARGO_TARGET_DIR/virgl-tree.txt"
+          cargo tree --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features legacy-scarlet-std --prefix none > "$CARGO_TARGET_DIR/legacy-tree.txt"
           python3 - <<'PY'
           import os
           from pathlib import Path
           target = Path(os.environ['CARGO_TARGET_DIR'])
-          for name in ('default-tree.txt', 'dynamic-tree.txt', 'virgl-tree.txt'):
+          for name in ('default-tree.txt', 'dynamic-tree.txt', 'virgl-tree.txt', 'legacy-tree.txt'):
               tree = (target / name).read_text()
               assert 'sgfx-backend-loader v' in tree, name
               assert 'sgfx-backend-scarlet-virgl v' not in tree, name
+              assert 'sgfx-backend-scarlet-adreno v' not in tree, name
           direct_dependencies = {
               line.split()[0]
               for line in (target / 'dynamic-direct-tree.txt').read_text().splitlines()

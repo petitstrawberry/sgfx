@@ -282,7 +282,7 @@ fn select_auto_backend(info: &gpu_raw::GpuQueryInfo) -> Result<BackendKind> {
     if crate::virgl::Device::supports(info) {
         return Ok(BackendKind::ScarletVirgl);
     }
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     if sgfx_backend_scarlet_adreno::Device::supports(info) {
         return Ok(BackendKind::ScarletAdreno);
     }
@@ -339,7 +339,7 @@ fn open_virgl(path: &str, gpu: Gpu, info: gpu_raw::GpuQueryInfo) -> Result<Devic
 }
 
 fn open_adreno(path: &str, gpu: Gpu, info: gpu_raw::GpuQueryInfo) -> Result<Device> {
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     {
         let _ = path;
         if !sgfx_backend_scarlet_adreno::Device::supports(&info) {
@@ -349,7 +349,7 @@ fn open_adreno(path: &str, gpu: Gpu, info: gpu_raw::GpuQueryInfo) -> Result<Devi
             .map(Device::Adreno)
             .map_err(Error::ScarletAdrenoHandle)
     }
-    #[cfg(all(not(feature = "backend-scarlet-adreno"), sgfx_dynamic))]
+    #[cfg(sgfx_dynamic)]
     {
         if !supports_gpu(&info, b"qcom-adreno") {
             return Err(Error::BackendDeviceMismatch(BackendKind::ScarletAdreno));
@@ -799,7 +799,7 @@ mod tests {
     use super::select_auto_backend;
     #[cfg(any(
         all(not(sgfx_dynamic_virgl), feature = "backend-scarlet-virgl"),
-        feature = "backend-scarlet-adreno"
+        all(not(sgfx_dynamic), feature = "backend-scarlet-adreno")
     ))]
     use crate::BackendKind;
 
@@ -827,7 +827,11 @@ mod tests {
     #[cfg(sgfx_dynamic)]
     #[test]
     fn auto_discovers_dynamic_drivers_for_ready_unrecognized_gpu_ids() {
-        for id in [b"example-gpu".as_slice(), b"another-vendor-gpu".as_slice()] {
+        for id in [
+            b"qcom-adreno".as_slice(),
+            b"example-gpu".as_slice(),
+            b"another-vendor-gpu".as_slice(),
+        ] {
             let info = ready_info(id);
             assert!(matches!(
                 select_auto_backend(&info),
@@ -846,7 +850,7 @@ mod tests {
         assert!(!crate::dynamic::Device::supports(&no_memory));
     }
 
-    #[cfg(feature = "backend-scarlet-adreno")]
+    #[cfg(all(not(sgfx_dynamic), feature = "backend-scarlet-adreno"))]
     #[test]
     fn auto_selects_adreno_for_the_qcom_adreno_id() {
         let info = ready_info(sgfx_backend_scarlet_adreno::BACKEND_ID);
