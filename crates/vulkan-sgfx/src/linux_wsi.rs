@@ -176,7 +176,7 @@ unsafe extern "system" fn create_surface(
     if unsafe { sgfx_wayland_supported(info.display.cast()) } == 0 {
         return LOST;
     }
-    let surface = crate::wsi::insert_linux_surface(
+    let surface = crate::wsi::insert_platform_surface(
         instance,
         SurfaceWindow::Wayland {
             display: info.display as usize,

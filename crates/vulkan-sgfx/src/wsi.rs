@@ -1,5 +1,9 @@
 //! Vulkan WSI backed by the selected SGFX presentation device.
 
+#[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+use crate::linux_wsi as platform_wsi;
+#[cfg(target_os = "scarlet")]
+use crate::sws_wsi as platform_wsi;
 use ash::vk::{self, Handle};
 use sgfx::ir;
 use std::{
@@ -12,6 +16,11 @@ use std::{
 use std::ffi::c_void;
 
 use crate::api::{next_id, signal_acquire_sync, wait_queue_semaphores, with_device, with_queue};
+
+#[cfg(target_os = "scarlet")]
+type PlatformSurface = std::sync::Arc<platform_wsi::SurfaceWindow>;
+#[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+type PlatformSurface = platform_wsi::SurfaceWindow;
 
 const INVALID: vk::Result = vk::Result::ERROR_INITIALIZATION_FAILED;
 const UNSUPPORTED: vk::Result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
@@ -61,8 +70,11 @@ struct Surface {
     instance: usize,
     #[cfg(target_os = "macos")]
     layer: usize,
-    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-    window: crate::linux_wsi::SurfaceWindow,
+    #[cfg(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
+    window: PlatformSurface,
 }
 
 fn surfaces() -> MutexGuard<'static, HashMap<vk::SurfaceKHR, Surface>> {
@@ -179,7 +191,10 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_capabilities(
         .limits()
         .max_image_dimension_2d
         .min(crate::images::MAX_IMAGE_DIMENSION);
-    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    #[cfg(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
     let (current_extent, min_extent, max_extent) = match _surface.window.extents(maximum) {
         Ok(extents) => extents,
         Err(error) => return error,
@@ -188,21 +203,30 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_capabilities(
         *output = vk::SurfaceCapabilitiesKHR {
             min_image_count: 2,
             max_image_count: MAX_SWAPCHAIN_IMAGES,
-            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
             current_extent: current_extent,
             #[cfg(target_os = "macos")]
             current_extent: vk::Extent2D {
                 width: u32::MAX,
                 height: u32::MAX,
             },
-            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
             min_image_extent: min_extent,
             #[cfg(target_os = "macos")]
             min_image_extent: vk::Extent2D {
                 width: 1,
                 height: 1,
             },
-            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
             max_image_extent: max_extent,
             #[cfg(target_os = "macos")]
             max_image_extent: vk::Extent2D {
@@ -305,8 +329,11 @@ pub(crate) struct Swapchain {
     next_image: usize,
     #[cfg(target_os = "macos")]
     window: sgfx::driver::WindowContext,
-    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-    window: crate::linux_wsi::Window,
+    #[cfg(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
+    window: platform_wsi::Window,
 }
 
 fn swapchain_usage(usage: vk::ImageUsageFlags) -> ir::TextureUsage {
@@ -410,7 +437,10 @@ pub(crate) unsafe extern "system" fn create_swapchain(
     {
         return UNSUPPORTED;
     }
-    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    #[cfg(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
     {
         let (_, min, max) = match surface.window.extents(crate::images::MAX_IMAGE_DIMENSION) {
             Ok(extents) => extents,
@@ -457,8 +487,11 @@ pub(crate) unsafe extern "system" fn create_swapchain(
             )
         }
         .map_err(crate::runtime::backend_failure)?;
-        #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-        let mut window = crate::linux_wsi::Window::new(surface.window, extent)?;
+        #[cfg(any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
+        let mut window = platform_wsi::Window::new(surface.window, extent)?;
         let size = ir::Extent2D::new(extent.width, extent.height).map_err(|_| INVALID)?;
         let mut images = Vec::with_capacity(image_count as usize);
         let mut physical_images = Vec::with_capacity(image_count as usize);
@@ -519,7 +552,10 @@ pub(crate) unsafe extern "system" fn create_swapchain(
                 },
             );
             images.push(image);
-            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
             if let Err(error) = window.register(&physical) {
                 remove_swapchain_images(runtime, &images)?;
                 return Err(error);
@@ -617,12 +653,18 @@ pub(crate) unsafe extern "system" fn acquire_next_image(
                 .swapchains
                 .get_mut(&swapchain)
                 .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
-            #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
             swapchain.window.dispatch()?;
             for offset in 0..swapchain.images.len() {
                 let index = (swapchain.next_image + offset) % swapchain.images.len();
                 if !swapchain.acquired[index] && {
-                    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+                    #[cfg(any(
+                        target_os = "scarlet",
+                        all(target_os = "linux", feature = "scarlet-wsi")
+                    ))]
                     {
                         swapchain.window.available(index)
                     }
@@ -707,7 +749,10 @@ pub(crate) unsafe extern "system" fn queue_present(
     if let Err(error) = wait_queue_semaphores(queue, &waits) {
         return error;
     }
-    #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+    #[cfg(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
     {
         let result = unsafe { crate::api::queue_wait_idle(queue) };
         if result != vk::Result::SUCCESS {
@@ -743,7 +788,10 @@ pub(crate) unsafe extern "system" fn queue_present(
                     .window
                     .present(&swapchain.physical_images[index])
                     .map_err(present_error);
-                #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
+                #[cfg(any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-wsi")
+                ))]
                 let result = swapchain.window.present(index);
                 if result.is_ok() {
                     swapchain.acquired[index] = false;
@@ -807,6 +855,11 @@ pub(crate) fn lookup_physical(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkGetPhysicalDeviceSurfacePresentModesKHR" => entry!(
             get_physical_device_surface_present_modes,
             vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
+        ),
+        #[cfg(target_os = "scarlet")]
+        b"vkGetPhysicalDevicePresentRectanglesKHR" => entry!(
+            physical_present_rectangles,
+            vk::PFN_vkGetPhysicalDevicePresentRectanglesKHR
         ),
         _ => None,
     }
@@ -908,16 +961,19 @@ pub(crate) fn insert_display_surface(
     extent: vk::Extent2D,
 ) -> Result<vk::SurfaceKHR, vk::Result> {
     let window = crate::display::SurfaceWindow::new(extent)?;
-    Ok(insert_linux_surface(
+    Ok(insert_platform_surface(
         instance,
-        crate::linux_wsi::SurfaceWindow::Display(window),
+        platform_wsi::SurfaceWindow::Display(window),
     ))
 }
 
-#[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
-pub(crate) fn insert_linux_surface(
+#[cfg(any(
+    target_os = "scarlet",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
+pub(crate) fn insert_platform_surface(
     instance: vk::Instance,
-    window: crate::linux_wsi::SurfaceWindow,
+    window: PlatformSurface,
 ) -> vk::SurfaceKHR {
     let handle = vk::SurfaceKHR::from_raw(next_id());
     surfaces().insert(
@@ -928,4 +984,92 @@ pub(crate) fn insert_linux_surface(
         },
     );
     handle
+}
+
+#[cfg(target_os = "scarlet")]
+pub(crate) unsafe extern "system" fn acquire_next_image2(
+    device: vk::Device,
+    info: *const vk::AcquireNextImageInfoKHR<'_>,
+    output: *mut u32,
+) -> vk::Result {
+    let Some(info) = info.as_ref() else {
+        return INVALID;
+    };
+    if info.s_type != vk::StructureType::ACQUIRE_NEXT_IMAGE_INFO_KHR
+        || !info.p_next.is_null()
+        || info.device_mask != 1
+    {
+        return UNSUPPORTED;
+    }
+    acquire_next_image(
+        device,
+        info.swapchain,
+        info.timeout,
+        info.semaphore,
+        info.fence,
+        output,
+    )
+}
+
+#[cfg(target_os = "scarlet")]
+pub(crate) unsafe extern "system" fn device_group_present_capabilities(
+    device: vk::Device,
+    output: *mut vk::DeviceGroupPresentCapabilitiesKHR<'_>,
+) -> vk::Result {
+    let Some(output) = output.as_mut() else {
+        return INVALID;
+    };
+    if output.s_type != vk::StructureType::DEVICE_GROUP_PRESENT_CAPABILITIES_KHR
+        || !output.p_next.is_null()
+    {
+        return UNSUPPORTED;
+    }
+    if let Err(error) = with_device(device, |_| Ok(())) {
+        return error;
+    }
+    output.present_mask = [0; vk::MAX_DEVICE_GROUP_SIZE];
+    output.present_mask[0] = 1;
+    output.modes = vk::DeviceGroupPresentModeFlagsKHR::LOCAL;
+    vk::Result::SUCCESS
+}
+
+#[cfg(target_os = "scarlet")]
+pub(crate) unsafe extern "system" fn device_group_surface_present_modes(
+    device: vk::Device,
+    surface: vk::SurfaceKHR,
+    output: *mut vk::DeviceGroupPresentModeFlagsKHR,
+) -> vk::Result {
+    if output.is_null() || !surfaces().contains_key(&surface) {
+        return INVALID;
+    }
+    if let Err(error) = with_device(device, |_| Ok(())) {
+        return error;
+    }
+    *output = vk::DeviceGroupPresentModeFlagsKHR::LOCAL;
+    vk::Result::SUCCESS
+}
+
+#[cfg(target_os = "scarlet")]
+unsafe extern "system" fn physical_present_rectangles(
+    physical: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    count: *mut u32,
+    output: *mut vk::Rect2D,
+) -> vk::Result {
+    let surface = match surface_for_physical(physical, surface) {
+        Ok(surface) => surface,
+        Err(error) => return error,
+    };
+    let extent = match surface.window.size() {
+        Ok(extent) => extent,
+        Err(error) => return error,
+    };
+    enumerate(
+        &[vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        }],
+        count,
+        output,
+    )
 }

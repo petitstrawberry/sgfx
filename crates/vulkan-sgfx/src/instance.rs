@@ -78,7 +78,11 @@ pub(crate) fn instance_valid(instance: vk::Instance) -> bool {
         .contains_key(&(instance.as_raw() as usize))
 }
 
-#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+#[cfg(any(
+    target_os = "scarlet",
+    target_os = "macos",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
 pub(crate) fn physical_instance(physical: vk::PhysicalDevice) -> Option<usize> {
     instances()
         .physical_owners
@@ -130,7 +134,11 @@ pub unsafe extern "system" fn vk_icdGetPhysicalDeviceProcAddr(
     if name.is_null() || !instance_valid(instance) {
         return None;
     }
-    #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+    #[cfg(any(
+        target_os = "scarlet",
+        target_os = "macos",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
     {
         let name = unsafe { CStr::from_ptr(name) };
         let function =
@@ -139,9 +147,15 @@ pub unsafe extern "system" fn vk_icdGetPhysicalDeviceProcAddr(
         let function = function
             .or_else(|| crate::display::lookup(name))
             .or_else(|| crate::linux_wsi::lookup(name));
+        #[cfg(target_os = "scarlet")]
+        let function = function.or_else(|| crate::scarlet_surface::lookup_physical(name));
         function
     }
-    #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi"))))]
+    #[cfg(not(any(
+        target_os = "scarlet",
+        target_os = "macos",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    )))]
     None
 }
 
@@ -260,26 +274,46 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             crate::wsi::create_macos_surface,
             vk::PFN_vkCreateMacOSSurfaceMVK
         ),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkDestroySurfaceKHR" => {
             procedure!(crate::wsi::destroy_surface, vk::PFN_vkDestroySurfaceKHR)
         }
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkGetPhysicalDeviceSurfaceSupportKHR" => procedure!(
             crate::wsi::get_physical_device_surface_support,
             vk::PFN_vkGetPhysicalDeviceSurfaceSupportKHR
         ),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR" => procedure!(
             crate::wsi::get_physical_device_surface_capabilities,
             vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR
         ),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkGetPhysicalDeviceSurfaceFormatsKHR" => procedure!(
             crate::wsi::get_physical_device_surface_formats,
             vk::PFN_vkGetPhysicalDeviceSurfaceFormatsKHR
         ),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkGetPhysicalDeviceSurfacePresentModesKHR" => procedure!(
             crate::wsi::get_physical_device_surface_present_modes,
             vk::PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
@@ -300,6 +334,12 @@ pub(crate) unsafe extern "system" fn get_instance_proc_addr(
             }
             #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
             if let Some(function) = crate::linux_wsi::lookup(name) {
+                return Some(function);
+            }
+            #[cfg(target_os = "scarlet")]
+            if let Some(function) =
+                crate::scarlet_surface::lookup(name).or_else(|| crate::wsi::lookup_physical(name))
+            {
                 return Some(function);
             }
             crate::api::lookup_device(name)
@@ -451,7 +491,11 @@ pub(crate) unsafe extern "system" fn destroy_instance(
             registry.physical_owners.remove(&physical.id());
         }
     }
-    #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+    #[cfg(any(
+        target_os = "scarlet",
+        target_os = "macos",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
     crate::wsi::destroy_instance_surfaces(instance);
 }
 
@@ -489,6 +533,14 @@ pub(crate) unsafe extern "system" fn enumerate_physical_devices(
 }
 
 fn instance_extensions() -> &'static [(&'static CStr, u32)] {
+    #[cfg(target_os = "scarlet")]
+    {
+        &[
+            (vk::KHR_SURFACE_NAME, vk::KHR_SURFACE_SPEC_VERSION),
+            (crate::scarlet_surface::INSTANCE_EXTENSION_NAME, 1),
+        ]
+    }
+
     #[cfg(target_os = "macos")]
     {
         &[
@@ -526,7 +578,11 @@ fn instance_extensions() -> &'static [(&'static CStr, u32)] {
             ),
         ]
     }
-    #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi"))))]
+    #[cfg(not(any(
+        target_os = "scarlet",
+        target_os = "macos",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    )))]
     &[]
 }
 
@@ -589,6 +645,7 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
     {
         &[
             (crate::scarlet_image::DEVICE_EXTENSION_NAME, 1),
+            (vk::KHR_SWAPCHAIN_NAME, vk::KHR_SWAPCHAIN_SPEC_VERSION),
             (vk::KHR_MAINTENANCE1_NAME, vk::KHR_MAINTENANCE1_SPEC_VERSION),
             #[cfg(any(
                 target_os = "scarlet",
@@ -1372,7 +1429,11 @@ mod tests {
                     "{name:?}"
                 );
             }
-            #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+            #[cfg(any(
+                target_os = "scarlet",
+                target_os = "macos",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
             assert!(get_instance_proc_addr(instance, c"vkCreateSwapchainKHR".as_ptr()).is_some());
             #[cfg(not(any(
                 target_os = "macos",
