@@ -51,7 +51,12 @@ fn device_uuid(properties: &vk::PhysicalDeviceProperties) -> [u8; vk::UUID_SIZE]
         .to_le_bytes()
         .into_iter()
         .chain(properties.device_id.to_le_bytes())
-        .chain(properties.device_name.iter().map(|&byte| byte as u8))
+        .chain(
+            properties
+                .device_name
+                .iter()
+                .map(|byte| byte.to_ne_bytes()[0]),
+        )
     {
         a = (a ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         b = (b ^ u64::from(byte)).wrapping_mul(0x100000001b3);

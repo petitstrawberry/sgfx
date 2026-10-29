@@ -113,6 +113,9 @@ pub fn export_image(device: vk::Device, image: vk::Image) -> Result<ExportedImag
 /// it. This is the C ABI entry point advertised by `VK_SGFX_scarlet_image`.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
+/// # Safety
+/// `device` and `image` must be live Vulkan handles belonging to this ICD, and a
+/// non-null `output` must point to writable storage for the returned handle.
 pub unsafe extern "system" fn vkGetImageScarletHandleSGFX(
     device: vk::Device,
     image: vk::Image,

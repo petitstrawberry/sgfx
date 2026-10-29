@@ -65,6 +65,11 @@ jobs:
           cargo test --locked -p vulkan-sgfx
       - name: Build the experimental Vulkan ICD and examples
         run: cargo build --locked -p vulkan-sgfx --examples
+      - name: Check Linux SWS and Wayland WSI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libwayland-bin
+          cargo check --locked -p vulkan-sgfx --features scarlet-wsi
       - name: Test native dispatch policy without GPU syscalls
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
@@ -118,6 +123,10 @@ jobs:
         run: cargo tree --locked -p sgfx --target '${{ matrix.target }}' --invert sgfx-core
       - name: Check std-enabled Scarlet target
         run: cargo check --locked -p sgfx --target '${{ matrix.target }}'
+      - name: Build native Vulkan ICD and SWS surface support
+        run: |
+          cargo build --locked -p vulkan-sgfx --no-default-features --target '${{ matrix.target }}'
+          cargo-clippy clippy --locked -p vulkan-sgfx --no-default-features --target '${{ matrix.target }}' --no-deps -- -D warnings
       - name: Check dynamic native dependency boundaries
         run: |
           cargo check --locked -p sgfx --target '${{ matrix.target }}' --no-default-features --features std,backend-dynamic

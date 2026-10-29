@@ -207,7 +207,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_capabilities(
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-wsi")
             ))]
-            current_extent: current_extent,
+            current_extent,
             #[cfg(target_os = "macos")]
             current_extent: vk::Extent2D {
                 width: u32::MAX,

@@ -14,6 +14,11 @@ pub struct ScarletSurfaceCreateInfo {
     pub flags: vk::Flags,
     pub window: u32,
 }
+/// Create a surface borrowing an application-owned SWS window.
+///
+/// # Safety
+/// Non-null input pointers must reference valid Vulkan structures and `out` must
+/// be writable. The SWS window must remain alive until surface destruction.
 pub unsafe extern "system" fn create_surface(
     instance: vk::Instance,
     info: *const ScarletSurfaceCreateInfo,

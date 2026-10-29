@@ -219,14 +219,13 @@ impl SurfaceWindow {
         if let Some(index) = retired
             .iter()
             .position(|&(buffer, serial)| buffer == event.buffer && serial == event.commit_serial)
+            && (event.kind == 1 || event.kind == 2)
         {
-            if event.kind == 1 || event.kind == 2 {
-                let (buffer, _) = retired.swap_remove(index);
-                unsafe {
-                    sws_gpu_destroy(buffer);
-                }
-                return true;
+            let (buffer, _) = retired.swap_remove(index);
+            unsafe {
+                sws_gpu_destroy(buffer);
             }
+            return true;
         }
         false
     }
