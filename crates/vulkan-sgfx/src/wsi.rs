@@ -736,10 +736,14 @@ pub(crate) unsafe extern "system" fn queue_present(
     {
         return UNSUPPORTED;
     }
-    let waits = unsafe {
-        std::slice::from_raw_parts(info.p_wait_semaphores, info.wait_semaphore_count as usize)
-    }
-    .to_vec();
+    let waits = if info.wait_semaphore_count == 0 {
+        Vec::new()
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(info.p_wait_semaphores, info.wait_semaphore_count as usize)
+        }
+        .to_vec()
+    };
     let swapchains =
         unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) }
             .to_vec();
@@ -1072,4 +1076,25 @@ unsafe extern "system" fn physical_present_rectangles(
         count,
         output,
     )
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn present_without_wait_semaphores_reaches_queue_validation() {
+        let chains = [vk::SwapchainKHR::null()];
+        let indices = [0];
+        let info = vk::PresentInfoKHR::default()
+            .swapchains(&chains)
+            .image_indices(&indices);
+        assert!(info.p_wait_semaphores.is_null());
+        // A null, zero-length wait list is legal. An invalid queue is rejected
+        // after parsing it rather than constructing an invalid Rust slice.
+        assert_eq!(
+            unsafe { queue_present(vk::Queue::null(), &info) },
+            vk::Result::ERROR_DEVICE_LOST
+        );
+    }
 }
