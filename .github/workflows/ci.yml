@@ -65,11 +65,6 @@ jobs:
           cargo test --locked -p vulkan-sgfx
       - name: Build the experimental Vulkan ICD and examples
         run: cargo build --locked -p vulkan-sgfx --examples
-      - name: Check Linux SWS and Wayland WSI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwayland-dev libwayland-bin
-          cargo check --locked -p vulkan-sgfx --features scarlet-wsi
       - name: Test native dispatch policy without GPU syscalls
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
@@ -97,6 +92,21 @@ jobs:
           cargo doc --locked --no-deps --manifest-path crates/sgfx-core/Cargo.toml
           cargo doc --locked --no-deps -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx -p vulkan-sgfx
           cargo doc --locked --no-deps -p sgfx --no-default-features
+
+  linux-wsi:
+    # The Scarlet Linux-ABI GPU transport is supported on AArch64.
+    runs-on: ubuntu-24.04-arm
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2025-12-31
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WSI build dependencies
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libwayland-bin
+      - name: Check Linux SWS and Wayland WSI
+        run: cargo check --locked -p vulkan-sgfx --features scarlet-wsi
 
   scarlet:
     runs-on: ubuntu-latest
