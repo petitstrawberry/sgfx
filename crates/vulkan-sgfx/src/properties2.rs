@@ -256,6 +256,29 @@ unsafe extern "system" fn external_buffer(
     }
 }
 
+unsafe extern "system" fn external_fence(
+    _physical: vk::PhysicalDevice,
+    _info: *const vk::PhysicalDeviceExternalFenceInfo<'_>,
+    out: *mut vk::ExternalFenceProperties<'_>,
+) {
+    if let Some(out) = unsafe { out.as_mut() } {
+        out.external_fence_features = vk::ExternalFenceFeatureFlags::empty();
+        out.export_from_imported_handle_types = vk::ExternalFenceHandleTypeFlags::empty();
+        out.compatible_handle_types = vk::ExternalFenceHandleTypeFlags::empty();
+    }
+}
+unsafe extern "system" fn external_semaphore(
+    _physical: vk::PhysicalDevice,
+    _info: *const vk::PhysicalDeviceExternalSemaphoreInfo<'_>,
+    out: *mut vk::ExternalSemaphoreProperties<'_>,
+) {
+    if let Some(out) = unsafe { out.as_mut() } {
+        out.external_semaphore_features = vk::ExternalSemaphoreFeatureFlags::empty();
+        out.export_from_imported_handle_types = vk::ExternalSemaphoreHandleTypeFlags::empty();
+        out.compatible_handle_types = vk::ExternalSemaphoreHandleTypeFlags::empty();
+    }
+}
+
 pub(crate) fn is_core(name: &CStr) -> bool {
     matches!(
         name.to_bytes(),
@@ -267,6 +290,8 @@ pub(crate) fn is_core(name: &CStr) -> bool {
             | b"vkGetPhysicalDeviceQueueFamilyProperties2"
             | b"vkGetPhysicalDeviceSparseImageFormatProperties2"
             | b"vkGetPhysicalDeviceExternalBufferProperties"
+            | b"vkGetPhysicalDeviceExternalFenceProperties"
+            | b"vkGetPhysicalDeviceExternalSemaphoreProperties"
     )
 }
 
@@ -311,6 +336,16 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
             external_buffer,
             vk::PFN_vkGetPhysicalDeviceExternalBufferProperties
         ),
+        b"vkGetPhysicalDeviceExternalFenceProperties"
+        | b"vkGetPhysicalDeviceExternalFencePropertiesKHR" => entry!(
+            external_fence,
+            vk::PFN_vkGetPhysicalDeviceExternalFenceProperties
+        ),
+        b"vkGetPhysicalDeviceExternalSemaphoreProperties"
+        | b"vkGetPhysicalDeviceExternalSemaphorePropertiesKHR" => entry!(
+            external_semaphore,
+            vk::PFN_vkGetPhysicalDeviceExternalSemaphoreProperties
+        ),
         _ => None,
     }
 }
@@ -348,6 +383,28 @@ mod tests {
         assert_eq!(uuid, device_uuid(&properties));
         properties.device_id = 8;
         assert_ne!(uuid, device_uuid(&properties));
+    }
+    #[test]
+    fn external_sync_queries_clear_unsupported_capabilities_without_changing_headers() {
+        let mut fence = vk::ExternalFenceProperties::default()
+            .external_fence_features(vk::ExternalFenceFeatureFlags::EXPORTABLE)
+            .compatible_handle_types(vk::ExternalFenceHandleTypeFlags::OPAQUE_FD);
+        let mut semaphore = vk::ExternalSemaphoreProperties::default()
+            .external_semaphore_features(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE)
+            .export_from_imported_handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        unsafe {
+            external_fence(vk::PhysicalDevice::null(), std::ptr::null(), &mut fence);
+            external_semaphore(vk::PhysicalDevice::null(), std::ptr::null(), &mut semaphore);
+        }
+        assert!(fence.external_fence_features.is_empty());
+        assert!(fence.compatible_handle_types.is_empty());
+        assert!(semaphore.external_semaphore_features.is_empty());
+        assert!(semaphore.export_from_imported_handle_types.is_empty());
+        assert_eq!(fence.s_type, vk::StructureType::EXTERNAL_FENCE_PROPERTIES);
+        assert_eq!(
+            semaphore.s_type,
+            vk::StructureType::EXTERNAL_SEMAPHORE_PROPERTIES
+        );
     }
     #[test]
     fn unsupported_external_memory_is_not_advertised_or_accepted() {
