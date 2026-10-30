@@ -320,6 +320,8 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_present_modes(
 }
 
 pub(crate) struct Swapchain {
+    #[cfg(feature = "frame-capture")]
+    capture: crate::frame_capture::Capture,
     surface: vk::SurfaceKHR,
     format: vk::Format,
     extent: vk::Extent2D,
@@ -338,6 +340,10 @@ pub(crate) struct Swapchain {
 
 fn swapchain_usage(usage: vk::ImageUsageFlags) -> ir::TextureUsage {
     let mut result = ir::TextureUsage::RENDER_ATTACHMENT | ir::TextureUsage::PRESENT;
+    #[cfg(feature = "frame-capture")]
+    if crate::frame_capture::enabled() {
+        result |= ir::TextureUsage::COPY_SRC;
+    }
     // Presentation images already carry a sampled backend allocation and a
     // mapped sampler view. Preserve this usage in the logical IR descriptor
     // so Kopper can sample or read back a previous swapchain image.
@@ -565,6 +571,8 @@ pub(crate) unsafe extern "system" fn create_swapchain(
         runtime.resources.swapchains.insert(
             swapchain,
             Swapchain {
+                #[cfg(feature = "frame-capture")]
+                capture: Default::default(),
                 surface: surface_handle,
                 format,
                 extent,
@@ -787,6 +795,23 @@ pub(crate) unsafe extern "system" fn queue_present(
                         height: swapchain.physical_images[index].height(),
                     }
                 );
+                #[cfg(feature = "frame-capture")]
+                {
+                    let image = runtime
+                        .resources
+                        .images
+                        .get(&swapchain.images[index])
+                        .ok_or(INVALID)?
+                        .id;
+                    swapchain.capture.presented(
+                        &runtime.queue,
+                        &mut runtime.cache,
+                        image,
+                        swapchain.format,
+                        swapchain.extent,
+                        handle.as_raw(),
+                    );
+                }
                 #[cfg(target_os = "macos")]
                 let result = swapchain
                     .window

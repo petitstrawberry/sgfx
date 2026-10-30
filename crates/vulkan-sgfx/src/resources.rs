@@ -120,6 +120,7 @@ pub(crate) struct DescriptorPool {
 }
 #[derive(Clone)]
 pub(crate) struct DescriptorSet {
+    pub texel_formats: HashMap<u32, vk::Format>,
     pub pool: vk::DescriptorPool,
     pub layout: ir::BindGroupLayoutDesc,
     pub types: BTreeMap<u32, vk::DescriptorType>,
@@ -231,6 +232,16 @@ pub(crate) unsafe fn specialization(
     Ok(result)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct ShaderViews {
+    textures: crate::spirv::TextureSwizzles,
+    narrow_texels: Vec<(u32, u32)>,
+}
+impl ShaderViews {
+    fn is_empty(&self) -> bool {
+        self.textures.is_empty() && self.narrow_texels.is_empty()
+    }
+}
 #[derive(Default)]
 pub(crate) struct Resources {
     pub mip_render_targets: HashMap<(vk::Format, u32, u32, usize), ir::TextureId>,
@@ -264,9 +275,8 @@ pub(crate) struct Resources {
     bind_group_cache: Vec<(ir::BindGroupDesc, ir::BindGroupId)>,
     pub pipeline_caches: HashMap<vk::PipelineCache, Vec<u8>>,
     pub pipelines: HashMap<vk::Pipeline, Pipeline>,
-    graphics_swizzles:
-        HashMap<(vk::Pipeline, crate::spirv::TextureSwizzles), ir::ProgrammableRenderPipelineId>,
-    compute_swizzles: HashMap<(vk::Pipeline, crate::spirv::TextureSwizzles), ir::ComputePipelineId>,
+    graphics_swizzles: HashMap<(vk::Pipeline, ShaderViews), ir::ProgrammableRenderPipelineId>,
+    compute_swizzles: HashMap<(vk::Pipeline, ShaderViews), ir::ComputePipelineId>,
     pub graphics_extents: HashMap<vk::Pipeline, vk::Extent2D>,
     pub graphics_state: HashMap<vk::Pipeline, crate::images::GraphicsDynamicState>,
     pub graphics_inputs: HashMap<vk::Pipeline, Vec<crate::input_attachments::InputBinding>>,
@@ -428,18 +438,29 @@ impl Resources {
         &self,
         layout: &ir::PipelineLayoutDesc,
         sets: &BTreeMap<u32, vk::DescriptorSet>,
-    ) -> Result<crate::spirv::TextureSwizzles, vk::Result> {
+    ) -> Result<ShaderViews, vk::Result> {
         let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
-        let mut maps = Vec::new();
+        let mut maps = ShaderViews::default();
         for (group, layout) in layout.bind_groups().iter().enumerate() {
             for entry in layout.entries() {
-                if !matches!(entry.ty(), ir::BindingType::SampledTextureView { .. }) {
+                if !matches!(
+                    entry.ty(),
+                    ir::BindingType::SampledTextureView { .. }
+                        | ir::BindingType::StorageBuffer { read_only: true }
+                ) {
                     continue;
                 }
                 let set = sets
                     .get(&(group as u32))
                     .and_then(|set| self.descriptor_sets.get(set))
                     .ok_or(invalid)?;
+                if matches!(entry.ty(), ir::BindingType::StorageBuffer { .. }) {
+                    let binding = set.ir_to_source(entry.binding()).ok_or(invalid)?;
+                    if set.texel_formats.get(&binding) == Some(&vk::Format::R8_SINT) {
+                        maps.narrow_texels.push((group as u32, entry.binding()));
+                    }
+                    continue;
+                }
                 let Some(DescriptorBinding::Image { view, .. }) = set
                     .bindings
                     .get(&set.ir_to_source(entry.binding()).ok_or(invalid)?)
@@ -448,7 +469,8 @@ impl Resources {
                 };
                 let view = self.views.get(view).ok_or(invalid)?;
                 if view.components != [0, 1, 2, 3] {
-                    maps.push((group as u32, entry.binding(), view.components));
+                    maps.textures
+                        .push((group as u32, entry.binding(), view.components));
                 }
             }
         }
@@ -647,6 +669,11 @@ impl Resources {
                     if offset.checked_add(size).is_none_or(|end| end > buf.size) {
                         return Err(invalid);
                     }
+                    let size = if set.texel_formats.get(&binding) == Some(&vk::Format::R8_SINT) {
+                        size.next_multiple_of(4)
+                    } else {
+                        size
+                    };
                     ir::BindingResource::Buffer {
                         buffer: buf.id,
                         offset,
@@ -749,7 +776,7 @@ impl Resources {
 fn swizzle_entry(
     table: &ir::ResourceTable,
     entry: &ir::ShaderEntryPoint,
-    maps: &crate::spirv::TextureSwizzles,
+    maps: &ShaderViews,
     orphaned: &mut HashSet<ir::ShaderModuleId>,
 ) -> Result<ir::ShaderEntryPoint, vk::Result> {
     let original = table
@@ -758,7 +785,8 @@ fn swizzle_entry(
     let ir::ShaderSource::SpirV(words) = original.source() else {
         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
     };
-    let changed = crate::spirv::sampled_image_swizzles(words, maps)?;
+    let changed = crate::spirv::sampled_image_swizzles(words, &maps.textures)?;
+    let changed = crate::texel_buffers::narrow_signed_bytes(changed, &maps.narrow_texels)?;
     if changed == *words {
         return Ok(entry.clone());
     }
@@ -1846,6 +1874,7 @@ unsafe extern "system" fn create_pipeline_layout(
                     pushed = Some((
                         index as u32,
                         DescriptorSet {
+                            texel_formats: HashMap::new(),
                             pool: vk::DescriptorPool::null(),
                             layout: r.resources.set_layouts[h].clone(),
                             types: r.resources.set_layout_types[h].clone(),
@@ -2095,6 +2124,7 @@ unsafe extern "system" fn allocate_descriptor_sets(
                 r.resources.descriptor_sets.insert(
                     handle,
                     DescriptorSet {
+                        texel_formats: HashMap::new(),
                         pool: pool_handle,
                         layout,
                         types,
@@ -2265,6 +2295,11 @@ pub(crate) unsafe fn snapshot_descriptor_writes(
 
 pub(crate) fn apply_descriptor_writes(r: &mut crate::runtime::Runtime, owned_writes: Vec<Write>) {
     for mut write in owned_writes {
+        let texel_format = if let Some(DescriptorBinding::TexelBuffer(view)) = write.value {
+            r.resources.buffer_views.get(&view).map(|v| v.format)
+        } else {
+            None
+        };
         if let Some(DescriptorBinding::TexelBuffer(view)) = write.value {
             write.value = r
                 .resources
@@ -2273,7 +2308,10 @@ pub(crate) fn apply_descriptor_writes(r: &mut crate::runtime::Runtime, owned_wri
                 .filter(|v| {
                     matches!(
                         v.format,
-                        vk::Format::R32_SINT | vk::Format::R32_UINT | vk::Format::R32_SFLOAT
+                        vk::Format::R8_SINT
+                            | vk::Format::R32_SINT
+                            | vk::Format::R32_UINT
+                            | vk::Format::R32_SFLOAT
                     )
                 })
                 .map(|v| DescriptorBinding::Buffer {
@@ -2305,7 +2343,7 @@ pub(crate) fn apply_descriptor_writes(r: &mut crate::runtime::Runtime, owned_wri
                         } else {
                             128 * 1024 * 1024
                         }
-                    && size.is_multiple_of(4)
+                    && (texel_format == Some(vk::Format::R8_SINT) || size.is_multiple_of(4))
                     && offset.is_multiple_of(u64::from(
                         if matches!(
                             write.ty,
@@ -2380,6 +2418,11 @@ pub(crate) fn apply_descriptor_writes(r: &mut crate::runtime::Runtime, owned_wri
             set.cached_group = None;
             if let (true, Some(binding), Some(value)) = (valid, binding, write.value) {
                 set.bindings.insert(binding, value);
+                if let Some(format) = texel_format {
+                    set.texel_formats.insert(binding, format);
+                } else {
+                    set.texel_formats.remove(&binding);
+                }
             } else {
                 if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                     eprintln!(
@@ -2439,6 +2482,12 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
                             .copied()
                             .zip(s.bindings.get(&src_binding).copied())
                     });
+                let texel_format = r
+                    .resources
+                    .descriptor_sets
+                    .get(&src)
+                    .and_then(|s| s.texel_formats.get(&src_binding))
+                    .copied();
                 if let Some(set) = r.resources.descriptor_sets.get_mut(&dst) {
                     set.cached_group = None;
                     if valid
@@ -2446,6 +2495,11 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
                     {
                         if let Some((_, value)) = source {
                             set.bindings.insert(dst_binding, value);
+                            if let Some(format) = texel_format {
+                                set.texel_formats.insert(dst_binding, format);
+                            } else {
+                                set.texel_formats.remove(&dst_binding);
+                            }
                         }
                     } else {
                         set.invalid = true;
@@ -3317,6 +3371,7 @@ mod tests {
     #[test]
     fn descriptor_writes_preserve_declared_stage_visibility() {
         let set = DescriptorSet {
+            texel_formats: HashMap::new(),
             pool: vk::DescriptorPool::null(),
             layout: ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
             types: [1, 3, 128]
@@ -3463,6 +3518,7 @@ mod tests {
         resources.descriptor_sets.insert(
             set,
             DescriptorSet {
+                texel_formats: HashMap::new(),
                 pool: vk::DescriptorPool::null(),
                 layout,
                 types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
@@ -3734,6 +3790,7 @@ mod tests {
         resources.descriptor_sets.insert(
             set_handle,
             DescriptorSet {
+                texel_formats: HashMap::new(),
                 pool: vk::DescriptorPool::null(),
                 layout,
                 types: BTreeMap::from([
@@ -3819,6 +3876,7 @@ mod tests {
         resources.descriptor_sets.insert(
             handle,
             DescriptorSet {
+                texel_formats: HashMap::new(),
                 pool: vk::DescriptorPool::null(),
                 types: BTreeMap::new(),
                 stages: BTreeMap::new(),
@@ -4207,6 +4265,7 @@ mod tests {
         resources.descriptor_sets.insert(
             set_handle,
             DescriptorSet {
+                texel_formats: HashMap::new(),
                 pool: vk::DescriptorPool::null(),
                 types: BTreeMap::from([(0, vk::DescriptorType::STORAGE_BUFFER)]),
                 stages: BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
@@ -4255,6 +4314,7 @@ mod tests {
         resources.descriptor_sets.insert(
             handle,
             DescriptorSet {
+                texel_formats: HashMap::new(),
                 pool: vk::DescriptorPool::null(),
                 types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
                 stages: BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),

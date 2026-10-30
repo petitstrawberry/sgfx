@@ -20,7 +20,8 @@ unsafe extern "system" fn create(
             || !i.flags.is_empty()
             || !matches!(
                 i.format,
-                vk::Format::R8G8B8A8_UNORM
+                vk::Format::R8_SINT
+                    | vk::Format::R8G8B8A8_UNORM
                     | vk::Format::R32_SINT
                     | vk::Format::R32_UINT
                     | vk::Format::R32_SFLOAT
@@ -58,7 +59,7 @@ unsafe extern "system" fn create(
                         | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
                 )
                 || range == 0
-                || !range.is_multiple_of(4)
+                || (view.format != vk::Format::R8_SINT && !range.is_multiple_of(4))
                 || view
                     .offset
                     .checked_add(range)

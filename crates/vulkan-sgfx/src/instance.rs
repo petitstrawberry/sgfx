@@ -1311,7 +1311,10 @@ pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
     if capabilities.supports_storage_buffers()
         && matches!(
             format,
-            vk::Format::R32_SINT | vk::Format::R32_UINT | vk::Format::R32_SFLOAT
+            vk::Format::R8_SINT
+                | vk::Format::R32_SINT
+                | vk::Format::R32_UINT
+                | vk::Format::R32_SFLOAT
         )
     {
         properties.buffer_features |= vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER;

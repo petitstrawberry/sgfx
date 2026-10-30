@@ -10,10 +10,12 @@ events, binary/timeline semaphores, dynamic rendering, indirect-count drawing,
 indexed indirect drawing with a negative vertex offset and exact image readback.
 The combined graphics path checks push descriptors, anisotropy 16, instance
 divisor two, firstInstance two, signed BaseVertex and DrawIndex after a skipped
-zero-count indirect command. It verifies 320 color pixels and 320 depth words
+zero-count indirect command. It verifies 448 color pixels and 448 depth words
 across triangle/indexed/point and Min/Max blending passes, including explicit
 sampling gradients, packed signed/normalized inputs, angle conversion, dynamic
-local-array stores and a signed texel view with byte offset 16.
+local-array stores and R32 signed texel views at byte offset 16, and an R8 signed view at offset 20
+with a seven-byte range. The R8 path checks -128, 127, negative values and
+packed-word boundaries, then returns to the original R32 view.
 Separate checks validate D32 upload/copy/clear, vertex-only depth rendering with
 static depth bias and preserved texels, plus RGBA16F/RGBA32F additive blending.
 The floating-point test compares 128 exact packed components, including negative

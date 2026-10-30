@@ -227,42 +227,43 @@ fn driver(id: u64, kind: Kind) -> VkResult<Arc<Driver>> {
         .ok_or(vk::Result::ERROR_DEVICE_LOST)
 }
 
+/// Loaded Scarlet DSOs share the loader's process envp, while their private
+/// Rust std environment is uninitialized. Copy values before returning them.
+pub(crate) fn process_env(name: &str) -> Option<String> {
+    #[cfg(target_os = "scarlet")]
+    unsafe {
+        unsafe extern "C" {
+            #[linkage = "extern_weak"]
+            static environ: *const *const *const c_char;
+        }
+        let address = environ;
+        if address.is_null() {
+            return None;
+        }
+        let mut cursor = *address;
+        if cursor.is_null() {
+            return None;
+        }
+        while !(*cursor).is_null() {
+            let entry = CStr::from_ptr(*cursor).to_bytes();
+            if let Some(value) = entry
+                .strip_prefix(name.as_bytes())
+                .and_then(|s| s.strip_prefix(b"="))
+            {
+                return std::str::from_utf8(value).ok().map(str::to_owned);
+            }
+            cursor = cursor.add(1);
+        }
+        None
+    }
+    #[cfg(not(target_os = "scarlet"))]
+    {
+        std::env::var(name).ok()
+    }
+}
 fn call_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        // Loaded Scarlet Rust DSOs have their own uninitialized std environment.
-        // Read the process envp published by scarlet-ld without requiring a
-        // libc getenv export from the application.
-        #[cfg(target_os = "scarlet")]
-        unsafe {
-            unsafe extern "C" {
-                // extern_weak contains the symbol's ADDRESS. The C data at
-                // that address is itself the char ** environment pointer.
-                #[linkage = "extern_weak"]
-                static environ: *const *const *const c_char;
-            }
-            let address = environ;
-            if address.is_null() {
-                return false;
-            }
-            let mut cursor = *address;
-            if cursor.is_null() {
-                return false;
-            }
-            while !(*cursor).is_null() {
-                let entry = CStr::from_ptr(*cursor).to_bytes();
-                if let Some(value) = entry.strip_prefix(b"SGFX_VULKAN_CALL_PROFILE=") {
-                    return value == b"1";
-                }
-                cursor = cursor.add(1);
-            }
-            false
-        }
-        #[cfg(not(target_os = "scarlet"))]
-        {
-            std::env::var("SGFX_VULKAN_CALL_PROFILE").is_ok_and(|v| v == "1")
-        }
-    })
+    *ENABLED.get_or_init(|| process_env("SGFX_VULKAN_CALL_PROFILE").is_some_and(|v| v == "1"))
 }
 
 #[derive(Clone, Copy)]
@@ -5242,6 +5243,7 @@ mod tests {
             resources.descriptor_sets.insert(
                 vk::DescriptorSet::from_raw(handle),
                 crate::resources::DescriptorSet {
+                    texel_formats: HashMap::new(),
                     pool: vk::DescriptorPool::from_raw(7),
                     layout: group_layout.clone(),
                     types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
@@ -6323,6 +6325,7 @@ mod owned_descriptor_tests {
             runtime.resources.descriptor_sets.insert(
                 set,
                 DescriptorSet {
+                    texel_formats: HashMap::new(),
                     pool,
                     layout: ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
                         0,

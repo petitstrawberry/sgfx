@@ -74,3 +74,6 @@ pub mod scarlet_surface;
 mod sws_wsi;
 
 mod texel_buffers;
+
+#[cfg(feature = "frame-capture")]
+mod frame_capture;

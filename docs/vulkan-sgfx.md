@@ -38,9 +38,13 @@ remain incomplete.
   Depth-only dynamic rendering retains a private discarded color attachment and
   an empty fragment stage when the application supplies only a vertex stage.
   Fixed finite constant/slope depth bias reaches the native rasterizer.
-- Scalar R32 signed/unsigned/float texel views use the original buffer and range
+- R8 signed and scalar R32 signed/unsigned/float texel views use the original buffer and range
   as read-only storage. `texelFetch` preserves component bits and supplies the
-  format's default zero/zero/one channels. Descriptor templates for texel views,
+  format's default zero/zero/one channels. R8 views select packed bytes and
+  sign-extend in the GPU shader; format-specialized pipelines keep the original
+  buffer backing and support byte ranges not divisible by four. View metadata
+  is retained across descriptor snapshots, copies and view destruction.
+  Descriptor templates for texel views,
   other texel formats and texel-buffer size queries are not implemented.
 - Native D32 images support checked staging uploads, image copies, readback and
   depth clears, with mip zero and one layer. The CGL host needs the depth-aware
@@ -656,3 +660,18 @@ and fragment counters on backends that expose the feature.
 | HVF guest log | `87421c1fe93e98e54a70e909edd40573702d60a0dfd835c62cc3b72fcb42c859` |
 
 Full receipts and logs are retained under `target/vulkan-next/scoped-summary.json`.
+
+
+### Diagnostic GPU frame capture
+
+Build `vulkan-sgfx` with `--features frame-capture` and set
+`SGFX_VULKAN_CAPTURE_DIR` to an output directory. The driver reads back the actual
+GPU presentation image after rendering completes and saves RGBA PNGs before
+handing the image to WSI. It captures the first frame and at most one frame every
+30 seconds, up to twelve per swapchain. Files use create-new semantics. Failures
+are logged without failing presentation. Capture adds synchronous readback and
+PNG encoding overhead; the default build contains no capture path.
+
+`SGFX_VULKAN_CALL_PROFILE=1` enables the existing worker/API phase profiler. Both
+settings use the loader-published process environment on Scarlet, where a loaded
+Rust DSO does not initialize its own std environment.

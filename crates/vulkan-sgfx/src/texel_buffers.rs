@@ -158,3 +158,101 @@ pub(crate) fn lower(words: Vec<u32>) -> Result<Vec<u32>, vk::Result> {
     out[3] = bound;
     Ok(out)
 }
+
+/// Specialize scalar R32 storage loads for signed byte texel views. The same
+/// GPU buffer remains bound: address packed words and sign-extend the selected
+/// byte in the shader, including high-bit values and nonzero view offsets.
+pub(crate) fn narrow_signed_bytes(
+    words: Vec<u32>,
+    bindings: &[(u32, u32)],
+) -> Result<Vec<u32>, vk::Result> {
+    if bindings.is_empty() {
+        return Ok(words);
+    }
+    let rows = crate::spirv::instructions(&words)?;
+    let mut decorations = HashMap::<u32, (Option<u32>, Option<u32>)>::new();
+    for r in &rows {
+        if r[0] & 65535 == 71 && r.len() == 4 {
+            let pair = decorations.entry(r[1]).or_default();
+            match r[2] {
+                34 => pair.0 = Some(r[3]),
+                33 => pair.1 = Some(r[3]),
+                _ => {}
+            }
+        }
+    }
+    let globals = decorations
+        .into_iter()
+        .filter_map(|(id, (set, binding))| bindings.contains(&(set?, binding?)).then_some(id))
+        .collect::<HashSet<_>>();
+    if globals.is_empty() {
+        return Ok(words);
+    }
+    let signed = rows
+        .iter()
+        .filter(|r| r[0] & 65535 == 21 && r.len() == 4 && r[2] == 32 && r[3] == 1)
+        .map(|r| r[1])
+        .collect::<HashSet<_>>();
+    let pointers = rows
+        .iter()
+        .filter(|r| r[0] & 65535 == 32 && r.len() == 4)
+        .map(|r| (r[1], r[3]))
+        .collect::<HashMap<_, _>>();
+    let mut bound = words[3];
+    let mut fresh = || {
+        let id = bound;
+        bound = bound.checked_add(1).ok_or(UNSUPPORTED)?;
+        Ok::<_, vk::Result>(id)
+    };
+    let uint = fresh()?;
+    let two = fresh()?;
+    let three = fresh()?;
+    let twenty_four = fresh()?;
+    let mut declarations = Vec::new();
+    emit(&mut declarations, 21, &[uint, 32, 0]);
+    for (id, value) in [(two, 2), (three, 3), (twenty_four, 24)] {
+        emit(&mut declarations, 43, &[uint, id, value]);
+    }
+    let mut out = words[..5].to_vec();
+    let mut added = false;
+    let mut accesses = HashMap::new();
+    for r in rows {
+        let op = r[0] & 65535;
+        if op == 54 && !added {
+            out.extend_from_slice(&declarations);
+            added = true;
+        }
+        if op == 65 && r.len() >= 4 && globals.contains(&r[3]) {
+            if r.len() != 6 || !pointers.get(&r[1]).is_some_and(|ty| signed.contains(ty)) {
+                return Err(UNSUPPORTED);
+            }
+            let coord = fresh()?;
+            let word = fresh()?;
+            emit(&mut out, 124, &[uint, coord, r[5]]);
+            emit(&mut out, 194, &[uint, word, coord, two]);
+            let mut access = r.to_vec();
+            access[5] = word;
+            out.extend_from_slice(&access);
+            accesses.insert(r[2], coord);
+        } else if op == 61 && r.len() == 4 && accesses.contains_key(&r[3]) {
+            if !signed.contains(&r[1]) {
+                return Err(UNSUPPORTED);
+            }
+            let raw = fresh()?;
+            let byte = fresh()?;
+            let shift = fresh()?;
+            let selected = fresh()?;
+            let high = fresh()?;
+            emit(&mut out, 61, &[r[1], raw, r[3]]);
+            emit(&mut out, 199, &[uint, byte, accesses[&r[3]], three]);
+            emit(&mut out, 196, &[uint, shift, byte, three]);
+            emit(&mut out, 194, &[r[1], selected, raw, shift]);
+            emit(&mut out, 196, &[r[1], high, selected, twenty_four]);
+            emit(&mut out, 195, &[r[1], r[2], high, twenty_four]);
+        } else {
+            out.extend_from_slice(r);
+        }
+    }
+    out[3] = bound;
+    Ok(out)
+}

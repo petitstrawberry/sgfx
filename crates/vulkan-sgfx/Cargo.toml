@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 default = ["backend-wgpu"]
 backend-wgpu = ["sgfx/backend-wgpu"]
 scarlet-wsi = ["sgfx/scarlet-native-api", "dep:dlmalloc"]
+frame-capture = ["dep:png"]
 cube-demo = ["dep:png", "dep:framebuffer", "naga/wgsl-in"]
 
 [[bin]]
