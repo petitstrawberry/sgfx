@@ -1769,6 +1769,8 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
 fn wgpu_timestamp(
     context: &sgfx_backend_wgpu::Context,
 ) -> core::result::Result<u64, sgfx_backend_wgpu::Error> {
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU8;
     use sgfx_backend_wgpu::Error;
     let device = context.raw_device();
     let queue = context.raw_queue();
@@ -1843,15 +1845,18 @@ fn wgpu_timestamp(
     encoder.resolve_query_set(&query, 0..1, &resolve, 0);
     encoder.copy_buffer_to_buffer(&resolve, 0, &output, 0, 8);
     queue.submit([encoder.finish()]);
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    // The facade can be no_std even when its host WGPU dependency uses std.
+    // Native poll(Wait) runs mapping callbacks before returning.
+    let mapped = Arc::new(AtomicU8::new(0));
+    let callback = Arc::clone(&mapped);
     let slice = output.slice(..);
     slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
+        callback.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
     });
     let _ = device.poll(wgpu::Maintain::Wait);
-    rx.recv()
-        .map_err(|_| Error::DeviceLost)?
-        .map_err(|_| Error::DeviceLost)?;
+    if mapped.load(Ordering::Acquire) != 1 {
+        return Err(Error::DeviceLost);
+    }
     let bytes = slice.get_mapped_range();
     let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
     drop(bytes);
