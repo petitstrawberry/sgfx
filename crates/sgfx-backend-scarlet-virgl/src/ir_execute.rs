@@ -616,7 +616,7 @@ impl BufferShadow {
             self.bytes
                 .as_deref()
                 .ok_or(IrSubmitError::InvalidVertexData)?,
-            self.upload.clone(),
+            PreparedBufferOnlyPlan(BufferOnlyPlan::default()).upload_for_slot(self, 0),
         ))
     }
 }
@@ -1021,6 +1021,7 @@ impl PreparedBufferOnlyPlan<'_> {
     ) -> Option<driver::IrBufferUpdate> {
         self.update_for_slot(slot)
             .map(|update| shadow.merged_upload(update.upload.clone()))
+            .or_else(|| shadow.upload.clone())
     }
 
     fn publish(
@@ -5278,6 +5279,52 @@ mod tests {
             BufferOnlyPlan::from_commands(&table, &shadows, &mixed)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn draw_only_preparation_retains_disjoint_updates_from_older_streams() {
+        const LENGTH: usize = 128 * 1024 * 1024;
+        let mut shadows = [range_test_shadow(vec![3; LENGTH])];
+        shadows[0].upload = None; // physical storage already contains revision 7
+        let pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
+        for (start, value) in [(4, 9), (LENGTH - 8, 7)] {
+            let mut update = BufferOnlyPlan::default();
+            update
+                .write(&shadows, 0, start, Cow::Owned(vec![value; 4]))
+                .unwrap();
+            update
+                .reserve(&mut shadows)
+                .unwrap()
+                .publish(&mut shadows, Ok(()))
+                .unwrap();
+        }
+        // Production draw preparation has no writes in this stream. It must
+        // use the cumulative physical base, rather than choose a full repair.
+        let drawing = BufferOnlyPlan::default().reserve(&mut shadows).unwrap();
+        let upload = drawing
+            .upload_for_slot(&shadows[0], 0)
+            .expect("preceding updates must survive a draw-only stream");
+        assert_eq!(upload.previous_revision, 7);
+        assert_eq!(shadows[0].revision, 9);
+        assert_eq!(
+            upload.intervals.as_ref().unwrap().ranges(),
+            &[4..8, LENGTH - 8..LENGTH - 4]
+        );
+        assert_eq!(
+            upload
+                .intervals
+                .as_ref()
+                .unwrap()
+                .ranges()
+                .iter()
+                .map(core::ops::Range::len)
+                .sum::<usize>(),
+            8
+        );
+        let mut overlays = Vec::new();
+        assert!(
+            matches!(drawing.source(&shadows[0], 0, &mut overlays).unwrap(), IrBufferSource::Contiguous(bytes) if bytes.as_ptr() == pointer)
         );
     }
 
