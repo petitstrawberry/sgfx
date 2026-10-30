@@ -78,7 +78,7 @@ remain incomplete.
   work. Attachments retain one mip; sampled images can contain a checked chain.
   Native VirGL also supports indexed strips without primitive restart. Indexed
   strips on WGPU, primitive restart, stencil, multisampling,
-  partial/flipped/format-converting blits, indirect drawing,
+  partial/flipped/format-converting blits,
   and other dynamic state are absent.
   Native VirGL retains its existing single-stream, single-instance subset;
   unsupported typed views and new vertex formats are rejected explicitly.
@@ -170,7 +170,35 @@ and a single-device mask of zero or one are supported. Resource barriers use
 the existing backend path; synchronization scopes conservatively retire prior
 GPU work. This costs overlap and does not raise the advertised Vulkan API
 version. Barriers and event commands remain outside render passes in this
-bounded profile. Timestamp queries remain unavailable (`timestampValidBits=0`).
+bounded profile. Timestamp writes use the same ordered control points, including
+pass splitting that preserves attachment contents.
+
+`VK_KHR_dynamic_rendering` supports explicitly enabled single-layer, single-sample
+rendering with 1–8 non-null color attachments (up to the backend limit) and
+optional D32 depth. Pipelines retain `VkPipelineRenderingCreateInfo` formats
+without application render-pass or framebuffer objects. Attachment loads,
+stores and render areas use the existing render-pass execution path. Resolves,
+stencil, multiview, null attachment slots, suspend/resume flags and depth-only
+rendering remain unsupported. Read-only depth follows backend capability checks.
+
+Indirect and indexed-indirect draws support multiple commands, GPU-written
+argument buffers, signed vertex offsets and nonzero first-instance values.
+`VK_KHR_draw_indirect_count` reads a GPU-written counter and clamps it to
+`maxDrawCount`; the reported command limit is 4096. This portable implementation
+retires preceding GPU work, reads the parameters, preserves/resumes attachments
+and emits direct IR draws. It adds synchronization and readback overhead. Native
+VirGL currently accepts transfer/update producers; it does not advertise writable
+storage buffers or compute.
+
+Timestamp query pools provide reset, 32/64-bit results, availability, WAIT,
+strided buffer copies and optional `VK_EXT_host_query_reset`. Only real GPU
+clocks enable `timestampValidBits=64` with a nanosecond period. An optional SGFX
+v2 timing table preserves existing backend ABI layouts. Metal samples its GPU
+clock after retiring prior commands; other WGPU backends use timestamp queries.
+VirGL uses timestamp query objects and CPU-visible query-result buffers, requiring
+Scarlet kernel `b229d6d007fbdf8e3b9a130c3feeaf94ee8019e9` or later. Older kernels,
+missing timing tables and unusable host timers leave valid bits and host-reset
+support at zero. Occlusion and pipeline-statistics queries remain unsupported.
 
 Vulkan 1.0 descriptor update rules apply: updating a set already bound in a
 recording or executable command buffer invalidates that buffer. Reset and
@@ -319,8 +347,8 @@ and verify the chosen Mesa driver. The Linux check also used
   FIFO mode and opaque composition. Windows presentation is through Wine's
   Win32-to-Wayland driver and Box64's native Vulkan wrapper. Direct3D/DXVK,
   general games, other platform surfaces, secondary command buffers, descriptor indexing,
-  compiled pipeline-cache payloads, queries, legacy device-event commands, sparse resources, external memory, multisampling,
-  indirect operations, partial/flipped/converting blits, or arbitrary
+  compiled pipeline-cache payloads, occlusion/pipeline-statistics queries, legacy device-event commands, sparse resources, external memory, multisampling,
+  indirect dispatch, partial/flipped/converting blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent
   append-only IDs. When no live Vulkan objects retain an epoch's IDs, the ICD
@@ -460,3 +488,23 @@ Vulkan conformance or broader application compatibility.
 | Native ICD | `2e7fa1542a8340fddf0e2f7c1af2f7d9b57d70ea394991dabf10de980b385777` |
 | Native queue/event log | `544bf49335086c01f6af3908859136b8545c73f6e0128315b38e05e7990f1a0d` |
 | Native presentation log | `f0195f8688119acb540ea3622cf295aa63aeed9df5e6274bf2f47b0b29d5a677` |
+
+
+## Modern rendering validation
+
+On 2026-10-30 all 33 opt-in Metal GPU contract tests passed. New pixel comparisons
+cover dynamic rendering without Vulkan render-pass/framebuffer objects,
+GPU-written indirect arguments/counters, first-instance values and signed
+indexed vertex offsets. Timestamp tests check increasing hardware GPU time,
+availability, 32/64-bit reads, strided copies, untouched padding and host reset.
+
+A native AArch64 HVF/OpenJDK 25 test passed dynamic rendering and both indirect
+count variants with GPU-updated argument/count buffers, baseVertex=-1, 128 exact
+pixel comparisons and teardown. Its synchronization2 transfer/event/timeline
+checks also passed. The guest rejects unsupported timestamp pools and reports
+zero valid bits on this host. Direct CGL tests that bypass QEMU/virglrenderer on
+Apple M3 Pro (OpenGL 4.1 Metal) report `GL_QUERY_COUNTER_BITS=0` and two available
+queries with value zero, reproducing the timer limitation in macOS OpenGL.
+This is separate from the working Metal GPU-clock path; zero values are not
+replaced with CPU time. Reproduction sources, hashes and logs are retained in
+`target/vulkan-next/summary.json` and its fixture directory.

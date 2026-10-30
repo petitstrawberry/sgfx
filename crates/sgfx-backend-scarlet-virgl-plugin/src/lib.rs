@@ -106,23 +106,32 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
         let path = std::str::from_utf8(unsafe { span(path) }?).map_err(|_| abi::INVALID)?;
         let device = virgl::Device::open(path).map_err(handle_error)?;
         let c = device.capabilities();
-        let flags = if c.supports_rendering() {
-            abi::RENDERING
-        } else {
-            0
-        } | if c.supports_presentation() {
-            abi::PRESENTATION
-        } else {
-            0
-        } | if c.supports_image_upload() {
-            abi::IMAGE_UPLOAD
-        } else {
-            0
-        } | if c.supports_image_readback() {
-            abi::IMAGE_READBACK
-        } else {
-            0
-        } | if c.supports_depth() { abi::DEPTH } else { 0 }
+        let timing = device
+            .create_context()
+            .and_then(|c| c.timestamp_ns())
+            .is_ok();
+        let flags = (if timing { abi::GPU_TIMESTAMPS } else { 0 })
+            | if c.supports_rendering() {
+                abi::RENDERING
+            } else {
+                0
+            }
+            | if c.supports_presentation() {
+                abi::PRESENTATION
+            } else {
+                0
+            }
+            | if c.supports_image_upload() {
+                abi::IMAGE_UPLOAD
+            } else {
+                0
+            }
+            | if c.supports_image_readback() {
+                abi::IMAGE_READBACK
+            } else {
+                0
+            }
+            | if c.supports_depth() { abi::DEPTH } else { 0 }
             | if c.supports_programmable_graphics() {
                 abi::PROGRAMMABLE_GRAPHICS
             } else {
@@ -557,5 +566,41 @@ pub unsafe extern "C" fn sgfx_backend_get_api_v2(
             drop_receipt,
         });
     }
+    abi::OK
+}
+
+unsafe extern "C" fn timestamp_ns(context: abi::Object, out: *mut u64) -> i32 {
+    if out.is_null() {
+        return abi::INVALID;
+    }
+    status((|| {
+        let c = unsafe { object::<virgl::Context>(context) }?;
+        let value = c.timestamp_ns().map_err(handle_error)?;
+        unsafe { out.write(value) };
+        Ok(())
+    })())
+}
+/// Negotiate the optional GPU timestamp table; no existing v2 table grows.
+/// # Safety
+/// A non-null output must point to writable aligned storage of the given size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sgfx_backend_get_timestamp_api_v2(
+    version: u32,
+    size: usize,
+    out: *mut abi::TimestampApi,
+) -> i32 {
+    if version != abi::VERSION || size < core::mem::size_of::<abi::TimestampApi>() {
+        return abi::ABI_MISMATCH;
+    }
+    if out.is_null() {
+        return abi::INVALID;
+    }
+    unsafe {
+        out.write(abi::TimestampApi {
+            version: abi::VERSION,
+            size: core::mem::size_of::<abi::TimestampApi>() as u32,
+            timestamp_ns,
+        })
+    };
     abi::OK
 }

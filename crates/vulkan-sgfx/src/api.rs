@@ -3,8 +3,11 @@ mod buffer_operations;
 mod buffer_views;
 mod core11;
 pub(crate) mod descriptor_template;
+pub(crate) mod dynamic_rendering;
 mod dynamic_states;
+mod indirect;
 mod maintenance1;
+mod queries;
 mod queue;
 mod render_pass2;
 mod render_passes;
@@ -148,6 +151,13 @@ struct Driver {
     queue_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     timeline_enabled: bool,
     synchronization2_enabled: bool,
+    dynamic_rendering_enabled: bool,
+    host_query_reset_enabled: bool,
+    timestamps: bool,
+    multi_draw_indirect_enabled: bool,
+    indirect_first_instance_enabled: bool,
+    indirect_count_enabled: bool,
+    queries: Mutex<HashMap<u64, Arc<queries::Pool>>>,
     timelines: Mutex<HashMap<u64, Arc<timeline::Timeline>>>,
     events: Mutex<HashMap<u64, Arc<bootstrap::Event>>>,
     fences: Fences,
@@ -574,6 +584,14 @@ unsafe fn device_chain_supported(
                 let f = &*next.cast::<vk::PhysicalDeviceFeatures2<'_>>();
                 core_device_features_supported(&f.features, supported_features)
             }
+            vk::StructureType::PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceHostQueryResetFeatures<'_>>();
+                matches!(f.host_query_reset, vk::FALSE | vk::TRUE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>();
+                matches!(f.dynamic_rendering, vk::FALSE | vk::TRUE)
+            }
             vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES => {
                 let f = &*next.cast::<vk::PhysicalDeviceSynchronization2Features<'_>>();
                 matches!(f.synchronization2, vk::FALSE | vk::TRUE)
@@ -688,7 +706,15 @@ unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
     names.iter().all(|&name| {
         !name.is_null() && {
             let name = unsafe { CStr::from_ptr(name) };
-            if name == vk::KHR_TIMELINE_SEMAPHORE_NAME || name == vk::KHR_SYNCHRONIZATION2_NAME {
+            if [
+                vk::KHR_TIMELINE_SEMAPHORE_NAME,
+                vk::KHR_SYNCHRONIZATION2_NAME,
+                vk::KHR_DYNAMIC_RENDERING_NAME,
+                vk::KHR_DRAW_INDIRECT_COUNT_NAME,
+                vk::EXT_HOST_QUERY_RESET_NAME,
+            ]
+            .contains(&name)
+            {
                 return true;
             }
             #[cfg(any(
@@ -755,8 +781,29 @@ pub(crate) unsafe extern "system" fn create_device(
     }
     let mut timeline_enabled = false;
     let mut synchronization2_enabled = false;
+    let mut dynamic_rendering_enabled = false;
+    let mut host_query_reset_enabled = false;
+    let timestamps = adapter.supports_timestamps();
+    let mut enabled_core = info
+        .p_enabled_features
+        .as_ref()
+        .copied()
+        .unwrap_or_default();
     let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
     while let Some(base) = node.as_ref() {
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_FEATURES_2 {
+            enabled_core = (*node.cast::<vk::PhysicalDeviceFeatures2<'_>>()).features;
+        }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES {
+            host_query_reset_enabled =
+                (*node.cast::<vk::PhysicalDeviceHostQueryResetFeatures<'_>>()).host_query_reset
+                    == vk::TRUE;
+        }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES {
+            dynamic_rendering_enabled =
+                (*node.cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>()).dynamic_rendering
+                    == vk::TRUE;
+        }
         if base.s_type == vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES {
             synchronization2_enabled =
                 (*node.cast::<vk::PhysicalDeviceSynchronization2Features<'_>>()).synchronization2
@@ -790,6 +837,29 @@ pub(crate) unsafe extern "system" fn create_device(
         .any(|&n| CStr::from_ptr(n) == vk::KHR_SYNCHRONIZATION2_NAME)
     {
         return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    }
+    if dynamic_rendering_enabled
+        && !slice(
+            info.pp_enabled_extension_names,
+            info.enabled_extension_count,
+        )
+        .unwrap()
+        .iter()
+        .any(|&n| CStr::from_ptr(n) == vk::KHR_DYNAMIC_RENDERING_NAME)
+    {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    }
+    if host_query_reset_enabled
+        && (!timestamps
+            || !slice(
+                info.pp_enabled_extension_names,
+                info.enabled_extension_count,
+            )
+            .unwrap()
+            .iter()
+            .any(|&n| CStr::from_ptr(n) == vk::EXT_HOST_QUERY_RESET_NAME))
+    {
+        return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
     let qs = match slice(info.p_queue_create_infos, info.queue_create_info_count) {
         Ok(v) => v,
@@ -911,6 +981,19 @@ pub(crate) unsafe extern "system" fn create_device(
         queue_thread: Mutex::new(Some(queue_thread)),
         timeline_enabled,
         synchronization2_enabled,
+        dynamic_rendering_enabled,
+        host_query_reset_enabled,
+        timestamps,
+        multi_draw_indirect_enabled: enabled_core.multi_draw_indirect == vk::TRUE,
+        indirect_first_instance_enabled: enabled_core.draw_indirect_first_instance == vk::TRUE,
+        indirect_count_enabled: slice(
+            info.pp_enabled_extension_names,
+            info.enabled_extension_count,
+        )
+        .unwrap()
+        .iter()
+        .any(|&n| CStr::from_ptr(n) == vk::KHR_DRAW_INDIRECT_COUNT_NAME),
+        queries: Default::default(),
         timelines: Default::default(),
         events: Default::default(),
         fences,
@@ -1082,6 +1165,7 @@ struct Recording {
     state: RecordingState,
     error: Option<vk::Result>,
     render_active: bool,
+    render_dynamic: bool,
     // Submit snapshots share immutable recorded data across the calling and
     // device threads. Re-recording uses copy-on-write instead of changing an
     // outstanding snapshot's commands.
@@ -1120,6 +1204,10 @@ pub(crate) fn set_pipeline_layout_metadata(
 #[derive(Clone)]
 enum RecordedCommand {
     InertDynamicState,
+    Query(queries::Action),
+    BeginRendering(dynamic_rendering::Rendering),
+    EndRendering,
+    DrawIndirect(indirect::Draw),
     Synchronize(synchronization2::Action),
     CopyImage {
         source: vk::Image,
@@ -1308,6 +1396,7 @@ impl Recording {
             state: RecordingState::Initial,
             error: None,
             render_active: false,
+            render_dynamic: false,
             commands: Arc::default(),
         }
     }
@@ -1324,11 +1413,36 @@ impl Recording {
             return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
         }
         match command {
+            RecordedCommand::BeginRendering(_) if self.render_active => {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::BeginRendering(_) => {
+                self.render_active = true;
+                self.render_dynamic = true;
+            }
+            RecordedCommand::EndRendering if !self.render_active || !self.render_dynamic => {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::EndRendering => {
+                self.render_active = false;
+                self.render_dynamic = false;
+            }
+            RecordedCommand::NextSubpass | RecordedCommand::EndRenderPass
+                if self.render_dynamic =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             RecordedCommand::BeginRenderPass { .. } if self.render_active => {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
-            RecordedCommand::BeginRenderPass { .. } => self.render_active = true,
+            RecordedCommand::BeginRenderPass { .. } => {
+                self.render_active = true;
+                self.render_dynamic = false;
+            }
             RecordedCommand::EndRenderPass | RecordedCommand::NextSubpass
                 if !self.render_active =>
             {
@@ -1336,8 +1450,15 @@ impl Recording {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
             RecordedCommand::EndRenderPass => self.render_active = false,
+            RecordedCommand::Query(queries::Action::Reset(..) | queries::Action::Copy { .. })
+                if self.render_active =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             RecordedCommand::Draw { .. }
             | RecordedCommand::DrawIndexed { .. }
+            | RecordedCommand::DrawIndirect(_)
             | RecordedCommand::ClearAttachments { .. }
                 if !self.render_active =>
             {
@@ -1412,6 +1533,10 @@ impl RecordedCommand {
     fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
         rec.order += 1;
         match self {
+            Self::Query(action) => queries::resolve(rt, rec, action)?,
+            Self::BeginRendering(rendering) => dynamic_rendering::begin(rt, rec, rendering)?,
+            Self::EndRendering => render_passes::end(rec)?,
+            Self::DrawIndirect(draw) => indirect::resolve(rt, rec, draw)?,
             Self::Synchronize(action) => {
                 if rec.render.is_some() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
@@ -2981,6 +3106,14 @@ fn graphics_bindings(
         )
         .map_err(crate::resources::failure)?;
     render_passes::validate_bindings(resources, rec, pipeline, desc.layout())?;
+    if rec
+        .active_render_pass
+        .as_ref()
+        .is_some_and(|a| a.pass.subpasses[a.subpass].read_only_depth)
+        && desc.depth_state().is_some_and(|d| d.write_enabled())
+    {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
     emit_changed(
         &mut rec.emitted_graphics.viewport,
         viewport,
@@ -4513,6 +4646,9 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
             .or_else(|| render_pass2::lookup(name))
             .or_else(|| timeline::lookup(name))
             .or_else(|| synchronization2::lookup(name))
+            .or_else(|| dynamic_rendering::lookup(name))
+            .or_else(|| queries::lookup(name))
+            .or_else(|| indirect::lookup(name))
             .or_else(|| bootstrap::lookup(name))
             .or_else(|| buffer_operations::lookup(name))
             .or_else(|| unsupported::lookup(name))
@@ -5237,6 +5373,13 @@ mod tests {
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
             synchronization2_enabled: true,
+            dynamic_rendering_enabled: true,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5308,6 +5451,13 @@ mod tests {
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
             synchronization2_enabled: true,
+            dynamic_rendering_enabled: true,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5363,6 +5513,13 @@ mod tests {
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
             synchronization2_enabled: true,
+            dynamic_rendering_enabled: true,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5554,6 +5711,13 @@ mod fence_notification_tests {
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
             synchronization2_enabled: true,
+            dynamic_rendering_enabled: true,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5794,6 +5958,13 @@ mod owned_descriptor_tests {
                 queue_thread: Mutex::new(None),
                 timeline_enabled: false,
                 synchronization2_enabled: false,
+                dynamic_rendering_enabled: false,
+                host_query_reset_enabled: false,
+                timestamps: false,
+                multi_draw_indirect_enabled: false,
+                indirect_first_instance_enabled: false,
+                indirect_count_enabled: false,
+                queries: Default::default(),
                 timelines: Default::default(),
                 events: Default::default(),
                 fences: Default::default(),

@@ -4,13 +4,13 @@ use super::*;
 #[test]
 #[ignore = "requires a native GPU and freshly built SGFX ICD"]
 fn packed_xy_scalar_vertex_fetch_draws_distinct_coverage_regions() {
-    vertex_contract(false);
+    vertex_contract(false, false, false, false);
 }
 
 #[test]
 #[ignore = "requires a native GPU and freshly built SGFX ICD"]
 fn instance_vertex_fetch_and_builtin_honor_nonzero_first_instance() {
-    vertex_contract(true);
+    vertex_contract(true, false, false, false);
 }
 
 fn vertex_storage(context: &Context, bytes: u64) -> Storage<'_> {
@@ -59,8 +59,12 @@ fn vertex_storage(context: &Context, bytes: u64) -> Storage<'_> {
     }
 }
 
-fn vertex_contract(instanced: bool) {
-    let context = Context::new();
+fn vertex_contract(instanced: bool, dynamic: bool, indirect: bool, indexed: bool) {
+    let context = if dynamic || indirect {
+        Context::configured(true)
+    } else {
+        Context::new()
+    };
     let vertices = vertex_storage(&context, if instanced { 72 } else { 144 });
     let output = Storage::with_usage(&context, vk::BufferUsageFlags::TRANSFER_DST);
     let source = if instanced {
@@ -223,17 +227,22 @@ fn vertex_contract(instanced: bool) {
         let subpasses = [vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&reference)];
-        let pass = d
-            .create_render_pass(
+        let pass = if dynamic {
+            vk::RenderPass::null()
+        } else {
+            d.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
                     .attachments(&attachments)
                     .subpasses(&subpasses),
                 None,
             )
-            .unwrap();
+            .unwrap()
+        };
         let views = [view];
-        let fb = d
-            .create_framebuffer(
+        let fb = if dynamic {
+            vk::Framebuffer::null()
+        } else {
+            d.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
                     .render_pass(pass)
                     .attachments(&views)
@@ -242,7 +251,8 @@ fn vertex_contract(instanced: bool) {
                     .layers(1),
                 None,
             )
-            .unwrap();
+            .unwrap()
+        };
         let shaders = words.each_ref().map(|words| {
             d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
                 .unwrap()
@@ -326,37 +336,91 @@ fn vertex_contract(instanced: bool) {
         let colors = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&colors);
+        let formats = [vk::Format::R8G8B8A8_UNORM];
+        let mut rendering =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
         let pipeline = d
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
-                &[vk::GraphicsPipelineCreateInfo::default()
-                    .stages(&stages)
-                    .vertex_input_state(&vertex)
-                    .input_assembly_state(&assembly)
-                    .viewport_state(&viewport)
-                    .rasterization_state(&raster)
-                    .multisample_state(&multisample)
-                    .color_blend_state(&blend)
-                    .layout(layout)
-                    .render_pass(pass)],
+                &[{
+                    let info = vk::GraphicsPipelineCreateInfo::default()
+                        .stages(&stages)
+                        .vertex_input_state(&vertex)
+                        .input_assembly_state(&assembly)
+                        .viewport_state(&viewport)
+                        .rasterization_state(&raster)
+                        .multisample_state(&multisample)
+                        .color_blend_state(&blend)
+                        .layout(layout)
+                        .render_pass(pass);
+                    if dynamic {
+                        info.render_pass(vk::RenderPass::null())
+                            .push_next(&mut rendering)
+                    } else {
+                        info
+                    }
+                }],
                 None,
             )
             .unwrap()[0];
         context.reset();
         d.begin_command_buffer(context.command, &Default::default())
             .unwrap();
+        let arguments = Storage::with_usage(
+            &context,
+            vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        );
+        let counter = Storage::with_usage(
+            &context,
+            vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        );
+        let indices = Storage::with_usage(
+            &context,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        );
+        if indirect {
+            let count = if instanced { 6u32 } else { 12 };
+            let instances = if instanced { 2 } else { 1 };
+            let first_instance = if instanced { 2 } else { 0 };
+            let words = if indexed {
+                vec![count, instances, 0, u32::MAX, first_instance, 0, 1, 0, 0, 0]
+            } else {
+                vec![count, instances, 0, first_instance, 0, 1, 0, 0]
+            };
+            let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
+            d.cmd_update_buffer(context.command, arguments.buffer, 0, &bytes);
+            d.cmd_update_buffer(context.command, counter.buffer, 0, &1u32.to_le_bytes());
+            let indices_bytes: Vec<u8> = (1..=12u32).flat_map(|v| v.to_le_bytes()).collect();
+            d.cmd_update_buffer(context.command, indices.buffer, 0, &indices_bytes);
+        }
         let clears = [vk::ClearValue {
             color: vk::ClearColorValue { float32: [0.0; 4] },
         }];
-        d.cmd_begin_render_pass(
-            context.command,
-            &vk::RenderPassBeginInfo::default()
-                .render_pass(pass)
-                .framebuffer(fb)
-                .render_area(area)
-                .clear_values(&clears),
-            vk::SubpassContents::INLINE,
-        );
+        let dynamic_api = ash::khr::dynamic_rendering::Device::new(&context.instance, d);
+        if dynamic {
+            dynamic_api.cmd_begin_rendering(
+                context.command,
+                &vk::RenderingInfo::default()
+                    .render_area(area)
+                    .layer_count(1)
+                    .color_attachments(&[vk::RenderingAttachmentInfo::default()
+                        .image_view(view)
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .clear_value(clears[0])]),
+            );
+        } else {
+            d.cmd_begin_render_pass(
+                context.command,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(pass)
+                    .framebuffer(fb)
+                    .render_area(area)
+                    .clear_values(&clears),
+                vk::SubpassContents::INLINE,
+            );
+        }
         d.cmd_bind_pipeline(context.command, vk::PipelineBindPoint::GRAPHICS, pipeline);
         if let Some(instances) = instances.as_ref() {
             d.cmd_bind_vertex_buffers(
@@ -365,12 +429,46 @@ fn vertex_contract(instanced: bool) {
                 &[vertices.buffer, instances.buffer],
                 &[0, 0],
             );
-            d.cmd_draw(context.command, 6, 2, 0, 2);
+            if !indirect {
+                d.cmd_draw(context.command, 6, 2, 0, 2);
+            }
         } else {
             d.cmd_bind_vertex_buffers(context.command, 0, &[vertices.buffer], &[0]);
-            d.cmd_draw(context.command, 12, 1, 0, 0);
+            if !indirect {
+                d.cmd_draw(context.command, 12, 1, 0, 0);
+            }
         }
-        d.cmd_end_render_pass(context.command);
+        if indirect {
+            let api = ash::khr::draw_indirect_count::Device::new(&context.instance, d);
+            if indexed {
+                d.cmd_bind_index_buffer(context.command, indices.buffer, 0, vk::IndexType::UINT32);
+                api.cmd_draw_indexed_indirect_count(
+                    context.command,
+                    arguments.buffer,
+                    0,
+                    counter.buffer,
+                    0,
+                    2,
+                    20,
+                );
+            } else {
+                api.cmd_draw_indirect_count(
+                    context.command,
+                    arguments.buffer,
+                    0,
+                    counter.buffer,
+                    0,
+                    2,
+                    16,
+                );
+            }
+        }
+        if dynamic {
+            dynamic_api.cmd_end_rendering(context.command);
+        } else {
+            d.cmd_end_render_pass(context.command);
+        }
+
         d.cmd_copy_image_to_buffer(
             context.command,
             image,
@@ -421,4 +519,20 @@ fn vertex_contract(instanced: bool) {
         d.destroy_image(image, None);
         d.free_memory(memory, None);
     }
+}
+
+#[test]
+#[ignore = "requires the built ICD and a native GPU"]
+fn dynamic_rendering_draws_without_renderpass_objects() {
+    vertex_contract(false, true, false, false);
+}
+#[test]
+#[ignore = "requires the built ICD and a native GPU"]
+fn gpu_written_indirect_count_preserves_first_instance_and_attachments() {
+    vertex_contract(true, true, true, false);
+}
+#[test]
+#[ignore = "requires the built ICD and a native GPU"]
+fn gpu_written_indexed_indirect_preserves_signed_vertex_offset() {
+    vertex_contract(true, true, true, true);
 }

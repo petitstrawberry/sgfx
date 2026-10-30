@@ -65,6 +65,20 @@ pub(super) fn begin(
         }
         &fb.attachments
     };
+    rec.used_framebuffers.push(framebuffer);
+    rec.used_render_passes.push(render_pass);
+    begin_owned(rt, rec, pass, views, (fb.width, fb.height), area, clears)
+}
+
+pub(super) fn begin_owned(
+    rt: &Runtime,
+    rec: &mut ResolvedRecording,
+    pass: &crate::render_pass::RenderPass,
+    views: &[vk::ImageView],
+    (width, height): (u32, u32),
+    area: ir::PixelRect,
+    clears: &[vk::ClearValue],
+) -> VkResult<()> {
     let images = views
         .iter()
         .map(|view| {
@@ -78,9 +92,7 @@ pub(super) fn begin(
         .collect::<VkResult<Vec<_>>>()?;
     rec.used_images
         .extend(images.iter().map(|(image, _)| *image));
-    rec.used_framebuffers.push(framebuffer);
-    rec.used_render_passes.push(render_pass);
-    rec.render = Some((fb.width, fb.height));
+    rec.render = Some((width, height));
     let mut active = ActiveRenderPass {
         pass: pass.clone(),
         views: views.to_vec(),
@@ -133,7 +145,7 @@ pub(super) fn clip_scissor(
     ))
 }
 
-fn retain_current_pass(rec: &mut ResolvedRecording) -> VkResult<()> {
+pub(super) fn retain_current_pass(rec: &mut ResolvedRecording) -> VkResult<()> {
     let original = rec
         .ops
         .iter_mut()
@@ -465,6 +477,19 @@ pub(super) fn validate_bindings(
     Ok(())
 }
 
+/// Split a pass without losing attachment contents or implicit binding state.
+pub(super) fn suspend(rec: &mut ResolvedRecording) -> VkResult<ActiveRenderPass> {
+    retain_current_pass(rec)?;
+    let active = rec.active_render_pass.take().ok_or(INVALID)?;
+    rec.ops.push(ir::OwnedCommand::EndRenderPass);
+    Ok(active)
+}
+pub(super) fn resume(rec: &mut ResolvedRecording, mut active: ActiveRenderPass) -> VkResult<()> {
+    active.emit(rec)?;
+    rec.active_render_pass = Some(active);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +521,7 @@ mod tests {
             .store_op(vk::AttachmentStoreOp::DONT_CARE);
         let mut active = ActiveRenderPass {
             pass: crate::render_pass::RenderPass {
+                dynamic: false,
                 attachments: vec![attachment],
                 subpasses: vec![crate::render_pass::Subpass {
                     colors: vec![0],
@@ -700,6 +726,7 @@ mod tests {
         let area = ir::PixelRect::new(7, 9, 25, 23).unwrap();
         let mut active = ActiveRenderPass {
             pass: crate::render_pass::RenderPass {
+                dynamic: false,
                 attachments: vec![attachment; 2],
                 subpasses: vec![
                     crate::render_pass::Subpass {

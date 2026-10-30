@@ -257,6 +257,12 @@ pub struct Context {
 }
 
 impl Context {
+    /// Return an actual GPU timestamp in nanoseconds after prior context work.
+    #[cfg(feature = "std")]
+    pub fn timestamp_ns(&self) -> HandleResult<u64> {
+        self.backend.timestamp_ns()
+    }
+
     /// Poll all accepted work without waiting, for resource retirement at ABI boundaries.
     #[cfg(feature = "backend-abi")]
     pub fn is_idle(&self) -> HandleResult<bool> {

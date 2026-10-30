@@ -643,6 +643,18 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
                 vk::KHR_SYNCHRONIZATION2_NAME,
                 vk::KHR_SYNCHRONIZATION2_SPEC_VERSION,
             ),
+            (
+                vk::KHR_DYNAMIC_RENDERING_NAME,
+                vk::KHR_DYNAMIC_RENDERING_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_DRAW_INDIRECT_COUNT_NAME,
+                vk::KHR_DRAW_INDIRECT_COUNT_SPEC_VERSION,
+            ),
+            (
+                vk::EXT_HOST_QUERY_RESET_NAME,
+                vk::EXT_HOST_QUERY_RESET_SPEC_VERSION,
+            ),
         ]
     }
     #[cfg(target_os = "scarlet")]
@@ -700,6 +712,18 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
             (
                 vk::KHR_SYNCHRONIZATION2_NAME,
                 vk::KHR_SYNCHRONIZATION2_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_DYNAMIC_RENDERING_NAME,
+                vk::KHR_DYNAMIC_RENDERING_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_DRAW_INDIRECT_COUNT_NAME,
+                vk::KHR_DRAW_INDIRECT_COUNT_SPEC_VERSION,
+            ),
+            (
+                vk::EXT_HOST_QUERY_RESET_NAME,
+                vk::EXT_HOST_QUERY_RESET_SPEC_VERSION,
             ),
         ]
     }
@@ -850,6 +874,8 @@ pub(crate) unsafe extern "system" fn get_physical_device_features(
         let mut features = vk::PhysicalDeviceFeatures::default();
         if let Some(adapter) = physical_adapter(physical) {
             let capabilities = adapter.capabilities();
+            features.multi_draw_indirect = u32::from(capabilities.supports_programmable_graphics());
+            features.draw_indirect_first_instance = features.multi_draw_indirect;
             // The Scarlet VirGL backend preserves each color target's blend
             // state, including separate RGB/alpha equations and write masks.
             // Do not infer this support for other backends from their limits.
@@ -906,6 +932,13 @@ pub(crate) unsafe extern "system" fn get_physical_device_properties(
         let compute = capabilities.supports_compute();
         let graphics = capabilities.supports_graphics();
         properties.limits = vk::PhysicalDeviceLimits {
+            max_draw_indirect_count: 4096,
+            timestamp_period: if adapter.supports_timestamps() {
+                1.0
+            } else {
+                0.0
+            },
+            timestamp_compute_and_graphics: u32::from(adapter.supports_timestamps()),
             max_image_dimension1_d: if info.backend() == sgfx::BackendKind::ScarletVirgl {
                 limits
                     .max_image_dimension_2d
@@ -1115,7 +1148,13 @@ pub(crate) unsafe extern "system" fn get_physical_device_queue_family_properties
             *output = vk::QueueFamilyProperties {
                 queue_flags,
                 queue_count: 1,
-                timestamp_valid_bits: 0,
+                timestamp_valid_bits: if physical_adapter(physical)
+                    .is_some_and(|a| a.supports_timestamps())
+                {
+                    64
+                } else {
+                    0
+                },
                 min_image_transfer_granularity: vk::Extent3D {
                     width: 1,
                     height: 1,

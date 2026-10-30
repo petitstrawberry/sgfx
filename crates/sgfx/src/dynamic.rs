@@ -191,6 +191,9 @@ impl Device {
         self.capabilities
     }
     /// Whether this plugin provides the optional low-level queue/resource API.
+    pub(crate) fn supports_timestamps(&self) -> bool {
+        self.owner.library.timestamp.is_some() && self.capabilities.0 & abi::GPU_TIMESTAMPS != 0
+    }
     pub(crate) fn supports_driver_api(&self) -> bool {
         self.owner.library.driver.is_some()
     }
@@ -217,6 +220,18 @@ pub struct Context {
     owner: Owner,
 }
 impl Context {
+    pub(crate) fn timestamp_ns(&self) -> Result<u64> {
+        let api = self
+            .owner
+            .library
+            .timestamp
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        let mut value = 0;
+        status(unsafe { (api.timestamp_ns)(self.owner.raw, &mut value) })?;
+        Ok(value)
+    }
+
     pub fn create_mapped_target_session(
         &self,
         resources: Rc<ir::ResourceTable>,

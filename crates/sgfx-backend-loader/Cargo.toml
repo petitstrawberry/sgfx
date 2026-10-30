@@ -10,7 +10,7 @@ std = []
 legacy-scarlet-std = ["dep:scarlet-std"]
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b229d6d007fbdf8e3b9a130c3feeaf94ee8019e9", optional = true }
 
 [dependencies]
 sgfx-backend-abi = { path = "../sgfx-backend-abi" }

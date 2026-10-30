@@ -55,6 +55,13 @@ pub(crate) enum Context {
 }
 
 impl Context {
+    #[cfg(feature = "std")]
+    pub(crate) fn timestamp_ns(&self) -> HandleResult<u64> {
+        match self {
+            Self::Virgl(c) => c.timestamp_ns(),
+        }
+    }
+
     #[cfg(feature = "backend-abi")]
     pub(crate) fn is_idle(&self) -> HandleResult<bool> {
         match self {

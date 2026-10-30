@@ -197,6 +197,22 @@ pub const IMAGE_BLITS: u64 = 32768;
 pub const PUSH_CONSTANTS_128: u64 = 65536;
 /// Up to eight simultaneous programmable color attachments.
 pub const COLOR_ATTACHMENTS_8: u64 = 131072;
+/// Actual GPU timestamps returned in nanoseconds by the optional timing API.
+pub const GPU_TIMESTAMPS: u64 = 262144;
+/// Optional timing extension; existing v2 table layouts remain unchanged.
+pub const TIMESTAMP_ENTRY: &[u8] = b"sgfx_backend_get_timestamp_api_v2\0";
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimestampApi {
+    pub version: u32,
+    pub size: u32,
+    /// Sample after retiring preceding work in this context. Ticks use one GPU
+    /// clock for the device, normalized to nanoseconds (not host wall time).
+    /// `context` belongs to this DSO; output is caller-owned aligned storage.
+    pub timestamp_ns: unsafe extern "C" fn(Object, *mut u64) -> i32,
+}
+const _: () = assert!(core::mem::size_of::<TimestampApi>() == 16);
+pub type GetTimestampApi = unsafe extern "C" fn(u32, usize, *mut TimestampApi) -> i32;
 
 /// Optional v2 extension for low-level API frontends, including Vulkan. The
 /// original mapped-session table remains binary compatible. Resolve once at

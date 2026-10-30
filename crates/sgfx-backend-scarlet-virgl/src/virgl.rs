@@ -429,6 +429,86 @@ pub(crate) struct Context {
 }
 
 impl Context {
+    #[cfg(feature = "std")]
+    pub(crate) fn timestamp_ns(&self) -> HandleResult<u64> {
+        use scarlet_os::handle::capability::memory_mapping::{MemoryMappingOps, flags, prot};
+        wait_scheduled(&self.scheduler)?;
+        let handle = self.allocate_object_handle()?;
+        let buffer = self.device.raw.create_buffer(
+            4096,
+            gpu_raw::GPU_BUFFER_FLAG_CPU_VISIBLE | gpu_raw::GPU_BUFFER_FLAG_QUERY_RESULT,
+        )?;
+        let token = self.raw.attach_buffer(&buffer)?;
+        let mapped = (|| {
+            let resource = resource_id_from_token(token)?;
+            let mapping = buffer.as_handle().as_memory_mapping()?;
+            // SAFETY: this fresh mapping is private to the query operation.
+            // GPU-written scalars are accessed with volatile reads below.
+            let address =
+                unsafe { mapping.mmap(0, 4096, prot::READ | prot::WRITE, flags::SHARED, 0) }
+                    .map_err(|_| HandleError::OutOfResources)?;
+            Ok((resource, address))
+        })();
+        let (resource, address) = match mapped {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                let _ = self.raw.detach_buffer(&buffer);
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            let mut commands = Vec::new();
+            // VirGL query object: VIRGL_QUERY_TIMESTAMP=2 (not modern Gallium enum values), 64-bit result at offset 8.
+            push_dword(
+                &mut commands,
+                command_header(VIRGL_CCMD_CREATE_OBJECT, 9, 4),
+            );
+            for value in [handle, 2, 0, resource] {
+                push_dword(&mut commands, value);
+            }
+            push_dword(&mut commands, command_header(20, 0, 1));
+            push_dword(&mut commands, handle);
+            push_dword(&mut commands, command_header(21, 0, 2));
+            push_dword(&mut commands, handle);
+            push_dword(&mut commands, 1);
+            self.raw.create_queue()?.submit(&commands)?;
+            let mut transfer = Vec::new();
+            push_dword(&mut transfer, command_header(43, 0, 13));
+            for value in [resource, 0, 0, 0, 0, 0, 0, 0, 16, 1, 1, 0, 2] {
+                push_dword(&mut transfer, value);
+            }
+            for _ in 0..100 {
+                self.raw.create_queue()?.submit(&transfer)?;
+                // SAFETY: the 16-byte query result lies within the live mapping.
+                if unsafe { core::ptr::read_volatile(address as *const u32) } == 1 {
+                    let value = unsafe { core::ptr::read_volatile((address + 8) as *const u64) };
+                    // Some host GL implementations expose timer queries yet
+                    // return a permanently zero counter. Do not advertise a clock.
+                    return if value == 0 {
+                        Err(HandleError::Unsupported)
+                    } else {
+                        Ok(value)
+                    };
+                }
+                std::thread::sleep(core::time::Duration::from_millis(1));
+            }
+            Err(HandleError::Unsupported)
+        })();
+        let mut destroy = Vec::new();
+        push_destroy_object(&mut destroy, 9, handle);
+        let cleanup = self
+            .raw
+            .create_queue()
+            .and_then(|q| q.submit(&destroy).map(|_| ()));
+        // SAFETY: all query/transfer calls have returned and no references exist.
+        let unmapped = unsafe { MemoryMappingOps::munmap(address, 4096) };
+        let detached = self.raw.detach_buffer(&buffer);
+        cleanup?;
+        unmapped.map_err(|_| HandleError::OutOfResources)?;
+        detached?;
+        result
+    }
+
     #[cfg(feature = "backend-abi")]
     pub(crate) fn is_idle(&self) -> HandleResult<bool> {
         // Poll the existing dispatch state directly. Creating a temporary

@@ -9,6 +9,8 @@
 use ash::{Entry, vk};
 use std::path::PathBuf;
 
+#[path = "contracts/queries.rs"]
+mod queries;
 #[path = "contracts/synchronization2.rs"]
 mod synchronization2;
 
@@ -115,14 +117,27 @@ impl Context {
                 vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
             let mut timeline =
                 vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+            let mut host_queries =
+                vk::PhysicalDeviceHostQueryResetFeatures::default().host_query_reset(true);
+            let mut rendering =
+                vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+            let indirect_features = vk::PhysicalDeviceFeatures::default()
+                .multi_draw_indirect(true)
+                .draw_indirect_first_instance(true);
             let extensions = [
+                vk::EXT_HOST_QUERY_RESET_NAME.as_ptr(),
+                vk::KHR_DYNAMIC_RENDERING_NAME.as_ptr(),
+                vk::KHR_DRAW_INDIRECT_COUNT_NAME.as_ptr(),
                 vk::KHR_SYNCHRONIZATION2_NAME.as_ptr(),
                 vk::KHR_TIMELINE_SEMAPHORE_NAME.as_ptr(),
             ];
             let mut info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
             if synchronization2 {
                 info = info
+                    .enabled_features(&indirect_features)
                     .enabled_extension_names(&extensions)
+                    .push_next(&mut rendering)
+                    .push_next(&mut host_queries)
                     .push_next(&mut sync)
                     .push_next(&mut timeline);
             }

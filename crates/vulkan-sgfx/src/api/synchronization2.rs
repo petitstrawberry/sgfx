@@ -5,6 +5,9 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) enum Action {
+    IndirectRead(indirect::Read),
+    Query(queries::Action),
+    IndirectDraw(Arc<Mutex<Vec<ir::OwnedCommand>>>),
     Barrier,
     Set(Arc<bootstrap::Event>),
     Reset(Arc<bootstrap::Event>),
@@ -23,6 +26,16 @@ pub(super) fn execute(
     ops: &mut Vec<ir::OwnedCommand>,
     action: &Action,
 ) -> VkResult<()> {
+    if let Action::IndirectDraw(commands) = action {
+        ops.extend(
+            commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
+        return Ok(());
+    }
     for submission in submit_owned(rt, std::mem::take(ops))? {
         wait_submission(rt, &submission)?;
     }
@@ -33,6 +46,9 @@ pub(super) fn execute(
         return Err(vk::Result::ERROR_DEVICE_LOST);
     }
     match action {
+        Action::IndirectRead(read) => indirect::read(rt, read)?,
+        Action::Query(action) => queries::execute(rt, ops, action)?,
+        Action::IndirectDraw(_) => unreachable!(),
         Action::Barrier => {}
         Action::Set(event) => event.state.store(true, Ordering::Release),
         Action::Reset(event) => event.state.store(false, Ordering::Release),
@@ -50,7 +66,7 @@ pub(super) fn execute(
 
 /// Do not truncate the 64-bit flags: split transfer, vertex-input and shader
 /// read/write scopes have bits beyond the original Vulkan 1.0 masks.
-fn stages(mask: vk::PipelineStageFlags2) -> VkResult<vk::PipelineStageFlags> {
+pub(super) fn stages(mask: vk::PipelineStageFlags2) -> VkResult<vk::PipelineStageFlags> {
     let extra = vk::PipelineStageFlags2::COPY
         | vk::PipelineStageFlags2::RESOLVE
         | vk::PipelineStageFlags2::BLIT
@@ -338,13 +354,15 @@ unsafe extern "system" fn wait_events(
 
 unsafe extern "system" fn timestamp(
     command: vk::CommandBuffer,
-    _: vk::PipelineStageFlags2,
-    _: vk::QueryPool,
-    _: u32,
+    stage: vk::PipelineStageFlags2,
+    pool: vk::QueryPool,
+    index: u32,
 ) {
-    // Queue families advertise timestampValidBits=0. No valid timestamp
-    // operation exists until the backend supplies actual GPU query support.
-    record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    if let Err(e) = enabled(command) {
+        record_error(command, e);
+        return;
+    }
+    queries::timestamp2(command, stage, pool, index);
 }
 
 struct Submit {

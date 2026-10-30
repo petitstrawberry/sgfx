@@ -210,6 +210,7 @@ pub struct Adapter {
     info: AdapterInfo,
     capabilities: Capabilities,
     backend: AdapterBackend,
+    timestamps: bool,
 }
 
 impl fmt::Debug for Adapter {
@@ -224,6 +225,11 @@ impl fmt::Debug for Adapter {
 }
 
 impl Adapter {
+    /// Whether this adapter supplies actual GPU timestamps in nanoseconds.
+    pub const fn supports_timestamps(&self) -> bool {
+        self.timestamps
+    }
+
     /// Ordinal stable for the lifetime of the discovering [`Instance`].
     pub const fn ordinal(&self) -> u32 {
         self.ordinal
@@ -351,6 +357,24 @@ struct WgpuDevice {
 }
 
 impl Device {
+    /// Sample a hardware GPU clock after previously submitted work has retired.
+    pub fn timestamp_ns(&self) -> Result<u64> {
+        match &self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            DeviceBackend::Wgpu(device) => wgpu_timestamp(&device.context).map_err(Error::Wgpu),
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                sgfx_dynamic_virgl
+            ))]
+            DeviceBackend::ScarletVirgl(context) => context.timestamp_ns().map_err(Error::from),
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            DeviceBackend::Dynamic(context) => context.timestamp_ns().map_err(Error::from),
+        }
+    }
+
     /// Create a backend materialization cache for one logical resource table.
     pub fn create_resources(&self, table: Rc<ir::ResourceTable>) -> Result<Resources> {
         match &self.backend {
@@ -1297,6 +1321,7 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
             let bgra = adapter.get_texture_format_features(wgpu::TextureFormat::Bgra8Unorm);
             let depth = adapter.get_texture_format_features(wgpu::TextureFormat::Depth32Float);
             Adapter {
+                timestamps: adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY),
                 ordinal: 0,
                 info: AdapterInfo {
                     name: raw_info.name,
@@ -1393,7 +1418,9 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
         .max_compute_workgroup_storage_size
         .min(16 * 1024);
     let required_features = adapter.features()
-        & (wgpu::Features::PUSH_CONSTANTS | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
+        & (wgpu::Features::PUSH_CONSTANTS
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+            | wgpu::Features::TIMESTAMP_QUERY);
     required_limits.max_push_constant_size =
         if required_features.contains(wgpu::Features::PUSH_CONSTANTS) {
             adapter_limits
@@ -1509,6 +1536,7 @@ fn discover_dynamic_adapters(preference: BackendPreference) -> Vec<Adapter> {
             backend_kind: backend,
         };
         adapters.push(Adapter {
+            timestamps: device.supports_timestamps(),
             ordinal: 0,
             info: AdapterInfo {
                 name: format!("Scarlet {} GPU {index}", device.backend_name()),
@@ -1660,6 +1688,100 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
             max_buffer_size: u64::from(u32::MAX),
         },
     }
+}
+
+#[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+fn wgpu_timestamp(
+    context: &sgfx_backend_wgpu::Context,
+) -> core::result::Result<u64, sgfx_backend_wgpu::Error> {
+    use sgfx_backend_wgpu::Error;
+    let device = context.raw_device();
+    let queue = context.raw_queue();
+    if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        return Err(Error::InvalidState);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // All earlier work is retired before sampling the hardware GPU clock.
+        // Metal's device sample avoids empty-pass counter sampling on drivers
+        // that return zero when resolving isolated query encoders.
+        let _ = device.poll(wgpu::Maintain::Wait);
+        // SAFETY: the HAL device remains borrowed for the callback; no resource
+        // is freed, submitted or mutated through this read-only clock sample.
+        let sampled = unsafe {
+            device.as_hal::<wgpu::hal::api::Metal, _, _>(|hal| {
+                hal.map(|hal| {
+                    let (mut cpu, mut gpu) = (0, 0);
+                    hal.raw_device()
+                        .lock()
+                        .sample_timestamps(&mut cpu, &mut gpu);
+                    gpu
+                })
+            })
+        };
+        if let Some(value) = sampled {
+            return Ok((value as f64 * f64::from(queue.get_timestamp_period())) as u64);
+        }
+    }
+    let query = device.create_query_set(&wgpu::QuerySetDescriptor {
+        label: Some("SGFX GPU timestamp"),
+        ty: wgpu::QueryType::Timestamp,
+        count: 1,
+    });
+    let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 8,
+        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 8,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("GPU clock sample"),
+        source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: &query,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(0),
+            }),
+        });
+        pass.set_pipeline(&pipeline);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    encoder.resolve_query_set(&query, 0..1, &resolve, 0);
+    encoder.copy_buffer_to_buffer(&resolve, 0, &output, 0, 8);
+    queue.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let slice = output.slice(..);
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::Maintain::Wait);
+    rx.recv()
+        .map_err(|_| Error::DeviceLost)?
+        .map_err(|_| Error::DeviceLost)?;
+    let bytes = slice.get_mapped_range();
+    let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    drop(bytes);
+    output.unmap();
+    Ok((value as f64 * f64::from(queue.get_timestamp_period())) as u64)
 }
 
 #[cfg(test)]

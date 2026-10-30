@@ -1126,7 +1126,9 @@ fn blend_factor(value: vk::BlendFactor, alpha: bool) -> Result<ir::BlendFactor, 
 unsafe fn graphics_state(
     info: &vk::GraphicsPipelineCreateInfo<'_>,
 ) -> Result<GraphicsState, vk::Result> {
-    if !info.p_next.is_null()
+    if (!info.p_next.is_null()
+        && (*(info.p_next.cast::<vk::BaseInStructure<'_>>())).s_type
+            != vk::StructureType::PIPELINE_RENDERING_CREATE_INFO)
         || !info.flags.is_empty()
         || info.s_type != vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO
         || !info.p_tessellation_state.is_null()
@@ -1435,6 +1437,17 @@ unsafe extern "system" fn create_graphics_pipelines(
             }
         };
         let layout = info.layout;
+        let dynamic_pass = match crate::api::dynamic_rendering::pipeline(info) {
+            Ok(pass) => pass,
+            Err(e) => {
+                first_error.get_or_insert(e);
+                continue;
+            }
+        };
+        if dynamic_pass.is_some() && !crate::api::dynamic_rendering::enabled(device) {
+            first_error.get_or_insert(UNSUPPORTED);
+            continue;
+        }
         let render_pass = info.render_pass;
         let subpass_index = info.subpass as usize;
         // Shader-module normalization already compensates for Vulkan's positive
@@ -1446,12 +1459,15 @@ unsafe extern "system" fn create_graphics_pipelines(
             );
             let result = (|| {
                 crate::api::bootstrap::validate_cache(&runtime.resources, cache)?;
-                let pass = runtime
-                    .resources
-                    .render_passes
-                    .get(&render_pass)
-                    .ok_or(INVALID)?;
-                let pass = pass.clone();
+                let pass = match &dynamic_pass {
+                    Some(pass) => pass.clone(),
+                    None => runtime
+                        .resources
+                        .render_passes
+                        .get(&render_pass)
+                        .ok_or(INVALID)?
+                        .clone(),
+                };
                 let subpass = pass.subpasses.get(subpass_index).ok_or(INVALID)?;
                 if subpass.colors.len() != state.colors.len() {
                     return Err(INVALID);

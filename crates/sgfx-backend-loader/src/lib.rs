@@ -158,6 +158,7 @@ pub struct LoadedBackend {
     pub driver: Option<abi::DriverApi>,
     pub ycbcr: Option<abi::YcbcrApi>,
     pub program_release: Option<abi::ProgramReleaseApi>,
+    pub timestamp: Option<abi::TimestampApi>,
     pub name: String,
     pub gpu_backend: String,
     /// Absolute path passed to the loader for this driver.
@@ -264,6 +265,40 @@ unsafe fn load_program_release(
     } else {
         let get: abi::GetProgramReleaseApi = unsafe { core::mem::transmute(address) };
         negotiate_program_release(get).map(Some)
+    }
+}
+
+#[cfg(any(unix, target_os = "scarlet"))]
+fn negotiate_timestamp(get: abi::GetTimestampApi) -> Result<abi::TimestampApi, Error> {
+    let mut table = core::mem::MaybeUninit::<abi::TimestampApi>::uninit();
+    if unsafe {
+        get(
+            abi::VERSION,
+            core::mem::size_of::<abi::TimestampApi>(),
+            table.as_mut_ptr(),
+        )
+    } != abi::OK
+    {
+        return Err(Error("driver rejected timestamp API".into()));
+    }
+    // Successful negotiation initializes the complete C extension record.
+    let table = unsafe { table.assume_init() };
+    if table.version != abi::VERSION
+        || (table.size as usize) < core::mem::size_of::<abi::TimestampApi>()
+    {
+        return Err(Error("invalid timestamp API".into()));
+    }
+    Ok(table)
+}
+#[cfg(any(unix, target_os = "scarlet"))]
+unsafe fn load_timestamp(library: *mut c_void) -> Result<Option<abi::TimestampApi>, Error> {
+    let address = unsafe { dlsym(library, abi::TIMESTAMP_ENTRY.as_ptr().cast()) };
+    if address.is_null() {
+        let _ = unsafe { dlerror() };
+        Ok(None)
+    } else {
+        let get: abi::GetTimestampApi = unsafe { core::mem::transmute(address) };
+        negotiate_timestamp(get).map(Some)
     }
 }
 
@@ -381,6 +416,7 @@ impl LoadedBackend {
             }
             Some(table)
         };
+        let timestamp = unsafe { load_timestamp(library) }?;
         let ycbcr = unsafe { load_ycbcr(library) }?;
         let program_release = unsafe { load_program_release(library) }?;
         Ok(Self {
@@ -388,6 +424,7 @@ impl LoadedBackend {
             driver,
             ycbcr,
             program_release,
+            timestamp,
             name,
             gpu_backend,
             library: library_path,
@@ -622,5 +659,43 @@ mod tests {
         assert!(!process.is_null());
         assert!(unsafe { load_program_release(process) }.unwrap().is_none());
         assert!(unsafe { dlerror() }.is_null());
+    }
+    unsafe extern "C" fn timestamp_sample(_: abi::Object, out: *mut u64) -> i32 {
+        unsafe { out.write(42) };
+        abi::OK
+    }
+    unsafe extern "C" fn timestamp_table<const V: u32, const S: u32>(
+        version: u32,
+        size: usize,
+        out: *mut abi::TimestampApi,
+    ) -> i32 {
+        if version != abi::VERSION || size != core::mem::size_of::<abi::TimestampApi>() {
+            return abi::ABI_MISMATCH;
+        }
+        unsafe {
+            out.write(abi::TimestampApi {
+                version: V,
+                size: S,
+                timestamp_ns: timestamp_sample,
+            })
+        };
+        abi::OK
+    }
+    #[cfg(any(unix, target_os = "scarlet"))]
+    #[test]
+    fn optional_timestamp_api_negotiates_and_absence_clears_loader_error() {
+        let process = unsafe { dlopen(core::ptr::null(), 2) };
+        assert!(!process.is_null());
+        assert!(unsafe { load_timestamp(process) }.unwrap().is_none());
+        assert!(unsafe { dlerror() }.is_null());
+        let api = negotiate_timestamp(timestamp_table::<2, 16>).unwrap();
+        let mut sample = 0;
+        assert_eq!(
+            unsafe { (api.timestamp_ns)(core::ptr::null_mut(), &mut sample) },
+            abi::OK
+        );
+        assert_eq!(sample, 42);
+        assert!(negotiate_timestamp(timestamp_table::<1, 16>).is_err());
+        assert!(negotiate_timestamp(timestamp_table::<2, 8>).is_err());
     }
 }

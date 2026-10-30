@@ -80,6 +80,18 @@ unsafe extern "system" fn features(
                 };
                 let tag = base.s_type;
                 let next = base.p_next;
+                if tag == vk::StructureType::PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES {
+                    (*node.cast::<vk::PhysicalDeviceHostQueryResetFeatures<'_>>())
+                        .host_query_reset = u32::from(
+                        crate::instance::physical_adapter(physical)
+                            .is_some_and(|a| a.supports_timestamps()),
+                    );
+                }
+                if tag == vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES {
+                    (*node.cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>())
+                        .dynamic_rendering =
+                        u32::from(crate::instance::physical_adapter(physical).is_some());
+                }
                 if tag == vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES {
                     (*node.cast::<vk::PhysicalDeviceSynchronization2Features<'_>>())
                         .synchronization2 =
