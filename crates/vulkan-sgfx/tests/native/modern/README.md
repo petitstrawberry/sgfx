@@ -6,14 +6,14 @@ are LWJGL core, SDL, Vulkan and Shaderc, a Vulkan loader and the SGFX backend DS
 The native providers and VM runner are produced by `scarlet-bundle-lwjgl`.
 
 The test uses no network or application assets. It also loads the actual VMA
-native library, creates a dedicated 64 MiB GPU buffer, verifies first/last-word
-GPU copies and rejects binding that allocation to a different buffer. Float
+native library, creates a dedicated 64 MiB buffer, verifies first/last-word
+ordered copies and rejects binding that allocation to a different buffer. Float
 image targets exercise image-dedicated allocations. It checks synchronization2,
 events, binary/timeline semaphores, dynamic rendering, indirect-count drawing,
 indexed indirect drawing with a negative vertex offset and exact image readback.
 The combined graphics path checks push descriptors, anisotropy 16, instance
 divisor two, firstInstance two, signed BaseVertex and DrawIndex after a skipped
-zero-count indirect command. It verifies 448 color pixels and 448 depth words
+zero-count indirect command. It verifies 512 color pixels and 512 depth words
 across triangle/indexed/point and Min/Max blending passes, including explicit
 sampling gradients, packed signed/normalized inputs, angle conversion, dynamic
 local-array stores and R32 signed texel views at byte offset 16, and an R8 signed view at offset 20
@@ -60,3 +60,18 @@ The graphics case uses a 64 MiB vertex backing initialized through its last word
 Its first draw exceeds 64 MiB once transport headers are included. Exact color
 and depth checks verify that every upload packet retired before drawing; later
 draws verify resource reuse.
+
+A separate R8 mode binds 710,159 bytes from offset 20 and reads byte 700,000
+on the GPU. This covers descriptors larger than 256 KiB while remaining within
+the native 1 MiB buffer-view budget.
+
+Run the capacity case with at least 4 GiB of guest RAM. It verifies that the
+reported native heap exceeds 512 MiB, reserves the full logical budget without
+materializing CPU/GPU storage, rejects the next allocation, and reuses freed
+budget twice. This tests allocation accounting, separately from the actual GPU
+buffer/image checks above.
+
+The dedicated-buffer case also submits eight separate four-byte updates near
+the end of its 64 MiB backing. Each round verifies the changed word and untouched
+words at both boundaries. Its elapsed time is printed for comparison between
+native builds; byte correctness determines the fixture result.

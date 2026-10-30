@@ -106,6 +106,13 @@ impl ImageReadbackRegion {
         })
     }
 
+    pub(crate) fn destination_ranges(&self) -> impl Iterator<Item = std::ops::Range<u64>> + '_ {
+        (0..self.rows).map(|row| {
+            let start = self.destination_offset + row as u64 * self.destination_stride;
+            start..start + self.row_bytes as u64
+        })
+    }
+
     pub(crate) fn writes(
         &self,
         pixels: &[u8],

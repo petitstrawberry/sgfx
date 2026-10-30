@@ -8,6 +8,9 @@ license = "MIT"
 name = "sgfx_scarlet_virgl"
 crate-type = ["cdylib"]
 
+[features]
+profile-submissions = ["sgfx-backend-scarlet-virgl/profile-submissions"]
+
 [target.'cfg(any(target_os = "scarlet", all(target_os = "linux", target_arch = "aarch64")))'.dependencies]
 sgfx-backend-abi = { path = "../sgfx-backend-abi" }
 sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "77e64a81115d78fab7c63671c2a6c16aac060c05", features = ["backend-abi"] }

@@ -1,6 +1,6 @@
 //! Ordered lowering of portable logical IR to the Scarlet VirGL adapter.
 
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{borrow::Cow, rc::Rc, vec::Vec};
 #[cfg(feature = "programmable")]
 use core::cell::RefCell;
 #[cfg(all(feature = "std", feature = "programmable"))]
@@ -153,8 +153,7 @@ pub struct IrResources {
     context_id: i32,
     backend: driver::IrResources,
     images: Vec<ImageMapping>,
-    buffer_shadows: Vec<Option<Vec<u8>>>,
-    buffer_revisions: Vec<u64>,
+    buffer_shadows: Vec<BufferShadow>,
     canonical_buffer_revisions: Vec<Option<u64>>,
     submission_failed: bool,
     cleanup_complete: bool,
@@ -250,17 +249,12 @@ impl IrResources {
         buffer_shadows
             .try_reserve_exact(MAX_BUFFERS)
             .map_err(|_| IrSubmitError::OutOfMemory)?;
-        let mut buffer_revisions = Vec::new();
-        buffer_revisions
-            .try_reserve_exact(MAX_BUFFERS)
-            .map_err(|_| IrSubmitError::OutOfMemory)?;
         let mut canonical_buffer_revisions = Vec::new();
         canonical_buffer_revisions
             .try_reserve_exact(MAX_BUFFERS)
             .map_err(|_| IrSubmitError::OutOfMemory)?;
         for _ in 0..MAX_BUFFERS {
-            buffer_shadows.push(None);
-            buffer_revisions.push(0);
+            buffer_shadows.push(BufferShadow::default());
             canonical_buffer_revisions.push(None);
         }
         Ok(Self {
@@ -270,7 +264,6 @@ impl IrResources {
             backend: context.create_ir_resources()?,
             images,
             buffer_shadows,
-            buffer_revisions,
             canonical_buffer_revisions,
             submission_failed: false,
             cleanup_complete: false,
@@ -315,10 +308,7 @@ impl IrResources {
         // A mirrored table can append and retire a buffer before its first
         // submission has grown these materialization caches.
         if let Some(shadow) = self.buffer_shadows.get_mut(slot) {
-            *shadow = None;
-        }
-        if let Some(revision) = self.buffer_revisions.get_mut(slot) {
-            *revision = 0;
+            shadow.clear();
         }
         if let Some(revision) = self.canonical_buffer_revisions.get_mut(slot) {
             *revision = None;
@@ -522,29 +512,18 @@ impl IrResources {
         Ok(self
             .buffer_shadows
             .get(buffer.slot())
-            .and_then(Option::as_deref))
+            .and_then(|shadow| shadow.bytes.as_deref()))
     }
 
     fn buffer_revision(&self, slot: usize) -> Result<u64, IrSubmitError> {
-        self.buffer_revisions
+        self.buffer_shadows
             .get(slot)
-            .copied()
+            .map(|shadow| shadow.revision)
             .ok_or(IrSubmitError::InvalidVertexData)
     }
 
     fn canonical_buffer_revision(&self, slot: usize) -> Option<u64> {
         self.canonical_buffer_revisions.get(slot).copied().flatten()
-    }
-
-    fn commit_buffer_updates(&mut self, updates: Vec<BufferShadowUpdate>) {
-        for update in updates {
-            if let Some(slot) = self.buffer_shadows.get_mut(update.slot) {
-                *slot = Some(update.bytes);
-            }
-            if let Some(revision) = self.buffer_revisions.get_mut(update.slot) {
-                *revision = update.revision;
-            }
-        }
     }
 
     fn commit_canonical_validations(&mut self, validations: Vec<(usize, u64)>) {
@@ -577,6 +556,61 @@ fn run_retirement(
     })
 }
 
+/// The last accepted CPU contents and their delta travel together across streams.
+/// Retaining only the last delta deliberately leaves revision gaps to the native
+/// upload path's exact-physical-predecessor check and full-shadow repair.
+#[derive(Default)]
+struct BufferShadow {
+    bytes: Option<Vec<u8>>,
+    revision: u64,
+    upload: Option<driver::IrBufferUpdate>,
+}
+
+impl BufferShadow {
+    fn replace(&mut self, bytes: Vec<u8>, revision: u64, upload: Option<driver::IrBufferUpdate>) {
+        *self = Self {
+            bytes: Some(bytes),
+            revision,
+            upload,
+        };
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn for_draw<'a>(
+        &'a self,
+        pending: Option<&'a BufferShadowUpdate>,
+    ) -> Result<(&'a [u8], Option<&'a driver::IrBufferUpdate>), IrSubmitError> {
+        if let Some(update) = pending {
+            return Ok((&update.bytes, Some(&update.upload)));
+        }
+        Ok((
+            self.bytes
+                .as_deref()
+                .ok_or(IrSubmitError::InvalidVertexData)?,
+            self.upload.as_ref(),
+        ))
+    }
+}
+
+fn commit_buffer_updates(
+    shadows: &mut [BufferShadow],
+    updates: Vec<BufferShadowUpdate>,
+    acceptance: Result<(), IrSubmitError>,
+) -> Result<(), IrSubmitError> {
+    // A tracked checkpoint can reject or report Busy after planning. Neither
+    // result may replace the accepted bytes, revision, or retained delta.
+    acceptance?;
+    for update in updates {
+        if let Some(shadow) = shadows.get_mut(update.slot) {
+            shadow.replace(update.bytes, update.revision, Some(update.upload));
+        }
+    }
+    Ok(())
+}
+
 struct BufferShadowUpdate {
     slot: usize,
     revision: u64,
@@ -587,6 +621,340 @@ struct BufferShadowUpdate {
 struct PendingBuffers {
     updates: Vec<BufferShadowUpdate>,
     canonical_validations: Vec<(usize, u64)>,
+}
+
+struct BufferRangeWrite<'a> {
+    slot: usize,
+    start: usize,
+    data: Cow<'a, [u8]>,
+    range: core::ops::Range<usize>,
+}
+
+impl BufferRangeWrite<'_> {
+    fn bytes(&self) -> &[u8] {
+        &self.data[self.range.clone()]
+    }
+}
+
+struct BufferRangeUpdate {
+    slot: usize,
+    revision: u64,
+    length: usize,
+    upload: driver::IrBufferUpdate,
+    fresh: Option<Vec<u8>>,
+}
+
+/// Buffer-only streams have no physical upload before their checkpoint. Keep
+/// accepted shadows intact while validating an ordered, sparse write overlay.
+#[derive(Default)]
+struct BufferOnlyPlan<'a> {
+    updates: Vec<BufferRangeUpdate>,
+    writes: Vec<BufferRangeWrite<'a>>,
+}
+
+struct PreparedBufferOnlyPlan<'a>(BufferOnlyPlan<'a>);
+
+impl<'a> BufferOnlyPlan<'a> {
+    fn from_commands(
+        table: &ResourceTable,
+        shadows: &[BufferShadow],
+        commands: &CommandBuffer<'_, 'a>,
+    ) -> Result<Option<Self>, IrSubmitError> {
+        if commands.command_count() == 0 {
+            return Ok(None);
+        }
+        let mut plan = Self::default();
+        // Preflight before staging anything: mixed streams keep the general
+        // execution path and its validation/materialization ordering.
+        for preflight in [true, false] {
+            #[cfg(feature = "backend-abi")]
+            let mut sequence = commands.command_reader();
+            #[cfg(not(feature = "backend-abi"))]
+            let mut sequence = commands.commands().iter();
+            while let Some(command) = {
+                #[cfg(feature = "backend-abi")]
+                let command = sequence.next_command()?;
+                #[cfg(not(feature = "backend-abi"))]
+                let command = sequence.next();
+                command
+            } {
+                match command {
+                    Command::WriteBuffer {
+                        buffer,
+                        offset,
+                        data,
+                    } => {
+                        if !preflight {
+                            let start = Self::write_start(table, *buffer, *offset, data.len())?;
+                            plan.write(shadows, buffer.slot(), start, Cow::Borrowed(*data))?;
+                        }
+                    }
+                    Command::CopyBufferToBuffer {
+                        source,
+                        source_offset,
+                        destination,
+                        destination_offset,
+                        size,
+                    } => {
+                        if !preflight {
+                            let descriptor = table.buffer(*source)?;
+                            if !descriptor.usage().contains(BufferUsage::COPY_SRC) {
+                                return Err(ir::Error::InvalidUsage.into());
+                            }
+                            let end = source_offset
+                                .checked_add(*size)
+                                .ok_or(ir::Error::Overflow)?;
+                            if end > descriptor.size() {
+                                return Err(ir::Error::OutOfBounds.into());
+                            }
+                            let size = usize::try_from(*size).map_err(|_| ir::Error::Overflow)?;
+                            let source_start =
+                                usize::try_from(*source_offset).map_err(|_| ir::Error::Overflow)?;
+                            let start =
+                                Self::write_start(table, *destination, *destination_offset, size)?;
+                            plan.copy(
+                                shadows,
+                                source.slot(),
+                                source_start,
+                                destination.slot(),
+                                start,
+                                size,
+                            )?;
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+            }
+        }
+        Ok(Some(plan))
+    }
+
+    fn write_start(
+        table: &ResourceTable,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        length: usize,
+    ) -> Result<usize, IrSubmitError> {
+        let descriptor = table.buffer(buffer)?;
+        if !descriptor.usage().contains(BufferUsage::COPY_DST) {
+            return Err(ir::Error::InvalidUsage.into());
+        }
+        let length = u64::try_from(length).map_err(|_| IrSubmitError::InvalidVertexData)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(IrSubmitError::InvalidVertexData)?;
+        if end > descriptor.size() {
+            return Err(IrSubmitError::InvalidVertexData);
+        }
+        usize::try_from(offset).map_err(|_| IrSubmitError::InvalidVertexData)
+    }
+
+    fn read_range(&self, shadows: &[BufferShadow], slot: usize, start: usize, bytes: &mut [u8]) {
+        bytes.fill(0);
+        if let Some(previous) = shadows.get(slot).and_then(|s| s.bytes.as_deref())
+            && start < previous.len()
+        {
+            let count = bytes.len().min(previous.len() - start);
+            bytes[..count].copy_from_slice(&previous[start..start + count]);
+        }
+        let end = start + bytes.len();
+        for write in self.writes.iter().filter(|write| write.slot == slot) {
+            let source = write.bytes();
+            let first = start.max(write.start);
+            let last = end.min(write.start + source.len());
+            if first < last {
+                bytes[first - start..last - start]
+                    .copy_from_slice(&source[first - write.start..last - write.start]);
+            }
+        }
+    }
+
+    fn copy(
+        &mut self,
+        shadows: &[BufferShadow],
+        source: usize,
+        source_start: usize,
+        destination: usize,
+        start: usize,
+        size: usize,
+    ) -> Result<(), IrSubmitError> {
+        source_start.checked_add(size).ok_or(ir::Error::Overflow)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        bytes.resize(size, 0);
+        // Snapshot before adding the destination write: self-copies overlap
+        // safely, and reads observe earlier writes and zero-filled growth gaps.
+        self.read_range(shadows, source, source_start, &mut bytes);
+        self.write(shadows, destination, start, Cow::Owned(bytes))
+    }
+
+    fn changed_range(
+        &self,
+        shadows: &[BufferShadow],
+        slot: usize,
+        start: usize,
+        data: &[u8],
+    ) -> Result<Option<core::ops::Range<usize>>, IrSubmitError> {
+        let end = start
+            .checked_add(data.len())
+            .ok_or(IrSubmitError::InvalidVertexData)?;
+        let shadow = shadows.get(slot).ok_or(IrSubmitError::InvalidVertexData)?;
+        let Some(update) = self.updates.iter().find(|update| update.slot == slot) else {
+            let previous = shadow.bytes.as_deref();
+            if previous.and_then(|bytes| bytes.get(start..end)) == Some(data) {
+                return Ok(None);
+            }
+            return changed_buffer_bytes(previous, start, data).map(Some);
+        };
+        let overlap = update.length.saturating_sub(start).min(data.len());
+        let mut scratch = [0; 256];
+        let mut prefix = 0;
+        while prefix < overlap {
+            let count = scratch.len().min(overlap - prefix);
+            self.read_range(shadows, slot, start + prefix, &mut scratch[..count]);
+            let equal = scratch[..count]
+                .iter()
+                .zip(&data[prefix..prefix + count])
+                .take_while(|(a, b)| a == b)
+                .count();
+            prefix += equal;
+            if equal != count {
+                break;
+            }
+        }
+        if prefix == data.len() && end <= update.length {
+            return Ok(None);
+        }
+        let mut suffix = 0;
+        if end <= update.length {
+            while suffix < data.len() - prefix {
+                let count = scratch.len().min(data.len() - prefix - suffix);
+                let offset = data.len() - suffix - count;
+                self.read_range(shadows, slot, start + offset, &mut scratch[..count]);
+                let equal = scratch[..count]
+                    .iter()
+                    .rev()
+                    .zip(data[offset..offset + count].iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                suffix += equal;
+                if equal != count {
+                    break;
+                }
+            }
+        }
+        Ok(Some((start + prefix).min(update.length)..end - suffix))
+    }
+
+    fn write(
+        &mut self,
+        shadows: &[BufferShadow],
+        slot: usize,
+        start: usize,
+        data: Cow<'a, [u8]>,
+    ) -> Result<(), IrSubmitError> {
+        let Some(changed) = self.changed_range(shadows, slot, start, &data)? else {
+            return Ok(());
+        };
+        let end = start + data.len(); // checked by changed_range
+        self.writes
+            .try_reserve(1)
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        if let Some(update) = self.updates.iter_mut().find(|update| update.slot == slot) {
+            update.length = update.length.max(end);
+            update.upload.range.start = update.upload.range.start.min(changed.start);
+            update.upload.range.end = update.upload.range.end.max(changed.end);
+        } else {
+            let shadow = &shadows[slot];
+            let revision = shadow
+                .revision
+                .checked_add(1)
+                .ok_or(IrSubmitError::OutOfMemory)?;
+            self.updates
+                .try_reserve(1)
+                .map_err(|_| IrSubmitError::OutOfMemory)?;
+            self.updates.push(BufferRangeUpdate {
+                slot,
+                revision,
+                length: end.max(shadow.bytes.as_ref().map_or(0, Vec::len)),
+                upload: driver::IrBufferUpdate {
+                    previous_revision: shadow.revision,
+                    range: changed.clone(),
+                },
+                fresh: None,
+            });
+        }
+        let first = start.max(changed.start);
+        self.writes.push(BufferRangeWrite {
+            slot,
+            start: first,
+            range: first - start..changed.end - start,
+            data,
+        });
+        Ok(())
+    }
+
+    fn reserve(
+        mut self,
+        shadows: &mut [BufferShadow],
+    ) -> Result<PreparedBufferOnlyPlan<'a>, IrSubmitError> {
+        for update in &mut self.updates {
+            if let Some(bytes) = shadows[update.slot].bytes.as_mut() {
+                // Capacity may move, but accepted length/bytes/revision/delta
+                // remain unchanged even if a later reserve or admission fails.
+                bytes
+                    .try_reserve(update.length - bytes.len())
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+            } else {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve(update.length)
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+                update.fresh = Some(bytes);
+            }
+        }
+        Ok(PreparedBufferOnlyPlan(self))
+    }
+}
+
+impl PreparedBufferOnlyPlan<'_> {
+    fn publish(
+        self,
+        shadows: &mut [BufferShadow],
+        acceptance: Result<(), IrSubmitError>,
+    ) -> Result<(), IrSubmitError> {
+        acceptance?;
+        let BufferOnlyPlan {
+            mut updates,
+            writes,
+        } = self.0;
+        for update in &mut updates {
+            let shadow = &mut shadows[update.slot];
+            if shadow.bytes.is_none() {
+                shadow.bytes = update.fresh.take();
+            }
+            let bytes = shadow.bytes.as_mut().expect("reserved shadow storage");
+            debug_assert!(bytes.capacity() >= update.length);
+            bytes.resize(update.length, 0);
+        }
+        for write in writes {
+            let bytes = shadows[write.slot]
+                .bytes
+                .as_mut()
+                .expect("reserved shadow storage");
+            bytes[write.start..write.start + write.bytes().len()].copy_from_slice(write.bytes());
+        }
+        for update in updates {
+            let shadow = &mut shadows[update.slot];
+            shadow.revision = update.revision;
+            shadow.upload = Some(update.upload);
+        }
+        // Canonical validation tags stay at their old revisions. Any changed
+        // shadow therefore requires validation when a later draw consumes it.
+        Ok(())
+    }
 }
 
 /// Bound changed bytes without walking large unchanged regions byte by byte.
@@ -844,6 +1212,262 @@ struct ExecutionPlan {
     canonical_validations: Vec<(usize, u64)>,
 }
 
+#[cfg(feature = "profile-submissions")]
+mod submission_profile {
+    use super::{BufferOnlyPlan, BufferShadow, ExecutionEvent, ExecutionPlan};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy)]
+    pub(super) enum Phase {
+        Snapshot,
+        Plan,
+        Materialize,
+        PrepareBuffers,
+        EventsCheckpoint,
+        Retire,
+        WaitIdle,
+    }
+
+    /// CPU submission service time, including local cleanup on rejection/Busy.
+    /// Retire measures CPU publication/cleanup, never asynchronous GPU completion.
+    pub(super) struct Profile {
+        started: Instant,
+        stage_started: Instant,
+        phase: Phase,
+        stages: [Duration; 7],
+        kind: &'static str,
+        pub(super) outcome: &'static str,
+        commands: usize,
+        buffer_only: bool,
+        staged_bytes: u128,
+        updates: usize,
+        update_bytes: u128,
+        shadow_clone_bytes: u128,
+        dirty_bytes: u128,
+        largest_update_bytes: usize,
+        passes: usize,
+        draws: usize,
+        prepared_buffers: usize,
+        prepared_shadow_bytes: u128,
+        largest_prepared_bytes: usize,
+    }
+
+    impl Profile {
+        pub(super) fn new(commands: usize, tracked: bool) -> Self {
+            let started = Instant::now();
+            Self {
+                started,
+                stage_started: started,
+                phase: if tracked {
+                    Phase::Snapshot
+                } else {
+                    Phase::WaitIdle
+                },
+                stages: [Duration::ZERO; 7],
+                kind: if tracked { "async" } else { "sync" },
+                outcome: "rejected",
+                commands,
+                buffer_only: false,
+                staged_bytes: 0,
+                updates: 0,
+                update_bytes: 0,
+                shadow_clone_bytes: 0,
+                dirty_bytes: 0,
+                largest_update_bytes: 0,
+                passes: 0,
+                draws: 0,
+                prepared_buffers: 0,
+                prepared_shadow_bytes: 0,
+                largest_prepared_bytes: 0,
+            }
+        }
+
+        fn advance_at(&mut self, phase: Phase, now: Instant) {
+            self.stages[self.phase as usize] += now.saturating_duration_since(self.stage_started);
+            self.stage_started = now;
+            self.phase = phase;
+        }
+
+        pub(super) fn enter(&mut self, phase: Phase) {
+            self.advance_at(phase, Instant::now());
+        }
+
+        pub(super) fn record_plan(&mut self, plan: &ExecutionPlan, shadows: &[BufferShadow]) {
+            self.updates = plan.buffer_updates.len();
+            for update in &plan.buffer_updates {
+                self.update_bytes += update.bytes.len() as u128;
+                self.dirty_bytes += update.upload.range.len() as u128;
+                self.largest_update_bytes = self.largest_update_bytes.max(update.bytes.len());
+                // The first changed write clones this persistent shadow once.
+                // Count metadata only; never inspect or format buffer contents.
+                self.shadow_clone_bytes += shadows[update.slot]
+                    .bytes
+                    .as_ref()
+                    .map_or(0, |bytes| bytes.len() as u128);
+            }
+            for event in &plan.events {
+                if let ExecutionEvent::Pass(pass) = event {
+                    self.passes += 1;
+                    self.draws += pass.submission.draws.len();
+                }
+            }
+        }
+
+        pub(super) fn record_buffer_only(&mut self, plan: &BufferOnlyPlan<'_>) {
+            self.buffer_only = true;
+            self.updates = plan.updates.len();
+            for update in &plan.updates {
+                self.update_bytes += update.length as u128;
+                self.dirty_bytes += update.upload.range.len() as u128;
+                self.largest_update_bytes = self.largest_update_bytes.max(update.length);
+            }
+            self.staged_bytes = plan
+                .writes
+                .iter()
+                .map(|write| write.bytes().len() as u128)
+                .sum();
+            // No persistent shadow is cloned; growth may reallocate capacity.
+        }
+
+        pub(super) fn record_prepared(&mut self, bytes: usize) {
+            // Available CPU bytes, not actual upload bytes: the physical backend
+            // may skip, use a delta, or fall back to the complete shadow.
+            self.prepared_buffers += 1;
+            self.prepared_shadow_bytes += bytes as u128;
+            self.largest_prepared_bytes = self.largest_prepared_bytes.max(bytes);
+        }
+
+        fn should_log(total: Duration) -> bool {
+            total >= Duration::from_millis(50)
+        }
+    }
+
+    impl Drop for Profile {
+        fn drop(&mut self) {
+            let now = Instant::now();
+            self.advance_at(self.phase, now);
+            let total = now.saturating_duration_since(self.started);
+            if !Self::should_log(total) {
+                return;
+            }
+            let us = |phase: Phase| self.stages[phase as usize].as_micros();
+            // A diagnostic I/O failure must not change submission acceptance.
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "SGFX_VIRGL_SUBMIT_PROFILE kind={} outcome={} total_us={} snapshot_us={} plan_us={} materialize_us={} prepare_buffers_us={} events_checkpoint_us={} retire_us={} wait_idle_us={} commands={} updates={} update_bytes={} shadow_clone_bytes={} dirty_bytes={} largest_update_bytes={} passes={} draws={} prepared_buffers={} prepared_shadow_bytes={} largest_prepared_bytes={} buffer_only={} staged_bytes={}",
+                self.kind,
+                self.outcome,
+                total.as_micros(),
+                us(Phase::Snapshot),
+                us(Phase::Plan),
+                us(Phase::Materialize),
+                us(Phase::PrepareBuffers),
+                us(Phase::EventsCheckpoint),
+                us(Phase::Retire),
+                us(Phase::WaitIdle),
+                self.commands,
+                self.updates,
+                self.update_bytes,
+                self.shadow_clone_bytes,
+                self.dirty_bytes,
+                self.largest_update_bytes,
+                self.passes,
+                self.draws,
+                self.prepared_buffers,
+                self.prepared_shadow_bytes,
+                self.largest_prepared_bytes,
+                u8::from(self.buffer_only),
+                self.staged_bytes,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::PendingBuffers;
+        use super::*;
+
+        #[test]
+        fn plan_counts_full_shadow_copies_separately_from_dirty_ranges() {
+            let shadows = vec![
+                BufferShadow {
+                    bytes: Some(vec![1; 4096]),
+                    revision: 1,
+                    upload: None,
+                },
+                BufferShadow::default(),
+            ];
+            let mut pending = PendingBuffers::new();
+            pending
+                .write_bytes(0, 1, shadows[0].bytes.as_deref(), 1024, &[2; 2])
+                .unwrap();
+            pending
+                .write_bytes(0, 1, shadows[0].bytes.as_deref(), 2048, &[2])
+                .unwrap();
+            pending.write_bytes(1, 0, None, 4, &[9; 4]).unwrap();
+            let plan = ExecutionPlan {
+                has_content_preserving_pass: false,
+                events: Vec::new(),
+                buffer_updates: pending.updates,
+                canonical_validations: Vec::new(),
+            };
+            let mut profile = Profile::new(3, true);
+            profile.record_plan(&plan, &shadows);
+            assert_eq!(profile.commands, 3);
+            assert_eq!(profile.updates, 2);
+            assert_eq!(profile.update_bytes, 4104);
+            assert_eq!(profile.shadow_clone_bytes, 4096);
+            assert_eq!(profile.dirty_bytes, 1025 + 8);
+            assert_eq!(profile.largest_update_bytes, 4096);
+            assert_eq!((profile.passes, profile.draws), (0, 0));
+            profile.record_prepared(128);
+            profile.record_prepared(256);
+            assert_eq!(profile.prepared_buffers, 2);
+            assert_eq!(profile.prepared_shadow_bytes, 384);
+            assert_eq!(profile.largest_prepared_bytes, 256);
+        }
+
+        #[test]
+        fn phases_accumulate_and_threshold_is_inclusive() {
+            let mut profile = Profile::new(7, true);
+            let start = profile.started;
+            profile.advance_at(Phase::Plan, start + Duration::from_micros(10));
+            profile.advance_at(Phase::Retire, start + Duration::from_micros(30));
+            profile.advance_at(Phase::Plan, start + Duration::from_micros(35));
+            profile.advance_at(Phase::Retire, start + Duration::from_micros(50));
+            assert_eq!(profile.stages[Phase::Snapshot as usize].as_micros(), 10);
+            assert_eq!(profile.stages[Phase::Plan as usize].as_micros(), 35);
+            assert_eq!(profile.stages[Phase::Retire as usize].as_micros(), 5);
+            assert_eq!(profile.stages.iter().sum::<Duration>().as_micros(), 50);
+            assert!(!Profile::should_log(Duration::from_micros(49_999)));
+            assert!(Profile::should_log(Duration::from_micros(50_000)));
+        }
+
+        #[test]
+        fn buffer_only_profile_reports_zero_cloned_shadow_bytes() {
+            let shadows = [BufferShadow {
+                bytes: Some(vec![3; 4096]),
+                revision: 7,
+                upload: None,
+            }];
+            let mut plan = BufferOnlyPlan::default();
+            plan.write(&shadows, 0, 8, std::borrow::Cow::Borrowed(&[9; 4]))
+                .unwrap();
+            let mut profile = Profile::new(1, true);
+            profile.record_buffer_only(&plan);
+            assert!(profile.buffer_only);
+            assert_eq!(profile.update_bytes, 4096);
+            assert_eq!(profile.shadow_clone_bytes, 0);
+            assert_eq!(profile.staged_bytes, 4);
+            assert_eq!(profile.dirty_bytes, 4);
+        }
+    }
+}
+
+#[cfg(feature = "profile-submissions")]
+use submission_profile::{Phase as SubmissionPhase, Profile as SubmissionProfile};
+
 enum ExecutionEvent {
     Upload(driver::IrTextureSpec, driver::IrTextureUpload),
     Copy(driver::IrTextureCopy),
@@ -1061,6 +1685,8 @@ impl Queue {
         if compute::contains_compute(commands).map_err(SubmitError::Rejected)? {
             return self.submit_compute_async(context, resources, commands);
         }
+        #[cfg(feature = "profile-submissions")]
+        let mut profile = SubmissionProfile::new(commands.command_count(), true);
         let limit = self
             .backend
             .check_async_support()
@@ -1081,7 +1707,16 @@ impl Queue {
         );
         let mut mode = SubmitMode::tracked();
         mode.set_limit(limit);
-        let result = self.submit_ir_with(context, resources, commands, &mut mode);
+        let result = self.submit_ir_with(
+            context,
+            resources,
+            commands,
+            &mut mode,
+            #[cfg(feature = "profile-submissions")]
+            &mut profile,
+        );
+        #[cfg(feature = "profile-submissions")]
+        profile.enter(SubmissionPhase::Retire);
         if result.is_err() {
             if mode.accepted() {
                 resources.submission_failed = true;
@@ -1092,7 +1727,18 @@ impl Queue {
                 }
             }
         }
-        mode.finish(result)
+        let result = mode.finish(result);
+        #[cfg(feature = "profile-submissions")]
+        {
+            profile.outcome = match &result {
+                Ok(_) => "accepted",
+                Err(SubmitError::Busy) => "busy",
+                Err(SubmitError::Rejected(_)) => "rejected",
+                Err(SubmitError::Failed { .. }) => "failed",
+                Err(_) => "error",
+            };
+        }
+        result
     }
 
     /// Validate, lower, and synchronously submit one logical IR command buffer.
@@ -1130,8 +1776,23 @@ impl Queue {
                     _ => IrSubmitError::SubmissionFailed,
                 });
         }
+        #[cfg(feature = "profile-submissions")]
+        let mut profile = SubmissionProfile::new(commands.command_count(), false);
         self.backend.wait_idle()?;
-        self.submit_ir_with(context, resources, commands, &mut SubmitMode::Synchronous)
+        let result = self.submit_ir_with(
+            context,
+            resources,
+            commands,
+            &mut SubmitMode::Synchronous,
+            #[cfg(feature = "profile-submissions")]
+            &mut profile,
+        );
+        #[cfg(feature = "profile-submissions")]
+        {
+            profile.enter(SubmissionPhase::Retire);
+            profile.outcome = if result.is_ok() { "accepted" } else { "error" };
+        }
+        result
     }
 
     fn submit_ir_with<'r, 'data>(
@@ -1140,7 +1801,10 @@ impl Queue {
         resources: &mut IrResources,
         commands: &CommandBuffer<'r, 'data>,
         mode: &mut SubmitMode,
+        #[cfg(feature = "profile-submissions")] profile: &mut SubmissionProfile,
     ) -> Result<(), IrSubmitError> {
+        #[cfg(feature = "profile-submissions")]
+        profile.enter(SubmissionPhase::Plan);
         resources.ensure_usable()?;
         if !core::ptr::eq(resources.resources(), commands.resources()) {
             return Err(IrSubmitError::ResourceTableMismatch);
@@ -1150,6 +1814,26 @@ impl Queue {
         {
             return Err(IrSubmitError::ContextMismatch);
         }
+        if mode.is_tracked()
+            && let Some(plan) = BufferOnlyPlan::from_commands(
+                resources.resources(),
+                &resources.buffer_shadows,
+                commands,
+            )?
+        {
+            #[cfg(feature = "profile-submissions")]
+            profile.record_buffer_only(&plan);
+            let prepared = plan.reserve(&mut resources.buffer_shadows)?;
+            #[cfg(feature = "profile-submissions")]
+            profile.enter(SubmissionPhase::EventsCheckpoint);
+            let acceptance = self
+                .backend
+                .checkpoint(mode)
+                .map_err(IrSubmitError::Backend);
+            #[cfg(feature = "profile-submissions")]
+            profile.enter(SubmissionPhase::Retire);
+            return prepared.publish(&mut resources.buffer_shadows, acceptance);
+        }
         let plan = ExecutionPlan::from_commands(
             resources,
             commands,
@@ -1158,12 +1842,16 @@ impl Queue {
                 .capabilities()
                 .supports_native_narrow_color(),
         )?;
+        #[cfg(feature = "profile-submissions")]
+        profile.record_plan(&plan, &resources.buffer_shadows);
         if !mode.is_tracked() && plan.events.is_empty() && !plan.has_content_preserving_pass {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::CommandSequence,
             ));
         }
         plan.validate_transport_chunks()?;
+        #[cfg(feature = "profile-submissions")]
+        profile.enter(SubmissionPhase::Materialize);
         register_mapped_images(context, resources)?;
         if mode.is_tracked() {
             // First-use allocation is explicitly synchronous. Do it for the
@@ -1205,6 +1893,8 @@ impl Queue {
                 }
             }
         }
+        #[cfg(feature = "profile-submissions")]
+        profile.enter(SubmissionPhase::PrepareBuffers);
         let mut prepared_buffers = Vec::new();
         for event in &plan.events {
             let ExecutionEvent::Pass(pass) = event else {
@@ -1236,21 +1926,19 @@ impl Queue {
                         .buffer_updates
                         .iter()
                         .find(|update| update.slot == binding.slot);
-                    let bytes = update
-                        .map(|update| update.bytes.as_slice())
-                        .or_else(|| {
-                            resources
-                                .buffer_shadows
-                                .get(binding.slot)
-                                .and_then(Option::as_deref)
-                        })
-                        .ok_or(IrSubmitError::InvalidVertexData)?;
+                    let (bytes, upload) = resources
+                        .buffer_shadows
+                        .get(binding.slot)
+                        .ok_or(IrSubmitError::InvalidVertexData)?
+                        .for_draw(update)?;
+                    #[cfg(feature = "profile-submissions")]
+                    profile.record_prepared(bytes.len());
                     self.backend.prepare_ir_buffer(
                         &context.backend,
                         &mut resources.backend,
                         binding,
                         bytes,
-                        update.map(|update| &update.upload),
+                        upload,
                         mode,
                     )?;
                     prepared_buffers
@@ -1271,9 +1959,17 @@ impl Queue {
             mut canonical_validations,
         } = plan;
         if !mode.is_tracked() {
-            resources.commit_buffer_updates(core::mem::take(&mut buffer_updates));
+            #[cfg(feature = "profile-submissions")]
+            profile.enter(SubmissionPhase::Retire);
+            commit_buffer_updates(
+                &mut resources.buffer_shadows,
+                core::mem::take(&mut buffer_updates),
+                Ok(()),
+            )?;
             resources.commit_canonical_validations(core::mem::take(&mut canonical_validations));
         }
+        #[cfg(feature = "profile-submissions")]
+        profile.enter(SubmissionPhase::EventsCheckpoint);
         for event in &events {
             match event {
                 ExecutionEvent::Upload(texture, upload) => self.backend.upload_ir_texture(
@@ -1313,10 +2009,17 @@ impl Queue {
             // including a real checkpoint for empty/CPU-shadow-only streams.
             // Busy cannot strand an uploaded prefix. The worker owns future
             // packet dispatch; acceptance commits this ordered stream's state.
-            self.backend.checkpoint(mode)?;
-            resources.commit_buffer_updates(buffer_updates);
+            let acceptance = self
+                .backend
+                .checkpoint(mode)
+                .map_err(IrSubmitError::Backend);
+            #[cfg(feature = "profile-submissions")]
+            profile.enter(SubmissionPhase::Retire);
+            commit_buffer_updates(&mut resources.buffer_shadows, buffer_updates, acceptance)?;
             resources.commit_canonical_validations(canonical_validations);
         }
+        #[cfg(feature = "profile-submissions")]
+        profile.enter(SubmissionPhase::Retire);
         Ok(())
     }
 }
@@ -3704,6 +4407,474 @@ mod tests {
         assert_eq!(pending.updates[0].bytes, [0; 8]);
         pending.write_bytes(2, 0, None, 0, &[0; 8]).unwrap();
         assert_eq!(pending.updates.len(), 1);
+    }
+
+    fn shadow_write(shadow: &BufferShadow, offset: usize, data: &[u8]) -> Vec<BufferShadowUpdate> {
+        let mut pending = PendingBuffers::new();
+        pending
+            .write_bytes(0, shadow.revision, shadow.bytes.as_deref(), offset, data)
+            .unwrap();
+        pending.updates
+    }
+
+    fn range_test_shadow(bytes: Vec<u8>) -> BufferShadow {
+        BufferShadow {
+            bytes: Some(bytes),
+            revision: 7,
+            upload: Some(driver::IrBufferUpdate {
+                previous_revision: 6,
+                range: 0..4,
+            }),
+        }
+    }
+
+    #[test]
+    fn buffer_only_acceptance_reuses_large_shadow_and_preserves_unwritten_bytes() {
+        let mut shadows = [range_test_shadow(vec![3; 1024 * 1024])];
+        let pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
+        let mut plan = BufferOnlyPlan::default();
+        plan.write(&shadows, 0, 513, Cow::Borrowed(&[9; 4]))
+            .unwrap();
+        assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.writes[0].bytes().len(), 4);
+        assert!(matches!(plan.writes[0].data, Cow::Borrowed(_)));
+        let prepared = plan.reserve(&mut shadows).unwrap();
+        assert_eq!(&shadows[0].bytes.as_ref().unwrap()[513..517], &[3; 4]);
+        assert_eq!(shadows[0].revision, 7);
+        prepared.publish(&mut shadows, Ok(())).unwrap();
+        let (bytes, upload) = shadows[0].for_draw(None).unwrap();
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert!(bytes[..513].iter().all(|byte| *byte == 3));
+        assert_eq!(&bytes[513..517], &[9; 4]);
+        assert!(bytes[517..].iter().all(|byte| *byte == 3));
+        assert_eq!(shadows[0].revision, 8);
+        assert_eq!(upload.unwrap().previous_revision, 7);
+        assert_eq!(upload.unwrap().range, 513..517);
+
+        let mut identical = BufferOnlyPlan::default();
+        identical
+            .write(&shadows, 0, 513, Cow::Borrowed(&[9; 4]))
+            .unwrap();
+        assert!(identical.updates.is_empty());
+        identical
+            .reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        assert_eq!(shadows[0].revision, 8);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 513..517);
+    }
+
+    #[test]
+    fn buffer_only_busy_and_rejection_preserve_accepted_state_after_reserving_growth() {
+        for busy_result in [false, true] {
+            let mut shadows = [range_test_shadow(vec![3; 16]), BufferShadow::default()];
+            let mut plan = BufferOnlyPlan::default();
+            plan.write(&shadows, 0, 4, Cow::Borrowed(&[9; 4])).unwrap();
+            plan.write(&shadows, 0, 4096, Cow::Borrowed(&[8; 4]))
+                .unwrap();
+            plan.write(&shadows, 1, 8, Cow::Borrowed(&[7; 4])).unwrap();
+            let prepared = plan.reserve(&mut shadows).unwrap();
+            assert!(shadows[0].bytes.as_ref().unwrap().capacity() >= 4100);
+            assert_eq!(shadows[0].bytes.as_deref(), Some(&[3; 16][..]));
+            assert!(shadows[1].bytes.is_none());
+            let mut mode = SubmitMode::tracked();
+            if let SubmitMode::Tracked { busy, .. } = &mut mode {
+                *busy = busy_result;
+            }
+            let error = if busy_result {
+                IrSubmitError::Backend(HandleError::OutOfResources)
+            } else {
+                IrSubmitError::InvalidVertexData
+            };
+            let result = mode.finish(prepared.publish(&mut shadows, Err(error)));
+            if busy_result {
+                assert!(matches!(result, Err(SubmitError::Busy)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SubmitError::Rejected(IrSubmitError::InvalidVertexData))
+                ));
+            }
+            assert_eq!(shadows[0].bytes.as_deref(), Some(&[3; 16][..]));
+            assert_eq!(shadows[0].revision, 7);
+            assert_eq!(shadows[0].upload.as_ref().unwrap().previous_revision, 6);
+            assert_eq!(shadows[0].upload.as_ref().unwrap().range, 0..4);
+            assert!(shadows[1].bytes.is_none());
+            assert_eq!(shadows[1].revision, 0);
+            assert!(shadows[1].upload.is_none());
+        }
+    }
+
+    #[test]
+    fn buffer_only_reserve_failure_and_revision_overflow_do_not_publish() {
+        let mut shadows = [range_test_shadow(vec![3; 16])];
+        let mut plan = BufferOnlyPlan::default();
+        plan.write(&shadows, 0, 0, Cow::Borrowed(&[9])).unwrap();
+        plan.updates[0].length = usize::MAX; // deterministic capacity failure
+        assert!(matches!(
+            plan.reserve(&mut shadows),
+            Err(IrSubmitError::OutOfMemory)
+        ));
+        assert_eq!(shadows[0].bytes.as_deref(), Some(&[3; 16][..]));
+        assert_eq!(shadows[0].revision, 7);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 0..4);
+        shadows[0].revision = u64::MAX;
+        let mut plan = BufferOnlyPlan::default();
+        assert!(matches!(
+            plan.write(&shadows, 0, 0, Cow::Borrowed(&[9])),
+            Err(IrSubmitError::OutOfMemory)
+        ));
+        assert_eq!(shadows[0].bytes.as_deref(), Some(&[3; 16][..]));
+    }
+
+    #[test]
+    fn buffer_only_copies_snapshot_overlap_and_observe_prior_writes() {
+        let mut shadows = [
+            range_test_shadow((0..16).collect()),
+            BufferShadow::default(),
+        ];
+        let pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
+        let mut plan = BufferOnlyPlan::default();
+        plan.write(&shadows, 0, 4, Cow::Borrowed(&[90, 91, 92, 93]))
+            .unwrap();
+        plan.copy(&shadows, 0, 0, 0, 4, 12).unwrap();
+        plan.copy(&shadows, 0, 8, 1, 0, 8).unwrap();
+        plan.reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        assert_eq!(
+            shadows[0].bytes.as_deref(),
+            Some(&[0, 1, 2, 3, 0, 1, 2, 3, 90, 91, 92, 93, 8, 9, 10, 11][..])
+        );
+        assert_eq!(
+            shadows[1].bytes.as_deref(),
+            Some(&[90, 91, 92, 93, 8, 9, 10, 11][..])
+        );
+        assert_eq!(shadows[0].bytes.as_ref().unwrap().as_ptr(), pointer);
+        assert_eq!(shadows[0].revision, 8);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 4..16);
+    }
+
+    #[test]
+    fn buffer_only_copies_zero_uninitialized_source_bytes_and_growth_gaps() {
+        let mut shadows = [range_test_shadow(vec![1, 2, 3, 4]), BufferShadow::default()];
+        let mut plan = BufferOnlyPlan::default();
+        plan.write(&shadows, 0, 8, Cow::Borrowed(&[8, 9, 10, 11]))
+            .unwrap();
+        plan.copy(&shadows, 0, 2, 1, 4, 16).unwrap();
+        plan.reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        assert_eq!(
+            shadows[0].bytes.as_deref(),
+            Some(&[1, 2, 3, 4, 0, 0, 0, 0, 8, 9, 10, 11][..])
+        );
+        assert_eq!(
+            shadows[1].bytes.as_deref(),
+            Some(&[0, 0, 0, 0, 3, 4, 0, 0, 0, 0, 8, 9, 10, 11, 0, 0, 0, 0, 0, 0][..])
+        );
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 4..12);
+        assert_eq!(shadows[1].upload.as_ref().unwrap().range, 0..20);
+
+        let mut shadows = [BufferShadow::default(), range_test_shadow(vec![7; 8])];
+        let mut plan = BufferOnlyPlan::default();
+        plan.copy(&shadows, 0, 0, 1, 2, 4).unwrap();
+        plan.reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        assert_eq!(
+            shadows[1].bytes.as_deref(),
+            Some(&[7, 7, 0, 0, 0, 0, 7, 7][..])
+        );
+        assert!(shadows[0].bytes.is_none());
+    }
+
+    #[test]
+    fn buffer_only_sparse_overlay_matches_general_shadow_planning() {
+        let mut shadows = [
+            range_test_shadow(vec![3; 512]),
+            range_test_shadow(vec![5; 1024]),
+            BufferShadow::default(),
+        ];
+        let mut sparse = BufferOnlyPlan::default();
+        let mut dense = PendingBuffers::new();
+        let mut seed = 42_u64;
+        for index in 0..96 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let slot = (seed as usize / 16) % 3;
+            let start = (seed as usize / 64) % 1024;
+            let size = 1 + (seed as usize / 1024) % 300;
+            let data = if index % 3 == 0 {
+                let source = (slot + 1) % 3;
+                let mut data = vec![0; size];
+                let source_bytes = dense
+                    .updates
+                    .iter()
+                    .find(|update| update.slot == source)
+                    .map(|update| update.bytes.as_slice())
+                    .or(shadows[source].bytes.as_deref())
+                    .unwrap_or(&[]);
+                if start < source_bytes.len() {
+                    let count = size.min(source_bytes.len() - start);
+                    data[..count].copy_from_slice(&source_bytes[start..start + count]);
+                }
+                sparse
+                    .copy(&shadows, source, start, slot, start, size)
+                    .unwrap();
+                data
+            } else {
+                let data = vec![index as u8; size];
+                sparse
+                    .write(&shadows, slot, start, Cow::Owned(data.clone()))
+                    .unwrap();
+                data
+            };
+            dense
+                .write_bytes(
+                    slot,
+                    shadows[slot].revision,
+                    shadows[slot].bytes.as_deref(),
+                    start,
+                    &data,
+                )
+                .unwrap();
+        }
+        sparse
+            .reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        for update in dense.updates {
+            let shadow = &shadows[update.slot];
+            assert_eq!(shadow.bytes.as_deref(), Some(update.bytes.as_slice()));
+            assert_eq!(shadow.revision, update.revision);
+            assert_eq!(shadow.upload.as_ref().unwrap().range, update.upload.range);
+            assert_eq!(
+                shadow.upload.as_ref().unwrap().previous_revision,
+                update.upload.previous_revision
+            );
+        }
+    }
+
+    #[cfg(feature = "backend-abi")]
+    #[test]
+    fn buffer_only_abi_commands_validate_and_publish_without_shadow_clones() {
+        let table = ResourceTable::new();
+        table.enable_abi_commands();
+        let usage = BufferUsage::COPY_SRC | BufferUsage::COPY_DST;
+        let source = table
+            .define_buffer(ir::BufferDesc::new(64, usage).unwrap())
+            .unwrap();
+        let destination = table
+            .define_buffer(ir::BufferDesc::new(64, usage).unwrap())
+            .unwrap();
+        let mut shadows: Vec<_> = (0..=destination.slot())
+            .map(|_| BufferShadow::default())
+            .collect();
+        shadows[source.slot()] = range_test_shadow(vec![3; 64]);
+        let mut encoder = ir::CommandEncoder::new(&table);
+        encoder.write_buffer(source, 4, &[9; 4]).unwrap();
+        encoder
+            .copy_buffer_to_buffer(source, 0, destination, 8, 12)
+            .unwrap();
+        let commands = encoder.finish().unwrap();
+        let batch = commands.abi_batch().unwrap();
+        let mut truncated = batch;
+        truncated.words.len -= 1;
+        // SAFETY: shortening the live word span retains valid backing storage.
+        let malformed = unsafe { CommandBuffer::from_abi(&table, batch.table, truncated) }.unwrap();
+        assert!(BufferOnlyPlan::from_commands(&table, &shadows, &malformed).is_err());
+        assert_eq!(shadows[source.slot()].revision, 7);
+        assert!(shadows[destination.slot()].bytes.is_none());
+        // SAFETY: commands and all borrowed upload bytes outlive the imported view.
+        let imported = unsafe { CommandBuffer::from_abi(&table, batch.table, batch) }.unwrap();
+        let plan = BufferOnlyPlan::from_commands(&table, &shadows, &imported)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.updates.len(), 2);
+        let pointer = shadows[source.slot()].bytes.as_ref().unwrap().as_ptr();
+        plan.reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        assert_eq!(
+            shadows[source.slot()].bytes.as_ref().unwrap().as_ptr(),
+            pointer
+        );
+        assert_eq!(
+            shadows[destination.slot()].bytes.as_deref(),
+            Some(&[0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 9, 9, 9, 9, 3, 3, 3, 3][..])
+        );
+        assert!(BufferOnlyPlan::write_start(&table, destination, 63, 4).is_err());
+        assert!(BufferOnlyPlan::write_start(&table, destination, u64::MAX, 4).is_err());
+
+        let mut encoder = ir::CommandEncoder::new(&table);
+        encoder.write_buffer(source, 0, &[1; 4]).unwrap();
+        encoder
+            .resource_barrier(ir::ResourceBarrier::Buffer {
+                buffer: source,
+                before: ir::BufferAccess::CopyDestination,
+                after: ir::BufferAccess::CopySource,
+            })
+            .unwrap();
+        let mixed = encoder.finish().unwrap();
+        assert!(
+            BufferOnlyPlan::from_commands(&table, &shadows, &mixed)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn accepted_buffer_only_update_retains_delta_for_later_draws() {
+        let mut shadows = [BufferShadow::default()];
+        let original = vec![3; 4096];
+        let initial = shadow_write(&shadows[0], 0, &original);
+        commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+
+        // A full frontend snapshot changes only six bytes. This stream has no
+        // draw, so its delta must survive publication until another stream uses it.
+        let mut changed = original.clone();
+        changed[5..11].fill(9);
+        let updates = shadow_write(&shadows[0], 0, &changed);
+        commit_buffer_updates(&mut shadows, updates, Ok(())).unwrap();
+        assert_eq!(shadows[0].revision, 2);
+        for _ in 0..2 {
+            let (bytes, upload) = shadows[0].for_draw(None).unwrap();
+            let upload = upload.expect("draw must retain the preceding update-only delta");
+            assert_eq!(upload.previous_revision, 1);
+            assert_eq!(upload.range, 5..11);
+            assert_eq!(bytes, changed);
+            assert_eq!(&bytes[..5], &original[..5]);
+            assert_eq!(&bytes[11..], &original[11..]);
+        }
+
+        // Empty control points and identical host snapshots must not erase the
+        // last accepted delta or advance its revision.
+        commit_buffer_updates(&mut shadows, Vec::new(), Ok(())).unwrap();
+        let identical = shadow_write(&shadows[0], 0, &changed);
+        assert!(identical.is_empty());
+        commit_buffer_updates(&mut shadows, identical, Ok(())).unwrap();
+        let (_, upload) = shadows[0].for_draw(None).unwrap();
+        assert_eq!(upload.unwrap().range, 5..11);
+        assert_eq!(shadows[0].revision, 2);
+    }
+
+    #[test]
+    fn current_draw_update_overrides_the_persistent_delta_without_publishing() {
+        let mut shadows = [BufferShadow::default()];
+        let initial = shadow_write(&shadows[0], 0, &[3; 64]);
+        commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+        let accepted = shadow_write(&shadows[0], 4, &[9; 4]);
+        commit_buffer_updates(&mut shadows, accepted, Ok(())).unwrap();
+
+        let pending = shadow_write(&shadows[0], 20, &[7; 4]);
+        let (bytes, upload) = shadows[0].for_draw(pending.first()).unwrap();
+        let upload = upload.unwrap();
+        assert_eq!(upload.previous_revision, 2);
+        assert_eq!(upload.range, 20..24);
+        assert_eq!(&bytes[4..8], &[9; 4]);
+        assert_eq!(&bytes[20..24], &[7; 4]);
+        assert_eq!(pending[0].revision, 3);
+
+        let (accepted, upload) = shadows[0].for_draw(None).unwrap();
+        assert_eq!(&accepted[20..24], &[3; 4]);
+        assert_eq!(upload.unwrap().range, 4..8);
+        assert_eq!(shadows[0].revision, 2);
+    }
+
+    #[test]
+    fn rejected_and_busy_publication_preserve_bytes_revision_and_delta() {
+        let mut shadows = [BufferShadow::default()];
+        let initial = shadow_write(&shadows[0], 0, &[3; 64]);
+        commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+        let accepted = shadow_write(&shadows[0], 4, &[9; 4]);
+        commit_buffer_updates(&mut shadows, accepted, Ok(())).unwrap();
+        let accepted_bytes = shadows[0].bytes.clone().unwrap();
+        let accepted_pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
+
+        for busy_result in [false, true] {
+            let pending = shadow_write(&shadows[0], 20, &[7; 4]);
+            let mut mode = SubmitMode::tracked();
+            if let SubmitMode::Tracked { busy, .. } = &mut mode {
+                *busy = busy_result;
+            }
+            let error = if busy_result {
+                IrSubmitError::Backend(HandleError::OutOfResources)
+            } else {
+                IrSubmitError::InvalidVertexData
+            };
+            let result = commit_buffer_updates(&mut shadows, pending, Err(error));
+            let result = mode.finish(result);
+            if busy_result {
+                assert!(matches!(result, Err(SubmitError::Busy)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SubmitError::Rejected(IrSubmitError::InvalidVertexData))
+                ));
+            }
+            let (bytes, upload) = shadows[0].for_draw(None).unwrap();
+            let upload = upload.unwrap();
+            assert_eq!(bytes, accepted_bytes);
+            assert_eq!(bytes.as_ptr(), accepted_pointer);
+            assert_eq!(shadows[0].revision, 2);
+            assert_eq!(upload.previous_revision, 1);
+            assert_eq!(upload.range, 4..8);
+        }
+    }
+
+    #[test]
+    fn successive_buffer_only_updates_retain_only_the_exact_last_predecessor() {
+        let mut shadows = [BufferShadow::default()];
+        let initial = shadow_write(&shadows[0], 0, &[3; 64]);
+        commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+        let first = shadow_write(&shadows[0], 4, &[9; 4]);
+        commit_buffer_updates(&mut shadows, first, Ok(())).unwrap();
+        let second = shadow_write(&shadows[0], 20, &[7; 4]);
+        commit_buffer_updates(&mut shadows, second, Ok(())).unwrap();
+
+        let (bytes, upload) = shadows[0].for_draw(None).unwrap();
+        let upload = upload.unwrap();
+        assert_eq!(shadows[0].revision, 3);
+        assert_eq!(upload.previous_revision, 2);
+        assert_eq!(upload.range, 20..24);
+        // Physical revision 1 must fail the native exact-predecessor gate.
+        // Its full-shadow repair still includes BOTH accepted updates.
+        assert_eq!(&bytes[4..8], &[9; 4]);
+        assert_eq!(&bytes[20..24], &[7; 4]);
+        assert_eq!(&bytes[8..20], &[3; 12]);
+    }
+
+    #[test]
+    fn retired_buffer_shadow_clears_delta_before_slot_reuse() {
+        let mut shadows = [BufferShadow::default()];
+        let initial = shadow_write(&shadows[0], 0, &[3; 64]);
+        commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+        let changed = shadow_write(&shadows[0], 4, &[9; 4]);
+        commit_buffer_updates(&mut shadows, changed, Ok(())).unwrap();
+
+        shadows[0].clear();
+        assert!(shadows[0].bytes.is_none());
+        assert!(shadows[0].upload.is_none());
+        assert_eq!(shadows[0].revision, 0);
+        assert!(matches!(
+            shadows[0].for_draw(None),
+            Err(IrSubmitError::InvalidVertexData)
+        ));
+
+        let replacement = shadow_write(&shadows[0], 8, &[0; 4]);
+        commit_buffer_updates(&mut shadows, replacement, Ok(())).unwrap();
+        let (bytes, upload) = shadows[0].for_draw(None).unwrap();
+        let upload = upload.unwrap();
+        assert_eq!(bytes, &[0; 12]);
+        assert_eq!(shadows[0].revision, 1);
+        assert_eq!(upload.previous_revision, 0);
+        assert_eq!(upload.range, 0..12);
     }
 
     fn target() -> driver::IrTextureSpec {

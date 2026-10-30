@@ -1,5 +1,6 @@
 pub(crate) mod bootstrap;
 mod buffer_operations;
+mod buffer_readback;
 mod buffer_views;
 mod core11;
 mod core12;
@@ -1430,7 +1431,7 @@ struct ResolvedRecording {
     viewport: Option<vk::Viewport>,
     scissor: Option<vk::Rect2D>,
     used_buffers: Vec<vk::Buffer>,
-    readback_buffers: Vec<vk::Buffer>,
+    readback_buffers: buffer_readback::Readbacks,
     used_images: Vec<vk::Image>,
     used_pipelines: Vec<vk::Pipeline>,
     used_framebuffers: Vec<vk::Framebuffer>,
@@ -1642,7 +1643,7 @@ impl ResolvedRecording {
             viewport: None,
             scissor: None,
             used_buffers: Vec::new(),
-            readback_buffers: Vec::new(),
+            readback_buffers: buffer_readback::Readbacks::default(),
             used_images: Vec::new(),
             used_pipelines: Vec::new(),
             used_framebuffers: Vec::new(),
@@ -2118,6 +2119,13 @@ impl RecordedCommand {
                             eprintln!("[SGFX Vulkan] image readback region rejected: {error:?} format={:?} extent={extent:?} buffer_size={} region={region:?}", image_data.format, buffer_data.size);
                         }
                     })?;
+                    for range in readback.destination_ranges() {
+                        rec.readback_buffers.insert(
+                            *buffer,
+                            range.start,
+                            range.end - range.start,
+                        )?;
+                    }
                     rec.copies.push(ReadImage {
                         order: rec.order,
                         mip_level: region.image_subresource.mip_level,
@@ -2129,7 +2137,6 @@ impl RecordedCommand {
                 }
                 rec.used_buffers.push(*buffer);
                 rec.used_images.push(*image);
-                rec.readback_buffers.push(*buffer);
             }
             Self::UpdateBuffer {
                 buffer,
@@ -2204,6 +2211,17 @@ impl RecordedCommand {
                     return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                 }
                 for region in regions {
+                    if region
+                        .dst_offset
+                        .checked_add(region.size)
+                        .is_none_or(|end| end > destination_data.size)
+                        || region
+                            .src_offset
+                            .checked_add(region.size)
+                            .is_none_or(|end| end > source_data.size)
+                    {
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
                     rec.ops.push(ir::OwnedCommand::CopyBufferToBuffer {
                         source: source_data.id,
                         source_offset: region.src_offset,
@@ -2211,9 +2229,10 @@ impl RecordedCommand {
                         destination_offset: region.dst_offset,
                         size: region.size,
                     });
+                    rec.readback_buffers
+                        .insert(*destination, region.dst_offset, region.size)?;
                 }
                 rec.used_buffers.extend([*source, *destination]);
-                rec.readback_buffers.push(*destination);
             }
             Self::PipelineBarrier {
                 full_scope,
@@ -3423,9 +3442,14 @@ fn mark_writable_descriptor_buffers(
                 if !rec.written_buffers.contains(buffer) {
                     rec.written_buffers.push(*buffer);
                 }
-                if !rec.readback_buffers.contains(buffer) {
-                    rec.readback_buffers.push(*buffer);
-                }
+                // Dynamic descriptor offsets and shader indexing can write any
+                // part of the backing buffer; retain the conservative range.
+                let size = resources
+                    .buffers
+                    .get(buffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                    .size;
+                rec.readback_buffers.insert(*buffer, 0, size)?;
             }
         }
     }
@@ -4221,16 +4245,18 @@ fn submit_owned(
 ) -> VkResult<Vec<sgfx::driver::Submission>> {
     let owned = ir::OwnedCommandBuffer::new(ops);
     let operation_count = owned.command_count();
-    let batches = if crate::upload_batches::needs_batches(
-        owned.commands(),
-        crate::upload_batches::UPLOAD_BATCH_BYTES,
-    ) {
-        crate::upload_batches::split(owned, &rt.table, crate::upload_batches::UPLOAD_BATCH_BYTES)
-            .inspect_err(|e| eprintln!("[SGFX Vulkan] upload batch preflight failed: operations={operation_count} error={e:?}"))
-            .map_err(crate::resources::failure)?
-    } else {
-        vec![owned]
-    };
+    let batches = profile_work("submit::partition_uploads", || {
+        if crate::upload_batches::needs_batches(
+            owned.commands(),
+            crate::upload_batches::UPLOAD_BATCH_BYTES,
+        ) {
+            crate::upload_batches::split(owned, &rt.table, crate::upload_batches::UPLOAD_BATCH_BYTES)
+                .inspect_err(|e| eprintln!("[SGFX Vulkan] upload batch preflight failed: operations={operation_count} error={e:?}"))
+                .map_err(crate::resources::failure)
+        } else {
+            Ok(vec![owned])
+        }
+    })?;
     let mut submissions = Vec::new();
     for batch in batches {
         match submit_owned_batch(rt, batch) {
@@ -4285,6 +4311,7 @@ fn submit_owned_batch(
                 Ok(Some(receipt))
             }
             Err(SubmitError::Rejected(error)) => {
+                trace_owned_recording_failure(&rt.table, &owned, &error);
                 let mut buffer_bytes = 0usize;
                 let mut texture_bytes = 0usize;
                 let mut draws = 0usize;
@@ -4342,10 +4369,10 @@ fn submit_owned_batch(
 fn trace_owned_recording_failure(
     table: &ir::ResourceTable,
     owned: &ir::OwnedCommandBuffer,
-    error: ir::Error,
+    error: impl std::fmt::Debug,
 ) {
     eprintln!(
-        "[SGFX Vulkan] IR recording rejected: {error:?}, {} operations",
+        "[SGFX Vulkan] IR stream rejected: {error:?}, {} operations",
         owned.command_count()
     );
     for (index, command) in owned.commands().iter().enumerate().take(512) {
@@ -4417,8 +4444,11 @@ fn trace_owned_recording_failure(
                     .programmable_render_pipeline_ref(*pipeline)
                     .and_then(|id| table.programmable_render_pipeline_shared(id));
                 eprintln!(
-                    "[SGFX Vulkan] IR[{index}] {command:?} vertex_layout={:?}",
-                    desc.as_ref().map(|desc| desc.vertex_buffers())
+                    "[SGFX Vulkan] IR[{index}] {command:?} vertex_layout={:?} colors={:?} depth={:?}",
+                    desc.as_ref().map(|desc| desc.vertex_buffers()),
+                    desc.as_ref()
+                        .map(|desc| desc.color_targets().collect::<Vec<_>>()),
+                    desc.as_ref().map(|desc| desc.depth_state())
                 );
             }
             ir::OwnedCommand::BeginRenderPass(desc)
@@ -4661,9 +4691,7 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
         }
     }
     let mut submissions = submit_owned(rt, ops)?;
-    let mut readback = rec.readback_buffers;
-    readback.sort_unstable_by_key(|buffer| buffer.as_raw());
-    readback.dedup();
+    let readback = rec.readback_buffers;
     if !readback.is_empty() {
         profile_work("execute::readback_wait", || {
             for submission in &submissions {
@@ -4673,39 +4701,42 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
         })?;
         submissions.clear();
     }
-    // Stage only GPU-written bytes back into allocations returned by MapMemory.
-    let mut dirty_memories = Vec::new();
-    for handle in &readback {
+    for (handle, _) in fresh_uploads {
+        rt.resources.uploaded_unmapped_buffers.insert(handle);
+    }
+    // The backend and this buffer's mirror agree after readback. Only aliases
+    // overlapping the modified allocation bytes need a later full upload.
+    for (handle, ranges) in readback.into_ranges() {
         profile_work("execute::buffer_readback", || {
             let buffer = rt
                 .resources
                 .buffers
-                .get(handle)
+                .get(&handle)
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            let id = buffer.id;
             if let Some((memory_handle, offset)) = buffer.bound {
-                let bytes = rt
-                    .cache
-                    .read_buffer(buffer.id, 0, buffer.size)
-                    .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-                let allocation = rt
-                    .resources
-                    .memories
-                    .get_mut(&memory_handle)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                allocation.bytes[offset as usize..(offset + buffer.size) as usize]
-                    .copy_from_slice(&bytes);
-                dirty_memories.push(memory_handle);
+                for range in ranges {
+                    let bytes = rt
+                        .cache
+                        .read_buffer(id, range.start, range.end - range.start)
+                        .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+                    let allocation = rt
+                        .resources
+                        .memories
+                        .get_mut(&memory_handle)
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    allocation.bytes
+                        [(offset + range.start) as usize..(offset + range.end) as usize]
+                        .copy_from_slice(&bytes);
+                    rt.resources.forget_uploads_for_memory_range(
+                        memory_handle,
+                        offset + range.start..offset + range.end,
+                        handle,
+                    );
+                }
             }
             Ok(())
         })?;
-    }
-    for memory in &dirty_memories {
-        rt.resources.forget_uploads_for_memory(*memory);
-    }
-    for (handle, memory) in fresh_uploads {
-        if !dirty_memories.contains(&memory) {
-            rt.resources.uploaded_unmapped_buffers.insert(handle);
-        }
     }
     Ok(submissions)
 }
@@ -5140,6 +5171,57 @@ mod tests {
         let (mapped, fresh) = snapshot_buffer_uploads(&resources, &[handle]).unwrap();
         assert_eq!(mapped.len(), 1);
         assert!(fresh.is_empty());
+    }
+
+    #[test]
+    fn gpu_readback_invalidates_only_overlapping_aliases() {
+        use crate::resources::{Buffer, Resources};
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let memory = vk::DeviceMemory::from_raw(1);
+        let other_memory = vk::DeviceMemory::from_raw(2);
+        for (raw, bound, offset) in [
+            (1, memory, 0),
+            (2, memory, 0),
+            (3, memory, 16),
+            (4, memory, 32),
+            (5, other_memory, 0),
+        ] {
+            let handle = vk::Buffer::from_raw(raw);
+            let id = table
+                .define_buffer(ir::BufferDesc::new(16, ir::BufferUsage::COPY_DST).unwrap())
+                .unwrap()
+                .id();
+            resources.buffers.insert(
+                handle,
+                Buffer {
+                    id,
+                    size: 16,
+                    usage: vk::BufferUsageFlags::TRANSFER_DST,
+                    bound: Some((bound, offset)),
+                },
+            );
+            resources.uploaded_unmapped_buffers.insert(handle);
+        }
+        // Updating the first buffer preserves its synchronized backend copy,
+        // invalidates its alias, and leaves adjacent buffers cached.
+        resources.forget_uploads_for_memory_range(memory, 4..16, vk::Buffer::from_raw(1));
+        assert_eq!(
+            (1..=5)
+                .filter(|raw| resources
+                    .uploaded_unmapped_buffers
+                    .contains(&vk::Buffer::from_raw(*raw)))
+                .collect::<Vec<_>>(),
+            [1, 3, 4, 5]
+        );
+        // A subsequent write via the alias invalidates the original buffer;
+        // it must not be re-marked as fresh at the end of the submission.
+        resources.forget_uploads_for_memory_range(memory, 4..8, vk::Buffer::from_raw(2));
+        assert!(
+            !resources
+                .uploaded_unmapped_buffers
+                .contains(&vk::Buffer::from_raw(1))
+        );
     }
 
     #[test]

@@ -14,7 +14,6 @@ const LIMIT: usize = 1024;
 pub(crate) const MAX_MEMORY_ALLOCATIONS: usize = 4_096;
 const MAX_DESCRIPTOR_SETS: usize = 16_384;
 pub(crate) const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
-pub(crate) const MAX_ALLOCATED: usize = 512 * 1024 * 1024;
 pub(crate) struct Buffer {
     pub id: ir::BufferId,
     pub size: u64,
@@ -300,6 +299,24 @@ impl Resources {
             buffers
                 .get(handle)
                 .is_some_and(|buffer| buffer.bound.is_some_and(|(bound, _)| bound != memory))
+        });
+    }
+    pub(crate) fn forget_uploads_for_memory_range(
+        &mut self,
+        memory: vk::DeviceMemory,
+        range: std::ops::Range<u64>,
+        synchronized: vk::Buffer,
+    ) {
+        let buffers = &self.buffers;
+        self.uploaded_unmapped_buffers.retain(|handle| {
+            *handle == synchronized
+                || buffers.get(handle).is_some_and(|buffer| {
+                    buffer.bound.is_some_and(|(bound, offset)| {
+                        bound != memory
+                            || offset >= range.end
+                            || offset + buffer.size <= range.start
+                    })
+                })
         });
     }
     /// Cache shader variants for the component maps of statically used views.
@@ -1116,11 +1133,9 @@ unsafe extern "system" fn allocate_memory(
             if r.resources.memories.len() >= MAX_MEMORY_ALLOCATIONS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
+            let budget = crate::memory_budget::heap_size();
             let allocated: usize = r.resources.memories.values().map(|m| m.bytes.len()).sum();
-            if allocated
-                .checked_add(size)
-                .is_none_or(|v| v > MAX_ALLOCATED)
-            {
+            if allocated.checked_add(size).is_none_or(|v| v > budget) {
                 // Allocation failures must identify the exhausted budget even
                 // in ordinary builds. Do not dump mapped application payloads.
                 let mut largest: Vec<_> = r
@@ -1169,7 +1184,7 @@ unsafe extern "system" fn allocate_memory(
                     .map(|memory| memory.bytes.words.len() * 8)
                     .sum::<usize>();
                 eprintln!(
-                    "[SGFX Vulkan] allocation budget exhausted: requested={size} allocated={allocated} limit={MAX_ALLOCATED} allocations={} buffers={} images={} largest_bytes_mapped={largest:?}",
+                    "[SGFX Vulkan] allocation budget exhausted: requested={size} allocated={allocated} limit={budget} allocations={} buffers={} images={} largest_bytes_mapped={largest:?}",
                     r.resources.memories.len(),
                     r.resources.buffers.len(),
                     r.resources.images.len(),

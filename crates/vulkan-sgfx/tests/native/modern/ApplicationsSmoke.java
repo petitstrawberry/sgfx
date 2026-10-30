@@ -26,6 +26,21 @@ public class ApplicationsSmoke {
   LongBuffer h=s.mallocLong(1);check(vkCreateBuffer(d,VkBufferCreateInfo.calloc(s).sType$Default().size(size).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE),null,h),"graphics buffer");long b=h.get(0);
   VkMemoryRequirements r=VkMemoryRequirements.calloc(s);vkGetBufferMemoryRequirements(d,b,r);check(vkAllocateMemory(d,VkMemoryAllocateInfo.calloc(s).sType$Default().allocationSize(r.size()).memoryTypeIndex(Integer.numberOfTrailingZeros(r.memoryTypeBits())),null,h),"graphics memory");long m=h.get(0);check(vkBindBufferMemory(d,b,m,0),"graphics bind");return new long[]{b,m};
  }}
+ static void memoryBudget(VkDevice d){try(MemoryStack s=MemoryStack.stackPush()){
+  VkPhysicalDeviceMemoryProperties props=VkPhysicalDeviceMemoryProperties.calloc(s);vkGetPhysicalDeviceMemoryProperties(d.getPhysicalDevice(),props);
+  long heap=props.memoryHeaps(0).size(),block=128L*1024*1024;LongBuffer h=s.mallocLong(1);
+  if(heap<640L*1024*1024)throw new AssertionError("native memory capacity requires the 4GiB test VM: "+heap);
+  for(int round=0;round<2;round++){
+   java.util.ArrayList<Long> allocations=new java.util.ArrayList<>();long remaining=heap;
+   while(remaining>0){long size=Math.min(block,remaining);check(vkAllocateMemory(d,VkMemoryAllocateInfo.calloc(s).sType$Default().allocationSize(size).memoryTypeIndex(0),null,h),"heap reservation");allocations.add(h.get(0));remaining-=size;}
+   int exhausted=vkAllocateMemory(d,VkMemoryAllocateInfo.calloc(s).sType$Default().allocationSize(1).memoryTypeIndex(0),null,h);
+   if(exhausted!=VK_ERROR_OUT_OF_DEVICE_MEMORY||h.get(0)!=0)throw new AssertionError("heap boundary not enforced "+exhausted);
+   vkFreeMemory(d,allocations.get(0),null);
+   check(vkAllocateMemory(d,VkMemoryAllocateInfo.calloc(s).sType$Default().allocationSize(block).memoryTypeIndex(0),null,h),"released heap budget reused");allocations.set(0,h.get(0));
+   for(long memory:allocations)vkFreeMemory(d,memory,null);
+  }
+  System.out.println("MEMORY_BUDGET_NATIVE PASS declared_heap="+heap+" logical reservations exhaust and reclaim twice");
+ }}
  static void vmaAllocations(VkDevice d,VkQueue q,long pool){try(MemoryStack s=MemoryStack.stackPush()){
   PointerBuffer p=s.mallocPointer(1),allocation=s.mallocPointer(1);LongBuffer h=s.mallocLong(1);
   VkInstance instance=d.getPhysicalDevice().getInstance();
@@ -35,15 +50,28 @@ public class ApplicationsSmoke {
   VmaAllocationInfo details=VmaAllocationInfo.calloc(s);vmaGetAllocationInfo(allocator,memory,details);
   check(vkCreateBuffer(d,VkBufferCreateInfo.calloc(s).sType$Default().size(4).usage(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT),null,h),"dedicated alias candidate");long alias=h.get(0);
   if(vkBindBufferMemory(d,alias,details.deviceMemory(),0)!=VK_ERROR_INITIALIZATION_FAILED)throw new AssertionError("dedicated buffer allocation reused by a different buffer");vkDestroyBuffer(d,alias,null);
-  long[] output=buffer(d,8,VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  long[] output=buffer(d,12,VK_BUFFER_USAGE_TRANSFER_DST_BIT);
   check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"VMA GPU commands");VkCommandBuffer cmd=new VkCommandBuffer(p.get(0),d);check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"VMA begin");
   vkCmdUpdateBuffer(cmd,source,0,s.ints(0x13579bdf));vkCmdUpdateBuffer(cmd,source,bytes-4,s.ints(0x2468ace0));
   vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,VkMemoryBarrier.calloc(1,s).sType$Default().srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT),null,null);
   vkCmdCopyBuffer(cmd,source,output[0],VkBufferCopy.calloc(2,s).apply(0,r->r.srcOffset(0).dstOffset(0).size(4)).apply(1,r->r.srcOffset(bytes-4).dstOffset(4).size(4)));
   check(vkEndCommandBuffer(cmd),"VMA end");check(vkQueueSubmit(q,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(cmd)),0),"VMA submit");check(vkQueueWaitIdle(q),"VMA idle");
   check(vkMapMemory(d,output[1],0,8,0,p),"VMA result map");IntBuffer got=MemoryUtil.memByteBuffer(p.get(0),8).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();if(got.get(0)!=0x13579bdf||got.get(1)!=0x2468ace0)throw new AssertionError("VMA GPU boundary copy");vkUnmapMemory(d,output[1]);
-  vkFreeCommandBuffers(d,pool,cmd);vkDestroyBuffer(d,output[0],null);vkFreeMemory(d,output[1],null);vmaDestroyBuffer(allocator,source,memory);vmaDestroyAllocator(allocator);
-  System.out.println("VMA_DEDICATED_NATIVE PASS actual VMA dedicated 64MiB allocation GPU boundary updates and copies");
+  vkFreeCommandBuffers(d,pool,cmd);
+  long partialStarted=System.nanoTime();
+  for(int round=0;round<8;round++){
+   check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"partial update commands");cmd=new VkCommandBuffer(p.get(0),d);
+   check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"partial update begin");vkCmdUpdateBuffer(cmd,source,bytes-8,s.ints(0x11220000+round));check(vkEndCommandBuffer(cmd),"partial update end");
+   check(vkQueueSubmit(q,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(cmd)),0),"partial update submit");check(vkQueueWaitIdle(q),"partial update idle");vkFreeCommandBuffers(d,pool,cmd);
+   check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"partial read commands");cmd=new VkCommandBuffer(p.get(0),d);
+   check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"partial read begin");
+   vkCmdCopyBuffer(cmd,source,output[0],VkBufferCopy.calloc(3,s).apply(0,r->r.srcOffset(0).dstOffset(0).size(4)).apply(1,r->r.srcOffset(bytes-8).dstOffset(4).size(4)).apply(2,r->r.srcOffset(bytes-4).dstOffset(8).size(4)));
+   check(vkEndCommandBuffer(cmd),"partial read end");check(vkQueueSubmit(q,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(cmd)),0),"partial read submit");check(vkQueueWaitIdle(q),"partial read idle");vkFreeCommandBuffers(d,pool,cmd);
+   check(vkMapMemory(d,output[1],0,12,0,p),"partial result map");got=MemoryUtil.memByteBuffer(p.get(0),12).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();if(got.get(0)!=0x13579bdf||got.get(1)!=0x11220000+round||got.get(2)!=0x2468ace0)throw new AssertionError("partial update overwrote untouched boundary round="+round);vkUnmapMemory(d,output[1]);
+  }
+  System.out.println("BUFFER_PARTIAL_UPDATE_NATIVE PASS rounds=8 backing=64MiB write_bytes=4 unchanged_boundaries=true elapsed_ms="+(System.nanoTime()-partialStarted)/1_000_000);
+  vkDestroyBuffer(d,output[0],null);vkFreeMemory(d,output[1],null);vmaDestroyBuffer(allocator,source,memory);vmaDestroyAllocator(allocator);
+  System.out.println("VMA_DEDICATED_NATIVE PASS actual VMA dedicated 64MiB allocation boundary updates and ordered copies");
  }}
  static void compute(VkDevice d,VkQueue queue,long pool){
   if(!compute){System.out.println("COMPUTE_NATIVE_UNAVAILABLE PASS graphics-only queue retained after isolated dispatch probe");return;}
@@ -72,7 +100,7 @@ public class ApplicationsSmoke {
  }
  static void graphics(VkDevice d,VkQueue queue,long pool){try(MemoryStack s=MemoryStack.stackPush()){
   LongBuffer h=s.mallocLong(1);PointerBuffer p=s.mallocPointer(1);
-  long vs=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_vertex_shader,"#version 450\n#extension GL_ARB_shader_draw_parameters : require\nlayout(set=0,binding=1) uniform isamplerBuffer words; layout(location=0) in vec2 pos; layout(location=1) in float record; layout(location=2) in vec4 normal; layout(location=3) in ivec2 signedPair; layout(location=4) in ivec3 wide; layout(push_constant) uniform Params { int base; } params; layout(location=0) flat out uint instance; layout(location=1) flat out uint valid; void main(){ instance=uint(gl_InstanceIndex)-2u; valid=(wide==ivec3(-2147483647-1,1234,2147483647) && (texelFetch(words,0)==ivec4(-9,0,0,1) || (texelFetch(words,0)==ivec4(-128,0,0,1) && texelFetch(words,1).x==127 && texelFetch(words,2).x==-9 && texelFetch(words,3).x==3 && texelFetch(words,4).x==-1 && texelFetch(words,5).x==64 && texelFetch(words,6).x==-64)) && gl_BaseInstanceARB==2 && gl_BaseVertexARB==params.base && gl_DrawIDARB==1 && record==(instance<2u?7.0:8.0) && abs(normal.x+1.0)<0.001 && abs(normal.y-1.0)<0.001 && abs(normal.z+64.0/127.0)<0.001 && abs(normal.w-64.0/127.0)<0.001 && signedPair==(instance<2u?ivec2(-32768,1234):ivec2(32767,-9)))?1u:0u; gl_Position=vec4(pos,0,1); }");
+  long vs=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_vertex_shader,"#version 450\n#extension GL_ARB_shader_draw_parameters : require\nlayout(set=0,binding=1) uniform isamplerBuffer words; layout(location=0) in vec2 pos; layout(location=1) in float record; layout(location=2) in vec4 normal; layout(location=3) in ivec2 signedPair; layout(location=4) in ivec3 wide; layout(push_constant) uniform Params { int base; } params; layout(location=0) flat out uint instance; layout(location=1) flat out uint valid; void main(){ instance=uint(gl_InstanceIndex)-2u; valid=(wide==ivec3(-2147483647-1,1234,2147483647) && (texelFetch(words,0)==ivec4(-9,0,0,1) || (texelFetch(words,0)==ivec4(-127,0,0,1) && texelFetch(words,700000).x==-64) || (texelFetch(words,0)==ivec4(-128,0,0,1) && texelFetch(words,1).x==127 && texelFetch(words,2).x==-9 && texelFetch(words,3).x==3 && texelFetch(words,4).x==-1 && texelFetch(words,5).x==64 && texelFetch(words,6).x==-64)) && gl_BaseInstanceARB==2 && gl_BaseVertexARB==params.base && gl_DrawIDARB==1 && record==(instance<2u?7.0:8.0) && abs(normal.x+1.0)<0.001 && abs(normal.y-1.0)<0.001 && abs(normal.z+64.0/127.0)<0.001 && abs(normal.w-64.0/127.0)<0.001 && signedPair==(instance<2u?ivec2(-32768,1234):ivec2(32767,-9)))?1u:0u; gl_Position=vec4(pos,0,1); }");
   long fs=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_fragment_shader,"#version 450\nlayout(set=0,binding=0) uniform sampler2D sampled; layout(location=0) flat in uint instance; layout(location=1) flat in uint valid; layout(location=0) out vec4 color; void main(){ if(uint((gl_FragCoord.x-2.0)*0.75)!=instance)discard; float a=degrees(radians(gl_FragCoord.x)); float values[4]=float[4](1,2,3,4); uint i=uint(gl_FragCoord.x)&3u; values[i]=values[(i+1u)&3u]+7.0; gl_FragDepth=0.375; bool ok=abs(a-gl_FragCoord.x)<0.001 && values[i]==float(((i+1u)&3u)+1u)+7.0; color=valid==1u && ok?textureGrad(sampled,vec2(0.5),vec2(0.125,0),vec2(0,0.125)):vec4(1,0,1,1); }");
   long pointVs=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_vertex_shader,"#version 450\nlayout(location=0) flat out uint instance; layout(location=1) flat out uint valid; void main(){uint x=uint(gl_VertexIndex)%4u,y=uint(gl_VertexIndex)/4u; instance=uint((float(x)+0.5)*0.75); valid=1u; gl_Position=vec4((float(x)+2.5)/4.0-1.0,1.0-(float(y)+2.5)/4.0,0,1); gl_PointSize=1.0; }");
   check(vkCreateImage(d,VkImageCreateInfo.calloc(s).sType$Default().imageType(VK_IMAGE_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM).extent(e->e.set(8,8,1)).mipLevels(4).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT).tiling(VK_IMAGE_TILING_OPTIMAL).usage(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT),null,h),"graphics image");long image=h.get(0);
@@ -104,19 +132,21 @@ public class ApplicationsSmoke {
    check(vkCreateGraphicsPipelines(d,0,info,null,h),"dynamic pipeline mode="+mode);pipelines[mode]=h.get(0);
   }
   long[] args=buffer(d,64,VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),counter=buffer(d,4,VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),vertices=buffer(d,64L*1024*1024,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),indices=buffer(d,8,VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),output=buffer(d,768,VK_BUFFER_USAGE_TRANSFER_DST_BIT),instances=buffer(d,96,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-  long[] texels=buffer(d,64,VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  long[] texels=buffer(d,710180,VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
   check(vkCreateBufferView(d,VkBufferViewCreateInfo.calloc(s).sType$Default().buffer(texels[0]).format(VK_FORMAT_R32_SINT).offset(16).range(32),null,h),"signed texel buffer view");long texelView=h.get(0);
   check(vkCreateBufferView(d,VkBufferViewCreateInfo.calloc(s).sType$Default().buffer(texels[0]).format(VK_FORMAT_R8_SINT).offset(20).range(7),null,h),"signed byte texel view");long byteView=h.get(0);
+  check(vkCreateBufferView(d,VkBufferViewCreateInfo.calloc(s).sType$Default().buffer(texels[0]).format(VK_FORMAT_R8_SINT).offset(20).range(710159),null,h),"large signed byte texel view");long largeByteView=h.get(0);
   if(timing)check(vkCreateQueryPool(d,VkQueryPoolCreateInfo.calloc(s).sType$Default().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(2),null,h),"graphics queries");long queries=timing?h.get(0):0;
   check(vkCreateQueryPool(d,VkQueryPoolCreateInfo.calloc(s).sType$Default().queryType(VK_QUERY_TYPE_OCCLUSION).queryCount(2),null,h),"occlusion pool");long visibility=h.get(0);
   int statMask=VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT|VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT|VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT|VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
   int statResult=vkCreateQueryPool(d,VkQueryPoolCreateInfo.calloc(s).sType$Default().queryType(VK_QUERY_TYPE_PIPELINE_STATISTICS).queryCount(1).pipelineStatistics(statMask),null,h);
   if(statistics)check(statResult,"statistics pool");else if(statResult!=VK_ERROR_FEATURE_NOT_PRESENT)throw new AssertionError("unsupported statistics accepted");long counters=statistics?h.get(0):0;
-  for(int indexed=0;indexed<7;indexed++){
-   final long activeTexelView=indexed==5?byteView:texelView;
+  for(int indexed=0;indexed<8;indexed++){
+   final long activeTexelView=indexed==5?byteView:indexed==7?largeByteView:texelView;
    check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"graphics commands");VkCommandBuffer cmd=new VkCommandBuffer(p.get(0),d);
    check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"graphics begin");if(timing)vkCmdResetQueryPool(cmd,queries,0,2);vkCmdResetQueryPool(cmd,visibility,0,2);if(statistics){vkCmdResetQueryPool(cmd,counters,0,1);vkCmdBeginQuery(cmd,counters,0,0);}
    vkCmdUpdateBuffer(cmd,texels[0],0,s.ints(99,99,99,99,-9,0x03f77f80,0x00c040ff,31,47,51,63,77,88,88,88,88));vkCmdUpdateBuffer(cmd,vertices[0],64L*1024*1024-24,s.floats(-1,-1,3,-1,-1,3));vkCmdUpdateBuffer(cmd,indices[0],0,s.shorts((short)1,(short)2,(short)3,(short)0));vkCmdUpdateBuffer(cmd,instances[0],0,s.ints(Float.floatToRawIntBits(99),0,0,0,0,0,Float.floatToRawIntBits(99),0,0,0,0,0,Float.floatToRawIntBits(7),0x40c07f80,0x04d28000,Integer.MIN_VALUE,1234,Integer.MAX_VALUE,Float.floatToRawIntBits(8),0x40c07f80,0xfff77fff,Integer.MIN_VALUE,1234,Integer.MAX_VALUE));vkCmdUpdateBuffer(cmd,counter[0],0,s.ints(2));vkCmdUpdateBuffer(cmd,args[0],0,indexed!=1?s.ints(0,0,0,0,indexed==4?16:3,3,0,2):s.ints(0,0,0,0,0,3,3,0,-1,2));
+   if(indexed==7){vkCmdUpdateBuffer(cmd,texels[0],20,s.ints(0x03f77f81));vkCmdUpdateBuffer(cmd,texels[0],700020,s.ints(0xc0));vkCmdUpdateBuffer(cmd,texels[0],710176,s.ints(0x12345678));}
    if(indexed==0){
     VkImageMemoryBarrier2.Buffer sampleBarrier=VkImageMemoryBarrier2.calloc(1,s).sType$Default().oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).srcStageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR).dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT_KHR).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR).srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(texture).subresourceRange(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
     vkCmdPipelineBarrier2KHR(cmd,VkDependencyInfo.calloc(s).sType$Default().pImageMemoryBarriers(sampleBarrier));
@@ -153,12 +183,12 @@ public class ApplicationsSmoke {
   }
   vkDestroyQueryPool(d,visibility,null);if(statistics)vkDestroyQueryPool(d,counters,null);
   if(timing)vkDestroyQueryPool(d,queries,null);for(long[] b:new long[][]{args,counter,vertices,indices,output,instances}){vkDestroyBuffer(d,b[0],null);vkFreeMemory(d,b[1],null);}
-  vkDestroyBufferView(d,byteView,null);vkDestroyBufferView(d,texelView,null);vkDestroyBuffer(d,texels[0],null);vkFreeMemory(d,texels[1],null);
+  vkDestroyBufferView(d,largeByteView,null);vkDestroyBufferView(d,byteView,null);vkDestroyBufferView(d,texelView,null);vkDestroyBuffer(d,texels[0],null);vkFreeMemory(d,texels[1],null);
   vkDestroySampler(d,sampler,null);vkDestroyImageView(d,textureView,null);vkDestroyImage(d,texture,null);vkFreeMemory(d,textureMemory,null);vkDestroyDescriptorSetLayout(d,pushLayout,null);
   for(long pipeline:pipelines)vkDestroyPipeline(d,pipeline,null);vkDestroyImageView(d,depthView,null);vkDestroyImage(d,depth,null);vkFreeMemory(d,depthMemory,null);vkDestroyShaderModule(d,pointVs,null);vkDestroyPipelineLayout(d,layout,null);vkDestroyImageView(d,view,null);vkDestroyImage(d,image,null);vkFreeMemory(d,memory,null);vkDestroyShaderModule(d,vs,null);vkDestroyShaderModule(d,fs,null);
   System.out.println("SCOPED_QUERIES_NATIVE PASS occlusion visible empty copy host-reset statistics_supported="+statistics);
   System.out.println("VULKAN_REQUIREMENTS_NATIVE PASS push descriptors anisotropy16 divisor2 firstInstance2 BaseVertex signed DrawIndex1 after zero-count entry");
-  System.out.println("MODERN_GRAPHICS_NATIVE PASS dynamic rendering GPU-written indirect count indexed baseVertex=-1 pixels=448 depth_words=448 vertex_backing=64MiB points MinMax angles dynamic-stores gradients packed-inputs signed-texel-buffer R32 offset16 R8 offset20 range7 R32-restored mip-zero-render timestamp_supported="+timing+"");
+  System.out.println("MODERN_GRAPHICS_NATIVE PASS dynamic rendering GPU-written indirect count indexed baseVertex=-1 pixels=512 depth_words=512 vertex_backing=64MiB points MinMax angles dynamic-stores gradients packed-inputs signed-texel-buffer R32 offset16 R8 offset20 range7 R32-restored R8-large-range710159-fetch700000 mip-zero-render timestamp_supported="+timing+"");
  }}
 
  static void depthTransfers(VkDevice d,VkQueue q,long pool){try(MemoryStack s=MemoryStack.stackPush()){
@@ -312,6 +342,7 @@ public class ApplicationsSmoke {
    VkDeviceCreateInfo di=VkDeviceCreateInfo.calloc(s).sType$Default().pNext(support.address()).pQueueCreateInfos(queues).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(s).multiDrawIndirect(true).drawIndirectFirstInstance(true).pipelineStatisticsQuery(statistics).samplerAnisotropy(true)).ppEnabledExtensionNames(s.pointers(s.UTF8(KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),s.UTF8(EXTVertexAttributeDivisor.VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME),s.UTF8(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME),s.UTF8(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME),s.UTF8(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME),s.UTF8(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME),s.UTF8(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME)));
    check(vkCreateDevice(physical,di,null,p),"device");VkDevice device=new VkDevice(p.get(0),physical,di);vkGetDeviceQueue(device,0,0,p);VkQueue queue=new VkQueue(p.get(0),device);
    System.out.println("CORE12_FEATURES_NATIVE PASS aggregate enablement aliases agree unsupported bits cleared");
+   memoryBudget(device);
    long[] buffers=new long[2],memories=new long[2];
    for(int i=0;i<2;i++){
     check(vkCreateBuffer(device,VkBufferCreateInfo.calloc(s).sType$Default().size(256).usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),null,h),"buffer");buffers[i]=h.get(0);

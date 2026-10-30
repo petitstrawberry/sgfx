@@ -51,6 +51,8 @@ unsafe extern "C" fn drop_resources(p: Object) {
 }
 unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
     status((|| {
+        #[cfg(feature = "profile-submissions")]
+        let started = std::time::Instant::now();
         let r = unsafe { object::<Resources>(p) }?;
         if r.poisoned {
             return Err(abi::DEVICE_LOST);
@@ -70,6 +72,8 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
             .table
             .abi_retired_programs(words)
             .map_err(|_| abi::INVALID)?;
+        #[cfg(feature = "profile-submissions")]
+        let scan_us = started.elapsed().as_micros();
         if (!textures.is_empty()
             || !buffers.is_empty()
             || !shaders.is_empty()
@@ -96,11 +100,24 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         for id in shaders {
             r.inner.release_shader_module(id).map_err(error)?;
         }
+        #[cfg(feature = "profile-submissions")]
+        let retire_us = started.elapsed().as_micros() - scan_us;
         match r.table.sync_abi_snapshot(words) {
             Ok((_, revision)) => r.revision = revision,
             Err(_) => {
                 r.poisoned = true;
                 return Err(abi::INVALID);
+            }
+        }
+        #[cfg(feature = "profile-submissions")]
+        {
+            let total_us = started.elapsed().as_micros();
+            if total_us >= 50_000 {
+                eprintln!(
+                    "SGFX_VIRGL_METADATA_PROFILE total_us={total_us} scan_us={scan_us} retire_us={retire_us} import_us={} words={}",
+                    total_us - scan_us - retire_us,
+                    words.len()
+                );
             }
         }
         Ok(())
@@ -369,9 +386,21 @@ unsafe extern "C" fn submit(
             return Err(abi::DEVICE_LOST);
         }
         let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
+        #[cfg(feature = "profile-submissions")]
+        let decode_started = std::time::Instant::now();
         let commands =
             unsafe { ir::CommandBuffer::from_abi(&r.table, r.source, core_batch(*batch)) }
                 .map_err(|_| abi::INVALID)?;
+        #[cfg(feature = "profile-submissions")]
+        {
+            let decode_us = decode_started.elapsed().as_micros();
+            if decode_us >= 50_000 {
+                eprintln!(
+                    "SGFX_VIRGL_DECODE_PROFILE decode_us={decode_us} commands={} words={}",
+                    batch.count, batch.words.len
+                );
+            }
+        }
         let (disposition, error, receipt) =
             match q.inner.submit_ir_async(&q.context, &mut r.inner, &commands) {
                 Ok(receipt) => (abi::ACCEPTED, abi::OK, receipt),

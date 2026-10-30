@@ -36,17 +36,24 @@ pub(super) fn execute(
         );
         return Ok(());
     }
-    for submission in submit_owned(rt, std::mem::take(ops)).inspect_err(|error| {
+    let submissions = submit_owned(rt, std::mem::take(ops)).inspect_err(|error| {
         eprintln!(
             "[SGFX Vulkan] control-point submission {:?}: {error:?}",
             std::mem::discriminant(action)
         )
-    })? {
-        wait_submission(rt, &submission)?;
-    }
+    })?;
+    profile_work("sync::gpu_wait", || {
+        for submission in submissions {
+            wait_submission(rt, &submission)?;
+        }
+        Ok(())
+    })?;
     // Earlier packets may have no operations in this command buffer. Their
     // completion observer runs independently of the resource worker.
-    rt.in_flight.wait();
+    profile_work("sync::in_flight_wait", || {
+        rt.in_flight.wait();
+        Ok(())
+    })?;
     if rt.device_lost.load(Ordering::Acquire) {
         return Err(vk::Result::ERROR_DEVICE_LOST);
     }

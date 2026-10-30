@@ -8,6 +8,18 @@ use sgfx_codegen_virgl::programmable::{CompiledShader, compile_shader};
 
 type Result<T> = core::result::Result<T, IrSubmitError>;
 
+fn publish_compute_shadow(
+    shadow: &mut BufferShadow,
+    canonical_revision: &mut Option<u64>,
+    bytes: Vec<u8>,
+    revision: u64,
+) {
+    // GPU replacement has no delta against the graphics shadow's physical
+    // predecessor; the next graphics upload must repair it.
+    shadow.replace(bytes, revision, None);
+    *canonical_revision = None;
+}
+
 pub(super) fn contains_compute(commands: &CommandBuffer<'_, '_>) -> Result<bool> {
     #[cfg(feature = "backend-abi")]
     {
@@ -613,11 +625,45 @@ impl Queue {
             });
         }
         for ((slot, revision), bytes) in plan.slots.into_iter().zip(plan.buffers) {
-            resources.buffer_shadows[slot] = Some(bytes);
-            resources.buffer_revisions[slot] = revision;
-            resources.canonical_buffer_revisions[slot] = None;
+            publish_compute_shadow(
+                &mut resources.buffer_shadows[slot],
+                &mut resources.canonical_buffer_revisions[slot],
+                bytes,
+                revision,
+            );
         }
         signal.complete(Ok(()));
         Ok(Submission { signal })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_shadow_replacement_discards_graphics_delta_and_validation() {
+        let mut shadow = BufferShadow::default();
+        shadow.replace(
+            vec![3; 64],
+            9,
+            Some(driver::IrBufferUpdate {
+                previous_revision: 8,
+                range: 4..8,
+            }),
+        );
+        let mut canonical_revision = Some(9);
+        let mut computed = vec![3; 64];
+        computed[40..44].fill(7);
+        publish_compute_shadow(&mut shadow, &mut canonical_revision, computed.clone(), 10);
+
+        let (bytes, upload) = shadow.for_draw(None).unwrap();
+        assert_eq!(bytes, computed);
+        assert_eq!(shadow.revision, 10);
+        assert!(canonical_revision.is_none());
+        assert!(
+            upload.is_none(),
+            "compute requires full-shadow upload fallback"
+        );
     }
 }

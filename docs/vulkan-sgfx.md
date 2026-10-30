@@ -530,7 +530,7 @@ write false dedicated-allocation requirements. Optional dedicated buffer/image
 allocations are accepted through `VkMemoryDedicatedAllocateInfo`, including
 single-device allocation flags. The allocation must match the resource
 requirements and may bind only its declared target at offset zero; aliases
-remain rejected. A native VMA test verifies a dedicated 64 MiB buffer with GPU
+remain rejected. A native VMA test verifies a dedicated 64 MiB buffer with ordered
 writes/copies at both boundaries and rejection of a different bind target.
 Float image tests exercise dedicated image allocations. Sparse queries report zero;
 YCbCr creation returns `ERROR_FEATURE_NOT_PRESENT`. Disabled Vulkan 1.1 feature
@@ -694,3 +694,44 @@ at most once per five seconds after the first frame. It reports cumulative
 accepted IR streams, draw commands and presented frames. Scarlet records are
 emitted only after the queue-idle completion check succeeds; they are separate
 from the API timing profiler and do not capture images.
+
+Read-only graphics storage/texel bindings use the native 1 MiB buffer-view
+budget for both the backing and the bound range. They do not inherit the
+compute planner's narrower range check. The native test switches from a
+seven-byte R8 view to an odd 710,159-byte view and verifies a GPU fetch at
+index 700,000, alongside 512 exact color pixels and 512 depth words. Rejected
+backend streams emit payload-free IR/resource metadata and the failing binding
+range, including when a failure occurs after API recording succeeded.
+
+On Scarlet the logical device-memory budget is one quarter of the kernel's
+managed physical RAM, capped at 2 GiB and rounded down to whole MiB. The stable
+budget is shared by memory-property reporting and allocation admission. Native
+memory metadata comes from `scarlet_os::system::memory_info`; unavailable
+metadata and other hosts retain a 512 MiB fallback. The remaining capacity is
+reserved for application memory, CPU mirrors, backend shadows and the kernel.
+The heap reports a capacity bound, not a guarantee of currently free memory.
+
+Transfer readback merges the written byte intervals and preserves gaps, including
+row padding in image-to-buffer copies. Once the backend and host mirror agree,
+unmapped buffers retain their upload cache; overlapping aliases are invalidated
+before reuse. Writable shader buffers retain conservative full-buffer readback.
+The native backend also retains the last accepted update's byte range and
+predecessor revision across update-only submissions. Later draws use this delta
+only when the physical buffer has that exact predecessor; revision gaps and
+compute replacements use a full-shadow repair. Rejected submissions and Busy
+leave the accepted bytes and revision intact.
+
+The frontend paces texture uploads at 8 MiB without splitting individual buffer
+writes. Native buffer upload limits are enforced when buffers are materialized
+for drawing; fragmenting CPU-shadow writes would repeatedly copy their entire
+previous contents. The optional native `profile-submissions` feature reports
+submission phases taking at least 50 ms, including shadow-copy bytes and dirty
+bytes. The plugin also reports slow metadata import and command decoding. These
+records contain counts and timings only; normal builds omit the instrumentation.
+
+Buffer-only native submissions validate an ordered overlay of modified ranges
+and reserve any growth before admission. After the checkpoint is accepted they
+apply these ranges to the existing CPU shadows. Copy sources observe preceding
+writes and zero-filled gaps. Rejection or Busy preserves accepted bytes,
+revisions and pending upload ranges; mixed graphics streams retain their
+existing materialization path.

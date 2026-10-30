@@ -332,7 +332,7 @@ fn compile_pipeline(
             || !(vertex_spirv && fragment_spirv) && input.interpolation != output.interpolation
         {
             #[cfg(feature = "std")]
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            {
                 std::eprintln!(
                     "[SGFX VirGL] stage interface mismatch: vertex={output:?} fragment={input:?}"
                 );
@@ -829,15 +829,32 @@ pub(super) fn decode_draw(
         core::iter::once(pass.attachment).chain(pass.additional_attachments.iter().copied());
     for target in pipeline.color_targets() {
         let Some(attachment) = attached.next() else {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX VirGL] draw descriptor: missing color attachment target={target:?}"
+            );
             return Err(ir::Error::InvalidDescriptor.into());
         };
         if resources.resources.texture(attachment)?.format() != target.format() {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX VirGL] draw descriptor: color format mismatch attachment={:?} target={target:?}",
+                resources.resources.texture(attachment)?
+            );
             return Err(ir::Error::InvalidDescriptor.into());
         }
     }
     if attached.next().is_some()
         || pipeline.depth_state().is_some() && pass.depth_attachment.is_none()
     {
+        #[cfg(feature = "std")]
+        std::eprintln!(
+            "[SGFX VirGL] draw descriptor: attachment count/depth mismatch colors={:?} depth={:?} pass_depth={:?} additional={}",
+            pipeline.color_targets().collect::<Vec<_>>(),
+            pipeline.depth_state(),
+            pass.depth_attachment,
+            pass.additional_attachments.len()
+        );
         return Err(ir::Error::InvalidDescriptor.into());
     }
     let compiled = resources.compiled_pipeline(reference.id())?;
@@ -901,11 +918,19 @@ pub(super) fn decode_draw(
                 if !desc.usage().contains(ir::BufferUsage::STORAGE)
                     || desc.size() > crate::virgl::MAX_STORAGE_VIEW_BYTES
                     || size == 0
-                    || size > 256 * 1024
+                    || size > crate::virgl::MAX_STORAGE_VIEW_BYTES
                     || !offset.is_multiple_of(4)
                     || !size.is_multiple_of(4)
                     || offset.checked_add(size).is_none_or(|end| end > desc.size())
                 {
+                    #[cfg(feature = "std")]
+                    std::eprintln!(
+                        "[SGFX VirGL] draw descriptor: storage binding stage={:?} group={} binding={} offset={offset} size={size} descriptor={desc:?} view_limit={}",
+                        shader.stage,
+                        binding.group,
+                        binding.binding,
+                        crate::virgl::MAX_STORAGE_VIEW_BYTES
+                    );
                     return Err(ir::Error::InvalidDescriptor.into());
                 }
                 storage_buffers.push(driver::IrStorageBufferBinding {

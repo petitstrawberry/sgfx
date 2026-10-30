@@ -21,6 +21,7 @@ mod instance;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod linux_wsi;
 mod memory_allocation;
+mod memory_budget;
 mod progress;
 mod properties2;
 mod push_constants;

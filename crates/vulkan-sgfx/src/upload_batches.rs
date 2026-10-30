@@ -1,18 +1,22 @@
-//! Bound uploads in transfer and mixed recordings without splitting pass state.
+//! Pace texture uploads without splitting passes or large buffer writes.
 
 use sgfx::ir::{self, OwnedCommand, OwnedCommandBuffer};
 
-// A pacing budget for uploads, independent of native packet encoding.
+// A pacing budget for texture uploads, independent of native packet encoding.
 // Leaves room for resource/transfer metadata in bounded backend schedulers.
 pub(crate) const UPLOAD_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn upload_bytes(command: &OwnedCommand) -> Option<usize> {
     match command {
-        OwnedCommand::WriteBuffer { data, .. }
-        | OwnedCommand::WriteTexture { data, .. }
+        OwnedCommand::WriteTexture { data, .. }
         | OwnedCommand::WriteTextureMip { data, .. }
         | OwnedCommand::WriteTextureLayer { data, .. } => Some(data.len()),
-        OwnedCommand::ResourceBarrier(
+        // Buffer writes update the backend's CPU shadow before a draw uploads
+        // it. Splitting one write repeatedly clones an ever-growing shadow and
+        // loses the exact physical predecessor between chunks. Native queue
+        // admission still bounds the eventual GPU upload.
+        OwnedCommand::WriteBuffer { .. }
+        | OwnedCommand::ResourceBarrier(
             ir::OwnedResourceBarrier::Texture { .. } | ir::OwnedResourceBarrier::TextureMip { .. },
         )
         | OwnedCommand::CopyTextureToTexture { .. }
@@ -75,29 +79,6 @@ pub(crate) fn split(
             push(&mut batches, &mut batch, &mut bytes, command, budget);
             continue;
         }
-        let command = match command {
-            OwnedCommand::WriteBuffer {
-                buffer,
-                offset,
-                data,
-            } => {
-                for (index, chunk) in data.chunks(budget).enumerate() {
-                    push(
-                        &mut batches,
-                        &mut batch,
-                        &mut bytes,
-                        OwnedCommand::WriteBuffer {
-                            buffer,
-                            offset: offset + (index * budget) as u64,
-                            data: chunk.to_vec(),
-                        },
-                        budget,
-                    );
-                }
-                continue;
-            }
-            command => command,
-        };
         let (texture, mip_level, array_layer, rect, stride, data) = match command {
             OwnedCommand::WriteTexture {
                 texture,
@@ -195,6 +176,42 @@ fn push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_buffer_writes_keep_one_owned_payload_and_overwrite_order() {
+        let table = ir::ResourceTable::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(80, ir::BufferUsage::COPY_DST).unwrap())
+            .unwrap()
+            .id();
+        let data: Vec<u8> = (0..64).collect();
+        let address = data.as_ptr();
+        let commands = vec![
+            OwnedCommand::WriteBuffer {
+                buffer,
+                offset: 4,
+                data,
+            },
+            OwnedCommand::WriteBuffer {
+                buffer,
+                offset: 8,
+                data: vec![99; 4],
+            },
+        ];
+        assert!(!needs_batches(&commands, 8));
+        let batches = split(OwnedCommandBuffer::new(commands), &table, 8).unwrap();
+        assert_eq!(batches.len(), 1);
+        let commands = batches[0].commands();
+        assert_eq!(commands.len(), 2);
+        assert!(
+            matches!(&commands[0], OwnedCommand::WriteBuffer { offset: 4, data, .. }
+            if data.as_ptr() == address && data.len() == 64)
+        );
+        assert!(
+            matches!(&commands[1], OwnedCommand::WriteBuffer { offset: 8, data, .. }
+            if data == &[99; 4])
+        );
+    }
 
     fn texture(table: &ir::ResourceTable) -> ir::TextureId {
         table

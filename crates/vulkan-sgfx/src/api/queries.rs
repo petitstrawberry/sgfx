@@ -355,7 +355,8 @@ pub(super) fn resolve(rt: &Runtime, rec: &mut ResolvedRecording, action: &Action
             return Err(INVALID);
         }
         rec.used_buffers.push(*buffer);
-        rec.readback_buffers.push(*buffer);
+        rec.readback_buffers
+            .insert(*buffer, *offset, needed as u64)?;
     }
     let active = if rec.render.is_some() {
         Some(render_passes::suspend(rec)?)

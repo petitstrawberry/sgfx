@@ -51,14 +51,14 @@ sgfx-backend-wgpu = { path = "../sgfx-backend-wgpu", optional = true }
 wgpu = { version = "24", features = ["spirv"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "8e7aa7d5431b7bb124206e0f3f9aa536e8941e7c", default-features = false, optional = true }
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "8e7aa7d5431b7bb124206e0f3f9aa536e8941e7c", optional = true }
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "8e7aa7d5431b7bb124206e0f3f9aa536e8941e7c", default-features = false, optional = true }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", default-features = false, optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", default-features = false, optional = true }
 
 # Scarlet Linux-ABI clients use the native GPU transport on AArch64.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "8e7aa7d5431b7bb124206e0f3f9aa536e8941e7c", default-features = false, optional = true }
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "8e7aa7d5431b7bb124206e0f3f9aa536e8941e7c", default-features = false, optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", default-features = false, optional = true }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", default-features = false, optional = true }
 
 [lib]
 name = "sgfx"

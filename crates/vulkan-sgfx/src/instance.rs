@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const LOADER_MAGIC: usize = 0x01cd_c0de;
-const MEMORY_HEAP_SIZE: u64 = crate::resources::MAX_ALLOCATED as u64;
 
 // The loader replaces this first word with its own dispatch table pointer.
 #[repr(C)]
@@ -1147,7 +1146,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_memory_properties(
         };
         properties.memory_heap_count = 1;
         properties.memory_heaps[0] = vk::MemoryHeap {
-            size: MEMORY_HEAP_SIZE,
+            size: crate::memory_budget::heap_size() as u64,
             flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
         };
     }
