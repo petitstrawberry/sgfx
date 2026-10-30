@@ -544,7 +544,9 @@ pub(crate) struct IrBufferSpec {
     pub(crate) revision: u64,
 }
 
-/// Byte changes relative to the last accepted CPU shadow revision.
+/// Cumulative byte changes since `previous_revision`, an exact physical base.
+/// The range covers every accepted CPU update through the current revision.
+#[derive(Clone)]
 pub(crate) struct IrBufferUpdate {
     pub(crate) previous_revision: u64,
     pub(crate) range: core::ops::Range<usize>,

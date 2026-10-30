@@ -282,8 +282,8 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                     })?;
                     let mut submissions = Vec::new();
                     for r in recordings {
-                        match profile_work("queue::execute", || execute(rt, r)) {
-                            Ok(mut receipts) => submissions.append(&mut receipts),
+                        match profile_work("queue::execute", || execute(rt, r, &mut submissions)) {
+                            Ok(()) => {}
                             Err(error) => {
                                 {
                                     eprintln!("[SGFX Vulkan] queue execution failed: {error:?}");

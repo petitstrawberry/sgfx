@@ -556,9 +556,8 @@ fn run_retirement(
     })
 }
 
-/// The last accepted CPU contents and their delta travel together across streams.
-/// Retaining only the last delta deliberately leaves revision gaps to the native
-/// upload path's exact-physical-predecessor check and full-shadow repair.
+/// Accepted CPU contents and all changes since the last accepted preparation.
+/// The retained base must exactly match physical storage for a partial upload.
 #[derive(Default)]
 struct BufferShadow {
     bytes: Option<Vec<u8>>,
@@ -568,11 +567,24 @@ struct BufferShadow {
 
 impl BufferShadow {
     fn replace(&mut self, bytes: Vec<u8>, revision: u64, upload: Option<driver::IrBufferUpdate>) {
+        let upload = upload.map(|update| self.merged_upload(update));
         *self = Self {
             bytes: Some(bytes),
             revision,
             upload,
         };
+    }
+
+    fn merged_upload(&self, mut update: driver::IrBufferUpdate) -> driver::IrBufferUpdate {
+        if let Some(previous) = &self.upload
+            && update.previous_revision == self.revision
+            && previous.previous_revision < self.revision
+        {
+            update.previous_revision = previous.previous_revision;
+            update.range.start = update.range.start.min(previous.range.start);
+            update.range.end = update.range.end.max(previous.range.end);
+        }
+        update
     }
 
     fn clear(&mut self) {
@@ -582,15 +594,18 @@ impl BufferShadow {
     fn for_draw<'a>(
         &'a self,
         pending: Option<&'a BufferShadowUpdate>,
-    ) -> Result<(&'a [u8], Option<&'a driver::IrBufferUpdate>), IrSubmitError> {
+    ) -> Result<(&'a [u8], Option<driver::IrBufferUpdate>), IrSubmitError> {
         if let Some(update) = pending {
-            return Ok((&update.bytes, Some(&update.upload)));
+            return Ok((
+                &update.bytes,
+                Some(self.merged_upload(update.upload.clone())),
+            ));
         }
         Ok((
             self.bytes
                 .as_deref()
                 .ok_or(IrSubmitError::InvalidVertexData)?,
-            self.upload.as_ref(),
+            self.upload.clone(),
         ))
     }
 }
@@ -606,6 +621,24 @@ fn commit_buffer_updates(
     for update in updates {
         if let Some(shadow) = shadows.get_mut(update.slot) {
             shadow.replace(update.bytes, update.revision, Some(update.upload));
+        }
+    }
+    Ok(())
+}
+
+fn commit_prepared_buffer_updates(
+    shadows: &mut [BufferShadow],
+    updates: Vec<BufferShadowUpdate>,
+    prepared: &[usize],
+    acceptance: Result<(), IrSubmitError>,
+) -> Result<(), IrSubmitError> {
+    commit_buffer_updates(shadows, updates, acceptance)?;
+    // Preparation only staged packets. Clear the accumulated range after the
+    // final checkpoint accepts them, including when preparation skipped an
+    // already-current physical buffer. Busy/rejection retain the entire chain.
+    for &slot in prepared {
+        if let Some(shadow) = shadows.get_mut(slot) {
+            shadow.upload = None;
         }
     }
     Ok(())
@@ -948,8 +981,8 @@ impl PreparedBufferOnlyPlan<'_> {
         }
         for update in updates {
             let shadow = &mut shadows[update.slot];
+            shadow.upload = Some(shadow.merged_upload(update.upload));
             shadow.revision = update.revision;
-            shadow.upload = Some(update.upload);
         }
         // Canonical validation tags stay at their old revisions. Any changed
         // shadow therefore requires validation when a later draw consumes it.
@@ -1938,7 +1971,7 @@ impl Queue {
                         &mut resources.backend,
                         binding,
                         bytes,
-                        upload,
+                        upload.as_ref(),
                         mode,
                     )?;
                     prepared_buffers
@@ -2015,8 +2048,22 @@ impl Queue {
                 .map_err(IrSubmitError::Backend);
             #[cfg(feature = "profile-submissions")]
             profile.enter(SubmissionPhase::Retire);
-            commit_buffer_updates(&mut resources.buffer_shadows, buffer_updates, acceptance)?;
+            commit_prepared_buffer_updates(
+                &mut resources.buffer_shadows,
+                buffer_updates,
+                &prepared_buffers,
+                acceptance,
+            )?;
             resources.commit_canonical_validations(canonical_validations);
+        } else {
+            // Synchronous mode has no deferred checkpoint: every preparation
+            // and event has now returned success. Preserve deltas on failures.
+            commit_prepared_buffer_updates(
+                &mut resources.buffer_shadows,
+                Vec::new(),
+                &prepared_buffers,
+                Ok(()),
+            )?;
         }
         #[cfg(feature = "profile-submissions")]
         profile.enter(SubmissionPhase::Retire);
@@ -4448,8 +4495,8 @@ mod tests {
         assert_eq!(&bytes[513..517], &[9; 4]);
         assert!(bytes[517..].iter().all(|byte| *byte == 3));
         assert_eq!(shadows[0].revision, 8);
-        assert_eq!(upload.unwrap().previous_revision, 7);
-        assert_eq!(upload.unwrap().range, 513..517);
+        assert_eq!(upload.as_ref().unwrap().previous_revision, 6);
+        assert_eq!(upload.as_ref().unwrap().range, 0..517);
 
         let mut identical = BufferOnlyPlan::default();
         identical
@@ -4462,7 +4509,7 @@ mod tests {
             .publish(&mut shadows, Ok(()))
             .unwrap();
         assert_eq!(shadows[0].revision, 8);
-        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 513..517);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 0..517);
     }
 
     #[test]
@@ -4554,7 +4601,7 @@ mod tests {
         );
         assert_eq!(shadows[0].bytes.as_ref().unwrap().as_ptr(), pointer);
         assert_eq!(shadows[0].revision, 8);
-        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 4..16);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 0..16);
     }
 
     #[test]
@@ -4576,7 +4623,7 @@ mod tests {
             shadows[1].bytes.as_deref(),
             Some(&[0, 0, 0, 0, 3, 4, 0, 0, 0, 0, 8, 9, 10, 11, 0, 0, 0, 0, 0, 0][..])
         );
-        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 4..12);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 0..12);
         assert_eq!(shadows[1].upload.as_ref().unwrap().range, 0..20);
 
         let mut shadows = [BufferShadow::default(), range_test_shadow(vec![7; 8])];
@@ -4642,6 +4689,9 @@ mod tests {
                     &data,
                 )
                 .unwrap();
+        }
+        for update in &mut dense.updates {
+            update.upload = shadows[update.slot].merged_upload(update.upload.clone());
         }
         sparse
             .reserve(&mut shadows)
@@ -4735,6 +4785,7 @@ mod tests {
         let original = vec![3; 4096];
         let initial = shadow_write(&shadows[0], 0, &original);
         commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
 
         // A full frontend snapshot changes only six bytes. This stream has no
         // draw, so its delta must survive publication until another stream uses it.
@@ -4765,18 +4816,19 @@ mod tests {
     }
 
     #[test]
-    fn current_draw_update_overrides_the_persistent_delta_without_publishing() {
+    fn current_draw_update_merges_the_persistent_delta_without_publishing() {
         let mut shadows = [BufferShadow::default()];
         let initial = shadow_write(&shadows[0], 0, &[3; 64]);
         commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
         let accepted = shadow_write(&shadows[0], 4, &[9; 4]);
         commit_buffer_updates(&mut shadows, accepted, Ok(())).unwrap();
 
         let pending = shadow_write(&shadows[0], 20, &[7; 4]);
         let (bytes, upload) = shadows[0].for_draw(pending.first()).unwrap();
         let upload = upload.unwrap();
-        assert_eq!(upload.previous_revision, 2);
-        assert_eq!(upload.range, 20..24);
+        assert_eq!(upload.previous_revision, 1);
+        assert_eq!(upload.range, 4..24);
         assert_eq!(&bytes[4..8], &[9; 4]);
         assert_eq!(&bytes[20..24], &[7; 4]);
         assert_eq!(pending[0].revision, 3);
@@ -4792,6 +4844,7 @@ mod tests {
         let mut shadows = [BufferShadow::default()];
         let initial = shadow_write(&shadows[0], 0, &[3; 64]);
         commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
         let accepted = shadow_write(&shadows[0], 4, &[9; 4]);
         commit_buffer_updates(&mut shadows, accepted, Ok(())).unwrap();
         let accepted_bytes = shadows[0].bytes.clone().unwrap();
@@ -4808,7 +4861,7 @@ mod tests {
             } else {
                 IrSubmitError::InvalidVertexData
             };
-            let result = commit_buffer_updates(&mut shadows, pending, Err(error));
+            let result = commit_prepared_buffer_updates(&mut shadows, pending, &[0], Err(error));
             let result = mode.finish(result);
             if busy_result {
                 assert!(matches!(result, Err(SubmitError::Busy)));
@@ -4829,10 +4882,11 @@ mod tests {
     }
 
     #[test]
-    fn successive_buffer_only_updates_retain_only_the_exact_last_predecessor() {
+    fn successive_buffer_only_updates_retain_the_physical_base_and_union() {
         let mut shadows = [BufferShadow::default()];
         let initial = shadow_write(&shadows[0], 0, &[3; 64]);
         commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
         let first = shadow_write(&shadows[0], 4, &[9; 4]);
         commit_buffer_updates(&mut shadows, first, Ok(())).unwrap();
         let second = shadow_write(&shadows[0], 20, &[7; 4]);
@@ -4841,13 +4895,80 @@ mod tests {
         let (bytes, upload) = shadows[0].for_draw(None).unwrap();
         let upload = upload.unwrap();
         assert_eq!(shadows[0].revision, 3);
-        assert_eq!(upload.previous_revision, 2);
-        assert_eq!(upload.range, 20..24);
-        // Physical revision 1 must fail the native exact-predecessor gate.
-        // Its full-shadow repair still includes BOTH accepted updates.
+        assert_eq!(upload.previous_revision, 1);
+        assert_eq!(upload.range, 4..24);
+        // Physical revision 1 can upload the union directly to CPU revision 3.
         assert_eq!(&bytes[4..8], &[9; 4]);
         assert_eq!(&bytes[20..24], &[7; 4]);
         assert_eq!(&bytes[8..20], &[3; 12]);
+    }
+
+    #[test]
+    fn prepared_delta_reset_is_acceptance_gated_and_slot_scoped() {
+        let mut shadows = [
+            range_test_shadow(vec![3; 64]),
+            range_test_shadow(vec![5; 64]),
+        ];
+        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0, 1], Ok(())).unwrap();
+        let mut first = BufferOnlyPlan::default();
+        first.write(&shadows, 0, 4, Cow::Borrowed(&[9; 4])).unwrap();
+        first.write(&shadows, 1, 8, Cow::Borrowed(&[8; 4])).unwrap();
+        first
+            .reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        let mut second = BufferOnlyPlan::default();
+        second
+            .write(&shadows, 0, 20, Cow::Borrowed(&[7; 4]))
+            .unwrap();
+        second
+            .reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        assert_eq!(shadows[0].revision, 9);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().previous_revision, 7);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 4..24);
+        let pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
+
+        for error in [
+            IrSubmitError::Backend(HandleError::OutOfResources),
+            IrSubmitError::InvalidVertexData,
+        ] {
+            let pending = shadow_write(&shadows[0], 40, &[6; 4]);
+            let (_, upload) = shadows[0].for_draw(pending.first()).unwrap();
+            assert_eq!(upload.as_ref().unwrap().previous_revision, 7);
+            assert_eq!(upload.as_ref().unwrap().range, 4..44);
+            assert!(
+                commit_prepared_buffer_updates(&mut shadows, pending, &[0], Err(error)).is_err()
+            );
+            assert_eq!(shadows[0].revision, 9);
+            assert_eq!(shadows[0].bytes.as_ref().unwrap().as_ptr(), pointer);
+            assert_eq!(&shadows[0].bytes.as_ref().unwrap()[40..44], &[3; 4]);
+            assert_eq!(shadows[0].upload.as_ref().unwrap().previous_revision, 7);
+            assert_eq!(shadows[0].upload.as_ref().unwrap().range, 4..24);
+        }
+
+        let pending = shadow_write(&shadows[0], 40, &[6; 4]);
+        commit_prepared_buffer_updates(&mut shadows, pending, &[0], Ok(())).unwrap();
+        assert_eq!(shadows[0].revision, 10);
+        assert!(shadows[0].upload.is_none());
+        assert_eq!(&shadows[0].bytes.as_ref().unwrap()[4..8], &[9; 4]);
+        assert_eq!(&shadows[0].bytes.as_ref().unwrap()[20..24], &[7; 4]);
+        assert_eq!(&shadows[0].bytes.as_ref().unwrap()[40..44], &[6; 4]);
+        assert_eq!(shadows[1].upload.as_ref().unwrap().previous_revision, 7);
+        assert_eq!(shadows[1].upload.as_ref().unwrap().range, 8..12);
+
+        let mut next = BufferOnlyPlan::default();
+        next.write(&shadows, 0, 56, Cow::Borrowed(&[2; 4])).unwrap();
+        next.reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        assert_eq!(shadows[0].revision, 11);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().previous_revision, 10);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 56..60);
     }
 
     #[test]

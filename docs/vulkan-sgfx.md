@@ -715,11 +715,11 @@ Transfer readback merges the written byte intervals and preserves gaps, includin
 row padding in image-to-buffer copies. Once the backend and host mirror agree,
 unmapped buffers retain their upload cache; overlapping aliases are invalidated
 before reuse. Writable shader buffers retain conservative full-buffer readback.
-The native backend also retains the last accepted update's byte range and
-predecessor revision across update-only submissions. Later draws use this delta
-only when the physical buffer has that exact predecessor; revision gaps and
-compute replacements use a full-shadow repair. Rejected submissions and Busy
-leave the accepted bytes and revision intact.
+The native backend accumulates dirty ranges across update-only submissions
+until a drawing submission's final checkpoint accepts their physical upload.
+Later draws use this cumulative delta only when physical storage has its exact
+base revision. Missing or stale bases and compute replacements use a full-shadow
+repair. Rejected submissions and Busy preserve accepted bytes and pending ranges.
 
 The frontend paces texture uploads at 8 MiB without splitting individual buffer
 writes. Native buffer upload limits are enforced when buffers are materialized
@@ -735,3 +735,9 @@ apply these ranges to the existing CPU shadows. Copy sources observe preceding
 writes and zero-filled gaps. Rejection or Busy preserves accepted bytes,
 revisions and pending upload ranges; mixed graphics streams retain their
 existing materialization path.
+
+GPU-only synchronization boundaries keep their submission receipts and rely on
+the queue's ordered execution. They do not wait on the CPU at each boundary.
+Queries, indirect argument reads, events and image/host readbacks retain explicit
+retirement waits. Every retained receipt participates in the enclosing fence or
+readback, including a final barrier with no following draw.

@@ -73,6 +73,19 @@ public class ApplicationsSmoke {
   vkDestroyBuffer(d,output[0],null);vkFreeMemory(d,output[1],null);vmaDestroyBuffer(allocator,source,memory);vmaDestroyAllocator(allocator);
   System.out.println("VMA_DEDICATED_NATIVE PASS actual VMA dedicated 64MiB allocation boundary updates and ordered copies");
  }}
+ static void boundedBarriers(VkDevice d,VkQueue queue,long pool){try(MemoryStack s=MemoryStack.stackPush()){
+  long[] source=buffer(d,4,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),result=buffer(d,4,VK_BUFFER_USAGE_TRANSFER_DST_BIT);PointerBuffer p=s.mallocPointer(1);
+  check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"barrier stress commands");VkCommandBuffer cmd=new VkCommandBuffer(p.get(0),d);
+  check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"barrier stress begin");IntBuffer value=s.ints(0);VkMemoryBarrier.Buffer barrier=VkMemoryBarrier.calloc(1,s).sType$Default().srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT);
+  for(int i=0;i<20000;i++){value.put(0,i);vkCmdUpdateBuffer(cmd,source[0],0,value);vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,barrier,null,null);}
+  vkCmdCopyBuffer(cmd,source[0],result[0],VkBufferCopy.calloc(1,s).size(4));check(vkEndCommandBuffer(cmd),"barrier stress end");check(vkQueueSubmit(queue,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(cmd)),0),"barrier stress submit");check(vkQueueWaitIdle(queue),"barrier stress idle");
+  check(vkMapMemory(d,result[1],0,4,0,p),"barrier stress map");if(MemoryUtil.memGetInt(p.get(0))!=19999)throw new AssertionError("barrier stress completion/order");vkUnmapMemory(d,result[1]);vkFreeCommandBuffers(d,pool,cmd);
+  for(long[] b:new long[][]{source,result}){vkDestroyBuffer(d,b[0],null);vkFreeMemory(d,b[1],null);}System.out.println("BOUNDED_BARRIERS_NATIVE PASS boundaries=20000 final_word=19999");
+ }}
+ static void separateUpdate(VkDevice d,VkQueue queue,long pool,long buffer,long offset,int value){try(MemoryStack s=MemoryStack.stackPush()){
+  PointerBuffer p=s.mallocPointer(1);check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"separate update commands");VkCommandBuffer cmd=new VkCommandBuffer(p.get(0),d);
+  check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"separate update begin");vkCmdUpdateBuffer(cmd,buffer,offset,s.ints(value));check(vkEndCommandBuffer(cmd),"separate update end");check(vkQueueSubmit(queue,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(cmd)),0),"separate update submit");check(vkQueueWaitIdle(queue),"separate update idle");vkFreeCommandBuffers(d,pool,cmd);
+ }}
  static void compute(VkDevice d,VkQueue queue,long pool){
   if(!compute){System.out.println("COMPUTE_NATIVE_UNAVAILABLE PASS graphics-only queue retained after isolated dispatch probe");return;}
   try(MemoryStack s=MemoryStack.stackPush()){
@@ -142,11 +155,13 @@ public class ApplicationsSmoke {
   int statResult=vkCreateQueryPool(d,VkQueryPoolCreateInfo.calloc(s).sType$Default().queryType(VK_QUERY_TYPE_PIPELINE_STATISTICS).queryCount(1).pipelineStatistics(statMask),null,h);
   if(statistics)check(statResult,"statistics pool");else if(statResult!=VK_ERROR_FEATURE_NOT_PRESENT)throw new AssertionError("unsupported statistics accepted");long counters=statistics?h.get(0):0;
   for(int indexed=0;indexed<8;indexed++){
+   if(indexed==6){separateUpdate(d,queue,pool,texels[0],16,-9);separateUpdate(d,queue,pool,texels[0],32,99);}
    final long activeTexelView=indexed==5?byteView:indexed==7?largeByteView:texelView;
    check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"graphics commands");VkCommandBuffer cmd=new VkCommandBuffer(p.get(0),d);
    check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"graphics begin");if(timing)vkCmdResetQueryPool(cmd,queries,0,2);vkCmdResetQueryPool(cmd,visibility,0,2);if(statistics){vkCmdResetQueryPool(cmd,counters,0,1);vkCmdBeginQuery(cmd,counters,0,0);}
    vkCmdUpdateBuffer(cmd,texels[0],0,s.ints(99,99,99,99,-9,0x03f77f80,0x00c040ff,31,47,51,63,77,88,88,88,88));vkCmdUpdateBuffer(cmd,vertices[0],64L*1024*1024-24,s.floats(-1,-1,3,-1,-1,3));vkCmdUpdateBuffer(cmd,indices[0],0,s.shorts((short)1,(short)2,(short)3,(short)0));vkCmdUpdateBuffer(cmd,instances[0],0,s.ints(Float.floatToRawIntBits(99),0,0,0,0,0,Float.floatToRawIntBits(99),0,0,0,0,0,Float.floatToRawIntBits(7),0x40c07f80,0x04d28000,Integer.MIN_VALUE,1234,Integer.MAX_VALUE,Float.floatToRawIntBits(8),0x40c07f80,0xfff77fff,Integer.MIN_VALUE,1234,Integer.MAX_VALUE));vkCmdUpdateBuffer(cmd,counter[0],0,s.ints(2));vkCmdUpdateBuffer(cmd,args[0],0,indexed!=1?s.ints(0,0,0,0,indexed==4?16:3,3,0,2):s.ints(0,0,0,0,0,3,3,0,-1,2));
    if(indexed==7){vkCmdUpdateBuffer(cmd,texels[0],20,s.ints(0x03f77f81));vkCmdUpdateBuffer(cmd,texels[0],700020,s.ints(0xc0));vkCmdUpdateBuffer(cmd,texels[0],710176,s.ints(0x12345678));}
+   if(indexed==5)vkCmdUpdateBuffer(cmd,texels[0],16,s.ints(99));
    if(indexed==0){
     VkImageMemoryBarrier2.Buffer sampleBarrier=VkImageMemoryBarrier2.calloc(1,s).sType$Default().oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL).srcStageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR).dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT_KHR).dstAccessMask(VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR).srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(texture).subresourceRange(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
     vkCmdPipelineBarrier2KHR(cmd,VkDependencyInfo.calloc(s).sType$Default().pImageMemoryBarriers(sampleBarrier));
@@ -386,7 +401,7 @@ public class ApplicationsSmoke {
    vkResetQueryPoolEXT(device,query,0,1);if(vkGetQueryPoolResults(device,query,0,1,stamps,16,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)!=VK_NOT_READY)throw new AssertionError("host reset availability");
    vkDestroyQueryPool(device,query,null);
    }else System.out.println("QUERY_NATIVE_UNAVAILABLE PASS timestampValidBits=0 query pool rejected");
-   vmaAllocations(device,queue,pool);compute(device,queue,pool);graphics(device,queue,pool);depthTransfers(device,queue,pool);mipTargets(device,queue,pool);floatTargets(device,queue,pool);capabilityCapacity(device,queue,pool);
+   boundedBarriers(device,queue,pool);vmaAllocations(device,queue,pool);compute(device,queue,pool);graphics(device,queue,pool);depthTransfers(device,queue,pool);mipTargets(device,queue,pool);floatTargets(device,queue,pool);capabilityCapacity(device,queue,pool);
    vkDestroyFence(device,fence,null);vkDestroySemaphore(device,binary,null);vkDestroySemaphore(device,timeline,null);vkDestroyEvent(device,event,null);vkDestroyCommandPool(device,pool,null);
    for(int i=0;i<2;i++){vkDestroyBuffer(device,buffers[i],null);vkFreeMemory(device,memories[i],null);}
    vkDestroyDevice(device,null);vkDestroyInstance(instance,null);VK.destroy();

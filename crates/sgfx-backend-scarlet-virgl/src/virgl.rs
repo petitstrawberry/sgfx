@@ -2108,6 +2108,8 @@ impl Queue {
             return Ok(());
         }
         let range = ir_buffer_upload_range(uploaded_revision, spec.revision, bytes.len(), update)?;
+        #[cfg(feature = "profile-submissions")]
+        let prepare_started = std::time::Instant::now();
         self.prepare_ir_upload_arena(context, resources, mode)?;
 
         const INLINE_WRITE_FIXED_BYTES: usize = 12 * core::mem::size_of::<u32>();
@@ -2153,6 +2155,29 @@ impl Queue {
         }
         let buffer = ir_buffer(context, resources, spec)?;
         buffer.uploaded_revision = Some(spec.revision);
+        #[cfg(feature = "profile-submissions")]
+        {
+            let prepare_us = prepare_started.elapsed().as_micros();
+            // Include tiny deltas into large native buffers, without logging
+            // every small uniform upload or unchanged draw binding. Tracked
+            // bytes are staged here; final checkpoint acceptance is separate.
+            if bytes.len() >= 1024 * 1024 || prepare_us >= 50_000 {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "SGFX_VIRGL_BUFFER_UPLOAD stage=prepared tracked={} slot={} physical_revision={:?} target_revision={} delta_base={:?} upload_start={} upload_bytes={} shadow_bytes={} prepare_us={}",
+                    mode.is_tracked(),
+                    spec.slot,
+                    uploaded_revision,
+                    spec.revision,
+                    update.map(|update| update.previous_revision),
+                    range.start,
+                    range.len(),
+                    bytes.len(),
+                    prepare_us,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -5716,7 +5741,7 @@ fn ir_address_mode(address: IrAddressMode) -> u32 {
     }
 }
 
-/// A partial upload is safe only on the exact physical predecessor revision.
+/// A cumulative delta is safe only on its exact physical base revision.
 fn ir_buffer_upload_range(
     uploaded_revision: Option<u64>,
     revision: u64,
@@ -5729,9 +5754,7 @@ fn ir_buffer_upload_range(
     if update.range.start >= update.range.end || update.range.end > length {
         return Err(HandleError::InvalidParameter);
     }
-    if uploaded_revision != Some(update.previous_revision)
-        || update.previous_revision.checked_add(1) != Some(revision)
-    {
+    if uploaded_revision != Some(update.previous_revision) || update.previous_revision >= revision {
         return Ok(0..length);
     }
     let start = update.range.start & !3;
@@ -6331,12 +6354,55 @@ mod tests {
         }
         assert_eq!(
             ir_buffer_upload_range(Some(8), 10, 4096, Some(&update)).unwrap(),
-            0..4096
+            4..12
         );
         assert_eq!(
             ir_buffer_upload_range(Some(8), 9, 4096, None).unwrap(),
             0..4096
         );
+    }
+
+    #[test]
+    fn cumulative_buffer_upload_encodes_union_only_on_the_exact_base() {
+        let update = IrBufferUpdate {
+            previous_revision: 8,
+            range: 5..37,
+        };
+        let bytes: Vec<u8> = (0..64).collect();
+        let range = ir_buffer_upload_range(Some(8), 11, bytes.len(), Some(&update)).unwrap();
+        assert_eq!(range, 4..40);
+        let mut commands = Vec::new();
+        push_ir_buffer_inline_write(&mut commands, 17, range.start as u32, &bytes[range.clone()])
+            .unwrap();
+        let words = dwords(&commands);
+        assert_eq!(words[6], 4);
+        assert_eq!(words[9], 36);
+        assert_eq!(&commands[48..], &bytes[4..40]);
+        // A missing, older, intervening, or newer physical base cannot certify
+        // this retained chain. Equality of the base, not proximity, is required.
+        for physical in [None, Some(7), Some(9), Some(10), Some(12)] {
+            assert_eq!(
+                ir_buffer_upload_range(physical, 11, bytes.len(), Some(&update)).unwrap(),
+                0..64
+            );
+        }
+        for current in [7, 8] {
+            assert_eq!(
+                ir_buffer_upload_range(Some(8), current, bytes.len(), Some(&update)).unwrap(),
+                0..64
+            );
+        }
+        assert_eq!(
+            ir_buffer_upload_range(Some(8), 11, bytes.len(), None).unwrap(),
+            0..64
+        );
+        for range in [5..5, 5..65] {
+            let invalid = IrBufferUpdate {
+                previous_revision: 8,
+                range,
+            };
+            assert!(ir_buffer_upload_range(Some(8), 11, bytes.len(), Some(&invalid)).is_err());
+        }
     }
 
     #[test]

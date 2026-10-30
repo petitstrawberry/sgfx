@@ -4564,7 +4564,11 @@ fn snapshot_buffer_uploads(
     Ok((ops, fresh_uploads))
 }
 
-fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
+fn execute(
+    rt: &mut Runtime,
+    rec: ResolvedRecording,
+    retained_submissions: &mut Vec<sgfx::driver::Submission>,
+) -> VkResult<()> {
     let mut used = rec.used_buffers;
     for insertion in &rec.descriptors {
         let set = rt
@@ -4653,11 +4657,17 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
                 .first()
                 .is_some_and(|s| s.position == position && s.order <= copy.order)
             {
-                synchronization2::execute(rt, &mut ops, &synchronizations[0].action)?;
+                synchronization2::execute(
+                    rt,
+                    &mut ops,
+                    &synchronizations[0].action,
+                    retained_submissions,
+                )?;
                 synchronizations = &synchronizations[1..];
             }
             profile_work("execute::texture_readback", || {
-                for submission in submit_owned(rt, std::mem::take(&mut ops))? {
+                retained_submissions.extend(submit_owned(rt, std::mem::take(&mut ops))?);
+                for submission in retained_submissions.drain(..) {
                     wait_submission(rt, &submission)?;
                 }
                 let image_id = rt
@@ -4683,18 +4693,24 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
             .first()
             .is_some_and(|s| s.position == position)
         {
-            synchronization2::execute(rt, &mut ops, &synchronizations[0].action)?;
+            synchronization2::execute(
+                rt,
+                &mut ops,
+                &synchronizations[0].action,
+                retained_submissions,
+            )?;
             synchronizations = &synchronizations[1..];
         }
         if let Some(op) = commands.next() {
             ops.push(op);
         }
     }
-    let mut submissions = submit_owned(rt, ops)?;
+    retained_submissions.extend(submit_owned(rt, ops)?);
+    let submissions = retained_submissions;
     let readback = rec.readback_buffers;
     if !readback.is_empty() {
         profile_work("execute::readback_wait", || {
-            for submission in &submissions {
+            for submission in submissions.iter() {
                 wait_submission(rt, submission)?;
             }
             Ok(())
@@ -4738,7 +4754,8 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
             Ok(())
         })?;
     }
-    Ok(submissions)
+    synchronization2::reap_completed(rt, submissions)?;
+    Ok(())
 }
 
 pub(crate) unsafe extern "system" fn get_device_proc_addr(

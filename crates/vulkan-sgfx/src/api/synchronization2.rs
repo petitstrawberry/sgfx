@@ -25,6 +25,7 @@ pub(super) fn execute(
     rt: &mut Runtime,
     ops: &mut Vec<ir::OwnedCommand>,
     action: &Action,
+    retained: &mut Vec<sgfx::driver::Submission>,
 ) -> VkResult<()> {
     if let Action::IndirectDraw(commands) = action {
         ops.extend(
@@ -42,8 +43,17 @@ pub(super) fn execute(
             std::mem::discriminant(action)
         )
     })?;
+    // Submissions on this queue execute in order. A GPU-only barrier needs
+    // an ordered stream boundary, while CPU observations below need retirement.
+    // Keep every receipt for the enclosing fence/readback instead of dropping
+    // it when the barrier returns.
+    retained.extend(submissions);
+    if matches!(action, Action::Barrier) {
+        reap_completed(rt, retained)?;
+        return Ok(());
+    }
     profile_work("sync::gpu_wait", || {
-        for submission in submissions {
+        for submission in retained.drain(..) {
             wait_submission(rt, &submission)?;
         }
         Ok(())
@@ -72,6 +82,33 @@ pub(super) fn execute(
                 }
                 std::thread::sleep(std::time::Duration::from_micros(50));
             }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn reap_completed(
+    rt: &mut Runtime,
+    retained: &mut Vec<sgfx::driver::Submission>,
+) -> VkResult<()> {
+    let mut failure = None;
+    retained.retain(|receipt| match receipt.poll() {
+        Ok(CompletionStatus::Complete) => false,
+        Ok(_) => true,
+        Err(error) => {
+            failure = Some(crate::runtime::backend_failure(error));
+            false
+        }
+    });
+    if let Some(error) = failure {
+        rt.lost = true;
+        return Err(error);
+    }
+    // Logical receipts own native notification handles. Keep a bounded
+    // window even when one recording contains thousands of boundaries.
+    if retained.len() >= 64 {
+        for receipt in retained.drain(..) {
+            wait_submission(rt, &receipt)?;
         }
     }
     Ok(())
