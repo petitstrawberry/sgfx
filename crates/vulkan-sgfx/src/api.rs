@@ -409,15 +409,23 @@ fn run_device_operation<T>(
         runtime.lost = true;
         Err(vk::Result::ERROR_DEVICE_LOST)
     } else {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime))).unwrap_or_else(
-            |_| {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                    eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
-                }
-                runtime.lost = true;
-                Err(vk::Result::ERROR_DEVICE_LOST)
-            },
-        )
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !void {
+                profile_work("worker::retire_images", || runtime.flush_retired_images())?;
+            }
+            let result = op(runtime);
+            if runtime.retired_images.len() >= crate::runtime::IMAGE_RETIREMENT_BATCH {
+                profile_work("worker::retire_images", || runtime.flush_retired_images())?;
+            }
+            result
+        }))
+        .unwrap_or_else(|_| {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
+            }
+            runtime.lost = true;
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        })
     };
     if void && result.is_err() {
         runtime.lost = true;

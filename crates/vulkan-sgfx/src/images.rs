@@ -7,7 +7,7 @@ use ash::vk::{self, Handle};
 use sgfx::ir;
 use std::ffi::CStr;
 
-use crate::api::{next_id, with_device};
+use crate::api::{next_id, with_device, with_device_owned};
 
 pub(crate) struct Image {
     pub id: ir::TextureId,
@@ -462,36 +462,7 @@ unsafe extern "system" fn destroy_image(
     _: *const vk::AllocationCallbacks<'_>,
 ) {
     if image != vk::Image::null() {
-        let _ = with_device(device, move |runtime| {
-            let removable = runtime
-                .resources
-                .images
-                .get(&image)
-                .is_some_and(|image| image.swapchain.is_none());
-            if removable {
-                let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
-                let id = data.id;
-                // Do not wait on driver deferred packets here: this closure runs
-                // on the device worker that consumes them. Only submitted GPU
-                // receipts are drained before physical and logical retirement.
-                runtime.in_flight.wait();
-                #[cfg(target_os = "scarlet")]
-                if data.shared.is_some() {
-                    runtime.cache.unmap_presentation_image(id);
-                }
-                runtime
-                    .cache
-                    .release_texture(id)
-                    .map_err(crate::runtime::backend_failure)?;
-                runtime
-                    .table
-                    .release_texture(id)
-                    .map_err(crate::resources::failure)?;
-                runtime.resources.image_view_formats.remove(&image);
-                runtime.resources.images.remove(&image);
-            }
-            Ok(())
-        });
+        let _ = with_device_owned(device, move |runtime| runtime.retire_image(image));
     }
 }
 
@@ -725,7 +696,7 @@ unsafe extern "system" fn destroy_image_view(
     _: *const vk::AllocationCallbacks<'_>,
 ) {
     if view != vk::ImageView::null() {
-        let _ = with_device(device, move |runtime| {
+        let _ = with_device_owned(device, move |runtime| {
             runtime.resources.views.remove(&view);
             Ok(())
         });
