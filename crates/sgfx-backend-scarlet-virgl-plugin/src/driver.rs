@@ -112,6 +112,7 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         #[cfg(feature = "profile-submissions")]
         {
             let total_us = started.elapsed().as_micros();
+            record_metadata_window(total_us, words.len());
             if total_us >= 50_000 {
                 eprintln!(
                     "SGFX_VIRGL_METADATA_PROFILE total_us={total_us} scan_us={scan_us} retire_us={retire_us} import_us={} words={}",
@@ -122,6 +123,33 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         }
         Ok(())
     })())
+}
+
+#[cfg(feature = "profile-submissions")]
+fn record_metadata_window(total_us: u128, words: usize) {
+    use std::{
+        sync::{Mutex, OnceLock},
+        time::{Duration, Instant},
+    };
+    static WINDOW: OnceLock<Mutex<(Instant, u64, u128, usize)>> = OnceLock::new();
+    let now = Instant::now();
+    let Ok(mut window) = WINDOW.get_or_init(|| Mutex::new((now, 0, 0, 0))).lock() else {
+        return;
+    };
+    window.1 += 1;
+    window.2 += total_us;
+    window.3 += words;
+    let period = now.saturating_duration_since(window.0);
+    if period >= Duration::from_secs(1) {
+        eprintln!(
+            "SGFX_VIRGL_METADATA_WINDOW period_us={} calls={} total_us={} words={}",
+            period.as_micros(),
+            window.1,
+            window.2,
+            window.3
+        );
+        *window = (now, 0, 0, 0);
+    }
 }
 unsafe extern "C" fn release_buffer(p: Object, slot: u32) -> i32 {
     status((|| {

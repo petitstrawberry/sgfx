@@ -888,10 +888,10 @@ impl<'a> BufferOnlyPlan<'a> {
         let shadow = shadows.get(slot).ok_or(IrSubmitError::InvalidVertexData)?;
         let Some(update) = self.updates.iter().find(|update| update.slot == slot) else {
             let previous = shadow.bytes.as_deref();
-            if previous.and_then(|bytes| bytes.get(start..end)) == Some(data) {
-                return Ok(None);
-            }
-            return changed_buffer_bytes(previous, start, data).map(Some);
+            let changed = changed_buffer_bytes(previous, start, data)?;
+            // The diff already proves equality; a separate slice comparison
+            // would scan every unchanged byte a second time.
+            return Ok((!changed.is_empty()).then_some(changed));
         };
         let overlap = update.length.saturating_sub(start).min(data.len());
         let mut scratch = [0; 256];
@@ -899,11 +899,16 @@ impl<'a> BufferOnlyPlan<'a> {
         while prefix < overlap {
             let count = scratch.len().min(overlap - prefix);
             self.read_range(shadows, slot, start + prefix, &mut scratch[..count]);
-            let equal = scratch[..count]
-                .iter()
-                .zip(&data[prefix..prefix + count])
-                .take_while(|(a, b)| a == b)
-                .count();
+            let new = &data[prefix..prefix + count];
+            let equal = if equal_buffer_chunk(&scratch[..count], new) {
+                count
+            } else {
+                scratch[..count]
+                    .iter()
+                    .zip(new)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            };
             prefix += equal;
             if equal != count {
                 break;
@@ -918,12 +923,17 @@ impl<'a> BufferOnlyPlan<'a> {
                 let count = scratch.len().min(data.len() - prefix - suffix);
                 let offset = data.len() - suffix - count;
                 self.read_range(shadows, slot, start + offset, &mut scratch[..count]);
-                let equal = scratch[..count]
-                    .iter()
-                    .rev()
-                    .zip(data[offset..offset + count].iter().rev())
-                    .take_while(|(a, b)| a == b)
-                    .count();
+                let new = &data[offset..offset + count];
+                let equal = if equal_buffer_chunk(&scratch[..count], new) {
+                    count
+                } else {
+                    scratch[..count]
+                        .iter()
+                        .rev()
+                        .zip(new.iter().rev())
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                };
                 suffix += equal;
                 if equal != count {
                     break;
@@ -1061,6 +1071,32 @@ impl PreparedBufferOnlyPlan<'_> {
     }
 }
 
+/// Avoid the byte-at-a-time generic native memcmp on large unchanged ranges.
+/// Conversion from byte arrays permits unaligned buffer offsets without unsafe
+/// loads; XOR/OR reduction also prevents lowering this loop back to memcmp.
+fn equal_buffer_chunk(old: &[u8], new: &[u8]) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    let mut old_words = old.chunks_exact(8);
+    let mut new_words = new.chunks_exact(8);
+    let difference =
+        old_words
+            .by_ref()
+            .zip(new_words.by_ref())
+            .fold(0, |difference, (old, new)| {
+                difference
+                    | (u64::from_ne_bytes(old.try_into().unwrap())
+                        ^ u64::from_ne_bytes(new.try_into().unwrap()))
+            });
+    difference == 0
+        && old_words
+            .remainder()
+            .iter()
+            .zip(new_words.remainder())
+            .all(|(old, new)| old == new)
+}
+
 /// Bound changed bytes without walking large unchanged regions byte by byte.
 fn changed_buffer_bytes(
     previous: Option<&[u8]>,
@@ -1077,7 +1113,7 @@ fn changed_buffer_bytes(
     let overlap = old.len().min(data.len());
     let mut prefix = 0;
     for (old, new) in old[..overlap].chunks(256).zip(data[..overlap].chunks(256)) {
-        if old != new {
+        if !equal_buffer_chunk(old, new) {
             prefix += old.iter().zip(new).take_while(|(a, b)| a == b).count();
             break;
         }
@@ -1089,7 +1125,7 @@ fn changed_buffer_bytes(
             .rchunks(256)
             .zip(data[prefix..].rchunks(256))
         {
-            if old != new {
+            if !equal_buffer_chunk(old, new) {
                 suffix += old
                     .iter()
                     .rev()
@@ -1390,6 +1426,7 @@ mod submission_profile {
             let now = Instant::now();
             self.advance_at(self.phase, now);
             let total = now.saturating_duration_since(self.started);
+            record_window(self, now, total);
             if !Self::should_log(total) {
                 return;
             }
@@ -1423,6 +1460,76 @@ mod submission_profile {
                 self.staged_bytes,
             );
         }
+    }
+
+    // Small submissions can dominate a frame even when none crosses the spike
+    // threshold. Aggregate every submission without logging once per draw.
+    fn record_window(profile: &Profile, now: Instant, total: Duration) {
+        use std::sync::{Mutex, OnceLock};
+        struct Window {
+            started: Instant,
+            calls: u64,
+            busy: u64,
+            total_us: u128,
+            phases: [u128; 7],
+            commands: usize,
+            draws: usize,
+            update_bytes: u128,
+            dirty_bytes: u128,
+        }
+        impl Window {
+            fn new(now: Instant) -> Self {
+                Self {
+                    started: now,
+                    calls: 0,
+                    busy: 0,
+                    total_us: 0,
+                    phases: [0; 7],
+                    commands: 0,
+                    draws: 0,
+                    update_bytes: 0,
+                    dirty_bytes: 0,
+                }
+            }
+        }
+        static WINDOW: OnceLock<Mutex<Window>> = OnceLock::new();
+        let Ok(mut window) = WINDOW.get_or_init(|| Mutex::new(Window::new(now))).lock() else {
+            return;
+        };
+        window.calls += 1;
+        window.busy += u64::from(profile.outcome == "busy");
+        window.total_us += total.as_micros();
+        for (sum, duration) in window.phases.iter_mut().zip(profile.stages) {
+            *sum += duration.as_micros();
+        }
+        window.commands += profile.commands;
+        window.draws += profile.draws;
+        window.update_bytes += profile.update_bytes;
+        window.dirty_bytes += profile.dirty_bytes;
+        let period = now.saturating_duration_since(window.started);
+        if period < Duration::from_secs(1) {
+            return;
+        }
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "SGFX_VIRGL_SUBMIT_WINDOW period_us={} calls={} busy={} total_us={} snapshot_us={} plan_us={} materialize_us={} prepare_buffers_us={} events_checkpoint_us={} retire_us={} wait_idle_us={} commands={} draws={} update_bytes={} dirty_bytes={}",
+            period.as_micros(),
+            window.calls,
+            window.busy,
+            window.total_us,
+            window.phases[0],
+            window.phases[1],
+            window.phases[2],
+            window.phases[3],
+            window.phases[4],
+            window.phases[5],
+            window.phases[6],
+            window.commands,
+            window.draws,
+            window.update_bytes,
+            window.dirty_bytes,
+        );
+        *window = Window::new(now);
     }
 
     #[cfg(test)]
@@ -4687,6 +4794,39 @@ mod tests {
         assert_eq!(
             changed_buffer_bytes(Some(&previous), 4, &[0, 1, 0, 0]).unwrap(),
             5..6
+        );
+    }
+
+    #[test]
+    fn shadow_diff_handles_unaligned_words_tails_and_growth() {
+        let previous: Vec<u8> = (0..530).map(|n| (n % 251) as u8).collect();
+        for start in 0..8 {
+            for length in [0, 1, 7, 8, 9, 255, 256, 257, 521] {
+                let original = &previous[start..start + length];
+                assert!(equal_buffer_chunk(original, original));
+                assert!(
+                    changed_buffer_bytes(Some(&previous), start, original)
+                        .unwrap()
+                        .is_empty()
+                );
+                for position in 0..length {
+                    let mut changed = original.to_vec();
+                    changed[position] ^= 0x80;
+                    assert!(!equal_buffer_chunk(original, &changed));
+                    assert_eq!(
+                        changed_buffer_bytes(Some(&previous), start, &changed).unwrap(),
+                        start + position..start + position + 1
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            changed_buffer_bytes(Some(&previous), 529, &[previous[529], 0, 0]).unwrap(),
+            530..532
+        );
+        assert_eq!(
+            changed_buffer_bytes(Some(&previous), 534, &[0, 0]).unwrap(),
+            530..536
         );
     }
 

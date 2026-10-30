@@ -60,7 +60,16 @@ impl RowCache {
         if row.generation != generation {
             return None;
         }
-        let equal = row.words == words;
+        // Native AArch64's generic memcmp walks one byte at a time. These
+        // snapshots are already u64 words; keep the comparison word-sized and
+        // permit vectorization rather than lowering slice equality to memcmp.
+        let equal = row.words.len() == words.len()
+            && row
+                .words
+                .iter()
+                .zip(words)
+                .fold(0, |difference, (old, new)| difference | (old ^ new))
+                == 0;
         #[cfg(test)]
         if equal {
             self.hits.set(self.hits.get() + 1);
