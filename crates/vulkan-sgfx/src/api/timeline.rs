@@ -196,6 +196,7 @@ mod tests {
             queue_sender: mpsc::channel().0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: false,
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),

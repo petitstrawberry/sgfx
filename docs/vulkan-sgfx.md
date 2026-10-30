@@ -159,7 +159,18 @@ blocked submitting work. A deterministic test covers an intentionally
 unserviced worker channel. `vkQueueWaitIdle`/`vkDeviceWaitIdle` serialize behind
 prior queue work. Acquire signals a semaphore or fence, queue submission consumes
 wait semaphores and signals completion semaphores, and queue present consumes
-its waits. Timeline semaphores are not implemented.
+its waits. `VK_KHR_timeline_semaphore` supports host signals, counter queries,
+waits and queue values; queue signals become visible only after GPU retirement.
+
+`VK_KHR_synchronization2` adds explicitly enabled `synchronization2` features,
+64-bit stage/access scopes, `vkCmdPipelineBarrier2KHR`, `vkQueueSubmit2KHR` and
+device event set/wait/reset commands. Split transfer/vertex-input/shader scopes,
+`NONE`, attachment/read-only layout aliases, mixed binary/timeline submissions
+and a single-device mask of zero or one are supported. Resource barriers use
+the existing backend path; synchronization scopes conservatively retire prior
+GPU work. This costs overlap and does not raise the advertised Vulkan API
+version. Barriers and event commands remain outside render passes in this
+bounded profile. Timestamp queries remain unavailable (`timestampValidBits=0`).
 
 Vulkan 1.0 descriptor update rules apply: updating a set already bound in a
 recording or executable command buffer invalidates that buffer. Reset and
@@ -307,8 +318,8 @@ and verify the chosen Mesa driver. The Linux check also used
   WSI currently covers macOS Metal and Scarlet Linux display/Wayland,
   FIFO mode and opaque composition. Windows presentation is through Wine's
   Win32-to-Wayland driver and Box64's native Vulkan wrapper. Direct3D/DXVK,
-  general games, other platform surfaces, timeline semaphores, secondary command buffers, descriptor indexing,
-  pipeline caches, queries, events, sparse resources, external memory, multisampling,
+  general games, other platform surfaces, secondary command buffers, descriptor indexing,
+  compiled pipeline-cache payloads, queries, legacy device-event commands, sparse resources, external memory, multisampling,
   indirect operations, partial/flipped/converting blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent

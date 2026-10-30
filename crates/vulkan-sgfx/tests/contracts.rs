@@ -9,6 +9,9 @@
 use ash::{Entry, vk};
 use std::path::PathBuf;
 
+#[path = "contracts/synchronization2.rs"]
+mod synchronization2;
+
 #[path = "contracts/scalar_vertex.rs"]
 mod scalar_vertex;
 
@@ -59,6 +62,9 @@ struct Context {
 
 impl Context {
     fn new() -> Self {
+        Self::configured(false)
+    }
+    fn configured(synchronization2: bool) -> Self {
         unsafe {
             let path = std::env::var_os("SGFX_ICD_LIBRARY")
                 .map(PathBuf::from)
@@ -84,7 +90,11 @@ impl Context {
             let entry = Entry::from_static_fn(ash::StaticFn {
                 get_instance_proc_addr,
             });
-            let application = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0);
+            let application = vk::ApplicationInfo::default().api_version(if synchronization2 {
+                vk::API_VERSION_1_1
+            } else {
+                vk::API_VERSION_1_0
+            });
             let instance = entry
                 .create_instance(
                     &vk::InstanceCreateInfo::default().application_info(&application),
@@ -101,12 +111,23 @@ impl Context {
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
                 .queue_priorities(&priorities)];
+            let mut sync =
+                vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+            let mut timeline =
+                vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+            let extensions = [
+                vk::KHR_SYNCHRONIZATION2_NAME.as_ptr(),
+                vk::KHR_TIMELINE_SEMAPHORE_NAME.as_ptr(),
+            ];
+            let mut info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+            if synchronization2 {
+                info = info
+                    .enabled_extension_names(&extensions)
+                    .push_next(&mut sync)
+                    .push_next(&mut timeline);
+            }
             let device = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                    None,
-                )
+                .create_device(physical, &info, None)
                 .expect("a native GPU adapter is required for this opt-in test");
             let queue = device.get_device_queue(family, 0);
             let pool = device

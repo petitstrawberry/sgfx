@@ -57,14 +57,14 @@ impl Semaphore {
     }
 }
 #[derive(Default)]
-struct Packet {
+pub(super) struct Packet {
     waits: Vec<Semaphore>,
     binary_signals: Vec<Arc<AtomicU8>>,
     timeline_signals: Vec<(Arc<timeline::Timeline>, u64)>,
     recordings: Vec<Recording>,
     originals: Vec<RecordingCell>,
 }
-unsafe fn decode(d: &Arc<Driver>, info: &vk::SubmitInfo<'_>) -> VkResult<Packet> {
+pub(super) unsafe fn decode(d: &Arc<Driver>, info: &vk::SubmitInfo<'_>) -> VkResult<Packet> {
     if info.s_type != vk::StructureType::SUBMIT_INFO {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
@@ -175,10 +175,13 @@ pub(super) unsafe fn submit(
     if references > 16384 {
         return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
     }
-    let mut packets = infos
+    let packets = infos
         .iter()
         .map(|info| decode(&d, info))
         .collect::<VkResult<Vec<_>>>()?;
+    enqueue(d, packets, fence)
+}
+pub(super) fn enqueue(d: Arc<Driver>, mut packets: Vec<Packet>, fence: vk::Fence) -> VkResult<()> {
     if packets.is_empty() {
         packets.push(Packet::default());
     }

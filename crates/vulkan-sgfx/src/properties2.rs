@@ -80,6 +80,11 @@ unsafe extern "system" fn features(
                 };
                 let tag = base.s_type;
                 let next = base.p_next;
+                if tag == vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES {
+                    (*node.cast::<vk::PhysicalDeviceSynchronization2Features<'_>>())
+                        .synchronization2 =
+                        u32::from(crate::instance::physical_adapter(physical).is_some());
+                }
                 if tag == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES {
                     (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
                         .timeline_semaphore =

@@ -8,6 +8,7 @@ mod maintenance1;
 mod queue;
 mod render_pass2;
 mod render_passes;
+mod synchronization2;
 mod timeline;
 mod unsupported;
 use crate::runtime::Runtime;
@@ -146,8 +147,9 @@ struct Driver {
     queue_sender: mpsc::Sender<queue::Request>,
     queue_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     timeline_enabled: bool,
+    synchronization2_enabled: bool,
     timelines: Mutex<HashMap<u64, Arc<timeline::Timeline>>>,
-    events: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    events: Mutex<HashMap<u64, Arc<bootstrap::Event>>>,
     fences: Fences,
     semaphores: Semaphores,
     recordings: Recordings,
@@ -572,6 +574,10 @@ unsafe fn device_chain_supported(
                 let f = &*next.cast::<vk::PhysicalDeviceFeatures2<'_>>();
                 core_device_features_supported(&f.features, supported_features)
             }
+            vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceSynchronization2Features<'_>>();
+                matches!(f.synchronization2, vk::FALSE | vk::TRUE)
+            }
             vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
                 let f = &*next.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>();
                 matches!(f.timeline_semaphore, vk::FALSE | vk::TRUE)
@@ -682,7 +688,7 @@ unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
     names.iter().all(|&name| {
         !name.is_null() && {
             let name = unsafe { CStr::from_ptr(name) };
-            if name == vk::KHR_TIMELINE_SEMAPHORE_NAME {
+            if name == vk::KHR_TIMELINE_SEMAPHORE_NAME || name == vk::KHR_SYNCHRONIZATION2_NAME {
                 return true;
             }
             #[cfg(any(
@@ -748,8 +754,14 @@ pub(crate) unsafe extern "system" fn create_device(
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
     let mut timeline_enabled = false;
+    let mut synchronization2_enabled = false;
     let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
     while let Some(base) = node.as_ref() {
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES {
+            synchronization2_enabled =
+                (*node.cast::<vk::PhysicalDeviceSynchronization2Features<'_>>()).synchronization2
+                    == vk::TRUE;
+        }
         if base.s_type == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES {
             timeline_enabled = (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
                 .timeline_semaphore
@@ -765,6 +777,17 @@ pub(crate) unsafe extern "system" fn create_device(
         .unwrap()
         .iter()
         .any(|&n| CStr::from_ptr(n) == vk::KHR_TIMELINE_SEMAPHORE_NAME)
+    {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    }
+    if synchronization2_enabled
+        && !slice(
+            info.pp_enabled_extension_names,
+            info.enabled_extension_count,
+        )
+        .unwrap()
+        .iter()
+        .any(|&n| CStr::from_ptr(n) == vk::KHR_SYNCHRONIZATION2_NAME)
     {
         return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
     }
@@ -887,6 +910,7 @@ pub(crate) unsafe extern "system" fn create_device(
         queue_sender,
         queue_thread: Mutex::new(Some(queue_thread)),
         timeline_enabled,
+        synchronization2_enabled,
         timelines: Default::default(),
         events: Default::default(),
         fences,
@@ -1020,6 +1044,7 @@ struct DeferredBarrier {
 }
 #[derive(Clone)]
 struct ReadImage {
+    order: usize,
     mip_level: u32,
     position: usize,
     image: vk::Image,
@@ -1095,6 +1120,7 @@ pub(crate) fn set_pipeline_layout_metadata(
 #[derive(Clone)]
 enum RecordedCommand {
     InertDynamicState,
+    Synchronize(synchronization2::Action),
     CopyImage {
         source: vk::Image,
         source_layout: vk::ImageLayout,
@@ -1206,6 +1232,7 @@ enum RecordedCommand {
         regions: Vec<vk::BufferImageCopy>,
     },
     PipelineBarrier {
+        full_scope: bool,
         source_stage: vk::PipelineStageFlags,
         destination_stage: vk::PipelineStageFlags,
         flags: vk::DependencyFlags,
@@ -1224,6 +1251,8 @@ struct ResolvedRecording {
     descriptors: Vec<DescriptorInsertion>,
     copies: Vec<ReadImage>,
     barriers: Vec<DeferredBarrier>,
+    synchronizations: Vec<synchronization2::Insertion>,
+    order: usize,
     written_buffers: Vec<vk::Buffer>,
     compute: Option<vk::Pipeline>,
     graphics: Option<vk::Pipeline>,
@@ -1315,7 +1344,9 @@ impl Recording {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
-            RecordedCommand::Dispatch { .. } | RecordedCommand::PipelineBarrier { .. }
+            RecordedCommand::Dispatch { .. }
+            | RecordedCommand::PipelineBarrier { .. }
+            | RecordedCommand::Synchronize(_)
                 if self.render_active =>
             {
                 self.fail(vk::Result::ERROR_FEATURE_NOT_PRESENT);
@@ -1351,6 +1382,8 @@ impl ResolvedRecording {
             descriptors: Vec::new(),
             copies: Vec::new(),
             barriers: Vec::new(),
+            synchronizations: Vec::new(),
+            order: 0,
             written_buffers: Vec::new(),
             compute: None,
             graphics: None,
@@ -1377,7 +1410,18 @@ impl ResolvedRecording {
 
 impl RecordedCommand {
     fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
+        rec.order += 1;
         match self {
+            Self::Synchronize(action) => {
+                if rec.render.is_some() {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                rec.synchronizations.push(synchronization2::Insertion {
+                    position: rec.ops.len(),
+                    order: rec.order,
+                    action: action.clone(),
+                });
+            }
             Self::InertDynamicState => (),
             Self::CopyImage {
                 source,
@@ -1804,6 +1848,7 @@ impl RecordedCommand {
                         }
                     })?;
                     rec.copies.push(ReadImage {
+                        order: rec.order,
                         mip_level: region.image_subresource.mip_level,
                         position: rec.ops.len(),
                         image: *image,
@@ -1900,6 +1945,7 @@ impl RecordedCommand {
                 rec.readback_buffers.push(*destination);
             }
             Self::PipelineBarrier {
+                full_scope,
                 source_stage,
                 destination_stage,
                 flags,
@@ -1917,19 +1963,26 @@ impl RecordedCommand {
                     if *extended {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
+                    if !supported_access(*source) || !supported_access(*destination) {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
                     if source
                         .intersects(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::MEMORY_WRITE)
                     {
                         rec.barriers.push(DeferredBarrier {
                             position: rec.ops.len(),
                             buffers: std::mem::take(&mut rec.written_buffers),
-                            after: buffer_access(*destination)?,
+                            after: buffer_access(if *full_scope && destination.is_empty() {
+                                vk::AccessFlags::MEMORY_READ
+                            } else {
+                                *destination
+                            })?,
                         });
-                    } else if !(vk::AccessFlags::TRANSFER_WRITE
-                        | vk::AccessFlags::HOST_WRITE
-                        | vk::AccessFlags::MEMORY_WRITE)
-                        .contains(*source)
-                        || !supported_access(*destination)
+                    } else if !*full_scope
+                        && !(vk::AccessFlags::TRANSFER_WRITE
+                            | vk::AccessFlags::HOST_WRITE
+                            | vk::AccessFlags::MEMORY_WRITE)
+                            .contains(*source)
                     {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
@@ -1953,14 +2006,43 @@ impl RecordedCommand {
                         .buffers
                         .get(buffer)
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    if *offset != 0 || (*size != vk::WHOLE_SIZE && *size != buffer_data.size) {
+                    let bytes = if *size == vk::WHOLE_SIZE {
+                        buffer_data.size.checked_sub(*offset)
+                    } else {
+                        Some(*size)
+                    };
+                    if bytes.is_none_or(|bytes| {
+                        bytes == 0
+                            || offset
+                                .checked_add(bytes)
+                                .is_none_or(|end| end > buffer_data.size)
+                    }) {
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                    if !*full_scope
+                        && (*offset != 0 || (*size != vk::WHOLE_SIZE && *size != buffer_data.size))
+                    {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
+                    rec.used_buffers.push(*buffer);
+                    if *full_scope && source.is_empty() && destination.is_empty() {
+                        continue;
+                    }
+                    let before = if *full_scope {
+                        synchronization2::buffer_access(*source, *destination, buffer_data.usage)?
+                    } else {
+                        buffer_access(*source)?
+                    };
+                    let after = if *full_scope {
+                        synchronization2::buffer_access(*destination, *source, buffer_data.usage)?
+                    } else {
+                        buffer_access(*destination)?
+                    };
                     rec.ops.push(ir::OwnedCommand::ResourceBarrier(
                         ir::OwnedResourceBarrier::Buffer {
                             buffer: buffer_data.id,
-                            before: buffer_access(*source)?,
-                            after: buffer_access(*destination)?,
+                            before,
+                            after,
                         },
                     ));
                     rec.used_buffers.push(*buffer);
@@ -2059,6 +2141,13 @@ impl RecordedCommand {
                         }
                     }
                     rec.used_images.push(*image);
+                }
+                if *full_scope {
+                    rec.synchronizations.push(synchronization2::Insertion {
+                        position: rec.ops.len(),
+                        order: rec.order,
+                        action: synchronization2::Action::Barrier,
+                    });
                 }
             }
         }
@@ -3295,6 +3384,7 @@ unsafe extern "system" fn cmd_pipeline_barrier(
     record(
         command,
         RecordedCommand::PipelineBarrier {
+            full_scope: false,
             source_stage,
             destination_stage,
             flags,
@@ -3319,6 +3409,7 @@ fn validate_pipeline_barrier_header(
     let allowed = vk::PipelineStageFlags::TOP_OF_PIPE
         | vk::PipelineStageFlags::BOTTOM_OF_PIPE
         | vk::PipelineStageFlags::HOST
+        | vk::PipelineStageFlags::DRAW_INDIRECT
         | vk::PipelineStageFlags::TRANSFER
         | vk::PipelineStageFlags::COMPUTE_SHADER
         | vk::PipelineStageFlags::VERTEX_SHADER
@@ -3354,7 +3445,9 @@ fn supported_access(access: vk::AccessFlags) -> bool {
         | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
         | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
         | vk::AccessFlags::VERTEX_ATTRIBUTE_READ
-        | vk::AccessFlags::INDEX_READ)
+        | vk::AccessFlags::INDEX_READ
+        | vk::AccessFlags::INPUT_ATTACHMENT_READ
+        | vk::AccessFlags::INDIRECT_COMMAND_READ)
         .contains(access)
 }
 fn buffer_access(access: vk::AccessFlags) -> VkResult<ir::BufferAccess> {
@@ -3369,6 +3462,8 @@ fn buffer_access(access: vk::AccessFlags) -> VkResult<ir::BufferAccess> {
         Ok(ir::BufferAccess::Vertex)
     } else if access.contains(vk::AccessFlags::INDEX_READ) {
         Ok(ir::BufferAccess::Index)
+    } else if access.contains(vk::AccessFlags::INDIRECT_COMMAND_READ) {
+        Ok(ir::BufferAccess::CopySource)
     } else if access.contains(vk::AccessFlags::UNIFORM_READ) {
         Ok(ir::BufferAccess::Uniform)
     } else if access.intersects(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE) {
@@ -4146,6 +4241,7 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
     let mut descriptors = rec.descriptors.as_slice();
     let mut barriers = rec.barriers.as_slice();
     let mut copies = rec.copies.as_slice();
+    let mut synchronizations = rec.synchronizations.as_slice();
     // Resolution already owns upload payloads. Transfer them to the final
     // stream instead of cloning every texture/buffer byte a second time.
     // Include the final insertion position after the last recorded command.
@@ -4202,6 +4298,13 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
             }
         }
         for copy in take_positioned(&mut copies, position, |c| c.position) {
+            while synchronizations
+                .first()
+                .is_some_and(|s| s.position == position && s.order <= copy.order)
+            {
+                synchronization2::execute(rt, &mut ops, &synchronizations[0].action)?;
+                synchronizations = &synchronizations[1..];
+            }
             profile_work("execute::texture_readback", || {
                 for submission in submit_owned(rt, std::mem::take(&mut ops))? {
                     wait_submission(rt, &submission)?;
@@ -4224,6 +4327,13 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
                 ops.extend(copy.region.writes(&bytes, buffer.id)?);
                 Ok(())
             })?;
+        }
+        while synchronizations
+            .first()
+            .is_some_and(|s| s.position == position)
+        {
+            synchronization2::execute(rt, &mut ops, &synchronizations[0].action)?;
+            synchronizations = &synchronizations[1..];
         }
         if let Some(op) = commands.next() {
             ops.push(op);
@@ -4402,6 +4512,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
             .or_else(|| buffer_views::lookup(name))
             .or_else(|| render_pass2::lookup(name))
             .or_else(|| timeline::lookup(name))
+            .or_else(|| synchronization2::lookup(name))
             .or_else(|| bootstrap::lookup(name))
             .or_else(|| buffer_operations::lookup(name))
             .or_else(|| unsupported::lookup(name))
@@ -5125,6 +5236,7 @@ mod tests {
             queue_sender: mpsc::channel().0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: true,
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5195,6 +5307,7 @@ mod tests {
             queue_sender: mpsc::channel().0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: true,
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5249,6 +5362,7 @@ mod tests {
             queue_sender: mpsc::channel().0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: true,
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5439,6 +5553,7 @@ mod fence_notification_tests {
             queue_sender: mpsc::channel().0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: true,
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5678,6 +5793,7 @@ mod owned_descriptor_tests {
                 queue_sender: mpsc::channel().0,
                 queue_thread: Mutex::new(None),
                 timeline_enabled: false,
+                synchronization2_enabled: false,
                 timelines: Default::default(),
                 events: Default::default(),
                 fences: Default::default(),

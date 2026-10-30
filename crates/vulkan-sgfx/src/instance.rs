@@ -639,6 +639,10 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
                 vk::KHR_TIMELINE_SEMAPHORE_NAME,
                 vk::KHR_TIMELINE_SEMAPHORE_SPEC_VERSION,
             ),
+            (
+                vk::KHR_SYNCHRONIZATION2_NAME,
+                vk::KHR_SYNCHRONIZATION2_SPEC_VERSION,
+            ),
         ]
     }
     #[cfg(target_os = "scarlet")]
@@ -693,6 +697,10 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
                 vk::KHR_TIMELINE_SEMAPHORE_NAME,
                 vk::KHR_TIMELINE_SEMAPHORE_SPEC_VERSION,
             ),
+            (
+                vk::KHR_SYNCHRONIZATION2_NAME,
+                vk::KHR_SYNCHRONIZATION2_SPEC_VERSION,
+            ),
         ]
     }
     #[cfg(not(any(
@@ -700,10 +708,16 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-wsi")
     )))]
-    &[(
-        vk::KHR_TIMELINE_SEMAPHORE_NAME,
-        vk::KHR_TIMELINE_SEMAPHORE_SPEC_VERSION,
-    )]
+    &[
+        (
+            vk::KHR_TIMELINE_SEMAPHORE_NAME,
+            vk::KHR_TIMELINE_SEMAPHORE_SPEC_VERSION,
+        ),
+        (
+            vk::KHR_SYNCHRONIZATION2_NAME,
+            vk::KHR_SYNCHRONIZATION2_SPEC_VERSION,
+        ),
+    ]
 }
 
 unsafe fn enabled_instance_extensions<'a>(
