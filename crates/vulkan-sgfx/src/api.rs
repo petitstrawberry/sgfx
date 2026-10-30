@@ -4354,6 +4354,8 @@ fn submit_owned(
     Ok(submissions)
 }
 
+mod barrier_only;
+
 fn submit_owned_batch(
     rt: &mut Runtime,
     owned: ir::OwnedCommandBuffer,
@@ -4367,6 +4369,12 @@ fn submit_owned_batch(
             crate::resources::failure(error)
         })
     })?;
+    if barrier_only::is_noop(owned.commands()) {
+        // These validated transitions need no backend operation on our ordered
+        // queue. Keep outer control points and FIFO completion observations:
+        // an empty receipt list still completes after the earlier queue prefix.
+        return Ok(None);
+    }
     profile_work("submit::backend", || {
         match submit_with_backpressure(|| rt.queue.submit(&mut rt.cache, &commands)) {
             Ok(receipt) => {
