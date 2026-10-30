@@ -73,11 +73,11 @@ impl Runtime {
 
 impl Runtime {
     pub(crate) fn retire_image(&mut self, image: ash::vk::Image) -> Result<(), ash::vk::Result> {
-        if !self
+        if self
             .resources
             .images
             .get(&image)
-            .is_some_and(|data| data.swapchain.is_none())
+            .is_none_or(|data| data.swapchain.is_some())
         {
             return Ok(());
         }
