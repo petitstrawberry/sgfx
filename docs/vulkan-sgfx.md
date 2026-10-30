@@ -431,3 +431,32 @@ scanner use the same declared capacities. Released generations remain invalid
 and slots remain reusable. The simultaneous-pipeline contract test retains
 160 graphics pipelines (320 distinct shader modules) while rendering and
 validating their pixels, rather than testing only sequential create/destroy.
+
+
+## Synchronization2 validation
+
+On 2026-10-30, the host suite passed 123 unit tests and 29 opt-in GPU
+contract tests against the built ICD on Metal. The synchronization2 GPU case
+checks a future host timeline signal after queue acceptance, ignored binary
+semaphore values, device events, partial buffer barriers and exact transfer
+readback after fence completion. Run it with:
+
+```sh
+cargo build --locked -p vulkan-sgfx --lib
+cargo test --locked -p vulkan-sgfx --lib
+cargo test --locked -p vulkan-sgfx --test contracts -- --ignored --test-threads=1
+```
+
+The same queue/event/transfer path passed in native OpenJDK 25 on an AArch64
+Scarlet HVF guest with the VirGL plugin. A second native test used only
+`vkCmdPipelineBarrier2KHR` and `vkQueueSubmit2KHR` for 320×240 and 384×256
+SDL/Vulkan swapchain presentation, including resize and keyboard/text input.
+It also checked VMA allocation and reached C2 level 4 in render/swapchain
+methods; these methods may subsequently deoptimize. Neither test establishes
+Vulkan conformance or broader application compatibility.
+
+| Validation artifact | SHA-256 |
+| --- | --- |
+| Native ICD | `2e7fa1542a8340fddf0e2f7c1af2f7d9b57d70ea394991dabf10de980b385777` |
+| Native queue/event log | `544bf49335086c01f6af3908859136b8545c73f6e0128315b38e05e7990f1a0d` |
+| Native presentation log | `f0195f8688119acb540ea3622cf295aa63aeed9df5e6274bf2f47b0b29d5a677` |
