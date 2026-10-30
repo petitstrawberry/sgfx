@@ -280,6 +280,20 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                         }
                         Ok(())
                     })?;
+                    // Descriptor identities are materialized only by execute.
+                    // Clear old cached groups first if this packet might need
+                    // the remaining capacity, preserving the previous maximum
+                    // number of distinct groups accepted in one packet.
+                    let definitions = recordings.iter().fold(0usize, |sum, recording| {
+                        sum.saturating_add(recording.descriptors.len())
+                    });
+                    if rt.resources.descriptor_groups_need_capacity(definitions) {
+                        rt.resources.release_descriptor_groups(&rt.table, |id| {
+                            rt.cache
+                                .release_bind_group(id)
+                                .map_err(crate::runtime::backend_failure)
+                        })?;
+                    }
                     let mut submissions = Vec::new();
                     for r in recordings {
                         match profile_work("queue::execute", || execute(rt, r, &mut submissions)) {
@@ -299,16 +313,19 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                     }
                     Ok(submissions)
                 })();
-                // All resolved recordings in this packet have now been
-                // consumed. Backends retain native bindings for submitted
-                // commands, so these immutable descriptor snapshots no longer
-                // need logical table slots or materialization-cache entries.
+                // Keep common groups across packets. A bounded LRU evicts only
+                // after all resolved recordings have been consumed; native
+                // submitted commands already own their bindings.
                 let cleanup = profile_work("queue::release_descriptors", || {
-                    rt.resources.release_descriptor_groups(&rt.table, |id| {
-                        rt.cache
-                            .release_bind_group(id)
-                            .map_err(crate::runtime::backend_failure)
-                    })
+                    rt.resources.trim_descriptor_groups(
+                        &rt.table,
+                        crate::resources::CACHED_DESCRIPTOR_GROUPS,
+                        |id| {
+                            rt.cache
+                                .release_bind_group(id)
+                                .map_err(crate::runtime::backend_failure)
+                        },
+                    )
                 });
                 let submissions = result?;
                 if let Err(error) = cleanup {

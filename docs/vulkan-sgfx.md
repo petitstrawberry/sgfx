@@ -475,16 +475,17 @@ and verify the chosen Mesa driver. The Linux check also used
   indirect dispatch, partial/flipped/converting blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent
-  append-only IDs. When no live Vulkan objects retain an epoch's IDs, the ICD
+  table-qualified IDs. When no live Vulkan objects retain an epoch's IDs, the ICD
   invalidates stale recordings, drops backend caches, and creates a fresh table.
   A test creates/destroys 1250 buffers on an otherwise idle device, then performs
-  real compute work. With long-lived pipelines/resources, unique transient
-  resources and descriptor configurations still consume that epoch's table
-  budget (including 8192 texture identities, 4096 buffers, 4096 memory allocations and 32768 bind-group configurations). Identical
+  real compute work. Live resources and cached descriptor configurations share
+  bounded budgets (including 8192 texture identities, 4096 buffers, 4096 memory
+  allocations and 32768 bind-group definitions). Identical
   descriptor configurations reuse definitions and physical groups; GPU image
   remapping invalidates physical groups. Exhaustion returns an allocation
-  error. General reclamation requires generational core/backend slots or a safe
-  migration of live resources; this remains a blocker for a general driver.
+  error. Descriptor-cache eviction recycles generational slots as described below.
+  Resource categories without reusable slots still require individual reclamation
+  or safe migration of live resources for a general driver.
 - **Command programs are bounded to 65,536 commands.** Vulkan recording uses
   the canonical IR bound. Lowering may add IR operations, which must also fit
   this bound. Overflow rejects recording/submission without signaling success.
@@ -570,19 +571,43 @@ resolution, validation, buffer snapshots, IR recording, backend submission,
 readback and descriptor retirement. Nested durations overlap the enclosing
 API call; summing them double-counts work. The disabled path reads no clocks.
 
-Transient descriptor groups are retired at the end of a queue packet. Backend
-retirements now see one unchanged resource-table revision; logical identities
-are invalidated after that batch. Interleaving those steps previously caused
-the dynamic backend to resynchronize the entire table for every group.
-Failed groups remain available for retry, while successful groups retire and
-keep their generation checks. Native YouTube profiling identified 150-210ms
-per second in the old retirement path. Unit tests cover a failure between two
-successful releases, an unchanged revision throughout the backend batch,
-retry and repeated slot reuse with immutable submitted descriptor snapshots.
+Immutable descriptor groups are reused across queue packets. Once all resolved
+recordings in a packet have been consumed, least-recently-used eviction trims
+the cache to 8,192 nonempty groups. Submitted backend commands already own their
+bindings, so evicting logical groups does not require a GPU completion wait.
+The shared empty group is retained because resolved commands can embed its ID
+directly.
+
+Before execution, capacity preflight counts the descriptor insertions in the
+resolved recordings as an upper bound on new definitions. If that count plus
+the cache size exceeds the 32,768-definition IR limit, the worker flushes cached
+nonempty groups before materializing the packet's descriptors. This flush clears
+per-set cached IDs and preserves the empty group used by resolved commands.
+The packet must still fit within the existing IR limit after the flush.
+
+Both LRU eviction and capacity flush batch backend retirements against one
+unchanged resource-table revision, then retire successful logical identities.
+This avoids synchronizing the entire table for each group. A backend retirement
+failure retains that group's cached descriptor and live logical ID for diagnosis
+or retry; successful retirements still recycle slots and invalidate per-set
+references to the retired IDs. Failed retirements can leave the cache above its
+normal retention bound and propagate an error. Unit tests cover partial failure,
+retry, per-set cache invalidation, LRU recency, and slot reuse while submitted
+descriptor snapshots remain immutable.
+
+The producer also caches serialized shader-module, compute-pipeline and
+programmable-render-pipeline rows by slot generation and active state. Unrelated
+resource-table revisions reuse those encodings instead of serializing unchanged
+programs again. Retirement, reactivation and generation reuse invalidate the
+affected rows. These caches belong to their resource-table epoch and preserve
+the existing snapshot bytes and ABI; no wire-format or ABI version changes are
+required. Tests compare cached snapshots with uncached serialization and check
+both vacancy-to-active reuse and release/replacement between snapshots.
 
 Shader modules have a separate bounded table of 1,024 live entries; compute
-and programmable graphics pipelines each retain their existing 256-entry
-limits. A graphics pipeline can own two distinct shader stages. Several Skia
+pipelines retain their 256-entry limit. Programmable graphics pipelines allow
+512 live entries so resource reloads can overlap the previous and replacement
+pipeline sets. A graphics pipeline can own two distinct shader stages. Several Skia
 contexts share the device table, so a 256-entry shader table could exhaust
 before the graphics-pipeline limit. The R3 metadata importer and retirement
 scanner use the same declared capacities. Released generations remain invalid

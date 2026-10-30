@@ -14,6 +14,9 @@ const LIMIT: usize = 1024;
 // Keep their count separate from metadata limits and from the byte budget.
 pub(crate) const MAX_MEMORY_ALLOCATIONS: usize = 4_096;
 const MAX_DESCRIPTOR_SETS: usize = 16_384;
+// Leave room for a whole packet's transient descriptors in the bounded IR
+// table, while reusing common immutable groups across queue submissions.
+pub(crate) const CACHED_DESCRIPTOR_GROUPS: usize = 8_192;
 pub(crate) const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
 pub(crate) struct Buffer {
     pub id: ir::BufferId,
@@ -432,6 +435,8 @@ pub(crate) struct Resources {
     pub descriptor_sets: HashMap<vk::DescriptorSet, DescriptorSet>,
     bind_group_cache: Vec<(ir::BindGroupDesc, ir::BindGroupId)>,
     bind_group_index: HashMap<u64, Vec<usize>>,
+    bind_group_recency: HashMap<ir::BindGroupId, u64>,
+    bind_group_clock: u64,
     pub pipeline_caches: HashMap<vk::PipelineCache, Vec<u8>>,
     pub pipelines: HashMap<vk::Pipeline, Pipeline>,
     graphics_swizzles: HashMap<(vk::Pipeline, ShaderViews), ir::ProgrammableRenderPipelineId>,
@@ -690,6 +695,8 @@ impl Resources {
         self.uploaded_unmapped_buffers.clear();
         self.bind_group_cache.clear();
         self.bind_group_index.clear();
+        self.bind_group_recency.clear();
+        self.bind_group_clock = 0;
         self.graphics_swizzles.clear();
         self.compute_swizzles.clear();
         self.orphaned_shader_modules.clear();
@@ -698,27 +705,61 @@ impl Resources {
         }
     }
 
-    /// Retire descriptor snapshots after every recording in a queue packet has
-    /// been encoded. Vulkan command recordings retain set handles, not these
-    /// transient IR identities; submitted backend commands own their bindings.
-    /// Keep the single shared empty group used to clear inactive layout slots.
+    /// Release cached snapshots before a packet that could need the entire IR
+    /// table. Resolved recordings contain set handles; empty layout groups are
+    /// kept because those are embedded directly in the resolved commands.
     pub(crate) fn release_descriptor_groups(
         &mut self,
         table: &ir::ResourceTable,
-        mut release_backend: impl FnMut(ir::BindGroupId) -> Result<(), vk::Result>,
+        release_backend: impl FnMut(ir::BindGroupId) -> Result<(), vk::Result>,
     ) -> Result<(), vk::Result> {
         for set in self.descriptor_sets.values_mut() {
             set.cached_group = None;
         }
+        self.trim_descriptor_groups(table, 0, release_backend)
+    }
+
+    pub(crate) fn descriptor_groups_need_capacity(&self, definitions: usize) -> bool {
+        self.bind_group_cache.len().saturating_add(definitions) > ir::MAX_BIND_GROUP_DEFINITIONS
+    }
+
+    /// Backend packets own their bindings after lowering. Evict only the least
+    /// recently used logical groups after the packet has been consumed, keeping
+    /// a bounded cache across submissions instead of changing every generation
+    /// and synchronizing all resource metadata for each packet.
+    pub(crate) fn trim_descriptor_groups(
+        &mut self,
+        table: &ir::ResourceTable,
+        keep: usize,
+        mut release_backend: impl FnMut(ir::BindGroupId) -> Result<(), vk::Result>,
+    ) -> Result<(), vk::Result> {
+        let count = self
+            .bind_group_cache
+            .iter()
+            .filter(|(desc, _)| !desc.layout().entries().is_empty())
+            .count();
+        if count <= keep {
+            return Ok(());
+        }
+        let mut oldest = self
+            .bind_group_cache
+            .iter()
+            .filter(|(desc, _)| !desc.layout().entries().is_empty())
+            .map(|(_, id)| (*id, self.bind_group_recency.get(id).copied().unwrap_or(0)))
+            .collect::<Vec<_>>();
+        oldest.sort_unstable_by_key(|(_, age)| *age);
+        let evict = oldest[..count - keep]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<HashSet<_>>();
         self.bind_group_index.clear();
         let mut result = Ok(());
         let mut retired = Vec::new();
         for (desc, id) in std::mem::take(&mut self.bind_group_cache) {
-            if desc.layout().entries().is_empty() {
+            if !evict.contains(&id) {
                 self.bind_group_cache.push((desc, id));
             } else if let Err(error) = release_backend(id) {
-                // Preserve failed retirements for diagnosis or a retry, while
-                // still releasing the rest of this packet's snapshots.
+                // Preserve failed retirements for diagnosis or a retry.
                 self.bind_group_cache.push((desc, id));
                 result = Err(error);
             } else {
@@ -728,10 +769,19 @@ impl Resources {
         // Keep one table revision for the whole backend retirement batch.
         // Each logical release changes the ABI revision; interleaving it with
         // backend calls would serialize the entire resource table per group.
+        let mut released = HashSet::new();
         for (desc, id) in retired {
             if let Err(error) = table.release_bind_group(id).map_err(failure) {
                 self.bind_group_cache.push((desc, id));
                 result = Err(error);
+            } else {
+                self.bind_group_recency.remove(&id);
+                released.insert(id);
+            }
+        }
+        for set in self.descriptor_sets.values_mut() {
+            if set.cached_group.is_some_and(|id| released.contains(&id)) {
+                set.cached_group = None;
             }
         }
         self.rebuild_bind_group_index();
@@ -761,6 +811,12 @@ impl Resources {
         let key = bind_group_cache_hash(&desc);
         self.bind_group_cache.push((desc, id));
         self.bind_group_index.entry(key).or_default().push(index);
+        self.touch_bind_group(id);
+    }
+
+    fn touch_bind_group(&mut self, id: ir::BindGroupId) {
+        self.bind_group_clock = self.bind_group_clock.saturating_add(1);
+        self.bind_group_recency.insert(id, self.bind_group_clock);
     }
 
     fn rebuild_bind_group_index(&mut self) {
@@ -771,12 +827,16 @@ impl Resources {
         }
     }
 
-    fn cached_bind_group(&self, desc: &ir::BindGroupDesc) -> Option<ir::BindGroupId> {
+    fn cached_bind_group(&mut self, desc: &ir::BindGroupDesc) -> Option<ir::BindGroupId> {
         let key = bind_group_cache_hash(desc);
-        self.bind_group_index.get(&key)?.iter().find_map(|&index| {
+        let id = self.bind_group_index.get(&key)?.iter().find_map(|&index| {
             let (cached, id) = self.bind_group_cache.get(index)?;
             (cached == desc).then_some(*id)
-        })
+        });
+        if let Some(id) = id {
+            self.touch_bind_group(id);
+        }
+        id
     }
 
     #[cfg(test)]
@@ -950,9 +1010,10 @@ impl Resources {
             && let Some(id) = set.cached_group
         {
             let cached = table
-                .bind_group(table.bind_group_ref(id).map_err(failure)?)
+                .bind_group_shared(table.bind_group_ref(id).map_err(failure)?)
                 .map_err(failure)?;
-            if cached == desc {
+            if *cached == desc {
+                self.touch_bind_group(id);
                 return Ok(id);
             }
         }
@@ -3999,6 +4060,207 @@ mod tests {
             None
         );
         assert_eq!(resources.bind_group_cache.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_cache_reuses_packets_and_evicts_oldest_without_aliasing_snapshots() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let groups = [0, 16, 32].map(|offset| {
+            let desc = ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap();
+            let id = table.define_bind_group(desc.clone()).unwrap().id();
+            resources.push_bind_group_cache(desc.clone(), id);
+            (desc, id)
+        });
+        let snapshot = table
+            .bind_group_shared(table.bind_group_ref(groups[1].1).unwrap())
+            .unwrap();
+        let revision = table.abi_revision();
+        for _ in 0..8 {
+            assert_eq!(resources.cached_bind_group(&groups[0].0), Some(groups[0].1));
+            resources
+                .trim_descriptor_groups(&table, 3, |_| panic!("cache within budget"))
+                .unwrap();
+            assert_eq!(table.abi_revision(), revision);
+        }
+        // The frequently reused first group survives; the second is oldest.
+        let mut released = Vec::new();
+        resources
+            .trim_descriptor_groups(&table, 2, |id| {
+                assert_eq!(table.abi_revision(), revision);
+                released.push(id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![groups[1].1]);
+        assert!(table.bind_group_ref(groups[1].1).is_err());
+        assert_eq!(resources.cached_bind_group(&groups[0].0), Some(groups[0].1));
+        assert_eq!(resources.cached_bind_group(&groups[1].0), None);
+        assert_eq!(resources.cached_bind_group(&groups[2].0), Some(groups[2].1));
+        assert!(matches!(
+            snapshot.entries()[0].resource(),
+            ir::BindingResource::Buffer {
+                offset: 16,
+                size: 16,
+                ..
+            }
+        ));
+        assert!(!resources.descriptor_groups_need_capacity(
+            ir::MAX_BIND_GROUP_DEFINITIONS - resources.bind_group_cache.len(),
+        ));
+        assert!(resources.descriptor_groups_need_capacity(
+            ir::MAX_BIND_GROUP_DEFINITIONS - resources.bind_group_cache.len() + 1,
+        ));
+        resources.clear_ir_cache();
+        assert!(resources.bind_group_recency.is_empty());
+    }
+
+    #[test]
+    fn descriptor_lru_retirement_clears_only_successful_set_caches_and_retries_failures() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer_handle = vk::Buffer::from_raw(1);
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        resources.buffers.insert(
+            buffer_handle,
+            Buffer {
+                id: buffer,
+                size: 128,
+                usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+                bound: Some((vk::DeviceMemory::from_raw(1), 0)),
+            },
+        );
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let sets = [2, 3, 4].map(vk::DescriptorSet::from_raw);
+        let groups = std::array::from_fn::<_, 3, _>(|index| {
+            resources.descriptor_sets.insert(
+                sets[index],
+                DescriptorSet::new(
+                    HashMap::new(),
+                    vk::DescriptorPool::null(),
+                    layout.clone(),
+                    BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                    BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                    HashMap::from([(
+                        0,
+                        DescriptorBinding::Buffer {
+                            buffer: buffer_handle,
+                            offset: index as u64 * 16,
+                            range: 16,
+                        },
+                    )]),
+                )
+                .unwrap(),
+            );
+            resources
+                .descriptor_group(&table, sets[index], &[])
+                .unwrap()
+        });
+        let empty = resources.empty_bind_group(&table).unwrap();
+        let snapshot = table
+            .bind_group_shared(table.bind_group_ref(groups[2]).unwrap())
+            .unwrap();
+        let revision = table.abi_revision();
+        // Refresh through the per-set fast path, rather than the hash index.
+        assert_eq!(
+            resources.descriptor_group(&table, sets[0], &[]).unwrap(),
+            groups[0]
+        );
+        let mut attempted = Vec::new();
+        assert_eq!(
+            resources.trim_descriptor_groups(&table, 1, |id| {
+                assert_eq!(table.abi_revision(), revision);
+                attempted.push(id);
+                if id == groups[1] {
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert_eq!(attempted, vec![groups[1], groups[2]]);
+        assert_eq!(
+            resources.descriptor_sets[&sets[0]].cached_group,
+            Some(groups[0])
+        );
+        assert_eq!(
+            resources.descriptor_sets[&sets[1]].cached_group,
+            Some(groups[1])
+        );
+        assert_eq!(resources.descriptor_sets[&sets[2]].cached_group, None);
+        assert!(table.bind_group_ref(groups[1]).is_ok());
+        assert!(table.bind_group_ref(groups[2]).is_err());
+        assert!(resources.bind_group_recency.contains_key(&groups[1]));
+        assert!(!resources.bind_group_recency.contains_key(&groups[2]));
+        resources
+            .trim_descriptor_groups(&table, 1, |id| {
+                assert_eq!(id, groups[1]);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(resources.descriptor_sets[&sets[1]].cached_group, None);
+        assert_eq!(
+            resources.descriptor_group(&table, sets[0], &[]).unwrap(),
+            groups[0]
+        );
+        let replacement = resources.descriptor_group(&table, sets[2], &[]).unwrap();
+        assert_ne!(replacement, groups[2]);
+        assert!(table.bind_group_ref(replacement).is_ok());
+        assert!(matches!(
+            snapshot.entries()[0].resource(),
+            ir::BindingResource::Buffer {
+                offset: 32,
+                size: 16,
+                ..
+            }
+        ));
+        // Capacity preflight must clear all per-set identities while retaining
+        // the empty group already embedded in resolved commands.
+        assert!(resources.descriptor_groups_need_capacity(ir::MAX_BIND_GROUP_DEFINITIONS));
+        resources
+            .release_descriptor_groups(&table, |_| Ok(()))
+            .unwrap();
+        assert!(
+            resources
+                .descriptor_sets
+                .values()
+                .all(|set| set.cached_group.is_none())
+        );
+        assert_eq!(resources.empty_bind_group(&table).unwrap(), empty);
+        assert!(table.bind_group_ref(groups[0]).is_err());
+        assert!(table.bind_group_ref(replacement).is_err());
+        assert!(!resources.descriptor_groups_need_capacity(ir::MAX_BIND_GROUP_DEFINITIONS - 1));
     }
 
     #[test]

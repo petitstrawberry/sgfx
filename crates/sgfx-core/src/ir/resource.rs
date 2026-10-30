@@ -25,7 +25,8 @@ pub const MAX_RENDER_PIPELINES: usize = 256;
 /// and several frontend contexts share a Vulkan device's resource table.
 pub const MAX_SHADER_MODULES: usize = 1_024;
 /// Maximum programmable render pipelines held by one shared table.
-pub const MAX_PROGRAMMABLE_RENDER_PIPELINES: usize = 256;
+/// Resource reloads may keep the previous pipeline set live during replacement.
+pub const MAX_PROGRAMMABLE_RENDER_PIPELINES: usize = 512;
 /// Maximum compute pipelines held by one shared table.
 pub const MAX_COMPUTE_PIPELINES: usize = 256;
 /// Maximum immutable bind-group definitions held by one resource table.
