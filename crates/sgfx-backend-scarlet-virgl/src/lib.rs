@@ -50,6 +50,8 @@ pub fn matches_backend_id(backend_id: &[u8]) -> bool {
 pub use sgfx_core::ir;
 
 mod completion;
+#[cfg(all(feature = "std", feature = "programmable"))]
+mod compute;
 mod dispatch;
 mod driver;
 mod ir_execute;
@@ -187,6 +189,19 @@ pub struct Device {
 }
 
 impl Device {
+    /// True only after an isolated native compute dispatch writes the expected
+    /// bytes and a fenced GPU-to-host transfer reads them back.
+    pub fn supports_compute(&self) -> bool {
+        #[cfg(all(feature = "std", feature = "programmable"))]
+        {
+            let driver::Device::Virgl(device) = self.backend.as_ref();
+            device.supports_compute()
+        }
+        #[cfg(not(all(feature = "std", feature = "programmable")))]
+        {
+            false
+        }
+    }
     /// Return whether already-queried GPU information selects this backend.
     ///
     /// # Arguments

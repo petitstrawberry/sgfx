@@ -1666,6 +1666,7 @@ struct DynamicFeatures {
     blits: bool,
     push_constants_128: bool,
     color_attachments_8: bool,
+    compute_buffers: bool,
 }
 
 #[cfg(sgfx_dynamic)]
@@ -1688,6 +1689,7 @@ impl From<crate::dynamic::Capabilities> for DynamicFeatures {
             blits: capabilities.supports_image_blits(),
             push_constants_128: capabilities.supports_push_constants_128(),
             color_attachments_8: capabilities.supports_color_attachments_8(),
+            compute_buffers: capabilities.supports_compute_buffers(),
         }
     }
 }
@@ -1698,15 +1700,16 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
     // Optional properties come exclusively from the negotiated ABI flags.
     // A manifest name never grants execution features or resource limits.
     let read_only_storage = programmable && features.read_only_storage;
+    let compute = programmable && features.compute_buffers;
     Capabilities {
         graphics: features.rendering,
-        compute: false,
+        compute,
         transfer: features.upload || features.readback,
         programmable_graphics: programmable,
         vertex_buffers: programmable,
         index_buffers: programmable,
         uniform_buffers: programmable,
-        storage_buffers: read_only_storage,
+        storage_buffers: read_only_storage || compute,
         storage_images: false,
         typed_texture_views: features.typed_views && features.arrays && features.depth_sampling,
         srgb_texture_views: programmable && features.srgb_views,
@@ -1727,10 +1730,14 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
             max_image_mip_levels: if features.mips { 13 } else { 1 },
             max_image_array_layers: if features.arrays { 2048 } else { 1 },
             max_uniform_buffer_range: if programmable { 16 * 1024 } else { 0 },
-            max_storage_buffer_range: if read_only_storage { 256 * 1024 } else { 0 },
+            max_storage_buffer_range: if read_only_storage || compute {
+                256 * 1024
+            } else {
+                0
+            },
             max_bound_descriptor_sets: if programmable { 4 } else { 0 },
             max_uniform_buffers_per_stage: if programmable { 12 } else { 0 },
-            max_storage_buffers_per_stage: if read_only_storage { 4 } else { 0 },
+            max_storage_buffers_per_stage: if read_only_storage || compute { 4 } else { 0 },
             max_storage_images_per_stage: 0,
             max_vertex_attributes: if programmable { 16 } else { 0 },
             max_vertex_buffers: if programmable { 8 } else { 0 },
@@ -1744,12 +1751,16 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
                 0
             },
             max_compute_shared_memory_size: 0,
-            max_compute_work_group_count: [0; 3],
-            max_compute_work_group_invocations: 0,
-            max_compute_work_group_size: [0; 3],
+            max_compute_work_group_count: if compute { [65535; 3] } else { [0; 3] },
+            max_compute_work_group_invocations: if compute { 128 } else { 0 },
+            max_compute_work_group_size: if compute { [128, 128, 64] } else { [0; 3] },
             min_uniform_buffer_offset_alignment: 16,
             min_storage_buffer_offset_alignment: 4,
-            max_buffer_size: u64::from(u32::MAX),
+            max_buffer_size: if compute {
+                1024 * 1024
+            } else {
+                u64::from(u32::MAX)
+            },
         },
     }
 }
@@ -1898,6 +1909,35 @@ mod tests {
             panic!("manifest preference must select a dynamic backend");
         };
         assert_eq!(selected.as_str(), name.as_str());
+    }
+
+    #[test]
+    fn dynamic_compute_requires_negotiation_and_has_bounded_limits() {
+        let missing = dynamic_capabilities(DynamicFeatures {
+            rendering: true,
+            programmable: true,
+            ..Default::default()
+        });
+        assert!(!missing.supports_compute());
+        assert_eq!(missing.limits().max_compute_work_group_count, [0; 3]);
+        let incomplete = dynamic_capabilities(DynamicFeatures {
+            compute_buffers: true,
+            ..Default::default()
+        });
+        assert!(!incomplete.supports_compute());
+        let compute = dynamic_capabilities(DynamicFeatures {
+            rendering: true,
+            programmable: true,
+            compute_buffers: true,
+            ..Default::default()
+        });
+        assert!(compute.supports_compute());
+        assert!(compute.supports_storage_buffers());
+        assert!(!compute.supports_storage_images());
+        assert_eq!(compute.limits().max_compute_work_group_invocations, 128);
+        assert_eq!(compute.limits().max_compute_work_group_size, [128, 128, 64]);
+        assert_eq!(compute.limits().max_compute_shared_memory_size, 0);
+        assert_eq!(compute.limits().max_storage_buffer_range, 256 * 1024);
     }
 
     #[test]

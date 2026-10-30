@@ -354,6 +354,8 @@ pub(crate) struct Device {
     pub(crate) raw: RawGpu,
     dialect: RawDialect,
     capabilities: Capabilities,
+    #[cfg(all(feature = "std", feature = "programmable"))]
+    pub(crate) compute_supported: Cell<Option<bool>>,
 }
 
 impl Device {
@@ -396,6 +398,8 @@ impl Device {
             raw,
             dialect,
             capabilities,
+            #[cfg(all(feature = "std", feature = "programmable"))]
+            compute_supported: Cell::new(None),
         })
     }
 
@@ -3943,7 +3947,7 @@ fn push_fragment_shader(commands: &mut Vec<u8>, handle: u32) {
     push_bind_shader(commands, PIPE_SHADER_FRAGMENT, handle);
 }
 
-fn push_bind_shader(commands: &mut Vec<u8>, stage: u32, handle: u32) {
+pub(crate) fn push_bind_shader(commands: &mut Vec<u8>, stage: u32, handle: u32) {
     push_dword(commands, command_header(VIRGL_CCMD_BIND_SHADER, 0, 2));
     push_dword(commands, handle);
     push_dword(commands, stage);
@@ -4480,7 +4484,7 @@ fn push_constant_buffer(
     Ok(())
 }
 
-fn push_constant_words(
+pub(crate) fn push_constant_words(
     commands: &mut Vec<u8>,
     shader_type: u32,
     values: &[u32],
@@ -4608,7 +4612,7 @@ fn push_programmable_pipeline(
 }
 
 #[cfg(feature = "programmable")]
-fn push_programmable_shader(
+pub(crate) fn push_programmable_shader(
     commands: &mut Vec<u8>,
     handle: u32,
     stage: u32,
@@ -5847,7 +5851,7 @@ fn push_instanced_draw_parameters(
     Ok(())
 }
 
-fn push_shader(commands: &mut Vec<u8>, handle: u32, shader_type: u32, source: &str) {
+pub(crate) fn push_shader(commands: &mut Vec<u8>, handle: u32, shader_type: u32, source: &str) {
     push_shader_with_token_count(
         commands,
         handle,

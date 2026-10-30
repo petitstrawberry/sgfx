@@ -22,7 +22,7 @@ use crate::{HandleError, HandleResult, IrSubmitError};
 /// Completion is not a presentation or SWS buffer-release acknowledgement.
 #[derive(Clone)]
 pub struct Submission {
-    signal: Arc<Signal>,
+    pub(crate) signal: Arc<Signal>,
 }
 
 #[cfg(feature = "backend-abi")]

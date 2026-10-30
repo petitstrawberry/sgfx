@@ -508,6 +508,13 @@ its ordered command stream and automatic resource transitions.
 
 ### Owned recording and the implemented subset
 
+Scarlet VirGL optionally supports compute-buffer streams after a real native
+dispatch/readback capability probe. This bounded profile executes compute-only
+streams synchronously, including buffer uploads/copies and retired SSBO writes.
+Shared memory, atomics, images and mixed rendering/compute streams are outside
+the native profile. See [native compute limits](vulkan-sgfx.md) for its limits
+and host requirements. WGPU retains its broader compute implementation.
+
 `OwnedCommandBuffer::new(Vec<OwnedCommand>)` retains persistent IDs and owns upload
 bytes without borrowing a resource table. Its source commands are inspectable and
 may be malformed until validated. `owned.record(&table)` resolves IDs and replays

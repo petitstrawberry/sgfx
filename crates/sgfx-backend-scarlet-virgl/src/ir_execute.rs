@@ -3,6 +3,9 @@
 use alloc::{rc::Rc, vec::Vec};
 #[cfg(feature = "programmable")]
 use core::cell::RefCell;
+#[cfg(all(feature = "std", feature = "programmable"))]
+#[path = "compute_ir.rs"]
+mod compute;
 #[path = "programmable.rs"]
 mod programmable;
 pub use programmable::ShaderCompileError;
@@ -1021,7 +1024,10 @@ impl Queue {
     /// resource API before any upload or draw from this call is sent. This cold
     /// setup may wait for earlier GPU work. Once materialized, uploads, copies,
     /// draws, and empty checkpoints use only the bounded async queue operation;
-    /// submission never waits for their completion or for admission capacity.
+    /// graphics submission never waits for their completion or admission capacity.
+    /// The optional compute-buffer profile uses fenced dispatch and readback;
+    /// its receipt is already retired on return. Mixed graphics/compute streams
+    /// are rejected before admission.
     /// Native packets are batched within the advertised transport limit; a
     /// bounded context-owned worker dispatches them after one logical admission.
     /// Busy/Rejected restore CPU
@@ -1049,6 +1055,10 @@ impl Queue {
         resources: &mut IrResources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<Submission, SubmitError<IrSubmitError, Submission>> {
+        #[cfg(all(feature = "std", feature = "programmable"))]
+        if compute::contains_compute(commands).map_err(SubmitError::Rejected)? {
+            return self.submit_compute_async(context, resources, commands);
+        }
         let limit = self
             .backend
             .check_async_support()
@@ -1108,6 +1118,16 @@ impl Queue {
         resources: &mut IrResources,
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<(), IrSubmitError> {
+        #[cfg(all(feature = "std", feature = "programmable"))]
+        if compute::contains_compute(commands)? {
+            return self
+                .submit_compute_async(context, resources, commands)
+                .map(|_| ())
+                .map_err(|error| match error {
+                    SubmitError::Rejected(error) | SubmitError::Failed { error, .. } => error,
+                    _ => IrSubmitError::SubmissionFailed,
+                });
+        }
         self.backend.wait_idle()?;
         self.submit_ir_with(context, resources, commands, &mut SubmitMode::Synchronous)
     }

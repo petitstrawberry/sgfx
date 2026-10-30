@@ -187,8 +187,50 @@ argument buffers, signed vertex offsets and nonzero first-instance values.
 `maxDrawCount`; the reported command limit is 4096. This portable implementation
 retires preceding GPU work, reads the parameters, preserves/resumes attachments
 and emits direct IR draws. It adds synchronization and readback overhead. Native
-VirGL currently accepts transfer/update producers; it does not advertise writable
-storage buffers or compute.
+VirGL accepts transfer/update producers and retired compute-buffer producers in
+separate submissions when the native compute capability probe succeeds.
+
+Native VirGL's optional compute-buffer profile lowers WGSL/SPIR-V to TGSI `COMP`,
+binds shader buffers and issues `LAUNCH_GRID` followed by a shader-buffer/update
+memory barrier and fenced GPU readback. It supports fixed workgroups with at
+most 128 invocations (`128,128,64` per-axis limits), `65535` groups per axis,
+invocation/workgroup IDs, four storage bindings of up to 256 KiB, 16 KiB uniforms
+and 128-byte push constants. Buffer allocations are bounded to 1 MiB; a stream
+retains at most 64 MiB of buffer snapshots. Descriptor aliases share one physical
+allocation, and range checks suppress invalid writes and return zero on invalid
+reads. GPU writes update CPU shadows and invalidate cached buffer revisions, so
+subsequent graphics submissions upload the new contents.
+
+Compute-only streams can contain uploads, buffer copies, multiple compute passes
+and buffer barriers. They execute synchronously even through the asynchronous
+submission API; the returned receipt is already retired. Mixed graphics/compute
+streams, shared workgroup memory, atomics, texture bindings and storage images
+remain unsupported and are rejected before execution. If a dispatch may have
+been accepted before a failure, submission reports a partial failure and makes
+the resource cache unusable rather than allowing replay.
+
+The `COMPUTE_BUFFERS` ABI flag and compute queue limits are advertised only after
+an isolated dispatch modifies eight SSBO words and GPU-to-host readback verifies
+every result. Failed probes leave the rendering context untouched. macOS CGL's
+OpenGL 4.1 host reports compute shaders unsupported, so this path stays disabled
+there; CPU TGSI semantic tests and a rejected probe are not GPU compute execution
+validation. Shared-memory limits remain zero for this profile.
+
+Local validation of this profile passed five WGSL/SPIR-V compute semantic tests
+(3D invocation IDs, read-modify-write, descriptor offsets, robust bounds and
+arithmetic overflow, distinct UBO/push/storage constants, and explicit profile
+rejection), plus parsing both generated compute shaders with the pinned
+virglrenderer TGSI parser. The native OpenJDK/HVF fixture passes the unsupported
+compute capability path and continues through indirect-count rendering, 128 pixel
+checks, visibility queries and synchronization2. Positive native GPU compute
+execution remains unverified on this CGL host. The conditional Java fixture also
+contains two real SSBO dispatches and descriptor-boundary sentinel checks for a
+compute-capable host.
+
+The native ICD SHA-256 for that check is `d7a0f818219fd79b7a52eb98115e660b269a9c1d6ffb9a72346fcb00071416d4`;
+the VirGL plugin SHA-256 is `52d98a21c98cce1bc26dd6e3bf9b8c18406b31d3edeeaafbcffc7467e70ef7c4`. These hashes identify
+that validation build, independently of the earlier query/rendering builds below.
+
 
 Timestamp query pools provide reset, 32/64-bit results, availability, WAIT,
 strided buffer copies and optional `VK_EXT_host_query_reset`. Only real GPU

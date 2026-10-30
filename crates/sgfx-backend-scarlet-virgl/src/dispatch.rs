@@ -136,7 +136,7 @@ pub(crate) struct Signal {
 }
 
 impl Signal {
-    fn new() -> HandleResult<Self> {
+    pub(crate) fn new() -> HandleResult<Self> {
         Ok(Self {
             result: Mutex::new(None),
             event: Event::new()?,
@@ -179,7 +179,7 @@ impl Signal {
         }
     }
 
-    fn complete(&self, result: Result<(), Failure>) {
+    pub(crate) fn complete(&self, result: Result<(), Failure>) {
         *lock(&self.result) = Some(result);
         self.event.notify();
     }

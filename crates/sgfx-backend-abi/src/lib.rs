@@ -199,6 +199,11 @@ pub const PUSH_CONSTANTS_128: u64 = 65536;
 pub const COLOR_ATTACHMENTS_8: u64 = 131072;
 /// Actual GPU timestamps returned in nanoseconds by the optional timing API.
 pub const GPU_TIMESTAMPS: u64 = 262144;
+/// Fixed-size compute workgroups (128 invocations), four writable SSBOs, inline
+/// uniforms and push constants. Compute-only streams retire before returning.
+/// No shared memory, atomics, storage images or mixed graphics/compute stream.
+/// Advertise only after native dispatch and GPU-written readback are verified.
+pub const COMPUTE_BUFFERS: u64 = 524288;
 /// Optional timing extension; existing v2 table layouts remain unchanged.
 pub const TIMESTAMP_ENTRY: &[u8] = b"sgfx_backend_get_timestamp_api_v2\0";
 #[repr(C)]

@@ -55,11 +55,19 @@ impl IrResources {
         ))
     }
 
-    /// Compute execution is not implemented by this native backend.
+    /// Validate the native compute profile and actual host execution support.
     pub fn validate_compute_pipeline(
         &self,
         id: ir::ComputePipelineId,
     ) -> Result<(), IrSubmitError> {
+        #[cfg(all(feature = "std", feature = "programmable"))]
+        {
+            super::compute::compile_pipeline(self, id)?;
+            let driver::Context::Virgl(context) = &self.context;
+            if context.compute_supported() {
+                return Ok(());
+            }
+        }
         self.resources
             .compute_pipeline(self.resources.compute_pipeline_ref(id)?)?;
         Err(IrSubmitError::Unsupported(
@@ -67,7 +75,7 @@ impl IrResources {
         ))
     }
 
-    /// Read ordered CPU-visible bytes. Native graphics never writes buffer storage.
+    /// Read ordered CPU-visible bytes, including retired compute SSBO writes.
     /// Callers must observe the submission receipt before reading GPU image results.
     pub fn read_buffer(
         &self,
@@ -647,17 +655,9 @@ fn pack_color_readback(bytes: &mut Vec<u8>, format: IrTextureFormat) {
 
 pub(super) fn validate_barrier(barrier: ir::ResourceBarrier<'_>) -> Result<(), IrSubmitError> {
     // Transfer, vertex/index fetch and attachment accesses execute in one ordered
-    // VirGL context. Shader writes are rejected instead of being treated as no-ops.
+    // VirGL context. Compute SSBO writes retire and update CPU shadows before
+    // returning, so buffer dependencies also cover earlier compute submissions.
     match barrier {
-        ir::ResourceBarrier::Buffer { before, after, .. }
-            if [before, after]
-                .iter()
-                .any(|access| matches!(access, ir::BufferAccess::StorageReadWrite)) =>
-        {
-            Err(IrSubmitError::Unsupported(
-                UnsupportedIrFeature::ExplicitBarrier,
-            ))
-        }
         ir::ResourceBarrier::Texture { before, after, .. }
         | ir::ResourceBarrier::TextureMip { before, after, .. }
             if [before, after].contains(&ir::TextureAccess::StorageWrite) =>

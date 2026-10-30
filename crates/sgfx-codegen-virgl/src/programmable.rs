@@ -1,4 +1,4 @@
-//! Bounded, semantic Naga IR to TGSI graphics shader lowering.
+//! Bounded, semantic Naga IR to TGSI graphics and compute shader lowering.
 //!
 //! This compiler deliberately rejects operations it cannot lower. It uses no
 //! shader-name matching or fixed-shader substitution. The optional feature uses
@@ -15,6 +15,8 @@ use sgfx_core::ir::{
 };
 
 type Result<T> = core::result::Result<T, ShaderCompileError>;
+
+mod compute;
 
 /// A parse, validation, unsupported-feature, or bounded-resource failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,14 +46,15 @@ pub struct UniformBufferBinding {
     pub required_size: u32,
 }
 
-/// A read-only storage buffer lowered to an integer buffer texture. The inline
-/// constant register contains the descriptor's byte offset and byte length.
+/// Storage binding metadata. Graphics uses an integer buffer texture; compute
+/// uses a byte-addressed shader buffer. Constants hold descriptor offset/length.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageBufferBinding {
     pub group: u32,
     pub binding: u32,
     pub slot: u32,
     pub first_register: u32,
+    pub writable: bool,
 }
 
 /// Push-constant byte layout and its separate inline constant-register span.
@@ -131,6 +134,8 @@ pub struct IoLocation {
 pub struct CompiledShader {
     /// Portable shader stage.
     pub stage: ShaderStage,
+    /// Fixed compute workgroup dimensions; absent for graphics stages.
+    pub workgroup_size: Option<[u32; 3]>,
     /// Complete TGSI text, excluding the transport's terminating NUL.
     pub tgsi: String,
     /// Used uniform buffers, flattened into an inline constant bank per stage.
@@ -158,15 +163,15 @@ pub struct CompiledShader {
     pub outputs: Vec<IoLocation>,
 }
 
-/// Compile a vertex or fragment entry point, rejecting unsupported semantics.
+/// Compile a graphics or compute entry point, rejecting unsupported semantics.
 ///
 /// SPIR-V is interpreted in SGFX's already-normalized coordinate convention,
 /// matching the Vulkan frontend's output. Vertex depth is converted from SGFX's
 /// zero-to-one clip range to Gallium's negative-one-to-one range at the output.
 /// Uniform buffers keep their declared byte layout and are flattened into each
 /// stage's bounded inline constant bank.
-/// Compute, storage writes, loops, dynamic indexing stores and early returns
-/// are currently rejected. See the tests for executable examples of the subset.
+/// Compute supports bounded storage-buffer reads/writes and invocation builtins.
+/// Workgroup memory, atomics and storage images require further lowering.
 pub fn compile_shader(
     desc: &ShaderModuleDesc,
     stage: ShaderStage,
@@ -175,7 +180,7 @@ pub fn compile_shader(
     let naga_stage = match stage {
         ShaderStage::Vertex => naga::ShaderStage::Vertex,
         ShaderStage::Fragment => naga::ShaderStage::Fragment,
-        ShaderStage::Compute => return Err(unsupported("compute stage")),
+        ShaderStage::Compute => naga::ShaderStage::Compute,
     };
     let module = parse_shader_module(desc)?;
     let info = validate_module(&module)?;
@@ -376,6 +381,7 @@ struct Compiler<'a> {
     module: &'a naga::Module,
     info: &'a naga::valid::ModuleInfo,
     stage: ShaderStage,
+    workgroup_size: [u32; 3],
     declarations: Vec<String>,
     immediates: Vec<String>,
     instructions: Vec<String>,
@@ -406,6 +412,7 @@ impl<'a> Compiler<'a> {
             module,
             info,
             stage,
+            workgroup_size: [1; 3],
             declarations: Vec::new(),
             immediates: Vec::new(),
             instructions: Vec::new(),
@@ -603,6 +610,19 @@ impl<'a> Compiler<'a> {
         Ok(result)
     }
     fn store(&mut self, pointer: &Value, value: &Value) -> Result<()> {
+        if self.stage == ShaderStage::Compute
+            && let Shape::StoragePointer {
+                inner,
+                slot,
+                metadata,
+                offset,
+            } = &pointer.shape
+        {
+            if !pointer.writable {
+                return Err(unsupported("read-only storage store"));
+            }
+            return self.compute_store(inner, *slot, *metadata, offset, value);
+        }
         if !pointer.writable || pointer.lanes.len() != value.lanes.len() {
             return Err(unsupported("store target"));
         }
@@ -747,6 +767,9 @@ impl<'a> Compiler<'a> {
             return Err(unsupported("aggregate stage location"));
         }
         let binding = binding.ok_or_else(|| unsupported("unbound stage IO"))?;
+        if self.stage == ShaderStage::Compute {
+            return self.compute_input(shape, binding, input);
+        }
         let register = match binding {
             Binding::Location {
                 location,
@@ -909,6 +932,23 @@ impl<'a> Compiler<'a> {
     }
     fn compile(mut self, index: usize) -> Result<CompiledShader> {
         let entry = &self.module.entry_points[index];
+        if self.stage == ShaderStage::Compute {
+            self.workgroup_size = entry.workgroup_size;
+            if self.workgroup_size.iter().any(|&n| n == 0 || n > 128)
+                || self
+                    .workgroup_size
+                    .iter()
+                    .map(|&n| u64::from(n))
+                    .product::<u64>()
+                    > 128
+                || self.workgroup_size[2] > 64
+                || entry.workgroup_size_overrides.is_some()
+            {
+                return Err(unsupported(
+                    "compute workgroup size (128 invocations maximum)",
+                ));
+            }
+        }
         let entry_info = self.info.get_entry_point(index);
         let uses_query_levels = self.module.functions.iter().any(|(_, function)| {
             function.expressions.iter().any(|(_, expression)| {
@@ -988,7 +1028,8 @@ impl<'a> Compiler<'a> {
                     uniform_handles.push((binding.group, binding.binding, handle));
                 }
                 AddressSpace::Storage { access }
-                    if !access.contains(naga::StorageAccess::STORE) =>
+                    if self.stage == ShaderStage::Compute
+                        || !access.contains(naga::StorageAccess::STORE) =>
                 {
                     let binding = global
                         .binding
@@ -1072,14 +1113,21 @@ impl<'a> Compiler<'a> {
             if next_constant_register > 1024 {
                 return Err(unsupported("more than 1024 inline constant registers"));
             }
-            self.declarations.push(format!("DCL SAMP[{slot}]"));
-            self.declarations
-                .push(format!("DCL SVIEW[{slot}], BUFFER, UINT"));
+            if self.stage == ShaderStage::Compute {
+                self.declarations.push(format!("DCL BUFFER[{slot}]"));
+            } else {
+                self.declarations.push(format!("DCL SAMP[{slot}]"));
+                self.declarations
+                    .push(format!("DCL SVIEW[{slot}], BUFFER, UINT"));
+            }
+            let writable = matches!(self.module.global_variables[handle].space,
+                AddressSpace::Storage { access } if access.contains(naga::StorageAccess::STORE));
             self.storage_buffers.push(StorageBufferBinding {
                 group,
                 binding,
                 slot,
                 first_register: metadata,
+                writable,
             });
             let offset = self.immediate(Literal::U32(0))?.lanes[0].clone();
             self.globals[handle.index()] = Some(Value {
@@ -1094,7 +1142,7 @@ impl<'a> Compiler<'a> {
                     offset,
                 },
                 lanes: Vec::new(),
-                writable: false,
+                writable,
                 indirect: None,
             });
         }
@@ -1190,11 +1238,18 @@ impl<'a> Compiler<'a> {
             self.declarations
                 .push(format!("DCL CONST[0..{}]", next_constant_register - 1));
         }
-        let mut tgsi = String::from(if self.stage == ShaderStage::Vertex {
-            "VERT\n"
-        } else {
-            "FRAG\nPROPERTY FS_COORD_ORIGIN UPPER_LEFT\nPROPERTY FS_COORD_PIXEL_CENTER HALF_INTEGER\n"
+        let mut tgsi = String::from(match self.stage {
+            ShaderStage::Vertex => "VERT\n",
+            ShaderStage::Fragment => {
+                "FRAG\nPROPERTY FS_COORD_ORIGIN UPPER_LEFT\nPROPERTY FS_COORD_PIXEL_CENTER HALF_INTEGER\n"
+            }
+            ShaderStage::Compute => "COMP\n",
         });
+        if self.stage == ShaderStage::Compute {
+            for (dimension, size) in ["WIDTH", "HEIGHT", "DEPTH"].iter().zip(self.workgroup_size) {
+                writeln!(&mut tgsi, "PROPERTY CS_FIXED_BLOCK_{dimension} {size}").unwrap();
+            }
+        }
         for line in &self.declarations {
             writeln!(&mut tgsi, "{line}").unwrap();
         }
@@ -1215,6 +1270,7 @@ impl<'a> Compiler<'a> {
         writeln!(&mut tgsi, "{}: END", self.instructions.len()).unwrap();
         Ok(CompiledShader {
             stage: self.stage,
+            workgroup_size: (self.stage == ShaderStage::Compute).then_some(self.workgroup_size),
             tgsi,
             uniform_buffers: self.uniforms,
             storage_buffers: self.storage_buffers,
@@ -1430,6 +1486,17 @@ impl<'a> Compiler<'a> {
                 },
                 S::Kill if self.stage == ShaderStage::Fragment => {
                     self.instructions.push("KILL".into())
+                }
+                S::Barrier(barrier) if self.stage == ShaderStage::Compute => {
+                    if barrier.intersects(naga::Barrier::WORK_GROUP | naga::Barrier::SUB_GROUP) {
+                        return Err(unsupported("workgroup/subgroup barrier"));
+                    }
+                    if barrier.contains(naga::Barrier::STORAGE) {
+                        let flags = self.immediate(Literal::U32(1))?;
+                        self.instructions
+                            .push(format!("MEMBAR {}", flags.lanes[0].src()));
+                    }
+                    self.instructions.push("BARRIER".into());
                 }
                 _ => {
                     return Err(unsupported(
@@ -2085,7 +2152,8 @@ impl<'a> Compiler<'a> {
         else {
             return Err(unsupported("storage pointer"));
         };
-        let (inner, stride, fixed) = match inner.as_ref() {
+        let parent = inner.as_ref();
+        let (inner, stride, fixed) = match parent {
             T::Struct { members, .. } => {
                 let member = constant
                     .and_then(|i| members.get(i as usize))
@@ -2123,6 +2191,9 @@ impl<'a> Compiler<'a> {
         };
         let address = self.allocate(Shape::Scalar(K::Uint), false)?;
         self.instruction("UADD", &address.lanes[0], &[offset, &delta.lanes[0]])?;
+        if self.stage == ShaderStage::Compute {
+            self.check_compute_index(parent, constant, index, stride, offset, &address.lanes[0])?;
+        }
         Ok(Value {
             shape: Shape::StoragePointer {
                 inner: Box::new(inner),
@@ -2131,7 +2202,7 @@ impl<'a> Compiler<'a> {
                 offset: address.lanes[0].clone(),
             },
             lanes: Vec::new(),
-            writable: false,
+            writable: value.writable,
             indirect: None,
         })
     }
@@ -2186,6 +2257,9 @@ impl<'a> Compiler<'a> {
         metadata: u32,
         offset: &Lane,
     ) -> Result<Value> {
+        if self.stage == ShaderStage::Compute {
+            return self.compute_load(inner, slot, metadata, offset);
+        }
         let result = self.allocate(self.shape(inner)?, false)?;
         let mut offsets = Vec::new();
         self.storage_offsets(inner, 0, &mut offsets)?;

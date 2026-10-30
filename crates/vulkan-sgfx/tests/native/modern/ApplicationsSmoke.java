@@ -10,7 +10,7 @@ import static org.lwjgl.vulkan.EXTHostQueryReset.*;
 import static org.lwjgl.vulkan.KHRDynamicRendering.*;
 import static org.lwjgl.vulkan.KHRDrawIndirectCount.*;
 public class ApplicationsSmoke {
- static boolean timing,statistics;
+ static boolean timing,statistics,compute;
  static void check(int r,String op){if(r!=VK_SUCCESS)throw new AssertionError(op+" "+r);}
  static long shader(VkDevice d,int kind,String text){
   long compiler=org.lwjgl.util.shaderc.Shaderc.shaderc_compiler_initialize();
@@ -24,6 +24,31 @@ public class ApplicationsSmoke {
   LongBuffer h=s.mallocLong(1);check(vkCreateBuffer(d,VkBufferCreateInfo.calloc(s).sType$Default().size(size).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE),null,h),"graphics buffer");long b=h.get(0);
   VkMemoryRequirements r=VkMemoryRequirements.calloc(s);vkGetBufferMemoryRequirements(d,b,r);check(vkAllocateMemory(d,VkMemoryAllocateInfo.calloc(s).sType$Default().allocationSize(r.size()).memoryTypeIndex(Integer.numberOfTrailingZeros(r.memoryTypeBits())),null,h),"graphics memory");long m=h.get(0);check(vkBindBufferMemory(d,b,m,0),"graphics bind");return new long[]{b,m};
  }}
+ static void compute(VkDevice d,VkQueue queue,long pool){
+  if(!compute){System.out.println("COMPUTE_NATIVE_UNAVAILABLE PASS graphics-only queue retained after isolated dispatch probe");return;}
+  try(MemoryStack s=MemoryStack.stackPush()){
+   LongBuffer h=s.mallocLong(1);PointerBuffer p=s.mallocPointer(1);
+   long[] data=buffer(d,64,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+   check(vkMapMemory(d,data[1],0,64,0,p),"compute initialize");ByteBuffer bytes=MemoryUtil.memByteBuffer(p.get(0),64).order(ByteOrder.LITTLE_ENDIAN);for(int i=0;i<16;i++)bytes.putInt(i*4,13);vkUnmapMemory(d,data[1]);
+   VkDescriptorSetLayoutBinding.Buffer bindings=VkDescriptorSetLayoutBinding.calloc(1,s).binding(0).descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+   check(vkCreateDescriptorSetLayout(d,VkDescriptorSetLayoutCreateInfo.calloc(s).sType$Default().pBindings(bindings),null,h),"compute descriptor layout");long setLayout=h.get(0);
+   check(vkCreatePipelineLayout(d,VkPipelineLayoutCreateInfo.calloc(s).sType$Default().pSetLayouts(s.longs(setLayout)),null,h),"compute pipeline layout");long layout=h.get(0);
+   long module=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_compute_shader,"#version 450\nlayout(local_size_x=4) in;layout(set=0,binding=0,std430) buffer Data { uint values[]; };void main(){uint i=gl_GlobalInvocationID.x;values[i]=values[i]*3u+i*7u+6699u;}");
+   VkPipelineShaderStageCreateInfo stage=VkPipelineShaderStageCreateInfo.calloc(s).sType$Default().stage(VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(s.UTF8("main"));
+   check(vkCreateComputePipelines(d,0,VkComputePipelineCreateInfo.calloc(1,s).sType$Default().stage(stage).layout(layout),null,h),"compute pipeline");long pipeline=h.get(0);
+   check(vkCreateDescriptorPool(d,VkDescriptorPoolCreateInfo.calloc(s).sType$Default().maxSets(1).pPoolSizes(VkDescriptorPoolSize.calloc(1,s).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1)),null,h),"compute descriptor pool");long descriptorPool=h.get(0);
+   check(vkAllocateDescriptorSets(d,VkDescriptorSetAllocateInfo.calloc(s).sType$Default().descriptorPool(descriptorPool).pSetLayouts(s.longs(setLayout)),h),"compute descriptor set");long set=h.get(0);
+   vkUpdateDescriptorSets(d,VkWriteDescriptorSet.calloc(1,s).sType$Default().dstSet(set).dstBinding(0).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1).pBufferInfo(VkDescriptorBufferInfo.calloc(1,s).buffer(data[0]).offset(16).range(32)),null);
+   check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"compute commands");VkCommandBuffer cmd=new VkCommandBuffer(p.get(0),d);
+   check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"compute begin");vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,layout,0,s.longs(set),null);vkCmdDispatch(cmd,2,1,1);
+   vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,VkMemoryBarrier.calloc(1,s).sType$Default().srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT).dstAccessMask(VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT),null,null);vkCmdDispatch(cmd,2,1,1);
+   check(vkEndCommandBuffer(cmd),"compute end");check(vkQueueSubmit(queue,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(cmd)),0),"compute submit");check(vkQueueWaitIdle(queue),"compute idle");
+   check(vkMapMemory(d,data[1],0,64,0,p),"compute readback");bytes=MemoryUtil.memByteBuffer(p.get(0),64).order(ByteOrder.LITTLE_ENDIAN);
+   for(int i=0;i<16;i++){int expected=i>=4&&i<12?(13*3+(i-4)*7+6699)*3+(i-4)*7+6699:13;if(bytes.getInt(i*4)!=expected)throw new AssertionError("compute GPU word "+i+" "+bytes.getInt(i*4)+" expected="+expected);}
+   vkUnmapMemory(d,data[1]);vkFreeCommandBuffers(d,pool,cmd);vkDestroyDescriptorPool(d,descriptorPool,null);vkDestroyPipeline(d,pipeline,null);vkDestroyShaderModule(d,module,null);vkDestroyPipelineLayout(d,layout,null);vkDestroyDescriptorSetLayout(d,setLayout,null);vkDestroyBuffer(d,data[0],null);vkFreeMemory(d,data[1],null);
+   System.out.println("COMPUTE_NATIVE PASS native SSBO GPU read-modify-write dispatches=2 offset=16 bytes=32 sentinels=8");
+  }
+ }
  static void graphics(VkDevice d,VkQueue queue,long pool){try(MemoryStack s=MemoryStack.stackPush()){
   LongBuffer h=s.mallocLong(1);PointerBuffer p=s.mallocPointer(1);
   long vs=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_vertex_shader,"#version 450\nlayout(location=0) in vec2 pos; void main(){ gl_Position=vec4(pos,0,1); }");
@@ -95,6 +120,8 @@ public class ApplicationsSmoke {
    if(!support.synchronization2())throw new AssertionError("sync2 query");
    VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeature=VkPhysicalDeviceTimelineSemaphoreFeatures.calloc(s).sType$Default().timelineSemaphore(true);
    vkGetPhysicalDeviceQueueFamilyProperties(physical,n,null);VkQueueFamilyProperties.Buffer families=VkQueueFamilyProperties.calloc(n.get(0),s);vkGetPhysicalDeviceQueueFamilyProperties(physical,n,families);timing=families.get(0).timestampValidBits()!=0;
+   compute=(families.get(0).queueFlags()&VK_QUEUE_COMPUTE_BIT)!=0;
+   VkPhysicalDeviceProperties properties=VkPhysicalDeviceProperties.calloc(s);vkGetPhysicalDeviceProperties(physical,properties);if(compute!=(properties.limits().maxComputeWorkGroupInvocations()>0))throw new AssertionError("compute queue/limit mismatch");
    VkPhysicalDeviceFeatures hardware=VkPhysicalDeviceFeatures.calloc(s);vkGetPhysicalDeviceFeatures(physical,hardware);statistics=hardware.pipelineStatisticsQuery();
    VkPhysicalDeviceHostQueryResetFeatures hostReset=VkPhysicalDeviceHostQueryResetFeatures.calloc(s).sType$Default().hostQueryReset(true);timelineFeature.pNext(hostReset.address());support.pNext(timelineFeature.address());
    VkDeviceQueueCreateInfo.Buffer queues=VkDeviceQueueCreateInfo.calloc(1,s).sType$Default().queueFamilyIndex(0).pQueuePriorities(s.floats(1));
@@ -144,7 +171,7 @@ public class ApplicationsSmoke {
    vkResetQueryPoolEXT(device,query,0,1);if(vkGetQueryPoolResults(device,query,0,1,stamps,16,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)!=VK_NOT_READY)throw new AssertionError("host reset availability");
    vkDestroyQueryPool(device,query,null);
    }else System.out.println("QUERY_NATIVE_UNAVAILABLE PASS timestampValidBits=0 query pool rejected");
-   graphics(device,queue,pool);
+   compute(device,queue,pool);graphics(device,queue,pool);
    vkDestroyFence(device,fence,null);vkDestroySemaphore(device,binary,null);vkDestroySemaphore(device,timeline,null);vkDestroyEvent(device,event,null);vkDestroyCommandPool(device,pool,null);
    for(int i=0;i<2;i++){vkDestroyBuffer(device,buffers[i],null);vkFreeMemory(device,memories[i],null);}
    vkDestroyDevice(device,null);vkDestroyInstance(instance,null);VK.destroy();

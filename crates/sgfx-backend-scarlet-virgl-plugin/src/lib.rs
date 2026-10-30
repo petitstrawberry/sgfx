@@ -111,6 +111,11 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
             .and_then(|c| c.timestamp_ns())
             .is_ok();
         let flags = (if timing { abi::GPU_TIMESTAMPS } else { 0 })
+            | if device.supports_compute() {
+                abi::COMPUTE_BUFFERS
+            } else {
+                0
+            }
             | if c.supports_rendering() {
                 abi::RENDERING
             } else {

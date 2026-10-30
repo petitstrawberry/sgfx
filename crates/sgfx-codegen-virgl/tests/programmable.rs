@@ -797,9 +797,9 @@ fn bounded_dynamic_reads_compile_for_fullscreen_vertex_arrays_and_components() {
 fn unsupported_shaders_fail_instead_of_emitting_a_compatibility_shader() {
     let cases = [
         (
-            "@compute @workgroup_size(1) fn main() {}",
+            "@compute @workgroup_size(256) fn main() {}",
             ShaderStage::Compute,
-            "compute",
+            "workgroup size",
         ),
         (
             "@group(0) @binding(0) var<storage,read_write> x:array<vec4<f32>>; @vertex fn main()->@builtin(position) vec4<f32>{x[0]=vec4<f32>(1.0); return x[0];}",

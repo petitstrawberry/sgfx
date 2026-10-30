@@ -83,6 +83,9 @@ impl Drop for Owner {
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities(u64);
 impl Capabilities {
+    pub fn supports_compute_buffers(self) -> bool {
+        self.0 & abi::COMPUTE_BUFFERS != 0
+    }
     pub fn supports_read_only_storage_buffers(self) -> bool {
         self.0 & abi::READ_ONLY_STORAGE_BUFFERS != 0
     }

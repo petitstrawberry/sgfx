@@ -60,6 +60,7 @@ jobs:
           cargo test --locked -p sgfx-core --features backend-abi
           cargo test --locked -p sgfx-backend-abi -p sgfx-backend-loader
           cargo test --locked -p sgfx-codegen-virgl
+          cargo test --locked -p sgfx-codegen-virgl --features programmable
           cargo test --locked -p sgfx-backend-wgpu
           cargo test --locked -p sgfx
           cargo test --locked -p vulkan-sgfx
@@ -77,6 +78,7 @@ jobs:
           cargo-clippy clippy --locked --manifest-path crates/sgfx-core/Cargo.toml --all-targets --no-deps -- -D warnings
           cargo-clippy clippy --locked -p sgfx-core -p sgfx-backend-loader --features sgfx-core/backend-abi --all-targets --no-deps -- -D warnings
           cargo-clippy clippy --locked -p sgfx-codegen-virgl -p sgfx-backend-wgpu -p sgfx -p vulkan-sgfx --all-targets --no-deps -- -D warnings
+          cargo-clippy clippy --locked -p sgfx-codegen-virgl --features programmable --all-targets --no-deps -- -D warnings
       - name: Test and lint facade feature boundaries
         run: |
           cargo test --locked -p sgfx --no-default-features
