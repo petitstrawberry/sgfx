@@ -123,11 +123,16 @@ public class ApplicationsSmoke {
    compute=(families.get(0).queueFlags()&VK_QUEUE_COMPUTE_BIT)!=0;
    VkPhysicalDeviceProperties properties=VkPhysicalDeviceProperties.calloc(s);vkGetPhysicalDeviceProperties(physical,properties);if(compute!=(properties.limits().maxComputeWorkGroupInvocations()>0))throw new AssertionError("compute queue/limit mismatch");
    VkPhysicalDeviceFeatures hardware=VkPhysicalDeviceFeatures.calloc(s);vkGetPhysicalDeviceFeatures(physical,hardware);statistics=hardware.pipelineStatisticsQuery();
-   VkPhysicalDeviceHostQueryResetFeatures hostReset=VkPhysicalDeviceHostQueryResetFeatures.calloc(s).sType$Default().hostQueryReset(true);timelineFeature.pNext(hostReset.address());support.pNext(timelineFeature.address());
+   VkPhysicalDeviceHostQueryResetFeatures hostReset=VkPhysicalDeviceHostQueryResetFeatures.calloc(s).sType$Default();timelineFeature.pNext(hostReset.address());
+   VkPhysicalDeviceVulkan12Features promoted=VkPhysicalDeviceVulkan12Features.calloc(s).sType$Default().bufferDeviceAddress(true).runtimeDescriptorArray(true);promoted.pNext(timelineFeature.address());
+   VK11.vkGetPhysicalDeviceFeatures2(physical,VkPhysicalDeviceFeatures2.calloc(s).sType$Default().pNext(promoted.address()));
+   if(!promoted.timelineSemaphore()||!promoted.hostQueryReset()||!promoted.drawIndirectCount()||promoted.timelineSemaphore()!=timelineFeature.timelineSemaphore()||promoted.hostQueryReset()!=hostReset.hostQueryReset()||promoted.bufferDeviceAddress()||promoted.runtimeDescriptorArray())throw new AssertionError("promoted/extension feature agreement timeline="+promoted.timelineSemaphore()+"/"+timelineFeature.timelineSemaphore()+" reset="+promoted.hostQueryReset()+"/"+hostReset.hostQueryReset()+" indirect="+promoted.drawIndirectCount()+" bda="+promoted.bufferDeviceAddress()+" arrays="+promoted.runtimeDescriptorArray());
+   promoted.pNext(0);support.pNext(promoted.address());
    VkDeviceQueueCreateInfo.Buffer queues=VkDeviceQueueCreateInfo.calloc(1,s).sType$Default().queueFamilyIndex(0).pQueuePriorities(s.floats(1));
-   VkPhysicalDeviceDynamicRenderingFeatures rendering=VkPhysicalDeviceDynamicRenderingFeatures.calloc(s).sType$Default().dynamicRendering(true);hostReset.pNext(rendering.address());
+   VkPhysicalDeviceDynamicRenderingFeatures rendering=VkPhysicalDeviceDynamicRenderingFeatures.calloc(s).sType$Default().dynamicRendering(true);promoted.pNext(rendering.address());
    VkDeviceCreateInfo di=VkDeviceCreateInfo.calloc(s).sType$Default().pNext(support.address()).pQueueCreateInfos(queues).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(s).multiDrawIndirect(true).drawIndirectFirstInstance(true).pipelineStatisticsQuery(statistics)).ppEnabledExtensionNames(s.pointers(s.UTF8(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME),s.UTF8(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME),s.UTF8(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME),s.UTF8(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME),s.UTF8(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME)));
    check(vkCreateDevice(physical,di,null,p),"device");VkDevice device=new VkDevice(p.get(0),physical,di);vkGetDeviceQueue(device,0,0,p);VkQueue queue=new VkQueue(p.get(0),device);
+   System.out.println("CORE12_FEATURES_NATIVE PASS aggregate enablement aliases agree unsupported bits cleared");
    long[] buffers=new long[2],memories=new long[2];
    for(int i=0;i<2;i++){
     check(vkCreateBuffer(device,VkBufferCreateInfo.calloc(s).sType$Default().size(256).usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),null,h),"buffer");buffers[i]=h.get(0);

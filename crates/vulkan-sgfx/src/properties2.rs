@@ -121,6 +121,11 @@ unsafe extern "system" fn features(
                     PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                     PhysicalDeviceVulkan11Features
                 );
+                if tag == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES {
+                    let value = &mut *node.cast::<vk::PhysicalDeviceVulkan12Features<'_>>();
+                    *value = core12_features(physical);
+                    value.p_next = next.cast();
+                }
                 disabled!(
                     PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
                     PhysicalDevice16BitStorageFeatures
@@ -151,6 +156,56 @@ unsafe extern "system" fn features(
             }
         }
     }
+}
+
+/// Aggregate queries must report the same implementation as the individual
+/// promoted feature records. Unimplemented fields are explicitly cleared.
+pub(crate) fn core12_features(
+    physical: vk::PhysicalDevice,
+) -> vk::PhysicalDeviceVulkan12Features<'static> {
+    let adapter = crate::instance::physical_adapter(physical);
+    vk::PhysicalDeviceVulkan12Features::default()
+        .timeline_semaphore(adapter.is_some())
+        .imageless_framebuffer(adapter.is_some())
+        .host_query_reset(
+            adapter
+                .as_ref()
+                .is_some_and(|a| a.supports_timestamps() || a.query_support() != 0),
+        )
+        .draw_indirect_count(
+            adapter
+                .as_ref()
+                .is_some_and(|a| a.capabilities().supports_programmable_graphics()),
+        )
+}
+
+pub(crate) fn core12_request_supported(f: &vk::PhysicalDeviceVulkan12Features<'_>) -> bool {
+    let mut unsupported = *f;
+    unsupported.timeline_semaphore = vk::FALSE;
+    unsupported.host_query_reset = vk::FALSE;
+    unsupported.draw_indirect_count = vk::FALSE;
+    unsupported.imageless_framebuffer = vk::FALSE;
+    // All members from samplerMirrorClampToEdge to subgroupBroadcastDynamicId
+    // are consecutive VkBool32s; exclude the header and trailing C padding.
+    let count = (std::mem::offset_of!(
+        vk::PhysicalDeviceVulkan12Features<'_>,
+        subgroup_broadcast_dynamic_id
+    ) - std::mem::offset_of!(
+        vk::PhysicalDeviceVulkan12Features<'_>,
+        sampler_mirror_clamp_to_edge
+    )) / 4
+        + 1;
+    unsafe { std::slice::from_raw_parts(&unsupported.sampler_mirror_clamp_to_edge, count) }
+        .iter()
+        .all(|&v| v == vk::FALSE)
+        && [
+            f.timeline_semaphore,
+            f.host_query_reset,
+            f.draw_indirect_count,
+            f.imageless_framebuffer,
+        ]
+        .into_iter()
+        .all(|v| matches!(v, vk::FALSE | vk::TRUE))
 }
 unsafe extern "system" fn memory(
     physical: vk::PhysicalDevice,
@@ -375,6 +430,46 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn core12_query_clears_unsupported_fields_without_breaking_chain() {
+        unsafe {
+            let mut tail = vk::PhysicalDeviceMultiviewFeatures::default().multiview(true);
+            let mut aggregate = vk::PhysicalDeviceVulkan12Features::default()
+                .timeline_semaphore(true)
+                .host_query_reset(true)
+                .buffer_device_address(true)
+                .descriptor_indexing(true)
+                .imageless_framebuffer(true)
+                .draw_indirect_count(true);
+            let next = (&mut tail as *mut vk::PhysicalDeviceMultiviewFeatures<'_>).cast();
+            let mut out = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut tail)
+                .push_next(&mut aggregate);
+            features(vk::PhysicalDevice::null(), &mut out);
+            assert_eq!(aggregate.p_next, next);
+            assert_eq!(aggregate.timeline_semaphore, vk::FALSE);
+            assert_eq!(aggregate.host_query_reset, vk::FALSE);
+            assert_eq!(aggregate.draw_indirect_count, vk::FALSE);
+            assert_eq!(aggregate.imageless_framebuffer, vk::FALSE);
+            assert_eq!(aggregate.buffer_device_address, vk::FALSE);
+            assert_eq!(aggregate.descriptor_indexing, vk::FALSE);
+            assert_eq!(tail.multiview, vk::FALSE);
+        }
+    }
+    #[test]
+    fn core12_requests_reject_unsupported_and_malformed_feature_bits() {
+        let mut f = vk::PhysicalDeviceVulkan12Features::default()
+            .timeline_semaphore(true)
+            .host_query_reset(true)
+            .draw_indirect_count(true)
+            .imageless_framebuffer(true);
+        assert!(core12_request_supported(&f));
+        f.buffer_device_address = vk::TRUE;
+        assert!(!core12_request_supported(&f));
+        f.buffer_device_address = vk::FALSE;
+        f.timeline_semaphore = 2;
+        assert!(!core12_request_supported(&f));
+    }
     #[test]
     fn unsupported_core11_features_are_zeroed_and_keep_the_chain() {
         unsafe {

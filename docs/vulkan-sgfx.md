@@ -162,6 +162,13 @@ wait semaphores and signals completion semaphores, and queue present consumes
 its waits. `VK_KHR_timeline_semaphore` supports host signals, counter queries,
 waits and queue values; queue signals become visible only after GPU retirement.
 
+`VkPhysicalDeviceVulkan12Features` queries report the same timeline semaphore,
+host query reset, indirect-count drawing and imageless framebuffer capabilities
+as their individual feature records. Device creation accepts those aggregate
+requests and routes timeline/query enablement to the existing execution paths;
+unsupported aggregate fields are cleared on query and rejected on enablement.
+This query/enablement support does not change the advertised Vulkan 1.1 API.
+
 `VK_KHR_synchronization2` adds explicitly enabled `synchronization2` features,
 64-bit stage/access scopes, `vkCmdPipelineBarrier2KHR`, `vkQueueSubmit2KHR` and
 device event set/wait/reset commands. Split transfer/vertex-input/shader scopes,

@@ -661,6 +661,11 @@ unsafe fn device_chain_supported(
                 .into_iter()
                 .all(|value| value == vk::FALSE)
             }
+            vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => {
+                crate::properties2::core12_request_supported(
+                    &*next.cast::<vk::PhysicalDeviceVulkan12Features<'_>>(),
+                )
+            }
             vk::StructureType::PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES => {
                 let f = &*next.cast::<vk::PhysicalDevice16BitStorageFeatures<'_>>();
                 [
@@ -786,6 +791,7 @@ pub(crate) unsafe extern "system" fn create_device(
     let mut synchronization2_enabled = false;
     let mut dynamic_rendering_enabled = false;
     let mut host_query_reset_enabled = false;
+    let mut core12 = false;
     let timestamps = adapter.supports_timestamps();
     let query_support = adapter.query_support();
     let mut enabled_core = info
@@ -795,6 +801,19 @@ pub(crate) unsafe extern "system" fn create_device(
         .unwrap_or_default();
     let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
     while let Some(base) = node.as_ref() {
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES {
+            let features = &*node.cast::<vk::PhysicalDeviceVulkan12Features<'_>>();
+            let supported = crate::properties2::core12_features(physical);
+            if (features.host_query_reset != 0 && supported.host_query_reset == 0)
+                || (features.timeline_semaphore != 0 && supported.timeline_semaphore == 0)
+                || (features.draw_indirect_count != 0 && supported.draw_indirect_count == 0)
+            {
+                return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+            }
+            host_query_reset_enabled = features.host_query_reset == vk::TRUE;
+            timeline_enabled = features.timeline_semaphore == vk::TRUE;
+            core12 = true;
+        }
         if base.s_type == vk::StructureType::PHYSICAL_DEVICE_FEATURES_2 {
             enabled_core = (*node.cast::<vk::PhysicalDeviceFeatures2<'_>>()).features;
         }
@@ -821,6 +840,7 @@ pub(crate) unsafe extern "system" fn create_device(
         node = base.p_next;
     }
     if timeline_enabled
+        && !core12
         && !slice(
             info.pp_enabled_extension_names,
             info.enabled_extension_count,
@@ -855,13 +875,14 @@ pub(crate) unsafe extern "system" fn create_device(
     }
     if host_query_reset_enabled
         && ((!timestamps && query_support == 0)
-            || !slice(
-                info.pp_enabled_extension_names,
-                info.enabled_extension_count,
-            )
-            .unwrap()
-            .iter()
-            .any(|&n| CStr::from_ptr(n) == vk::EXT_HOST_QUERY_RESET_NAME))
+            || (!core12
+                && !slice(
+                    info.pp_enabled_extension_names,
+                    info.enabled_extension_count,
+                )
+                .unwrap()
+                .iter()
+                .any(|&n| CStr::from_ptr(n) == vk::EXT_HOST_QUERY_RESET_NAME)))
     {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }

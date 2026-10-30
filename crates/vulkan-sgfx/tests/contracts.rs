@@ -115,10 +115,32 @@ impl Context {
                 .queue_priorities(&priorities)];
             let mut sync =
                 vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-            let mut timeline =
-                vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
-            let mut host_queries =
-                vk::PhysicalDeviceHostQueryResetFeatures::default().host_query_reset(true);
+            let mut aggregate = vk::PhysicalDeviceVulkan12Features::default();
+            if synchronization2 {
+                let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+                let mut host_queries = vk::PhysicalDeviceHostQueryResetFeatures::default();
+                let mut queried = vk::PhysicalDeviceFeatures2::default()
+                    .push_next(&mut aggregate)
+                    .push_next(&mut timeline)
+                    .push_next(&mut host_queries);
+                let query: vk::PFN_vkGetPhysicalDeviceFeatures2 = std::mem::transmute(
+                    entry
+                        .get_instance_proc_addr(
+                            instance.handle(),
+                            c"vkGetPhysicalDeviceFeatures2KHR".as_ptr(),
+                        )
+                        .unwrap(),
+                );
+                query(physical, &mut queried);
+                assert_eq!(aggregate.timeline_semaphore, timeline.timeline_semaphore);
+                assert_eq!(aggregate.host_query_reset, host_queries.host_query_reset);
+                assert_eq!(aggregate.buffer_device_address, vk::FALSE);
+                assert_eq!(aggregate.runtime_descriptor_array, vk::FALSE);
+                // Enable only the implemented promoted features. The query chain
+                // above also exercises alias agreement; device creation uses only
+                // the aggregate record, without the former extension names.
+                aggregate.p_next = std::ptr::null_mut();
+            }
             let mut rendering =
                 vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
             let supported = instance.get_physical_device_features(physical);
@@ -128,11 +150,9 @@ impl Context {
                 .multi_draw_indirect(true)
                 .draw_indirect_first_instance(true);
             let extensions = [
-                vk::EXT_HOST_QUERY_RESET_NAME.as_ptr(),
                 vk::KHR_DYNAMIC_RENDERING_NAME.as_ptr(),
                 vk::KHR_DRAW_INDIRECT_COUNT_NAME.as_ptr(),
                 vk::KHR_SYNCHRONIZATION2_NAME.as_ptr(),
-                vk::KHR_TIMELINE_SEMAPHORE_NAME.as_ptr(),
             ];
             let mut info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
             if synchronization2 {
@@ -140,9 +160,8 @@ impl Context {
                     .enabled_features(&indirect_features)
                     .enabled_extension_names(&extensions)
                     .push_next(&mut rendering)
-                    .push_next(&mut host_queries)
                     .push_next(&mut sync)
-                    .push_next(&mut timeline);
+                    .push_next(&mut aggregate);
             }
             let device = instance
                 .create_device(physical, &info, None)
