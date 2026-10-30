@@ -2,8 +2,9 @@
 use ash::vk::{self, Handle};
 use sgfx::ir;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher},
     ffi::{CStr, c_void},
+    hash::{Hash, Hasher},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice,
 };
@@ -170,6 +171,104 @@ fn descriptor_binding_maps(
     }
     Ok((binding_map, reverse_binding_map))
 }
+
+fn texture_format_key(format: ir::TextureFormat) -> u8 {
+    match format {
+        ir::TextureFormat::Bgra8Unorm => 0,
+        ir::TextureFormat::Bgra8UnormSrgb => 1,
+        ir::TextureFormat::Rgba8Unorm => 2,
+        ir::TextureFormat::Rgba8UnormSrgb => 3,
+        ir::TextureFormat::R8Unorm => 4,
+        ir::TextureFormat::Rg8Unorm => 5,
+        ir::TextureFormat::Nv12 => 6,
+        ir::TextureFormat::Depth32Float => 7,
+        ir::TextureFormat::Rgba16Float => 8,
+        ir::TextureFormat::Rgba32Float => 9,
+    }
+}
+
+fn texture_view_dimension_key(dimension: ir::TextureViewDimension) -> u8 {
+    match dimension {
+        ir::TextureViewDimension::D1 => 0,
+        ir::TextureViewDimension::D1Array => 1,
+        ir::TextureViewDimension::D2 => 2,
+        ir::TextureViewDimension::D2Array => 3,
+        ir::TextureViewDimension::Cube => 4,
+    }
+}
+
+fn binding_type_key(ty: &ir::BindingType) -> u8 {
+    match ty {
+        ir::BindingType::UniformBuffer => 0,
+        ir::BindingType::StorageBuffer { .. } => 1,
+        ir::BindingType::SampledTexture => 2,
+        ir::BindingType::SampledTextureView { .. } => 3,
+        ir::BindingType::Sampler => 4,
+        ir::BindingType::ComparisonSampler => 5,
+        ir::BindingType::StorageTexture { .. } => 6,
+    }
+}
+
+/// Hash only immutable descriptor identity fields. Equality remains the final
+/// authority for cache hits, so this hash may omit fields when that is cheaper.
+fn bind_group_cache_hash(desc: &ir::BindGroupDesc) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    desc.layout().entries().len().hash(&mut hasher);
+    for entry in desc.layout().entries() {
+        entry.binding().hash(&mut hasher);
+        entry.visibility().bits().hash(&mut hasher);
+        binding_type_key(&entry.ty()).hash(&mut hasher);
+        match entry.ty() {
+            ir::BindingType::StorageBuffer { read_only } => read_only.hash(&mut hasher),
+            ir::BindingType::SampledTextureView { dimension, depth } => {
+                texture_view_dimension_key(dimension).hash(&mut hasher);
+                depth.hash(&mut hasher);
+            }
+            ir::BindingType::StorageTexture { format, .. } => {
+                texture_format_key(format).hash(&mut hasher);
+            }
+            ir::BindingType::UniformBuffer
+            | ir::BindingType::SampledTexture
+            | ir::BindingType::Sampler
+            | ir::BindingType::ComparisonSampler => {}
+        }
+    }
+    desc.entries().len().hash(&mut hasher);
+    for entry in desc.entries() {
+        entry.binding().hash(&mut hasher);
+        match entry.resource() {
+            ir::BindingResource::Buffer {
+                buffer,
+                offset,
+                size,
+            } => {
+                0u8.hash(&mut hasher);
+                buffer.hash(&mut hasher);
+                offset.hash(&mut hasher);
+                size.hash(&mut hasher);
+            }
+            ir::BindingResource::Texture(texture) => {
+                1u8.hash(&mut hasher);
+                texture.hash(&mut hasher);
+            }
+            ir::BindingResource::TextureView { texture, view } => {
+                2u8.hash(&mut hasher);
+                texture.hash(&mut hasher);
+                texture_format_key(view.format()).hash(&mut hasher);
+                texture_view_dimension_key(view.dimension()).hash(&mut hasher);
+                view.base_mip_level().hash(&mut hasher);
+                view.mip_level_count().hash(&mut hasher);
+                view.base_array_layer().hash(&mut hasher);
+                view.array_layer_count().hash(&mut hasher);
+            }
+            ir::BindingResource::Sampler(sampler) => {
+                3u8.hash(&mut hasher);
+                sampler.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
 impl DescriptorSet {
     #[cfg(test)]
     pub(crate) fn new(
@@ -332,6 +431,7 @@ pub(crate) struct Resources {
     pub descriptor_pools: HashMap<vk::DescriptorPool, DescriptorPool>,
     pub descriptor_sets: HashMap<vk::DescriptorSet, DescriptorSet>,
     bind_group_cache: Vec<(ir::BindGroupDesc, ir::BindGroupId)>,
+    bind_group_index: HashMap<u64, Vec<usize>>,
     pub pipeline_caches: HashMap<vk::PipelineCache, Vec<u8>>,
     pub pipelines: HashMap<vk::Pipeline, Pipeline>,
     graphics_swizzles: HashMap<(vk::Pipeline, ShaderViews), ir::ProgrammableRenderPipelineId>,
@@ -589,6 +689,7 @@ impl Resources {
         self.depth_only_fragment = None;
         self.uploaded_unmapped_buffers.clear();
         self.bind_group_cache.clear();
+        self.bind_group_index.clear();
         self.graphics_swizzles.clear();
         self.compute_swizzles.clear();
         self.orphaned_shader_modules.clear();
@@ -609,6 +710,7 @@ impl Resources {
         for set in self.descriptor_sets.values_mut() {
             set.cached_group = None;
         }
+        self.bind_group_index.clear();
         let mut result = Ok(());
         let mut retired = Vec::new();
         for (desc, id) in std::mem::take(&mut self.bind_group_cache) {
@@ -632,6 +734,7 @@ impl Resources {
                 result = Err(error);
             }
         }
+        self.rebuild_bind_group_index();
         result
     }
 
@@ -649,8 +752,31 @@ impl Resources {
         let layout = ir::BindGroupLayoutDesc::new(Vec::new()).map_err(failure)?;
         let desc = ir::BindGroupDesc::new(table, layout, Vec::new()).map_err(failure)?;
         let id = table.define_bind_group(desc.clone()).map_err(failure)?.id();
-        self.bind_group_cache.push((desc, id));
+        self.push_bind_group_cache(desc, id);
         Ok(id)
+    }
+
+    fn push_bind_group_cache(&mut self, desc: ir::BindGroupDesc, id: ir::BindGroupId) {
+        let index = self.bind_group_cache.len();
+        let key = bind_group_cache_hash(&desc);
+        self.bind_group_cache.push((desc, id));
+        self.bind_group_index.entry(key).or_default().push(index);
+    }
+
+    fn rebuild_bind_group_index(&mut self) {
+        self.bind_group_index.clear();
+        for (index, (desc, _)) in self.bind_group_cache.iter().enumerate() {
+            let key = bind_group_cache_hash(desc);
+            self.bind_group_index.entry(key).or_default().push(index);
+        }
+    }
+
+    fn cached_bind_group(&self, desc: &ir::BindGroupDesc) -> Option<ir::BindGroupId> {
+        let key = bind_group_cache_hash(desc);
+        self.bind_group_index.get(&key)?.iter().find_map(|&index| {
+            let (cached, id) = self.bind_group_cache.get(index)?;
+            (cached == desc).then_some(*id)
+        })
     }
 
     #[cfg(test)]
@@ -830,15 +956,11 @@ impl Resources {
                 return Ok(id);
             }
         }
-        let id = if let Some((_, id)) = self
-            .bind_group_cache
-            .iter()
-            .find(|(cached, _)| *cached == desc)
-        {
-            *id
+        let id = if let Some(id) = self.cached_bind_group(&desc) {
+            id
         } else {
             let id = table.define_bind_group(desc.clone()).map_err(failure)?.id();
-            self.bind_group_cache.push((desc, id));
+            self.push_bind_group_cache(desc, id);
             id
         };
         if dynamic_offsets.is_empty() {
@@ -3828,6 +3950,177 @@ mod tests {
     }
 
     #[test]
+    fn bind_group_hash_index_reuses_only_equal_descriptors() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let vertex_layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let fragment_layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::FRAGMENT,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let descriptor = |layout: &ir::BindGroupLayoutDesc, offset| {
+            ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap()
+        };
+
+        let original = descriptor(&vertex_layout, 0);
+        let id = table.define_bind_group(original.clone()).unwrap().id();
+        resources.push_bind_group_cache(original.clone(), id);
+
+        assert_eq!(resources.cached_bind_group(&original), Some(id));
+        assert_eq!(
+            resources.cached_bind_group(&descriptor(&vertex_layout, 16)),
+            None
+        );
+        assert_eq!(
+            resources.cached_bind_group(&descriptor(&fragment_layout, 0)),
+            None
+        );
+        assert_eq!(resources.bind_group_cache.len(), 1);
+    }
+
+    #[test]
+    fn bind_group_hash_collision_requires_full_descriptor_equality() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let descriptor = |offset| {
+            ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap()
+        };
+        let wanted = descriptor(0);
+        let wanted_id = table.define_bind_group(wanted.clone()).unwrap().id();
+        let colliding = descriptor(16);
+        let colliding_id = table.define_bind_group(colliding.clone()).unwrap().id();
+        let wanted_key = bind_group_cache_hash(&wanted);
+
+        let colliding_index = resources.bind_group_cache.len();
+        resources.bind_group_cache.push((colliding, colliding_id));
+        resources
+            .bind_group_index
+            .entry(wanted_key)
+            .or_default()
+            .push(colliding_index);
+        resources.push_bind_group_cache(wanted.clone(), wanted_id);
+
+        assert_eq!(resources.cached_bind_group(&wanted), Some(wanted_id));
+    }
+
+    #[test]
+    fn bind_group_index_is_rebuilt_after_release_and_cleared_with_epoch_cache() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let descriptor = |offset| {
+            ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap()
+        };
+        let released = descriptor(0);
+        let released_id = table.define_bind_group(released.clone()).unwrap().id();
+        let retained = descriptor(16);
+        let retained_id = table.define_bind_group(retained.clone()).unwrap().id();
+        resources.push_bind_group_cache(released.clone(), released_id);
+        resources.push_bind_group_cache(retained.clone(), retained_id);
+        let empty = resources.empty_bind_group(&table).unwrap();
+
+        let error = resources
+            .release_descriptor_groups(&table, |id| {
+                if id == retained_id {
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error, vk::Result::ERROR_DEVICE_LOST);
+        assert_eq!(resources.cached_bind_group(&released), None);
+        assert_eq!(resources.cached_bind_group(&retained), Some(retained_id));
+        assert_eq!(
+            resources.cached_bind_group(&descriptor(16)),
+            Some(retained_id)
+        );
+        assert!(
+            resources
+                .bind_group_cache
+                .iter()
+                .any(|(_, id)| *id == empty)
+        );
+        assert!(
+            resources
+                .bind_group_index
+                .values()
+                .flatten()
+                .all(|&index| index < resources.bind_group_cache.len())
+        );
+
+        resources.clear_ir_cache();
+        assert!(resources.bind_group_cache.is_empty());
+        assert!(resources.bind_group_index.is_empty());
+    }
+
+    #[test]
     fn descriptor_retirement_error_preserves_failed_groups_and_releases_others() {
         let table = ir::ResourceTable::new();
         let mut resources = Resources::new();
@@ -3856,7 +4149,7 @@ mod tests {
             )
             .unwrap();
             let id = table.define_bind_group(desc.clone()).unwrap().id();
-            resources.bind_group_cache.push((desc, id));
+            resources.push_bind_group_cache(desc, id);
             id
         });
         let empty = resources.empty_bind_group(&table).unwrap();
