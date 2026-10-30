@@ -233,6 +233,7 @@ pub(crate) unsafe fn specialization(
 
 #[derive(Default)]
 pub(crate) struct Resources {
+    pub mip_render_targets: HashMap<(vk::Format, u32, u32, usize), ir::TextureId>,
     pub depth_only_fragment: Option<ir::ShaderModuleId>,
     pub depth_clear_colors: HashMap<(u32, u32), ir::TextureId>,
     pub image_view_formats: HashMap<vk::Image, Vec<vk::Format>>,
@@ -484,6 +485,7 @@ impl Resources {
 
     /// Forget every cached identity before swapping to a fresh IR table.
     pub(crate) fn clear_ir_cache(&mut self) {
+        self.mip_render_targets.clear();
         self.depth_clear_colors.clear();
         self.depth_only_fragment = None;
         self.uploaded_unmapped_buffers.clear();
@@ -831,9 +833,7 @@ pub(crate) fn backend_failure(error: crate::runtime::BackendError) -> vk::Result
     crate::runtime::backend_failure(error)
 }
 pub(crate) fn failure(error: ir::Error) -> vk::Result {
-    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-        eprintln!("[SGFX Vulkan] IR failure: {error:?}");
-    }
+    eprintln!("[SGFX Vulkan] IR failure: {error:?}");
     match error {
         ir::Error::OutOfMemory => vk::Result::ERROR_OUT_OF_HOST_MEMORY,
         ir::Error::ResourceLimitExceeded => vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,

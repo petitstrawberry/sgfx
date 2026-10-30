@@ -2248,13 +2248,6 @@ impl RecordedCommand {
                                 *destination
                             })?,
                         });
-                    } else if !*full_scope
-                        && !(vk::AccessFlags::TRANSFER_WRITE
-                            | vk::AccessFlags::HOST_WRITE
-                            | vk::AccessFlags::MEMORY_WRITE)
-                            .contains(*source)
-                    {
-                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
                 }
                 for (
@@ -2412,7 +2405,10 @@ impl RecordedCommand {
                     }
                     rec.used_images.push(*image);
                 }
-                if *full_scope {
+                // Global dependencies cover attachment writes as well as buffers.
+                // Retire preceding GPU work at this control point for legacy
+                // memory barriers, just as for synchronization2 dependencies.
+                if *full_scope || !memory.is_empty() {
                     rec.synchronizations.push(synchronization2::Insertion {
                         position: rec.ops.len(),
                         order: rec.order,
@@ -4223,11 +4219,13 @@ fn submit_owned(
     ops: Vec<ir::OwnedCommand>,
 ) -> VkResult<Vec<sgfx::driver::Submission>> {
     let owned = ir::OwnedCommandBuffer::new(ops);
+    let operation_count = owned.command_count();
     let batches = if crate::upload_batches::needs_batches(
         owned.commands(),
         crate::upload_batches::UPLOAD_BATCH_BYTES,
     ) {
         crate::upload_batches::split(owned, &rt.table, crate::upload_batches::UPLOAD_BATCH_BYTES)
+            .inspect_err(|e| eprintln!("[SGFX Vulkan] upload batch preflight failed: operations={operation_count} error={e:?}"))
             .map_err(crate::resources::failure)?
     } else {
         vec![owned]
@@ -4569,7 +4567,7 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
                     .min_storage_buffer_offset_alignment
                     .max(4),
             ).inspect_err(|error| {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                {
                     eprintln!("[SGFX Vulkan] descriptor materialization failed: {error:?} set={:?} offsets={:?} layout={:?}", d.set, d.dynamic_offsets, d.layout);
                     if let Some(set) = rt.resources.descriptor_sets.get(&d.set) {
                         eprintln!("[SGFX Vulkan] descriptor contents: invalid={} layout={:?} types={:?} bindings={:?}", set.invalid, set.layout, set.types, set.bindings);

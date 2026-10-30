@@ -186,7 +186,7 @@ unsafe extern "system" fn create_image(
     allocator: *const vk::AllocationCallbacks<'_>,
     output: *mut vk::Image,
 ) -> vk::Result {
-    if !info.is_null() {
+    if !info.is_null() && std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
         let i = &*info;
         eprintln!(
             "[SGFX Vulkan] image create: format={:?} type={:?} extent={:?} mips={} layers={} samples={:?} usage={:?} flags={:?} pnext={:?}",
@@ -299,6 +299,10 @@ unsafe extern "system" fn create_image(
     }
     if info.usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
         usage |= ir::TextureUsage::COPY_DST;
+    }
+    // Private GPU transfers preserve attachment views into nonzero mip levels.
+    if info.mip_levels > 1 && info.usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        usage |= ir::TextureUsage::COPY_SRC | ir::TextureUsage::COPY_DST;
     }
     match with_device(device, move |runtime| {
         if dimension_1d && !runtime.native_texture_1d {

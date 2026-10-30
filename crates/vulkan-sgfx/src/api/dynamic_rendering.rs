@@ -161,7 +161,7 @@ pub(super) fn begin(
             })
             || Some(view.desc.format()) != crate::images::texture_format(image.format)
             || view.components != [0, 1, 2, 3]
-            || view.desc.base_mip_level() != 0
+            || (depth && view.desc.base_mip_level() != 0)
             || view.desc.mip_level_count() != 1
             || view.desc.base_array_layer() != 0
             || view.desc.array_layer_count() != 1
@@ -196,8 +196,9 @@ pub(super) fn begin(
         if read_only && a.load == vk::AttachmentLoadOp::CLEAR {
             return Err(INVALID);
         }
-        dimensions.0 = dimensions.0.min(image.extent.width);
-        dimensions.1 = dimensions.1.min(image.extent.height);
+        let extent = image.mip_extent(view.desc.base_mip_level())?;
+        dimensions.0 = dimensions.0.min(extent.width);
+        dimensions.1 = dimensions.1.min(extent.height);
         views.push(a.view);
         clears.push(a.clear);
         descriptions.push(

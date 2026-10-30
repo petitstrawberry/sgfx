@@ -71,7 +71,11 @@ remain incomplete.
   uploads/barriers/readback, complete matching-format GPU mip blits with
   nearest/linear filtering, and sampler mip filtering/LOD clamps. Native VirGL
   uploads/samples color mip chains and emits full-mip color blits when the kernel
-  reports real mip storage. Multi-mip readback remains unsupported there. Older
+  reports real mip storage. Dynamic color attachments may select a nonzero mip:
+  private GPU render targets and subresource blits preserve LOAD/STORE, partial
+  render areas and other mip levels. The scratch targets are reused by format,
+  size and attachment slot. Native readback selects mip zero; copy other levels
+  to a single-level image before reading them. Older
   kernels and A618 reject unsupported mip storage and blits.
 - Metal supports R8 uploads, layered textures, cube and array sampling, mutable
   UNORM/sRGB views, component swizzles, and sampled D32 depth with comparison
@@ -472,7 +476,7 @@ and verify the chosen Mesa driver. The Linux check also used
   A test creates/destroys 1250 buffers on an otherwise idle device, then performs
   real compute work. With long-lived pipelines/resources, unique transient
   resources and descriptor configurations still consume that epoch's table
-  budget (including 8192 texture identities, 4096 buffers, 4096 memory allocations and 4096 bind-group configurations). Identical
+  budget (including 8192 texture identities, 4096 buffers, 4096 memory allocations and 32768 bind-group configurations). Identical
   descriptor configurations reuse definitions and physical groups; GPU image
   remapping invalidates physical groups. Exhaustion returns an allocation
   error. General reclamation requires generational core/backend slots or a safe

@@ -177,6 +177,55 @@ public class ApplicationsSmoke {
   System.out.println("DEPTH_ONLY_NATIVE PASS vertex-only dynamic rendering D32 writes static depth bias untouched texels preserved");
   System.out.println("DEPTH_TRANSFER_NATIVE PASS GPU D32 upload copy readback clear 32 exact float words");
  }}
+ static void capabilityCapacity(VkDevice d,VkQueue q,long pool){try(MemoryStack s=MemoryStack.stackPush()){
+  LongBuffer h=s.mallocLong(1);PointerBuffer p=s.mallocPointer(1);long[] images=new long[1100],memories=new long[1100],views=new long[1100];
+  long[] read=buffer(d,8,VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  for(int round=0;round<2;round++){
+   check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"capacity command");VkCommandBuffer c=new VkCommandBuffer(p.get(0),d);check(vkBeginCommandBuffer(c,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"capacity begin");
+   for(int i=0;i<images.length;i++){try(MemoryStack t=MemoryStack.stackPush()){
+    check(vkCreateImage(d,VkImageCreateInfo.calloc(t).sType$Default().imageType(VK_IMAGE_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM).extent(e->e.set(1,1,1)).mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT).tiling(VK_IMAGE_TILING_OPTIMAL).usage(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT),null,h),"capacity image");images[i]=h.get(0);
+    VkMemoryRequirements r=VkMemoryRequirements.calloc(t);vkGetImageMemoryRequirements(d,images[i],r);check(vkAllocateMemory(d,VkMemoryAllocateInfo.calloc(t).sType$Default().allocationSize(r.size()).memoryTypeIndex(Integer.numberOfTrailingZeros(r.memoryTypeBits())),null,h),"capacity memory");memories[i]=h.get(0);check(vkBindImageMemory(d,images[i],memories[i],0),"capacity bind");
+    check(vkCreateImageView(d,VkImageViewCreateInfo.calloc(t).sType$Default().image(images[i]).viewType(VK_IMAGE_VIEW_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM).subresourceRange(v->v.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1)),null,h),"capacity view");views[i]=h.get(0);
+    final int phase=round;
+    vkCmdBeginRenderingKHR(c,VkRenderingInfo.calloc(t).sType$Default().renderArea(a->a.extent(e->e.set(1,1))).layerCount(1).pColorAttachments(VkRenderingAttachmentInfo.calloc(1,t).sType$Default().imageView(views[i]).imageLayout(VK_IMAGE_LAYOUT_GENERAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE).clearValue(v->v.color(col->col.float32(0,phase==0?1:0).float32(1,phase==0?0:1).float32(2,0).float32(3,1)))));vkCmdEndRenderingKHR(c);
+   }}
+   vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,VkMemoryBarrier.calloc(1,s).sType$Default().srcAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT),null,null);
+   for(int end=0;end<2;end++)vkCmdCopyImageToBuffer(c,images[end==0?0:1099],VK_IMAGE_LAYOUT_GENERAL,read[0],VkBufferImageCopy.calloc(1,s).bufferOffset(end*4).imageSubresource(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).imageExtent(e->e.set(1,1,1)));
+   check(vkEndCommandBuffer(c),"capacity end");check(vkQueueSubmit(q,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(c)),0),"capacity submit");check(vkQueueWaitIdle(q),"capacity idle");
+   check(vkMapMemory(d,read[1],0,8,0,p),"capacity readback");IntBuffer got=MemoryUtil.memByteBuffer(p.get(0),8).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();for(int end=0;end<2;end++)if(got.get(end)!=(round==0?0xff0000ff:0xff00ff00))throw new AssertionError("capacity pixel round="+round+" end="+end);vkUnmapMemory(d,read[1]);
+   vkFreeCommandBuffers(d,pool,c);for(int i=0;i<images.length;i++){vkDestroyImageView(d,views[i],null);vkDestroyImage(d,images[i],null);vkFreeMemory(d,memories[i],null);}
+  }
+  vkDestroyBuffer(d,read[0],null);vkFreeMemory(d,read[1],null);
+  System.out.println("GPU_HANDLES_NATIVE PASS 1100 live GPU images plus completion handles two rounds exact pixels retirement and reuse");
+ }}
+ static void mipTargets(VkDevice d,VkQueue q,long pool){try(MemoryStack s=MemoryStack.stackPush()){
+  LongBuffer h=s.mallocLong(1);PointerBuffer p=s.mallocPointer(1);long[] images=new long[2],memories=new long[2];
+  for(int i=0;i<2;i++){
+   final int size=i==0?8:4;
+   check(vkCreateImage(d,VkImageCreateInfo.calloc(s).sType$Default().imageType(VK_IMAGE_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM).extent(e->e.set(size,size,1)).mipLevels(i==0?4:1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT).tiling(VK_IMAGE_TILING_OPTIMAL).usage(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT),null,h),"mip image");images[i]=h.get(0);
+   VkMemoryRequirements r=VkMemoryRequirements.calloc(s);vkGetImageMemoryRequirements(d,images[i],r);check(vkAllocateMemory(d,VkMemoryAllocateInfo.calloc(s).sType$Default().allocationSize(r.size()).memoryTypeIndex(Integer.numberOfTrailingZeros(r.memoryTypeBits())),null,h),"mip memory");memories[i]=h.get(0);check(vkBindImageMemory(d,images[i],memories[i],0),"mip bind");
+  }
+  check(vkCreateImageView(d,VkImageViewCreateInfo.calloc(s).sType$Default().image(images[0]).viewType(VK_IMAGE_VIEW_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM).subresourceRange(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(1).levelCount(1).layerCount(1)),null,h),"mip-one view");long view=h.get(0);
+  long[] upload=buffer(d,320,VK_BUFFER_USAGE_TRANSFER_SRC_BIT),read=buffer(d,320,VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  check(vkMapMemory(d,upload[1],0,320,0,p),"mip upload");IntBuffer data=MemoryUtil.memByteBuffer(p.get(0),320).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();for(int i=0;i<80;i++)data.put(i,i<64?0xff0000ff:0xffff0000);vkUnmapMemory(d,upload[1]);
+  check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"mip command");VkCommandBuffer c=new VkCommandBuffer(p.get(0),d);check(vkBeginCommandBuffer(c,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"mip begin");
+  VkImageMemoryBarrier.Buffer barriers=VkImageMemoryBarrier.calloc(2,s);for(int i=0;i<2;i++)barriers.get(i).sType$Default().oldLayout(VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK_IMAGE_LAYOUT_GENERAL).image(images[i]).srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).subresourceRange(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(VK_REMAINING_MIP_LEVELS).layerCount(1));
+  vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,null,null,barriers);
+  VkBufferImageCopy.Buffer regions=VkBufferImageCopy.calloc(2,s);regions.get(0).imageSubresource(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).imageExtent(e->e.set(8,8,1));regions.get(1).bufferOffset(256).imageSubresource(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(1).layerCount(1)).imageExtent(e->e.set(4,4,1));vkCmdCopyBufferToImage(c,upload[0],images[0],VK_IMAGE_LAYOUT_GENERAL,regions);
+  vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,VkMemoryBarrier.calloc(1,s).sType$Default().srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT),null,null);
+  VkRenderingAttachmentInfo.Buffer attachment=VkRenderingAttachmentInfo.calloc(1,s).sType$Default().imageView(view).imageLayout(VK_IMAGE_LAYOUT_GENERAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE).clearValue(v->v.color(col->col.float32(0,0).float32(1,1).float32(2,0).float32(3,1)));
+  vkCmdBeginRenderingKHR(c,VkRenderingInfo.calloc(s).sType$Default().renderArea(r->r.offset(o->o.set(1,1)).extent(e->e.set(2,2))).layerCount(1).pColorAttachments(attachment));vkCmdEndRenderingKHR(c);
+  attachment.loadOp(VK_ATTACHMENT_LOAD_OP_LOAD);
+  vkCmdBeginRenderingKHR(c,VkRenderingInfo.calloc(s).sType$Default().renderArea(r->r.extent(e->e.set(4,4))).layerCount(1).pColorAttachments(attachment));
+  vkCmdClearAttachments(c,VkClearAttachment.calloc(1,s).aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).colorAttachment(0).clearValue(v->v.color(col->col.float32(0,1).float32(1,1).float32(2,0).float32(3,1))),VkClearRect.calloc(1,s).rect(r->r.extent(e->e.set(1,1))).layerCount(1));vkCmdEndRenderingKHR(c);
+  vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,VkMemoryBarrier.calloc(1,s).sType$Default().srcAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT),null,null);
+  VkImageBlit.Buffer blit=VkImageBlit.calloc(1,s).srcSubresource(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(1).layerCount(1)).dstSubresource(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1));blit.srcOffsets(1).set(4,4,1);blit.dstOffsets(1).set(4,4,1);vkCmdBlitImage(c,images[0],VK_IMAGE_LAYOUT_GENERAL,images[1],VK_IMAGE_LAYOUT_GENERAL,blit,VK_FILTER_NEAREST);
+  regions.limit(1);vkCmdCopyImageToBuffer(c,images[0],VK_IMAGE_LAYOUT_GENERAL,read[0],regions);regions.get(0).bufferOffset(256).imageExtent(e->e.set(4,4,1));vkCmdCopyImageToBuffer(c,images[1],VK_IMAGE_LAYOUT_GENERAL,read[0],regions);
+  check(vkEndCommandBuffer(c),"mip end");check(vkQueueSubmit(q,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(c)),0),"mip submit");check(vkQueueWaitIdle(q),"mip idle");
+  check(vkMapMemory(d,read[1],0,320,0,p),"mip readback");IntBuffer got=MemoryUtil.memByteBuffer(p.get(0),320).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();for(int i=0;i<80;i++){int x=(i-64)%4,y=(i-64)/4;int want=i<64?0xff0000ff:i==64?0xff00ffff:x>=1&&x<=2&&y>=1&&y<=2?0xff00ff00:0xffff0000;if(got.get(i)!=want)throw new AssertionError("mip pixel "+i+" got="+Integer.toHexString(got.get(i))+" want="+Integer.toHexString(want));}vkUnmapMemory(d,read[1]);
+  vkFreeCommandBuffers(d,pool,c);vkDestroyImageView(d,view,null);for(int i=0;i<2;i++){vkDestroyImage(d,images[i],null);vkFreeMemory(d,memories[i],null);}for(long[] b:new long[][]{upload,read}){vkDestroyBuffer(d,b[0],null);vkFreeMemory(d,b[1],null);}
+  System.out.println("MIP_ATTACHMENT_NATIVE PASS mip1 partial clear LOAD clearAttachments resume exact80pixels mip0 and outside-area preserved");
+ }}
  static void floatTargets(VkDevice d,VkQueue q,long pool){try(MemoryStack s=MemoryStack.stackPush()){
   LongBuffer h=s.mallocLong(1);PointerBuffer p=s.mallocPointer(1);
   long vs=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_vertex_shader,"#version 450\nvoid main(){vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));gl_Position=vec4(p[gl_VertexIndex],0,1);}");
@@ -283,7 +332,7 @@ public class ApplicationsSmoke {
    vkResetQueryPoolEXT(device,query,0,1);if(vkGetQueryPoolResults(device,query,0,1,stamps,16,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)!=VK_NOT_READY)throw new AssertionError("host reset availability");
    vkDestroyQueryPool(device,query,null);
    }else System.out.println("QUERY_NATIVE_UNAVAILABLE PASS timestampValidBits=0 query pool rejected");
-   compute(device,queue,pool);graphics(device,queue,pool);depthTransfers(device,queue,pool);floatTargets(device,queue,pool);
+   compute(device,queue,pool);graphics(device,queue,pool);depthTransfers(device,queue,pool);mipTargets(device,queue,pool);floatTargets(device,queue,pool);capabilityCapacity(device,queue,pool);
    vkDestroyFence(device,fence,null);vkDestroySemaphore(device,binary,null);vkDestroySemaphore(device,timeline,null);vkDestroyEvent(device,event,null);vkDestroyCommandPool(device,pool,null);
    for(int i=0;i<2;i++){vkDestroyBuffer(device,buffers[i],null);vkFreeMemory(device,memories[i],null);}
    vkDestroyDevice(device,null);vkDestroyInstance(instance,null);VK.destroy();

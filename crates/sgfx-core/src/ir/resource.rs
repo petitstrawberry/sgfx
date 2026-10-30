@@ -29,7 +29,7 @@ pub const MAX_PROGRAMMABLE_RENDER_PIPELINES: usize = 256;
 /// Maximum compute pipelines held by one shared table.
 pub const MAX_COMPUTE_PIPELINES: usize = 256;
 /// Maximum immutable bind-group definitions held by one resource table.
-pub const MAX_BIND_GROUP_DEFINITIONS: usize = 4_096;
+pub const MAX_BIND_GROUP_DEFINITIONS: usize = 32_768;
 
 static NEXT_RESOURCE_TABLE_ID: AtomicUsize = AtomicUsize::new(1);
 

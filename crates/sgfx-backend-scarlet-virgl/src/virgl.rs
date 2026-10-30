@@ -143,7 +143,7 @@ const PIPE_SWIZZLE_Z: u32 = 2;
 const PIPE_SWIZZLE_W: u32 = 3;
 const IR_VERTEX_BUFFER_BYTES: usize = MAX_IR_VERTICES * 10 * core::mem::size_of::<f32>();
 const IR_BUFFER_SLOTS: usize = crate::ir::MAX_BUFFERS;
-const IR_TEXTURE_SLOTS: usize = 1_024;
+const IR_TEXTURE_SLOTS: usize = crate::ir::MAX_TEXTURES;
 const IR_SAMPLER_SLOTS: usize = 256;
 const IR_PIPELINE_SLOTS: usize = 512;
 // Internal transfer draws cannot collide with public IR resource slots.
@@ -2038,6 +2038,11 @@ impl Queue {
             || info.max_pending_submissions == 0
             || info.max_opaque_command_size < self.raw.max_opaque_command_size()
         {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX native] async capability mismatch: info={info:?} required_size={}",
+                self.raw.max_opaque_command_size()
+            );
             return Err(HandleError::Unsupported);
         }
         Ok(info.max_opaque_command_size as usize)

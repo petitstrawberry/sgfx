@@ -46,8 +46,12 @@ fn core_batch(batch: abi::Batch) -> ir::abi::Batch {
 
 fn error(e: virgl::IrSubmitError) -> i32 {
     use virgl::IrSubmitError as E;
+    eprintln!("[SGFX VirGL] driver error: {e:?}");
     match e {
-        E::OutOfMemory | E::SubmissionTooLarge => abi::OUT_OF_MEMORY,
+        cause @ (E::OutOfMemory | E::SubmissionTooLarge) => {
+            eprintln!("[SGFX VirGL] resource exhaustion: {cause:?}");
+            abi::OUT_OF_MEMORY
+        }
         cause @ (E::Unsupported(_) | E::ShaderCompile(_)) => {
             eprintln!("[SGFX VirGL] unsupported operation: {cause:?}");
             abi::UNSUPPORTED
@@ -71,8 +75,14 @@ fn handle_error(e: virgl::HandleError) -> i32 {
     use virgl::HandleError as E;
     match e {
         E::InvalidHandle | E::InvalidParameter => abi::INVALID,
-        E::Unsupported => abi::UNSUPPORTED,
-        E::OutOfResources => abi::OUT_OF_MEMORY,
+        E::Unsupported => {
+            eprintln!("[SGFX VirGL] native operation unsupported");
+            abi::UNSUPPORTED
+        }
+        E::OutOfResources => {
+            eprintln!("[SGFX VirGL] native resources exhausted");
+            abi::OUT_OF_MEMORY
+        }
         E::NotFound => abi::INITIALIZATION_FAILED,
         cause => {
             eprintln!("[SGFX VirGL] native operation failed: {cause:?}");
@@ -306,15 +316,15 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         if words[2] == s.revision {
             return Ok(());
         }
-        let (textures, buffers) = s
-            .table
-            .abi_retired_resources(words)
-            .map_err(|_| abi::INVALID)?;
+        let (textures, buffers) = s.table.abi_retired_resources(words).map_err(|e| {
+            eprintln!("[SGFX VirGL] resource retirement decode failed: {e:?}");
+            abi::INVALID
+        })?;
         // Never turn resource retirement into a hidden GPU wait in submit.
-        let (shaders, compute, render) = s
-            .table
-            .abi_retired_programs(words)
-            .map_err(|_| abi::INVALID)?;
+        let (shaders, compute, render) = s.table.abi_retired_programs(words).map_err(|e| {
+            eprintln!("[SGFX VirGL] program retirement decode failed: {e:?}");
+            abi::INVALID
+        })?;
         if (!textures.is_empty()
             || !buffers.is_empty()
             || !shaders.is_empty()
@@ -343,7 +353,8 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         }
         match s.table.sync_abi_snapshot(words) {
             Ok((_, revision)) => s.revision = revision,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[SGFX VirGL] resource table synchronization failed: {e:?}");
                 s.poisoned = true;
                 return Err(abi::INVALID);
             }
@@ -456,7 +467,10 @@ unsafe extern "C" fn submit(p: Object, batch: *const abi::Batch, out: *mut abi::
         let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
         let commands =
             unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, core_batch(*batch)) }
-                .map_err(|_| abi::INVALID)?;
+                .map_err(|e| {
+                    eprintln!("[SGFX VirGL] command ABI decode failed: {e:?}");
+                    abi::INVALID
+                })?;
         let (disposition, error, receipt) = match s.inner.executor().submit(&commands) {
             Ok(receipt) => (abi::ACCEPTED, abi::OK, receipt),
             Err(SubmitError::Busy) => return Err(abi::BUSY),
