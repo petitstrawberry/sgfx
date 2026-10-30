@@ -508,3 +508,10 @@ queries with value zero, reproducing the timer limitation in macOS OpenGL.
 This is separate from the working Metal GPU-clock path; zero values are not
 replaced with CPU time. Reproduction sources, hashes and logs are retained in
 `target/vulkan-next/summary.json` and its fixture directory.
+
+
+| Modern native validation artifact | SHA-256 |
+| --- | --- |
+| AArch64 ICD | `625f58b4a6d01f09e3bcb94085d5cba33cdb67ee7cf1058c571d85e04d31b3db` |
+| HVF guest log | `81c4dc7858b2c5e9ee1cd48aa6046f38e28baeaf9c6bc612935e0d6186335965` |
+| Query-buffer kernel Image | `4c335ca8f0dbee755fcd14abdc490c7ab62195ca597f64dfc82f30fc46fd199c` |
