@@ -523,6 +523,14 @@ pub(crate) unsafe extern "system" fn bind_image_memory(
     offset: vk::DeviceSize,
 ) -> vk::Result {
     let result = status(with_device(device, move |runtime| {
+        if !crate::memory_allocation::permits(
+            &runtime.resources,
+            memory,
+            crate::memory_allocation::DedicatedTarget::Image(image),
+            offset,
+        ) {
+            return Err(INVALID);
+        }
         let size = runtime
             .resources
             .images

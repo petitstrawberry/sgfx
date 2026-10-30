@@ -824,6 +824,7 @@ pub(crate) unsafe extern "system" fn queue_present(
                 let result = swapchain.window.present(index);
                 if result.is_ok() {
                     swapchain.acquired[index] = false;
+                    crate::progress::presented(handle.as_raw());
                 }
                 result
             });

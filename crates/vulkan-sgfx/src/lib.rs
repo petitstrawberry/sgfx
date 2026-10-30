@@ -20,6 +20,8 @@ mod input_attachments;
 mod instance;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod linux_wsi;
+mod memory_allocation;
+mod progress;
 mod properties2;
 mod push_constants;
 mod render_pass;

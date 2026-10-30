@@ -5,7 +5,10 @@ with `VK_DRIVER_FILES` selecting the freshly built SGFX ICD. Required providers
 are LWJGL core, SDL, Vulkan and Shaderc, a Vulkan loader and the SGFX backend DSO.
 The native providers and VM runner are produced by `scarlet-bundle-lwjgl`.
 
-The test uses no network or application assets. It checks synchronization2,
+The test uses no network or application assets. It also loads the actual VMA
+native library, creates a dedicated 64 MiB GPU buffer, verifies first/last-word
+GPU copies and rejects binding that allocation to a different buffer. Float
+image targets exercise image-dedicated allocations. It checks synchronization2,
 events, binary/timeline semaphores, dynamic rendering, indirect-count drawing,
 indexed indirect drawing with a negative vertex offset and exact image readback.
 The combined graphics path checks push descriptors, anisotropy 16, instance
@@ -39,7 +42,8 @@ Expected final markers are `MODERN_GRAPHICS_NATIVE PASS`, `SYNC2_NATIVE PASS`,
 `SCOPED_QUERIES_NATIVE PASS`, `CORE11_PROPERTIES_NATIVE PASS`,
 `CORE12_FEATURES_NATIVE PASS`, `VULKAN_REQUIREMENTS_NATIVE PASS`,
 `DEPTH_TRANSFER_NATIVE PASS`, `DEPTH_ONLY_NATIVE PASS`, `FLOAT_COLOR_NATIVE PASS`,
-`MIP_ATTACHMENT_NATIVE PASS`, `GPU_HANDLES_NATIVE PASS`, and either `QUERY_NATIVE PASS` or
+`MIP_ATTACHMENT_NATIVE PASS`, `GPU_HANDLES_NATIVE PASS`,
+`VMA_DEDICATED_NATIVE PASS`, and either `QUERY_NATIVE PASS` or
 `QUERY_NATIVE_UNAVAILABLE PASS`.
 
 On macOS, `host-gl-clock.c` checks OpenGL timestamp counter bits and query values
@@ -51,3 +55,8 @@ as a replacement GPU counter.
 For Cocoa/HVF runs include virtio keyboard and mouse devices. A Cocoa input
 callback in the QEMU host can dereference absent keyboard state if an event
 arrives in a GPU-only VM; that host failure must not be counted as a passing run.
+
+The graphics case uses a 64 MiB vertex backing initialized through its last word.
+Its first draw exceeds 64 MiB once transport headers are included. Exact color
+and depth checks verify that every upload packet retired before drawing; later
+draws verify resource reuse.

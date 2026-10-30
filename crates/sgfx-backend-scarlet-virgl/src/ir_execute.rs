@@ -116,7 +116,7 @@ pub enum IrSubmitError {
     InvalidVertexData,
     /// Allocation for persistent shadow data or decoded backend data failed.
     OutOfMemory,
-    /// The lowered stream exceeds the queue's 64 MiB logical-admission budget.
+    /// The lowered stream exceeds the queue's 512 MiB exclusive-stream budget.
     SubmissionTooLarge,
     /// The active graphics backend rejected resource creation, upload, or submission.
     Backend(HandleError),
@@ -1033,8 +1033,9 @@ impl Queue {
     /// bounded context-owned worker dispatches them after one logical admission.
     /// Busy/Rejected restore CPU
     /// initialization/revision bookkeeping and do not send an uploaded prefix.
-    /// Logical admission is bounded to 16 streams and 64 MiB of retained command
-    /// bytes. A single stream exceeding that byte budget is rejected explicitly;
+    /// Ordinary logical admission is bounded to 16 streams / 64 MiB. A larger
+    /// stream (at most 512 MiB) requires an empty queue and remains exclusive
+    /// until every native chunk retires. Larger streams are rejected explicitly;
     /// consumers do not partition meshes or uploads to fit native request sizes.
     ///
     /// # Arguments

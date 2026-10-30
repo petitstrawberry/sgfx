@@ -4267,7 +4267,23 @@ fn submit_owned_batch(
     })?;
     profile_work("submit::backend", || {
         match submit_with_backpressure(|| rt.queue.submit(&mut rt.cache, &commands)) {
-            Ok(receipt) => Ok(Some(receipt)),
+            Ok(receipt) => {
+                let draws = owned
+                    .commands()
+                    .iter()
+                    .filter(|command| {
+                        matches!(
+                            command,
+                            ir::OwnedCommand::Draw { .. }
+                                | ir::OwnedCommand::DrawIndexed { .. }
+                                | ir::OwnedCommand::DrawInstanced { .. }
+                                | ir::OwnedCommand::DrawIndexedInstanced { .. }
+                        )
+                    })
+                    .count() as u64;
+                crate::progress::submitted(draws);
+                Ok(Some(receipt))
+            }
             Err(SubmitError::Rejected(error)) => {
                 let mut buffer_bytes = 0usize;
                 let mut texture_bytes = 0usize;

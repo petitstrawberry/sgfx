@@ -526,7 +526,13 @@ The Vulkan API version alone does not define an optional arbitrary subset.
 
 The memory2 entry points use the same allocation, ownership, range and alignment
 checks as the original API. Requirements queries preserve output chains and
-write false dedicated-allocation requirements. Sparse queries report zero;
+write false dedicated-allocation requirements. Optional dedicated buffer/image
+allocations are accepted through `VkMemoryDedicatedAllocateInfo`, including
+single-device allocation flags. The allocation must match the resource
+requirements and may bind only its declared target at offset zero; aliases
+remain rejected. A native VMA test verifies a dedicated 64 MiB buffer with GPU
+writes/copies at both boundaries and rejection of a different bind target.
+Float image tests exercise dedicated image allocations. Sparse queries report zero;
 YCbCr creation returns `ERROR_FEATURE_NOT_PRESENT`. Disabled Vulkan 1.1 feature
 records can accompany device creation, but nonzero unsupported features are
 rejected. Layout-support queries share creation's pure validation and do not
@@ -675,3 +681,16 @@ PNG encoding overhead; the default build contains no capture path.
 `SGFX_VULKAN_CALL_PROFILE=1` enables the existing worker/API phase profiler. Both
 settings use the loader-published process environment on Scarlet, where a loaded
 Rust DSO does not initialize its own std environment.
+
+Large native buffer uploads include inline payload and transport headers in the
+logical stream. VirGL admits streams above the ordinary 64 MiB queue budget
+exclusively, up to 512 MiB, after prior work retires. Native dispatch remains
+bounded to individual transport packets and four upload arenas. The native
+modern regression initializes a 64 MiB vertex backing through its last word,
+then verifies actual rendered color and depth across repeated draws.
+
+`SGFX_VULKAN_PROGRESS=1` emits a progress record after successful presentation,
+at most once per five seconds after the first frame. It reports cumulative
+accepted IR streams, draw commands and presented frames. Scarlet records are
+emitted only after the queue-idle completion check succeeds; they are separate
+from the API timing profiler and do not capture images.

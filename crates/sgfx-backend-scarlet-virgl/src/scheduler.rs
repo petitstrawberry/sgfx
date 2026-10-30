@@ -6,6 +6,10 @@ use alloc::{collections::VecDeque, vec::Vec};
 
 pub(crate) const MAX_SUBMISSIONS: usize = 16;
 pub(crate) const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+// Large initialized buffers include their bytes in the command stream. Admit a
+// bounded oversize stream exclusively, without weakening ordinary backpressure
+// or dispatching a prefix before validation and ownership are complete.
+pub(crate) const MAX_STREAM_BYTES: usize = 512 * 1024 * 1024;
 const MAX_NATIVE_IN_FLIGHT: usize = 16;
 
 pub(crate) enum DispatchError<E> {
@@ -93,10 +97,12 @@ impl<T: Transport> Scheduler<T> {
         let bytes = chunks
             .iter()
             .try_fold(0usize, |size, chunk| size.checked_add(T::size(chunk)))
-            .filter(|size| *size <= MAX_PENDING_BYTES)
+            .filter(|size| *size <= MAX_STREAM_BYTES)
             .ok_or(AdmissionError::TooLarge)?;
         if self.jobs.len() == MAX_SUBMISSIONS
-            || self.bytes.saturating_add(bytes) > MAX_PENDING_BYTES
+            || (!self.jobs.is_empty()
+                && (bytes > MAX_PENDING_BYTES
+                    || self.bytes.saturating_add(bytes) > MAX_PENDING_BYTES))
         {
             return Err(AdmissionError::Busy);
         }
@@ -339,7 +345,7 @@ mod tests {
         let signal = Rc::new(Cell::new(None));
         assert_eq!(
             queue.enqueue(
-                alloc::vec![(1, MAX_PENDING_BYTES + 1)],
+                alloc::vec![(1, MAX_STREAM_BYTES + 1)],
                 Rc::new(()),
                 Rc::clone(&signal)
             ),
@@ -358,6 +364,41 @@ mod tests {
             queue.enqueue(alloc::vec![], Rc::new(()), signal),
             Err(AdmissionError::Busy)
         );
+    }
+
+    #[test]
+    fn large_stream_waits_for_exclusive_admission_and_retires_every_chunk() {
+        let native = ready();
+        let mut queue = Scheduler::new();
+        let prior = add(&mut queue, alloc::vec![(0, 1)]);
+        let signal = Rc::new(Cell::new(None));
+        let chunks = || alloc::vec![(1, MAX_PENDING_BYTES), (2, 65536)];
+        assert_eq!(
+            queue.enqueue(chunks(), Rc::new(()), Rc::clone(&signal)),
+            Err(AdmissionError::Busy)
+        );
+        assert!(native.accepted.borrow().is_empty());
+        queue.advance(&native);
+        native.fences.borrow()[0].set(Some(Ok(())));
+        queue.advance(&native);
+        assert_eq!(prior.get(), Some(Ok(())));
+        queue
+            .enqueue(chunks(), Rc::new(()), Rc::clone(&signal))
+            .unwrap();
+        assert_eq!(
+            queue.enqueue(alloc::vec![], Rc::new(()), Rc::new(Cell::new(None))),
+            Err(AdmissionError::Busy)
+        );
+        queue.advance(&native);
+        assert_eq!(&*native.accepted.borrow(), &[0, 1, 2]);
+        native.fences.borrow()[2].set(Some(Ok(())));
+        queue.advance(&native);
+        assert_eq!(signal.get(), None);
+        native.fences.borrow()[1].set(Some(Ok(())));
+        queue.advance(&native);
+        assert_eq!(signal.get(), Some(Ok(())));
+        assert!(queue.is_empty());
+        add(&mut queue, alloc::vec![(3, MAX_PENDING_BYTES)]);
     }
 
     #[test]

@@ -35,7 +35,13 @@ impl Capture {
         };
         let frame = self.frames;
         self.frames = self.frames.saturating_add(1);
-        if self.captures >= 12 || self.last.is_some_and(|last| last.elapsed() < std::time::Duration::from_secs(30)) { return; }
+        if self.captures >= 12
+            || self
+                .last
+                .is_some_and(|last| last.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return;
+        }
         self.captures += 1;
         self.last = Some(std::time::Instant::now());
         // The caller has retired rendering and waited on presentation's

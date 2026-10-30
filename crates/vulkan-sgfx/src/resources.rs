@@ -244,6 +244,7 @@ impl ShaderViews {
 }
 #[derive(Default)]
 pub(crate) struct Resources {
+    pub dedicated_allocations: HashMap<vk::DeviceMemory, crate::memory_allocation::DedicatedTarget>,
     pub mip_render_targets: HashMap<(vk::Format, u32, u32, usize), ir::TextureId>,
     pub depth_only_fragment: Option<ir::ShaderModuleId>,
     pub depth_clear_colors: HashMap<(u32, u32), ir::TextureId>,
@@ -1089,16 +1090,29 @@ unsafe extern "system" fn allocate_memory(
         if i.s_type != vk::StructureType::MEMORY_ALLOCATE_INFO {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        if !i.p_next.is_null()
-            || i.memory_type_index != 0
-            || i.allocation_size == 0
-            || i.allocation_size > MAX_ALLOCATION
+        let dedicated = crate::memory_allocation::parse(i.p_next.cast())?;
+        if i.memory_type_index != 0 || i.allocation_size == 0 || i.allocation_size > MAX_ALLOCATION
         {
+            let tag = i
+                .p_next
+                .cast::<vk::BaseInStructure<'_>>()
+                .as_ref()
+                .map(|node| node.s_type);
+            eprintln!(
+                "[SGFX Vulkan] memory allocation rejected: size={} type={} pnext={tag:?} max={MAX_ALLOCATION}",
+                i.allocation_size, i.memory_type_index
+            );
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let size =
             usize::try_from(i.allocation_size).map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
         let handle = crate::api::with_device(device, move |r| {
+            if let Some(target) = dedicated
+                && crate::memory_allocation::allocation_size(&r.resources, target)
+                    != Some(size as u64)
+            {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             if r.resources.memories.len() >= MAX_MEMORY_ALLOCATIONS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
@@ -1167,6 +1181,9 @@ unsafe extern "system" fn allocate_memory(
             }
             let bytes = AlignedBytes::unbacked(size)?;
             let handle = vk::DeviceMemory::from_raw(crate::api::next_id());
+            if let Some(target) = dedicated {
+                r.resources.dedicated_allocations.insert(handle, target);
+            }
             r.resources.memories.insert(
                 handle,
                 Memory {
@@ -1188,6 +1205,7 @@ unsafe extern "system" fn free_memory(
     let _ = crate::api::with_device(device, move |r| {
         r.resources.forget_uploads_for_memory(memory);
         r.resources.memories.remove(&memory);
+        r.resources.dedicated_allocations.remove(&memory);
         for buffer in r.resources.buffers.values_mut() {
             if buffer.bound.is_some_and(|(m, _)| m == memory) {
                 buffer.bound = None;
@@ -1209,6 +1227,14 @@ pub(crate) unsafe extern "system" fn bind_buffer_memory(
 ) -> vk::Result {
     ffi(|| {
         crate::api::with_device(device, move |r| {
+            if !crate::memory_allocation::permits(
+                &r.resources,
+                memory,
+                crate::memory_allocation::DedicatedTarget::Buffer(buffer),
+                offset,
+            ) {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             let current = r
                 .resources
                 .buffers

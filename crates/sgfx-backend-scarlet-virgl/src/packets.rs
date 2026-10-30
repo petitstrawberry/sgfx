@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub(crate) const UPLOAD_ARENA_COUNT: usize = 4;
-const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+use crate::scheduler::MAX_STREAM_BYTES;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -168,6 +168,29 @@ mod tests {
         assert_eq!(stream.upload_range(60).unwrap(), (0, 0));
         assert_eq!(stream.upload_range(u32::MAX), Err(Error::TooLarge));
         assert_eq!(stream.upload_range(60).unwrap(), (0, 60));
+    }
+
+    #[test]
+    fn full_64_mib_upload_keeps_room_for_following_draw_packets() {
+        let mut stream = Packets::new(2 * 1024 * 1024);
+        let upload = alloc::vec![7; 2 * 1024 * 1024];
+        for _ in 0..32 {
+            stream.append(&upload).unwrap();
+        }
+        stream.append(&[9; 65536]).unwrap();
+        let chunks = stream.finish().unwrap();
+        assert_eq!(chunks.len(), 33);
+        assert!(chunks[..32].iter().all(|chunk| chunk.bytes == upload));
+        assert_eq!(chunks[32].bytes, &[9; 65536]);
+    }
+
+    #[test]
+    fn exclusive_stream_bound_rejects_before_mutating_packet_state() {
+        let mut stream = Packets::new(128);
+        stream.bytes = MAX_STREAM_BYTES;
+        assert_eq!(stream.append(&[1; 4]), Err(Error::TooLarge));
+        assert!(stream.current.bytes.is_empty());
+        assert!(stream.chunks.is_empty());
     }
 
     #[test]

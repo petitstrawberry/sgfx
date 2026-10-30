@@ -54,7 +54,9 @@ write dependencies use the core's explicit resource barriers; ordinary ordered
 accesses and physical transitions are handled by WGPU. VirGL and Adreno reject
 the programmable commands they cannot lower before native submission.
 
-VirGL admits up to 16 logical streams and 64 MiB of retained command bytes.
+VirGL normally admits up to 16 logical streams and 64 MiB of retained command
+bytes. A stream between 64 MiB and 512 MiB requires an empty queue and remains
+exclusive until every chunk retires. Larger streams are rejected before dispatch.
 Native packet splitting, FIFO progress and upload-arena reuse belong to the
 backend. A receipt remains pending until every chunk and its ordered prefix
 retire. Dropping a frontend owner or receipt does not cancel accepted work or
