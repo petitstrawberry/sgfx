@@ -211,21 +211,31 @@ the resource cache unusable rather than allowing replay.
 
 The `COMPUTE_BUFFERS` ABI flag and compute queue limits are advertised only after
 an isolated dispatch modifies eight SSBO words and GPU-to-host readback verifies
-every result. Failed probes leave the rendering context untouched. macOS CGL's
-OpenGL 4.1 host reports compute shaders unsupported, so this path stays disabled
-there; CPU TGSI semantic tests and a rejected probe are not GPU compute execution
-validation. Shared-memory limits remain zero for this profile.
+every result. Failed probes leave the rendering context untouched. Plain macOS
+CGL/OpenGL 4.1 has no GL compute support, so a renderer without a compute bridge
+keeps this path disabled. The Scarlet virglrenderer fork's optional Metal compute
+backend executes these same VirGL commands on Metal and synchronizes buffer bytes
+with GL. Shared-memory limits remain zero for this SGFX profile.
 
 Local validation of this profile passed five WGSL/SPIR-V compute semantic tests
 (3D invocation IDs, read-modify-write, descriptor offsets, robust bounds and
 arithmetic overflow, distinct UBO/push/storage constants, and explicit profile
 rejection), plus parsing both generated compute shaders with the pinned
-virglrenderer TGSI parser. The native OpenJDK/HVF fixture passes the unsupported
-compute capability path and continues through indirect-count rendering, 128 pixel
-checks, visibility queries and synchronization2. Positive native GPU compute
-execution remains unverified on this CGL host. The conditional Java fixture also
-contains two real SSBO dispatches and descriptor-boundary sentinel checks for a
-compute-capable host.
+virglrenderer TGSI parser. On Apple M3 Pro, the native OpenJDK 25/HVF fixture now
+passes two real SSBO read-modify-write dispatches, descriptor offset/range and
+eight sentinel-word checks, followed by indirect-count rendering, 128 pixel
+checks, visibility queries and synchronization2. Metal API validation is enabled
+for the packaged host renderer. This validates actual guest-to-host GPU compute;
+the same fixture also verifies disabled compute on a plain CGL renderer.
+
+The host renderer is
+[`petitstrawberry/virglrenderer` at cbe9e52f55a72e625da4b8ad5aba906b681fc46a](https://github.com/petitstrawberry/virglrenderer/commit/cbe9e52f55a72e625da4b8ad5aba906b681fc46a),
+built with `-Dmetal-compute=enabled`. Its direct public-API test additionally
+checks aliased SSBO bindings at slots 3/7, 3D workgroups/global IDs and 64 output
+words, rejection of unbound storage and fence completion. The bridge uses
+synchronous CPU copies between GL and Metal; it does not add images, shared
+memory or mixed-stream execution to SGFX. The validated host library SHA-256 is
+`f422834b493da917587cd5178d94c7371e08cc11ad6f2bdffbe9c113d88328da`.
 
 The native ICD SHA-256 for that check is `d7a0f818219fd79b7a52eb98115e660b269a9c1d6ffb9a72346fcb00071416d4`;
 the VirGL plugin SHA-256 is `52d98a21c98cce1bc26dd6e3bf9b8c18406b31d3edeeaafbcffc7467e70ef7c4`. These hashes identify
