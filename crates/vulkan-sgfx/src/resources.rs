@@ -123,6 +123,8 @@ pub(crate) struct DescriptorSet {
     pub pool: vk::DescriptorPool,
     pub layout: ir::BindGroupLayoutDesc,
     pub types: BTreeMap<u32, vk::DescriptorType>,
+    binding_map: DescriptorBindingMap,
+    reverse_binding_map: DescriptorBindingMap,
     pub stages: BTreeMap<u32, vk::ShaderStageFlags>,
     pub bindings: HashMap<u32, DescriptorBinding>,
     pub cached_group: Option<ir::BindGroupId>,
@@ -154,17 +156,74 @@ fn descriptor_binding_map(
     }
     Ok(map)
 }
+
+fn descriptor_binding_maps(
+    types: &BTreeMap<u32, vk::DescriptorType>,
+) -> Result<(DescriptorBindingMap, DescriptorBindingMap), vk::Result> {
+    let binding_map = descriptor_binding_map(types)?;
+    let mut reverse_binding_map = BTreeMap::new();
+    for (&binding, &slot) in &binding_map {
+        // SGFX reserves an adjacent even/odd pair for every Vulkan binding.
+        // The reverse lookup accepts either half, just as the previous scan did.
+        reverse_binding_map.insert(slot, binding);
+        reverse_binding_map.insert(slot + 1, binding);
+    }
+    Ok((binding_map, reverse_binding_map))
+}
 impl DescriptorSet {
-    pub(crate) fn binding_map(&self) -> DescriptorBindingMap {
-        descriptor_binding_map(&self.types).expect("validated descriptor layout")
+    #[cfg(test)]
+    pub(crate) fn new(
+        texel_formats: HashMap<u32, vk::Format>,
+        pool: vk::DescriptorPool,
+        layout: ir::BindGroupLayoutDesc,
+        types: BTreeMap<u32, vk::DescriptorType>,
+        stages: BTreeMap<u32, vk::ShaderStageFlags>,
+        bindings: HashMap<u32, DescriptorBinding>,
+    ) -> Result<Self, vk::Result> {
+        let (binding_map, reverse_binding_map) = descriptor_binding_maps(&types)?;
+        Ok(Self::with_binding_maps(
+            texel_formats,
+            pool,
+            layout,
+            types,
+            (binding_map, reverse_binding_map),
+            stages,
+            bindings,
+        ))
+    }
+
+    fn with_binding_maps(
+        texel_formats: HashMap<u32, vk::Format>,
+        pool: vk::DescriptorPool,
+        layout: ir::BindGroupLayoutDesc,
+        types: BTreeMap<u32, vk::DescriptorType>,
+        maps: (DescriptorBindingMap, DescriptorBindingMap),
+        stages: BTreeMap<u32, vk::ShaderStageFlags>,
+        bindings: HashMap<u32, DescriptorBinding>,
+    ) -> Self {
+        let (binding_map, reverse_binding_map) = maps;
+        Self {
+            texel_formats,
+            pool,
+            layout,
+            types,
+            binding_map,
+            reverse_binding_map,
+            stages,
+            bindings,
+            cached_group: None,
+            invalid: false,
+        }
+    }
+
+    pub(crate) fn binding_map(&self) -> &DescriptorBindingMap {
+        &self.binding_map
     }
     pub(crate) fn source_to_ir(&self, binding: u32) -> Option<u32> {
-        self.binding_map().get(&binding).copied()
+        self.binding_map.get(&binding).copied()
     }
     fn ir_to_source(&self, slot: u32) -> Option<u32> {
-        self.binding_map()
-            .into_iter()
-            .find_map(|(binding, base)| (base == slot / 2 * 2).then_some(binding))
+        self.reverse_binding_map.get(&slot).copied()
     }
 }
 pub(crate) type Specialization = Vec<(u32, Vec<u8>)>;
@@ -1888,7 +1947,7 @@ unsafe extern "system" fn create_pipeline_layout(
             let binding_maps = handles
                 .iter()
                 .map(|h| {
-                    descriptor_binding_map(
+                    descriptor_binding_maps(
                         r.resources
                             .set_layout_types
                             .get(h)
@@ -1912,18 +1971,18 @@ unsafe extern "system" fn create_pipeline_layout(
                     if pushed.is_some() {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
+                    let (binding_map, reverse_binding_map) = binding_maps[index].clone();
                     pushed = Some((
                         index as u32,
-                        DescriptorSet {
-                            texel_formats: HashMap::new(),
-                            pool: vk::DescriptorPool::null(),
-                            layout: r.resources.set_layouts[h].clone(),
-                            types: r.resources.set_layout_types[h].clone(),
-                            stages: r.resources.set_layout_stages[h].clone(),
-                            bindings: HashMap::new(),
-                            cached_group: None,
-                            invalid: false,
-                        },
+                        DescriptorSet::with_binding_maps(
+                            HashMap::new(),
+                            vk::DescriptorPool::null(),
+                            r.resources.set_layouts[h].clone(),
+                            r.resources.set_layout_types[h].clone(),
+                            (binding_map, reverse_binding_map),
+                            r.resources.set_layout_stages[h].clone(),
+                            HashMap::new(),
+                        ),
                     ));
                 }
             }
@@ -1951,9 +2010,13 @@ unsafe extern "system" fn create_pipeline_layout(
                 r.resources.pipeline_push_sets.insert(handle, pushed);
             }
             r.resources.pipeline_layouts.insert(handle, desc.clone());
-            r.resources
-                .pipeline_binding_maps
-                .insert(handle, binding_maps);
+            r.resources.pipeline_binding_maps.insert(
+                handle,
+                binding_maps
+                    .into_iter()
+                    .map(|(binding_map, _)| binding_map)
+                    .collect(),
+            );
             r.resources
                 .pipeline_binding_stages
                 .insert(handle, binding_stages);
@@ -2161,19 +2224,19 @@ unsafe extern "system" fn allocate_descriptor_sets(
             pool.remaining = remaining;
             let mut result = Vec::with_capacity(layouts.len());
             for (layout, types, stages) in layouts {
+                let (binding_map, reverse_binding_map) = descriptor_binding_maps(&types)?;
                 let handle = vk::DescriptorSet::from_raw(crate::api::next_id());
                 r.resources.descriptor_sets.insert(
                     handle,
-                    DescriptorSet {
-                        texel_formats: HashMap::new(),
-                        pool: pool_handle,
+                    DescriptorSet::with_binding_maps(
+                        HashMap::new(),
+                        pool_handle,
                         layout,
                         types,
+                        (binding_map, reverse_binding_map),
                         stages,
-                        bindings: HashMap::new(),
-                        cached_group: None,
-                        invalid: false,
-                    },
+                        HashMap::new(),
+                    ),
                 );
                 result.push(handle);
             }
@@ -3410,24 +3473,56 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_set_reuses_bidirectional_binding_maps_across_copies_and_updates() {
+        let types = BTreeMap::from([
+            (0, vk::DescriptorType::UNIFORM_BUFFER),
+            (4, vk::DescriptorType::UNIFORM_BUFFER),
+            (128, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+            (u32::MAX, vk::DescriptorType::STORAGE_BUFFER),
+        ]);
+        let set = DescriptorSet::new(
+            HashMap::new(),
+            vk::DescriptorPool::null(),
+            ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+            types.clone(),
+            BTreeMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(set.binding_map(), &descriptor_binding_map(&types).unwrap());
+        for (&binding, &slot) in set.binding_map() {
+            assert_eq!(set.source_to_ir(binding), Some(slot));
+            assert_eq!(set.ir_to_source(slot), Some(binding));
+            assert_eq!(set.ir_to_source(slot + 1), Some(binding));
+        }
+
+        let mut copied = set.clone();
+        copied.texel_formats.insert(128, vk::Format::R8_SINT);
+        copied.invalid = true;
+        assert_eq!(copied.binding_map, set.binding_map);
+        assert_eq!(copied.source_to_ir(128), Some(2));
+        assert_eq!(copied.ir_to_source(3), Some(128));
+    }
+
+    #[test]
     fn descriptor_writes_preserve_declared_stage_visibility() {
-        let set = DescriptorSet {
-            texel_formats: HashMap::new(),
-            pool: vk::DescriptorPool::null(),
-            layout: ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
-            types: [1, 3, 128]
+        let set = DescriptorSet::new(
+            HashMap::new(),
+            vk::DescriptorPool::null(),
+            ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+            [1, 3, 128]
                 .into_iter()
                 .map(|b| (b, vk::DescriptorType::UNIFORM_BUFFER))
                 .collect(),
-            stages: BTreeMap::from([
+            BTreeMap::from([
                 (1, vk::ShaderStageFlags::GEOMETRY),
                 (3, vk::ShaderStageFlags::GEOMETRY),
                 (128, vk::ShaderStageFlags::FRAGMENT),
             ]),
-            bindings: HashMap::new(),
-            cached_group: None,
-            invalid: false,
-        };
+            HashMap::new(),
+        )
+        .unwrap();
         // Declared but unused stages still accept updates. Consecutive writes
         // may cross holes only while the ORIGINAL Vulkan visibility matches.
         assert_eq!(
@@ -3558,13 +3653,13 @@ mod tests {
         .unwrap();
         resources.descriptor_sets.insert(
             set,
-            DescriptorSet {
-                texel_formats: HashMap::new(),
-                pool: vk::DescriptorPool::null(),
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
                 layout,
-                types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
-                stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
-                bindings: HashMap::from([(
+                BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
+                BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                HashMap::from([(
                     0,
                     DescriptorBinding::Buffer {
                         buffer: buffer_handle,
@@ -3572,9 +3667,8 @@ mod tests {
                         range: 64,
                     },
                 )]),
-                cached_group: None,
-                invalid: false,
-            },
+            )
+            .unwrap(),
         );
         let first = resources.descriptor_group(&table, set, &[0]).unwrap();
         let second = resources.descriptor_group(&table, set, &[256]).unwrap();
@@ -3830,22 +3924,21 @@ mod tests {
         .unwrap();
         resources.descriptor_sets.insert(
             set_handle,
-            DescriptorSet {
-                texel_formats: HashMap::new(),
-                pool: vk::DescriptorPool::null(),
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
                 layout,
-                types: BTreeMap::from([
+                BTreeMap::from([
                     (0, vk::DescriptorType::UNIFORM_BUFFER),
                     (4, vk::DescriptorType::UNIFORM_BUFFER),
                 ]),
-                stages: BTreeMap::from([
+                BTreeMap::from([
                     (0, vk::ShaderStageFlags::VERTEX),
                     (4, vk::ShaderStageFlags::FRAGMENT),
                 ]),
-                bindings: HashMap::new(),
-                cached_group: None,
-                invalid: false,
-            },
+                HashMap::new(),
+            )
+            .unwrap(),
         );
         let empty = resources.empty_bind_group(&table).unwrap();
         let mut previous = None;
@@ -3916,16 +4009,15 @@ mod tests {
         let handle = vk::DescriptorSet::from_raw(1);
         resources.descriptor_sets.insert(
             handle,
-            DescriptorSet {
-                texel_formats: HashMap::new(),
-                pool: vk::DescriptorPool::null(),
-                types: BTreeMap::new(),
-                stages: BTreeMap::new(),
-                layout: ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
-                bindings: HashMap::new(),
-                cached_group: None,
-                invalid: false,
-            },
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
+                ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                HashMap::new(),
+            )
+            .unwrap(),
         );
         let old_group = resources.descriptor_group(&old_table, handle, &[]).unwrap();
         resources.clear_ir_cache();
@@ -4305,13 +4397,13 @@ mod tests {
         .unwrap();
         resources.descriptor_sets.insert(
             set_handle,
-            DescriptorSet {
-                texel_formats: HashMap::new(),
-                pool: vk::DescriptorPool::null(),
-                types: BTreeMap::from([(0, vk::DescriptorType::STORAGE_BUFFER)]),
-                stages: BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
                 layout,
-                bindings: HashMap::from([(
+                BTreeMap::from([(0, vk::DescriptorType::STORAGE_BUFFER)]),
+                BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
+                HashMap::from([(
                     0,
                     DescriptorBinding::Buffer {
                         buffer: buffer_handle,
@@ -4319,9 +4411,8 @@ mod tests {
                         range: vk::WHOLE_SIZE,
                     },
                 )]),
-                cached_group: None,
-                invalid: false,
-            },
+            )
+            .unwrap(),
         );
         let first = resources.descriptor_group(&table, set_handle, &[]).unwrap();
         for _ in 0..1100 {
@@ -4354,16 +4445,15 @@ mod tests {
         .unwrap();
         resources.descriptor_sets.insert(
             handle,
-            DescriptorSet {
-                texel_formats: HashMap::new(),
-                pool: vk::DescriptorPool::null(),
-                types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
-                stages: BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
                 layout,
-                bindings: HashMap::new(),
-                cached_group: None,
-                invalid: false,
-            },
+                BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
+                HashMap::new(),
+            )
+            .unwrap(),
         );
         assert!(resources.descriptor_group(&table, handle, &[]).is_err());
         let buffer_handle = vk::Buffer::from_raw(2);

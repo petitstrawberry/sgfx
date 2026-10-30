@@ -37,12 +37,21 @@ pub(super) fn execute(
         );
         return Ok(());
     }
-    let submissions = submit_owned(rt, std::mem::take(ops)).inspect_err(|error| {
-        eprintln!(
-            "[SGFX Vulkan] control-point submission {:?}: {error:?}",
-            std::mem::discriminant(action)
-        )
-    })?;
+    // A boundary with no preceding commands has nothing new to dispatch. The
+    // retained receipts below already cover the earlier queue prefix; CPU
+    // observations still wait for them and for earlier in-flight packets.
+    // Sending empty streams here created native fences and attachment snapshots
+    // for consecutive barriers without adding any ordering guarantee.
+    let submissions = if ops.is_empty() {
+        Vec::new()
+    } else {
+        submit_owned(rt, std::mem::take(ops)).inspect_err(|error| {
+            eprintln!(
+                "[SGFX Vulkan] control-point submission {:?}: {error:?}",
+                std::mem::discriminant(action)
+            )
+        })?
+    };
     // Submissions on this queue execute in order. A GPU-only barrier needs
     // an ordered stream boundary, while CPU observations below need retirement.
     // Keep every receipt for the enclosing fence/readback instead of dropping

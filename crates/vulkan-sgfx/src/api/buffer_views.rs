@@ -84,7 +84,7 @@ unsafe extern "system" fn destroy(
     view: vk::BufferView,
     _: *const vk::AllocationCallbacks<'_>,
 ) {
-    let _ = with_device(device, move |rt| {
+    let _ = with_device_owned(device, move |rt| {
         rt.resources.buffer_views.remove(&view);
         Ok(())
     });

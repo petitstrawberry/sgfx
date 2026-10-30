@@ -1,6 +1,7 @@
 pub(crate) mod bootstrap;
 mod buffer_operations;
 mod buffer_readback;
+mod buffer_uploads;
 mod buffer_views;
 mod core11;
 mod core12;
@@ -486,6 +487,14 @@ pub(crate) fn with_device<T: Send + 'static>(
     call(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
 }
 
+/// Queue a fully owned void operation without waiting behind GPU submission.
+pub(crate) fn with_device_owned(
+    device: vk::Device,
+    op: impl FnOnce(&mut Runtime) -> VkResult<()> + Send + 'static,
+) -> VkResult<()> {
+    enqueue_device_owned(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
+}
+
 /// Publish fully owned descriptor metadata on the device FIFO without waiting
 /// for a reply. Invalidation belongs to the API invocation, before a subsequent
 /// command recording can bind the newly updated set. Doing it in the worker
@@ -497,6 +506,13 @@ pub(crate) fn update_descriptors_owned(
 ) -> VkResult<()> {
     let driver = driver(device.as_raw(), Kind::Device)?;
     invalidate_recorded_descriptor_sets(&driver.recordings, sets);
+    enqueue_device_owned(&driver, op)
+}
+
+fn enqueue_device_owned(
+    driver: &Driver,
+    op: impl FnOnce(&mut Runtime) -> VkResult<()> + Send + 'static,
+) -> VkResult<()> {
     // The synchronous call profiler intentionally excludes this one-way job:
     // enqueue-to-completion is not an API round trip or response wake delay.
     driver
@@ -1302,6 +1318,15 @@ enum RecordedCommand {
         point: vk::PipelineBindPoint,
         pipeline: vk::Pipeline,
     },
+    PushDescriptorWrites {
+        point: vk::PipelineBindPoint,
+        layout: vk::PipelineLayout,
+        set: u32,
+        writes: Vec<crate::resources::Write>,
+        handle: vk::DescriptorSet,
+        owner: std::sync::Weak<()>,
+        history: push_descriptors::History,
+    },
     BindDescriptorSets {
         point: vk::PipelineBindPoint,
         layout: vk::PipelineLayout,
@@ -1737,6 +1762,21 @@ impl RecordedCommand {
                 }
                 rec.used_pipelines.push(*pipeline);
             }
+            Self::PushDescriptorWrites {
+                point,
+                layout,
+                set,
+                writes,
+                handle,
+                owner,
+                history,
+            } => {
+                debug_assert!(matches!(
+                    *point,
+                    vk::PipelineBindPoint::GRAPHICS | vk::PipelineBindPoint::COMPUTE
+                ));
+                push_descriptors::resolve(rt, *layout, *set, writes, *handle, owner, history)?;
+            }
             Self::BindDescriptorSets {
                 point,
                 layout,
@@ -1782,7 +1822,7 @@ impl RecordedCommand {
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
                     let group_index = *first as usize + index;
                     if layout.bind_groups().get(group_index) != Some(&descriptor.layout)
-                        || binding_maps.get(group_index) != Some(&descriptor.binding_map())
+                        || binding_maps.get(group_index) != Some(descriptor.binding_map())
                         || binding_stages.get(group_index) != Some(&descriptor.stages)
                     {
                         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -1869,7 +1909,13 @@ impl RecordedCommand {
                             .unwrap_or_default(),
                     });
                 }
-                mark_writable_descriptor_buffers(&rt.resources, rec, &active_sets, desc.layout())?;
+                mark_writable_descriptor_buffers(
+                    &rt.resources,
+                    rec,
+                    &active_sets,
+                    desc.layout(),
+                    vk::PipelineBindPoint::COMPUTE,
+                )?;
                 if *x != 0 && *y != 0 && *z != 0 {
                     rec.ops.push(ir::OwnedCommand::Dispatch {
                         x: *x,
@@ -3409,7 +3455,13 @@ fn graphics_bindings(
             dynamic_offsets,
         });
     }
-    mark_writable_descriptor_buffers(resources, rec, &active_sets, desc.layout())?;
+    mark_writable_descriptor_buffers(
+        resources,
+        rec,
+        &active_sets,
+        desc.layout(),
+        vk::PipelineBindPoint::GRAPHICS,
+    )?;
     Ok(visible)
 }
 
@@ -3418,6 +3470,7 @@ fn mark_writable_descriptor_buffers(
     rec: &mut ResolvedRecording,
     sets: &[(u32, vk::DescriptorSet)],
     layout: &ir::PipelineLayoutDesc,
+    point: vk::PipelineBindPoint,
 ) -> VkResult<()> {
     for (index, handle) in sets {
         let set = resources
@@ -3436,20 +3489,35 @@ fn mark_writable_descriptor_buffers(
                         )
                 });
             if writable {
-                let crate::resources::DescriptorBinding::Buffer { buffer, .. } = resource else {
+                let crate::resources::DescriptorBinding::Buffer {
+                    buffer,
+                    offset,
+                    range,
+                } = resource
+                else {
                     continue;
                 };
                 if !rec.written_buffers.contains(buffer) {
                     rec.written_buffers.push(*buffer);
                 }
-                // Dynamic descriptor offsets and shader indexing can write any
-                // part of the backing buffer; retain the conservative range.
+                let offsets = if point == vk::PipelineBindPoint::COMPUTE {
+                    &rec.compute_offsets
+                } else {
+                    &rec.graphics_offsets
+                };
+                let dynamic = buffer_uploads::dynamic_offset(
+                    set,
+                    binding,
+                    offsets.get(index).map_or(&[], Vec::as_slice),
+                )?;
                 let size = resources
                     .buffers
                     .get(buffer)
                     .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
                     .size;
-                rec.readback_buffers.insert(*buffer, 0, size)?;
+                let range = buffer_uploads::descriptor_range(size, *offset, *range, dynamic)?;
+                rec.readback_buffers
+                    .insert(*buffer, range.start, range.end - range.start)?;
             }
         }
     }
@@ -4524,44 +4592,12 @@ fn take_positioned<'a, T>(
     current
 }
 
+#[cfg(test)]
 fn snapshot_buffer_uploads(
     resources: &crate::resources::Resources,
     used: &[vk::Buffer],
 ) -> VkResult<BufferUploads> {
-    let mut ops = Vec::new();
-    let mut fresh_uploads = Vec::new();
-    // Every upload is copied into SGFX-owned command storage before submission
-    // returns, so application mappings need not remain borrowed by the backend.
-    for handle in used {
-        let buffer = resources
-            .buffers
-            .get(handle)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if let Some((memory, offset)) = buffer.bound {
-            let allocation = resources
-                .memories
-                .get(&memory)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if !allocation.mapped && resources.uploaded_unmapped_buffers.contains(handle) {
-                continue;
-            }
-            let mut bytes = allocation
-                .bytes
-                .get(offset as usize..(offset + buffer.size) as usize)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
-                .to_vec();
-            bytes.resize(bytes.len().next_multiple_of(4), 0);
-            ops.push(ir::OwnedCommand::WriteBuffer {
-                buffer: buffer.id,
-                offset: 0,
-                data: bytes,
-            });
-            if !allocation.mapped {
-                fresh_uploads.push((*handle, memory));
-            }
-        }
-    }
-    Ok((ops, fresh_uploads))
+    buffer_uploads::whole(resources, used)
 }
 
 fn execute(
@@ -4569,28 +4605,15 @@ fn execute(
     rec: ResolvedRecording,
     retained_submissions: &mut Vec<sgfx::driver::Submission>,
 ) -> VkResult<()> {
-    let mut used = rec.used_buffers;
-    for insertion in &rec.descriptors {
-        let set = rt
-            .resources
-            .descriptor_sets
-            .get(&insertion.set)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        for binding in set.bindings.values() {
-            let crate::resources::DescriptorBinding::Buffer { buffer, .. } = binding else {
-                continue;
-            };
-            used.push(*buffer);
-        }
-    }
-    used.sort_unstable_by_key(|b| b.as_raw());
-    used.dedup();
     let (mut ops, fresh_uploads) = profile_work("execute::snapshot_buffers", || {
-        snapshot_buffer_uploads(&rt.resources, &used)
+        buffer_uploads::for_recording(&rt.resources, &rec.used_buffers, &rec.descriptors)
     })
     .inspect_err(|error| {
         if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-            eprintln!("[SGFX Vulkan] buffer snapshot failed: {error:?} used={used:?}");
+            eprintln!(
+                "[SGFX Vulkan] buffer snapshot failed: {error:?} used={:?}",
+                rec.used_buffers
+            );
         }
     })?;
     let mut descriptors = rec.descriptors.as_slice();
@@ -5357,13 +5380,13 @@ mod tests {
         for handle in [5, 6] {
             resources.descriptor_sets.insert(
                 vk::DescriptorSet::from_raw(handle),
-                crate::resources::DescriptorSet {
-                    texel_formats: HashMap::new(),
-                    pool: vk::DescriptorPool::from_raw(7),
-                    layout: group_layout.clone(),
-                    types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
-                    stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
-                    bindings: HashMap::from([(
+                crate::resources::DescriptorSet::new(
+                    HashMap::new(),
+                    vk::DescriptorPool::from_raw(7),
+                    group_layout.clone(),
+                    BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
+                    BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                    HashMap::from([(
                         0,
                         crate::resources::DescriptorBinding::Buffer {
                             buffer,
@@ -5371,9 +5394,8 @@ mod tests {
                             range: 16,
                         },
                     )]),
-                    cached_group: None,
-                    invalid: false,
-                },
+                )
+                .unwrap(),
             );
         }
         let mut rec = ResolvedRecording::new();
@@ -6439,21 +6461,20 @@ mod owned_descriptor_tests {
         for set in sets {
             runtime.resources.descriptor_sets.insert(
                 set,
-                DescriptorSet {
-                    texel_formats: HashMap::new(),
+                DescriptorSet::new(
+                    HashMap::new(),
                     pool,
-                    layout: ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+                    ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
                         0,
                         ir::ShaderStages::VERTEX,
                         ir::BindingType::UniformBuffer,
                     )])
                     .unwrap(),
-                    types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
-                    stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
-                    bindings: HashMap::new(),
-                    cached_group: None,
-                    invalid: false,
-                },
+                    BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                    BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                    HashMap::new(),
+                )
+                .unwrap(),
             );
         }
         (pool, sets, buffer)
