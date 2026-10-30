@@ -122,10 +122,31 @@ pub struct Capabilities {
     depth32_attachment: bool,
     image_readback: bool,
     image_blits: bool,
+    anisotropy_16: bool,
+    vertex_divisors: bool,
+    shader_draw_parameters: bool,
+    depth_transfers: bool,
+    float_color: bool,
     limits: Limits,
 }
 
 impl Capabilities {
+    /// Whether native floating-point RGBA render targets and transfers are available.
+    pub const fn supports_float_color(&self) -> bool {
+        self.float_color
+    }
+    pub const fn supports_depth_transfers(&self) -> bool {
+        self.depth_transfers
+    }
+    pub const fn supports_shader_draw_parameters(&self) -> bool {
+        self.shader_draw_parameters
+    }
+    pub const fn supports_vertex_divisors(&self) -> bool {
+        self.vertex_divisors
+    }
+    pub const fn supports_anisotropy_16(&self) -> bool {
+        self.anisotropy_16
+    }
     pub const fn supports_graphics(&self) -> bool {
         self.graphics
     }
@@ -1426,6 +1447,11 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                         .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
                     image_readback: true,
                     image_blits: true,
+                    anisotropy_16: false,
+                    vertex_divisors: false,
+                    shader_draw_parameters: false,
+                    depth_transfers: false,
+                    float_color: false,
                     limits: runtime,
                 },
                 backend: AdapterBackend::Wgpu(WgpuAdapter {
@@ -1667,6 +1693,11 @@ struct DynamicFeatures {
     push_constants_128: bool,
     color_attachments_8: bool,
     compute_buffers: bool,
+    anisotropy_16: bool,
+    vertex_divisors: bool,
+    shader_draw_parameters: bool,
+    depth_transfers: bool,
+    float_color: bool,
 }
 
 #[cfg(sgfx_dynamic)]
@@ -1690,6 +1721,11 @@ impl From<crate::dynamic::Capabilities> for DynamicFeatures {
             push_constants_128: capabilities.supports_push_constants_128(),
             color_attachments_8: capabilities.supports_color_attachments_8(),
             compute_buffers: capabilities.supports_compute_buffers(),
+            anisotropy_16: capabilities.supports_anisotropy_16(),
+            vertex_divisors: capabilities.supports_vertex_divisors(),
+            shader_draw_parameters: capabilities.supports_shader_draw_parameters(),
+            depth_transfers: capabilities.supports_depth_transfers(),
+            float_color: capabilities.supports_float_color(),
         }
     }
 }
@@ -1720,6 +1756,11 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
         depth32_attachment: features.depth,
         image_readback: features.readback,
         image_blits: features.blits,
+        anisotropy_16: programmable && features.anisotropy_16,
+        vertex_divisors: programmable && features.vertex_divisors,
+        shader_draw_parameters: programmable && features.shader_draw_parameters,
+        depth_transfers: features.depth && features.depth_transfers,
+        float_color: features.float_color,
         limits: Limits {
             max_push_constants_size: if programmable && features.push_constants_128 {
                 128

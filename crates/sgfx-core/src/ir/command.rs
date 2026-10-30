@@ -412,6 +412,8 @@ pub enum Command<'r, 'data> {
     SetSampler(SamplerRef<'r>),
     /// Bind transform and color uniforms for subsequent draws.
     SetUniforms(DrawUniforms),
+    /// Logical index within a multi-draw operation. Defaults to zero.
+    SetDrawIndex(u32),
     /// Set or reset the scissor for subsequent draws.
     SetScissor(Option<PixelRect>),
     /// Set the viewport for subsequent draws.
@@ -1153,6 +1155,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     ///
     /// # Returns
     /// Success, or an allocation/capacity error.
+    /// Select the logical multi-draw index for following draws.
+    pub fn set_draw_index(&mut self, index: u32) -> Result<()> {
+        self.encoder.push(Command::SetDrawIndex(index))
+    }
+
     pub fn set_uniforms(&mut self, uniforms: DrawUniforms) -> Result<()> {
         if self.uniforms.is_some_and(|current| {
             current.transform().columns().map(f32::to_bits)

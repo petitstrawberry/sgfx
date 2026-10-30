@@ -281,8 +281,8 @@ non-transactional [backend execution failures](reference.md#execution-and-comple
 
 | Bound | Value | Scope |
 | --- | --- | --- |
-| `MAX_TEXTURES` | 1,024 | Per resource table. |
-| `MAX_BUFFERS` | 1,024 | Per resource table. |
+| `MAX_TEXTURES` | 8,192 | Per resource table. |
+| `MAX_BUFFERS` | 4,096 | Per resource table. |
 | `MAX_SAMPLERS` | 256 | Per resource table. |
 | `MAX_RENDER_PIPELINES` | 256 | Per resource table. |
 | `MAX_BIND_GROUP_DEFINITIONS` | 4,096 | Immutable bind-group definitions per resource table. |

@@ -18,12 +18,19 @@ unsafe extern "system" fn create(
             || i.s_type != vk::StructureType::BUFFER_VIEW_CREATE_INFO
             || !i.p_next.is_null()
             || !i.flags.is_empty()
-            || i.format != vk::Format::R8G8B8A8_UNORM
+            || !matches!(
+                i.format,
+                vk::Format::R8G8B8A8_UNORM
+                    | vk::Format::R32_SINT
+                    | vk::Format::R32_UINT
+                    | vk::Format::R32_SFLOAT
+            )
             || !i.offset.is_multiple_of(4)
         {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let view = crate::resources::BufferView {
+            format: i.format,
             buffer: i.buffer,
             offset: i.offset,
             range: i.range,
@@ -40,7 +47,12 @@ unsafe extern "system" fn create(
                 Some(view.range)
             }
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if buffer.bound.is_none()
+            if !view.offset.is_multiple_of(u64::from(
+                rt.capabilities
+                    .limits()
+                    .min_storage_buffer_offset_alignment
+                    .max(4),
+            )) || buffer.bound.is_none()
                 || !buffer.usage.intersects(
                     vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
                         | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,

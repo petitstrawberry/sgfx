@@ -67,7 +67,9 @@ pub(crate) unsafe fn pipeline(
         return Err(UNSUPPORTED);
     }
     let formats = slice(info.p_color_attachment_formats, info.color_attachment_count)?;
-    pass(formats, info.depth_attachment_format, false).map(Some)
+    pass(formats, info.depth_attachment_format, false).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] pipeline attachment formats: colors={formats:?} depth={:?}: {error:?}", info.depth_attachment_format);
+    }).map(Some)
 }
 
 fn pass(
@@ -75,7 +77,7 @@ fn pass(
     depth: vk::Format,
     read_only_depth: bool,
 ) -> VkResult<crate::render_pass::RenderPass> {
-    if colors.is_empty()
+    if (colors.is_empty() && depth == vk::Format::UNDEFINED)
         || colors.len() > 8
         || colors
             .iter()
@@ -123,7 +125,7 @@ fn pass(
 }
 
 pub(super) fn begin(
-    rt: &Runtime,
+    rt: &mut Runtime,
     rec: &mut ResolvedRecording,
     rendering: &Rendering,
 ) -> VkResult<()> {
@@ -174,6 +176,10 @@ pub(super) fn begin(
                     | vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
             )
         {
+            eprintln!(
+                "[SGFX Vulkan] rendering attachment rejected: index={index} depth={depth} image={:?} format={:?} extent={:?} usage={:?} layout={layout:?} view={:?} components={:?}",
+                view.image, image.format, image.extent, image.usage, view.desc, view.components
+            );
             return Err(UNSUPPORTED);
         }
         if depth {

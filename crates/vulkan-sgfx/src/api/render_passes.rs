@@ -10,13 +10,14 @@ pub(super) struct ActiveRenderPass {
     pub subpass: usize,
     clears: Vec<vk::ClearValue>,
     images: Vec<(vk::Image, ir::TextureId)>,
+    discarded_color: Option<ir::TextureId>,
     used: Vec<bool>,
     accesses: Vec<Option<ir::TextureAccess>>,
     pub(super) area: ir::PixelRect,
 }
 
 pub(super) fn begin(
-    rt: &Runtime,
+    rt: &mut Runtime,
     rec: &mut ResolvedRecording,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
@@ -28,8 +29,14 @@ pub(super) fn begin(
         .resources
         .render_passes
         .get(&render_pass)
+        .cloned()
         .ok_or(INVALID)?;
-    let fb = rt.resources.framebuffers.get(&framebuffer).ok_or(INVALID)?;
+    let fb = rt
+        .resources
+        .framebuffers
+        .get(&framebuffer)
+        .cloned()
+        .ok_or(INVALID)?;
     if !pass.compatible(&fb.render_pass) {
         return Err(INVALID);
     }
@@ -67,11 +74,11 @@ pub(super) fn begin(
     };
     rec.used_framebuffers.push(framebuffer);
     rec.used_render_passes.push(render_pass);
-    begin_owned(rt, rec, pass, views, (fb.width, fb.height), area, clears)
+    begin_owned(rt, rec, &pass, views, (fb.width, fb.height), area, clears)
 }
 
 pub(super) fn begin_owned(
-    rt: &Runtime,
+    rt: &mut Runtime,
     rec: &mut ResolvedRecording,
     pass: &crate::render_pass::RenderPass,
     views: &[vk::ImageView],
@@ -93,12 +100,18 @@ pub(super) fn begin_owned(
     rec.used_images
         .extend(images.iter().map(|(image, _)| *image));
     rec.render = Some((width, height));
+    let discarded_color = if pass.subpasses.iter().any(|p| p.colors.is_empty()) {
+        Some(crate::clear::discarded_color(rt, width, height)?)
+    } else {
+        None
+    };
     let mut active = ActiveRenderPass {
         pass: pass.clone(),
         views: views.to_vec(),
         subpass: 0,
         clears: clears.to_vec(),
         images,
+        discarded_color,
         used: vec![false; pass.attachments.len()],
         accesses: vec![None; pass.attachments.len()],
         area,
@@ -394,6 +407,13 @@ impl ActiveRenderPass {
             self.access(index, ir::TextureAccess::Sampled, rec);
             self.used[index] = true;
         }
+        if colors.is_empty() {
+            colors.push(ir::OwnedColorAttachment {
+                target: self.discarded_color.ok_or(INVALID)?,
+                load: ir::LoadOp::DontCare,
+                store: ir::StoreOp::DontCare,
+            });
+        }
         let first = colors.remove(0);
         let desc = ir::OwnedRenderPassDesc {
             target: first.target,
@@ -520,6 +540,7 @@ mod tests {
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE);
         let mut active = ActiveRenderPass {
+            discarded_color: None,
             pass: crate::render_pass::RenderPass {
                 dynamic: false,
                 attachments: vec![attachment],
@@ -725,6 +746,7 @@ mod tests {
             .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         let area = ir::PixelRect::new(7, 9, 25, 23).unwrap();
         let mut active = ActiveRenderPass {
+            discarded_color: None,
             pass: crate::render_pass::RenderPass {
                 dynamic: false,
                 attachments: vec![attachment; 2],

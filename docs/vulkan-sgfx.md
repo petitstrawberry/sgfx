@@ -4,16 +4,49 @@
 implements a bounded executable subset to exercise Vulkan → SGFX portable IR →
 backend execution, macOS presentation through Metal, and Linux ABI presentation
 through Scarlet SWS with `VK_KHR_display` and `VK_KHR_wayland_surface`. The native
-Scarlet VirGL adapter additionally exposes the Vulkan 1.1 entry-point ABI used
-by Ganesh: memory requirements2/bind memory2, maintenance queries, core
-properties2 aliases, single-device groups and queue2. Other adapters continue
-to report Vulkan 1.0. Neither version is a conformance claim: substantial
-mandatory core functionality is absent. Do not
+Scarlet VirGL adapter exposes core 1.1 aliases and, when native compute,
+draw parameters, divisors, anisotropy and D32 transfers are available, the core
+1.2 entry-point profile. Aggregate 1.1/1.2 feature/property queries agree with
+their extension aliases, including the enforced 256 MiB allocation limit.
+Other adapters continue to report Vulkan 1.0. These API versions are not
+conformance claims: substantial mandatory core functionality is absent. Do not
 select it as a general application driver. Cross-platform WSI, resource
 reclamation with long-lived objects, broader API coverage and conformance work
 remain incomplete.
 
 ## Implemented path
+
+- Push descriptors and push descriptor templates retain immutable command-owned
+  snapshots. Partial updates preserve compatible prior bindings, including
+  replay after caller memory changes. Dynamic buffer descriptors are rejected
+  for push layouts; one push set and up to 16 descriptors are supported.
+- Capable native VirGL adapters support linear sampler anisotropy up to 16,
+  nonzero per-instance attribute divisors, and shader base-instance,
+  base-vertex and draw-index builtins. Indirect draw indices preserve skipped
+  zero-count entries. Native vertex fetch also accepts signed normalized byte
+  vectors, signed 16-bit pairs and 32-bit integer vectors. These features are
+  negotiated separately and stay disabled
+  on backends without the corresponding execution path.
+- Point-list assembly, Min/Max color and alpha blending, explicit sampling
+  gradients, fragment depth output, angle conversions and dynamic local-array
+  stores execute through the normal IR/compiler paths. SPIR-V normalization
+  retains external buffer offsets while repairing internal return-value struct
+  layouts affected by Naga's point-size IO serialization.
+- RGBA16F and RGBA32F sampled color targets, GPU clears, additive blending and
+  raw packed transfers are enabled when the host format masks support both.
+  Fragment output arrays become distinct attachment locations before validation.
+  Depth-only dynamic rendering retains a private discarded color attachment and
+  an empty fragment stage when the application supplies only a vertex stage.
+  Fixed finite constant/slope depth bias reaches the native rasterizer.
+- Scalar R32 signed/unsigned/float texel views use the original buffer and range
+  as read-only storage. `texelFetch` preserves component bits and supplies the
+  format's default zero/zero/one channels. Descriptor templates for texel views,
+  other texel formats and texel-buffer size queries are not implemented.
+- Native D32 images support checked staging uploads, image copies, readback and
+  depth clears, with mip zero and one layer. The CGL host needs the depth-aware
+  framebuffer copy path. GPU timestamps use the host's real GPU query result;
+  the Metal bridge retires GL work before sampling a Metal GPU completion marker.
+  A failed clock probe leaves timestamps disabled.
 
 - An actual C ABI `cdylib`, ICD interface negotiation (versions 2–5), scoped
   procedure lookup, instance/physical-device/device/queue/command-buffer
@@ -439,7 +472,7 @@ and verify the chosen Mesa driver. The Linux check also used
   A test creates/destroys 1250 buffers on an otherwise idle device, then performs
   real compute work. With long-lived pipelines/resources, unique transient
   resources and descriptor configurations still consume that epoch's table
-  budget (including 4096 buffers, 4096 memory allocations and 4096 bind-group configurations). Identical
+  budget (including 8192 texture identities, 4096 buffers, 4096 memory allocations and 4096 bind-group configurations). Identical
   descriptor configurations reuse definitions and physical groups; GPU image
   remapping invalidates physical groups. Exhaustion returns an allocation
   error. General reclamation requires generational core/backend slots or a safe

@@ -500,7 +500,9 @@ pub(super) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCreateQueryPool" => f!(create, vk::PFN_vkCreateQueryPool),
         b"vkDestroyQueryPool" => f!(destroy, vk::PFN_vkDestroyQueryPool),
         b"vkGetQueryPoolResults" => f!(results, vk::PFN_vkGetQueryPoolResults),
-        b"vkResetQueryPool" | b"vkResetQueryPoolEXT" => f!(host_reset, vk::PFN_vkResetQueryPool),
+        b"vkResetQueryPool" | b"vkResetQueryPoolEXT" => {
+            f!(host_reset, vk::PFN_vkResetQueryPool)
+        }
         b"vkCmdResetQueryPool" => f!(reset, vk::PFN_vkCmdResetQueryPool),
         b"vkCmdWriteTimestamp" => f!(timestamp, vk::PFN_vkCmdWriteTimestamp),
         b"vkCmdCopyQueryPoolResults" => f!(copy, vk::PFN_vkCmdCopyQueryPoolResults),

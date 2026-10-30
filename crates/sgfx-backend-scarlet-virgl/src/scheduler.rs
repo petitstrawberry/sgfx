@@ -210,7 +210,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         accepted: RefCell<Vec<u32>>,
-        fences: RefCell<Vec<Rc<Cell<Option<Result<(), u32>>>>>>,
+        fences: RefCell<Vec<Signal>>,
         busy: Cell<bool>,
         ready: Cell<bool>,
         fail_submit: Cell<bool>,

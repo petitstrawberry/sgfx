@@ -13,7 +13,7 @@ use super::{
 };
 
 /// Maximum textures held by one [`ResourceTable`].
-pub const MAX_TEXTURES: usize = 1_024;
+pub const MAX_TEXTURES: usize = 8_192;
 /// Maximum buffers held by one [`ResourceTable`].
 pub const MAX_BUFFERS: usize = 4_096;
 /// Maximum samplers held by one [`ResourceTable`].
@@ -53,6 +53,10 @@ pub enum TextureFormat {
     Nv12,
     /// One 32-bit floating-point depth component.
     Depth32Float,
+    /// Four half-precision floating-point color components.
+    Rgba16Float,
+    /// Four full-precision floating-point color components.
+    Rgba32Float,
 }
 
 impl TextureFormat {
@@ -63,7 +67,9 @@ impl TextureFormat {
             (
                 Self::Rgba8Unorm | Self::Bgra8Unorm,
                 Self::Rgba8Unorm | Self::Bgra8Unorm
-            ) | (Self::R8Unorm, Self::R8Unorm)
+            ) | (Self::Rgba16Float, Self::Rgba16Float)
+                | (Self::Rgba32Float, Self::Rgba32Float)
+                | (Self::R8Unorm, Self::R8Unorm)
                 | (Self::Rg8Unorm, Self::Rg8Unorm)
                 | (
                     Self::R8Unorm | Self::Rg8Unorm,
@@ -83,6 +89,8 @@ impl TextureFormat {
             | Self::Bgra8UnormSrgb
             | Self::Rgba8UnormSrgb
             | Self::Depth32Float => Some(4),
+            Self::Rgba16Float => Some(8),
+            Self::Rgba32Float => Some(16),
             Self::R8Unorm => Some(1),
             Self::Rg8Unorm => Some(2),
             Self::Nv12 => None,
@@ -99,7 +107,9 @@ impl TextureFormat {
             ) | (
                 Self::Rgba8Unorm | Self::Rgba8UnormSrgb,
                 Self::Rgba8Unorm | Self::Rgba8UnormSrgb
-            ) | (Self::R8Unorm, Self::R8Unorm)
+            ) | (Self::Rgba16Float, Self::Rgba16Float)
+                | (Self::Rgba32Float, Self::Rgba32Float)
+                | (Self::R8Unorm, Self::R8Unorm)
                 | (Self::Rg8Unorm, Self::Rg8Unorm)
                 | (Self::Depth32Float, Self::Depth32Float)
         )
@@ -222,14 +232,19 @@ impl TextureDesc {
     /// # Returns
     ///
     /// A descriptor, or [`Error::InvalidDescriptor`] for empty usage or a
-    /// depth format carrying usage other than `RENDER_ATTACHMENT` or `SAMPLED`.
+    /// depth format carrying storage or presentation usage.
     pub const fn new(format: TextureFormat, extent: Extent2D, usage: TextureUsage) -> Result<Self> {
         if (matches!(format, TextureFormat::Nv12) && usage.0 != TextureUsage::SAMPLED.0)
             || usage.0 == 0
             || (usage.contains(TextureUsage::STORAGE)
                 && !matches!(format, TextureFormat::Rgba8Unorm))
             || (matches!(format, TextureFormat::Depth32Float)
-                && usage.0 & !(TextureUsage::RENDER_ATTACHMENT.0 | TextureUsage::SAMPLED.0) != 0)
+                && usage.0
+                    & !(TextureUsage::RENDER_ATTACHMENT.0
+                        | TextureUsage::SAMPLED.0
+                        | TextureUsage::COPY_SRC.0
+                        | TextureUsage::COPY_DST.0)
+                    != 0)
         {
             Err(Error::InvalidDescriptor)
         } else {
@@ -526,6 +541,7 @@ pub struct SamplerDesc {
     min_lod_bits: u32,
     max_lod_bits: u32,
     compare: Option<super::CompareFunction>,
+    anisotropy: u8,
 }
 
 impl SamplerDesc {
@@ -555,6 +571,7 @@ impl SamplerDesc {
             min_lod_bits: 0,
             max_lod_bits: 0,
             compare: None,
+            anisotropy: 1,
         }
     }
     /// Return the minification filter.
@@ -602,6 +619,19 @@ impl SamplerDesc {
         self.max_lod_bits = if max_lod == 0.0 { 0 } else { max_lod.to_bits() };
         Ok(self)
     }
+    /// Set the maximum anisotropy. One disables anisotropic filtering.
+    pub fn with_anisotropy(mut self, maximum: u8) -> Result<Self> {
+        if !(1..=16).contains(&maximum) {
+            return Err(Error::InvalidValue);
+        }
+        self.anisotropy = maximum;
+        Ok(self)
+    }
+    /// Maximum anisotropic sampling ratio, between one and sixteen.
+    pub const fn anisotropy(self) -> u8 {
+        self.anisotropy
+    }
+
     /// Return mip-level filtering.
     pub const fn mip_filter(self) -> FilterMode {
         self.mip_filter

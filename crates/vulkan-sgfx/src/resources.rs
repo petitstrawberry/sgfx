@@ -13,7 +13,7 @@ const LIMIT: usize = 1024;
 // Keep their count separate from metadata limits and from the byte budget.
 pub(crate) const MAX_MEMORY_ALLOCATIONS: usize = 4_096;
 const MAX_DESCRIPTOR_SETS: usize = 16_384;
-const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_ALLOCATED: usize = 512 * 1024 * 1024;
 pub(crate) struct Buffer {
     pub id: ir::BufferId,
@@ -23,6 +23,7 @@ pub(crate) struct Buffer {
 }
 #[derive(Clone, Copy)]
 pub(crate) struct BufferView {
+    pub format: vk::Format,
     pub buffer: vk::Buffer,
     pub offset: u64,
     pub range: u64,
@@ -98,6 +99,7 @@ pub(crate) enum Pipeline {
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DescriptorBinding {
+    TexelBuffer(vk::BufferView),
     Buffer {
         buffer: vk::Buffer,
         offset: u64,
@@ -116,6 +118,7 @@ pub(crate) struct DescriptorPool {
     pub capacity: HashMap<vk::DescriptorType, u32>,
     pub remaining: HashMap<vk::DescriptorType, u32>,
 }
+#[derive(Clone)]
 pub(crate) struct DescriptorSet {
     pub pool: vk::DescriptorPool,
     pub layout: ir::BindGroupLayoutDesc,
@@ -230,6 +233,8 @@ pub(crate) unsafe fn specialization(
 
 #[derive(Default)]
 pub(crate) struct Resources {
+    pub depth_only_fragment: Option<ir::ShaderModuleId>,
+    pub depth_clear_colors: HashMap<(u32, u32), ir::TextureId>,
     pub image_view_formats: HashMap<vk::Image, Vec<vk::Format>>,
     pub descriptor_templates:
         HashMap<vk::DescriptorUpdateTemplate, crate::api::descriptor_template::Template>,
@@ -242,6 +247,9 @@ pub(crate) struct Resources {
     // Destroying VkShaderModule must not retire modules still referenced by a
     // live VkPipeline. View-swizzle modules have no VkShaderModule owner.
     orphaned_shader_modules: HashSet<ir::ShaderModuleId>,
+    pub push_set_layouts: HashSet<vk::DescriptorSetLayout>,
+    pub pipeline_push_sets: HashMap<vk::PipelineLayout, (u32, DescriptorSet)>,
+    pub pushed_set_owners: HashMap<vk::DescriptorSet, std::sync::Weak<()>>,
     pub set_layouts: HashMap<vk::DescriptorSetLayout, ir::BindGroupLayoutDesc>,
     pub set_layout_types: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::DescriptorType>>,
     pub set_layout_stages: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::ShaderStageFlags>>,
@@ -476,6 +484,8 @@ impl Resources {
 
     /// Forget every cached identity before swapping to a fresh IR table.
     pub(crate) fn clear_ir_cache(&mut self) {
+        self.depth_clear_colors.clear();
+        self.depth_only_fragment = None;
         self.uploaded_unmapped_buffers.clear();
         self.bind_group_cache.clear();
         self.graphics_swizzles.clear();
@@ -606,6 +616,9 @@ impl Resources {
             let binding = set.ir_to_source(entry.binding()).ok_or(invalid)?;
             let resource = *set.bindings.get(&binding).ok_or(invalid)?;
             let resource = match resource {
+                DescriptorBinding::TexelBuffer(_) => {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
                 DescriptorBinding::Buffer {
                     buffer,
                     offset,
@@ -941,6 +954,10 @@ unsafe extern "system" fn create_buffer(
             (
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 ir::BufferUsage::UNIFORM,
+            ),
+            (
+                vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER,
+                ir::BufferUsage::STORAGE,
             ),
             (
                 vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -1377,28 +1394,51 @@ fn normalize_spirv_specialized(
     inputs: &[Option<bool>],
     bindings: &[DescriptorBindingMap],
 ) -> Result<ir::ShaderModuleDesc, vk::Result> {
-    ir::ShaderModuleDesc::spirv(words.clone()).map_err(failure)?;
-    let words = crate::specialization::freeze(words, values)?;
-    let words = crate::input_attachments::lower(words, inputs)?;
-    let words = crate::spirv::separate_combined_samplers(words)?;
-    let words = crate::uniform_arrays::lower(words)?;
-    let words = crate::stage_inputs::lower(words)?;
+    ir::ShaderModuleDesc::spirv(words.clone())
+        .map_err(failure)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] shader resource header: {e:?}"))?;
+    let words = crate::specialization::freeze(words, values).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader specialization: {error:?}");
+    })?;
+    let words = crate::input_attachments::lower(words, inputs).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader input attachments: {error:?}");
+    })?;
+    let words = crate::texel_buffers::lower(words)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] texel buffer lowering: {e:?}"))?;
+    let words = crate::spirv::separate_combined_samplers(words).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader combined samplers: {error:?}");
+    })?;
+    let words = crate::uniform_arrays::lower(words).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader uniform arrays: {error:?}");
+    })?;
+    let words = crate::stage_inputs::lower(words).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader stage inputs: {error:?}");
+    })?;
     let options = naga::front::spv::Options {
         adjust_coordinate_space: true,
         strict_capabilities: true,
         block_ctx_dump_prefix: None,
     };
+    let draw_parameters = crate::spirv::instructions(&words)?
+        .iter()
+        .any(|i| i[0] & 65535 == 71 && i.len() == 4 && i[2] == 11 && (4424..=4426).contains(&i[3]));
+    let words = ir::spirv_compat::naga24_spirv(&words)
+        .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
     let mut module = naga::front::spv::Frontend::new(words.into_iter(), &options)
         .parse()
         .map_err(|e| {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            {
                 eprintln!("[SGFX Vulkan] SPIR-V parse: {e:?}");
             }
             vk::Result::ERROR_FEATURE_NOT_PRESENT
         })?;
-    crate::shader_functions::specialize(&mut module)?;
-    crate::shader_functions::resolve_sampler_types(&mut module)?;
-    crate::shader_functions::widen_fragment_outputs(&mut module)?;
+    crate::shader_functions::specialize(&mut module)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] shader function specialization: {e:?}"))?;
+    crate::shader_functions::resolve_sampler_types(&mut module)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] shader sampler types: {e:?}"))?;
+    crate::shader_functions::flatten_fragment_output_arrays(&mut module)?;
+    crate::shader_functions::widen_fragment_outputs(&mut module)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] shader fragment outputs: {e:?}"))?;
     // SPIR-V combined image samplers become two Naga globals with the same
     // Vulkan binding. SGFX has separate texture/sampler resources. Reserve an
     // adjacent pair per logical binding, including ordinary buffer bindings.
@@ -1438,20 +1478,32 @@ fn normalize_spirv_specialized(
     )
     .validate(&module)
     .map_err(|e| {
-        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        {
             eprintln!("[SGFX Vulkan] shader validation: {e:?}");
         }
         vk::Result::ERROR_FEATURE_NOT_PRESENT
     })?;
     let mut output = naga::back::spv::Options {
-        lang_version: (1, 0),
+        lang_version: if draw_parameters { (1, 3) } else { (1, 0) },
         ..Default::default()
     };
     output
         .flags
         .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
-    let normalized = naga::back::spv::write_vec(&module, &info, &output, None)
-        .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    let mut normalized =
+        naga::back::spv::write_vec(&module, &info, &output, None).map_err(|error| {
+            {
+                eprintln!("[SGFX Vulkan] normalized SPIR-V: {error:?}");
+            }
+            vk::Result::ERROR_FEATURE_NOT_PRESENT
+        })?;
+    if draw_parameters
+        && !crate::spirv::instructions(&normalized)?
+            .iter()
+            .any(|i| i[0] & 65535 == 17 && i.get(1) == Some(&4427))
+    {
+        normalized.splice(5..5, [(2u32 << 16) | 17, 4427]);
+    }
     // Validate the representation consumed by backends, including the SPIR-V
     // writer/parser round trip. WGPU 24 cannot format SPIR-V validation spans
     // against its empty text source and would otherwise panic on this path.
@@ -1459,15 +1511,31 @@ fn normalize_spirv_specialized(
         adjust_coordinate_space: false,
         ..options
     };
-    let normalized_module = naga::front::spv::Frontend::new(normalized.iter().copied(), &options)
-        .parse()
-        .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    let normalized = crate::spirv::function_struct_layouts(normalized)?;
+    let normalized_module = naga::front::spv::Frontend::new(
+        ir::spirv_compat::naga24_spirv(&normalized)
+            .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?
+            .into_iter(),
+        &options,
+    )
+    .parse()
+    .map_err(|error| {
+        {
+            eprintln!("[SGFX Vulkan] normalized SPIR-V: {error:?}");
+        }
+        vk::Result::ERROR_FEATURE_NOT_PRESENT
+    })?;
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(&normalized_module)
-    .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    .map_err(|error| {
+        {
+            eprintln!("[SGFX Vulkan] normalized SPIR-V: {error:?}");
+        }
+        vk::Result::ERROR_FEATURE_NOT_PRESENT
+    })?;
     ir::ShaderModuleDesc::spirv(normalized).map_err(failure)
 }
 unsafe extern "system" fn create_shader_module(
@@ -1543,7 +1611,7 @@ pub(crate) unsafe fn descriptor_layout(
     if i.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO {
         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
     }
-    if !i.flags.is_empty() {
+    if !vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR.contains(i.flags) {
         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
     }
     if !i.p_next.is_null() {
@@ -1590,6 +1658,16 @@ pub(crate) unsafe fn descriptor_layout(
             }
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
+        if i.flags
+            .contains(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+            && matches!(
+                binding.descriptor_type,
+                vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+            )
+        {
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
         original_stages.insert(binding.binding, binding.stage_flags);
     }
     let binding_map = descriptor_binding_map(&types)?;
@@ -1597,6 +1675,9 @@ pub(crate) unsafe fn descriptor_layout(
         let ty = match binding.descriptor_type {
             vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
                 ir::BindingType::UniformBuffer
+            }
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER => {
+                ir::BindingType::StorageBuffer { read_only: true }
             }
             vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
                 ir::BindingType::StorageBuffer { read_only: false }
@@ -1655,12 +1736,21 @@ unsafe extern "system" fn create_descriptor_set_layout(
         if info.is_null() || !allocator.is_null() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let (desc, types, original_stages) = descriptor_layout(&*info)?;
+        let pushed = (*info)
+            .flags
+            .contains(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
+        let (desc, types, original_stages) = descriptor_layout(&*info).inspect_err(|error| {
+            let i = &*info;
+            eprintln!("[SGFX Vulkan] descriptor layout rejected: {error:?} flags={:?} pnext={:?} bindings={:?}", i.flags, i.p_next, copied(i.p_bindings, i.binding_count as usize, ir::MAX_BINDINGS_PER_GROUP));
+        })?;
         let handle = crate::api::with_device(device, move |r| {
             if r.resources.set_layouts.len() >= LIMIT {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
             let handle = vk::DescriptorSetLayout::from_raw(crate::api::next_id());
+            if pushed {
+                r.resources.push_set_layouts.insert(handle);
+            }
             r.resources.set_layouts.insert(handle, desc);
             r.resources.set_layout_types.insert(handle, types);
             r.resources
@@ -1678,6 +1768,7 @@ unsafe extern "system" fn destroy_descriptor_set_layout(
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
     let _ = crate::api::with_device(device, move |r| {
+        r.resources.push_set_layouts.remove(&handle);
         r.resources.set_layouts.remove(&handle);
         r.resources.set_layout_types.remove(&handle);
         r.resources.set_layout_stages.remove(&handle);
@@ -1746,6 +1837,26 @@ unsafe extern "system" fn create_pipeline_layout(
                         .ok_or(vk::Result::ERROR_UNKNOWN)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let mut pushed = None;
+            for (index, h) in handles.iter().enumerate() {
+                if r.resources.push_set_layouts.contains(h) {
+                    if pushed.is_some() {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    pushed = Some((
+                        index as u32,
+                        DescriptorSet {
+                            pool: vk::DescriptorPool::null(),
+                            layout: r.resources.set_layouts[h].clone(),
+                            types: r.resources.set_layout_types[h].clone(),
+                            stages: r.resources.set_layout_stages[h].clone(),
+                            bindings: HashMap::new(),
+                            cached_group: None,
+                            invalid: false,
+                        },
+                    ));
+                }
+            }
             let groups = handles
                 .into_iter()
                 .map(|h| {
@@ -1766,6 +1877,9 @@ unsafe extern "system" fn create_pipeline_layout(
                 .with_push_constant_ranges(push_ranges)
                 .map_err(failure)?;
             let handle = vk::PipelineLayout::from_raw(crate::api::next_id());
+            if let Some(pushed) = pushed {
+                r.resources.pipeline_push_sets.insert(handle, pushed);
+            }
             r.resources.pipeline_layouts.insert(handle, desc.clone());
             r.resources
                 .pipeline_binding_maps
@@ -1786,6 +1900,7 @@ unsafe extern "system" fn destroy_pipeline_layout(
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
     let _ = crate::api::with_device(device, move |r| {
+        r.resources.pipeline_push_sets.remove(&handle);
         r.resources.pipeline_layouts.remove(&handle);
         r.resources.pipeline_binding_maps.remove(&handle);
         r.resources.pipeline_binding_stages.remove(&handle);
@@ -1922,6 +2037,12 @@ unsafe extern "system" fn allocate_descriptor_sets(
             {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
+            if layouts
+                .iter()
+                .any(|h| r.resources.push_set_layouts.contains(h))
+            {
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
             let layouts = layouts
                 .into_iter()
                 .map(|h| {
@@ -2039,12 +2160,12 @@ unsafe extern "system" fn free_descriptor_sets(
     })
 }
 #[derive(Clone)]
-struct Write {
-    set: vk::DescriptorSet,
-    binding: u32,
-    element: u32,
-    ty: vk::DescriptorType,
-    value: Option<DescriptorBinding>,
+pub(crate) struct Write {
+    pub(crate) set: vk::DescriptorSet,
+    pub(crate) binding: u32,
+    pub(crate) element: u32,
+    pub(crate) ty: vk::DescriptorType,
+    pub(crate) value: Option<DescriptorBinding>,
 }
 // This frontend's descriptors each have count one. Vulkan updates may still
 // span consecutive compatible bindings, skipping absent (zero-count) slots.
@@ -2074,6 +2195,204 @@ fn descriptor_write_binding(
     }
 }
 
+pub(crate) unsafe fn snapshot_descriptor_writes(
+    writes: &[vk::WriteDescriptorSet<'_>],
+) -> Vec<Write> {
+    let mut owned_writes = Vec::with_capacity(writes.len());
+    for write in writes {
+        let valid = write.s_type == vk::StructureType::WRITE_DESCRIPTOR_SET
+            && write.p_next.is_null()
+            && (1..=16).contains(&write.descriptor_count)
+            && write.dst_array_element == 0;
+        for element in 0..if valid { write.descriptor_count } else { 1 } {
+            let value = if !valid {
+                None
+            } else {
+                match write.descriptor_type {
+                    vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                        if !write.p_texel_buffer_view.is_null() =>
+                    {
+                        Some(DescriptorBinding::TexelBuffer(
+                            *write.p_texel_buffer_view.add(element as usize),
+                        ))
+                    }
+
+                    vk::DescriptorType::UNIFORM_BUFFER
+                    | vk::DescriptorType::STORAGE_BUFFER
+                    | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                        if !write.p_buffer_info.is_null() =>
+                    {
+                        let b = *write.p_buffer_info.add(element as usize);
+                        Some(DescriptorBinding::Buffer {
+                            buffer: b.buffer,
+                            offset: b.offset,
+                            range: b.range,
+                        })
+                    }
+                    vk::DescriptorType::SAMPLED_IMAGE
+                    | vk::DescriptorType::INPUT_ATTACHMENT
+                    | vk::DescriptorType::STORAGE_IMAGE
+                    | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                        if !write.p_image_info.is_null() =>
+                    {
+                        let i = *write.p_image_info.add(element as usize);
+                        Some(DescriptorBinding::Image {
+                            view: i.image_view,
+                            sampler: i.sampler,
+                            layout: i.image_layout,
+                        })
+                    }
+                    vk::DescriptorType::SAMPLER if !write.p_image_info.is_null() => {
+                        Some(DescriptorBinding::Sampler(
+                            (*write.p_image_info.add(element as usize)).sampler,
+                        ))
+                    }
+                    _ => None,
+                }
+            };
+            owned_writes.push(Write {
+                set: write.dst_set,
+                binding: write.dst_binding,
+                element,
+                ty: write.descriptor_type,
+                value,
+            });
+        }
+    }
+    owned_writes
+}
+
+pub(crate) fn apply_descriptor_writes(r: &mut crate::runtime::Runtime, owned_writes: Vec<Write>) {
+    for mut write in owned_writes {
+        if let Some(DescriptorBinding::TexelBuffer(view)) = write.value {
+            write.value = r
+                .resources
+                .buffer_views
+                .get(&view)
+                .filter(|v| {
+                    matches!(
+                        v.format,
+                        vk::Format::R32_SINT | vk::Format::R32_UINT | vk::Format::R32_SFLOAT
+                    )
+                })
+                .map(|v| DescriptorBinding::Buffer {
+                    buffer: v.buffer,
+                    offset: v.offset,
+                    range: v.range,
+                });
+        }
+        let valid = write.value.is_some_and(|v| match v {
+            DescriptorBinding::TexelBuffer(_) => false,
+            DescriptorBinding::Buffer {
+                buffer,
+                offset,
+                range,
+            } => r.resources.buffers.get(&buffer).is_some_and(|b| {
+                let size = if range == vk::WHOLE_SIZE {
+                    b.size.saturating_sub(offset)
+                } else {
+                    range
+                };
+                size > 0
+                    && size
+                        <= if matches!(
+                            write.ty,
+                            vk::DescriptorType::UNIFORM_BUFFER
+                                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                        ) {
+                            16 * 1024
+                        } else {
+                            128 * 1024 * 1024
+                        }
+                    && size.is_multiple_of(4)
+                    && offset.is_multiple_of(u64::from(
+                        if matches!(
+                            write.ty,
+                            vk::DescriptorType::UNIFORM_BUFFER
+                                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                        ) {
+                            r.capabilities
+                                .limits()
+                                .min_uniform_buffer_offset_alignment
+                                .max(16)
+                        } else {
+                            r.capabilities
+                                .limits()
+                                .min_storage_buffer_offset_alignment
+                                .max(4)
+                        },
+                    ))
+                    && offset.checked_add(size).is_some_and(|end| end <= b.size)
+                    && b.usage.contains(
+                        if matches!(
+                            write.ty,
+                            vk::DescriptorType::UNIFORM_BUFFER
+                                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                        ) {
+                            vk::BufferUsageFlags::UNIFORM_BUFFER
+                        } else if write.ty == vk::DescriptorType::UNIFORM_TEXEL_BUFFER {
+                            vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                        } else {
+                            vk::BufferUsageFlags::STORAGE_BUFFER
+                        },
+                    )
+            }),
+            DescriptorBinding::Sampler(sampler) => r.resources.samplers.contains_key(&sampler),
+            DescriptorBinding::Image {
+                view,
+                sampler,
+                layout,
+            } => {
+                matches!(
+                    layout,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        | vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                        | vk::ImageLayout::GENERAL
+                ) && r
+                    .resources
+                    .views
+                    .get(&view)
+                    .and_then(|view| r.resources.images.get(&view.image))
+                    .is_some_and(|image| {
+                        image
+                            .usage
+                            .contains(if write.ty == vk::DescriptorType::STORAGE_IMAGE {
+                                vk::ImageUsageFlags::STORAGE
+                            } else if write.ty == vk::DescriptorType::INPUT_ATTACHMENT {
+                                vk::ImageUsageFlags::INPUT_ATTACHMENT
+                            } else {
+                                vk::ImageUsageFlags::SAMPLED
+                            })
+                    })
+                    && (write.ty != vk::DescriptorType::STORAGE_IMAGE
+                        || (layout == vk::ImageLayout::GENERAL
+                            && r.resources
+                                .views
+                                .get(&view)
+                                .is_some_and(|view| view.components == [0, 1, 2, 3])))
+                    && (write.ty != vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                        || r.resources.samplers.contains_key(&sampler))
+            }
+        });
+        if let Some(set) = r.resources.descriptor_sets.get_mut(&write.set) {
+            let binding = descriptor_write_binding(set, write.binding, write.element, write.ty);
+            set.cached_group = None;
+            if let (true, Some(binding), Some(value)) = (valid, binding, write.value) {
+                set.bindings.insert(binding, value);
+            } else {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] invalid descriptor write: set={:?} binding={} element={} type={:?} value={:?} valid_resource={valid} resolved_binding={binding:?}",
+                        write.set, write.binding, write.element, write.ty, write.value
+                    );
+                }
+                set.invalid = true;
+            }
+        }
+    }
+}
+
 pub(crate) unsafe extern "system" fn update_descriptor_sets(
     device: vk::Device,
     write_count: u32,
@@ -2084,60 +2403,7 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
     let result = ffi(|| {
         let writes = copied(writes, write_count as usize, LIMIT)?;
         let copies = copied(copies, copy_count as usize, LIMIT)?;
-        let mut owned_writes = Vec::with_capacity(writes.len());
-        for write in writes {
-            let valid = write.s_type == vk::StructureType::WRITE_DESCRIPTOR_SET
-                && write.p_next.is_null()
-                && (1..=16).contains(&write.descriptor_count)
-                && write.dst_array_element == 0;
-            for element in 0..if valid { write.descriptor_count } else { 1 } {
-                let value = if !valid {
-                    None
-                } else {
-                    match write.descriptor_type {
-                        vk::DescriptorType::UNIFORM_BUFFER
-                        | vk::DescriptorType::STORAGE_BUFFER
-                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                        | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
-                            if !write.p_buffer_info.is_null() =>
-                        {
-                            let b = *write.p_buffer_info.add(element as usize);
-                            Some(DescriptorBinding::Buffer {
-                                buffer: b.buffer,
-                                offset: b.offset,
-                                range: b.range,
-                            })
-                        }
-                        vk::DescriptorType::SAMPLED_IMAGE
-                        | vk::DescriptorType::INPUT_ATTACHMENT
-                        | vk::DescriptorType::STORAGE_IMAGE
-                        | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-                            if !write.p_image_info.is_null() =>
-                        {
-                            let i = *write.p_image_info.add(element as usize);
-                            Some(DescriptorBinding::Image {
-                                view: i.image_view,
-                                sampler: i.sampler,
-                                layout: i.image_layout,
-                            })
-                        }
-                        vk::DescriptorType::SAMPLER if !write.p_image_info.is_null() => {
-                            Some(DescriptorBinding::Sampler(
-                                (*write.p_image_info.add(element as usize)).sampler,
-                            ))
-                        }
-                        _ => None,
-                    }
-                };
-                owned_writes.push(Write {
-                    set: write.dst_set,
-                    binding: write.dst_binding,
-                    element,
-                    ty: write.descriptor_type,
-                    value,
-                });
-            }
-        }
+        let owned_writes = snapshot_descriptor_writes(&writes);
         let owned_copies = copies
             .into_iter()
             .map(|c| {
@@ -2160,116 +2426,7 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
             .chain(owned_copies.iter().map(|c| c.2))
             .collect::<Vec<_>>();
         crate::api::update_descriptors_owned(device, &modified_sets, move |r| {
-            for write in owned_writes {
-                let valid = write.value.is_some_and(|v| match v {
-                    DescriptorBinding::Buffer {
-                        buffer,
-                        offset,
-                        range,
-                    } => r.resources.buffers.get(&buffer).is_some_and(|b| {
-                        let size = if range == vk::WHOLE_SIZE {
-                            b.size.saturating_sub(offset)
-                        } else {
-                            range
-                        };
-                        size > 0
-                            && size
-                                <= if matches!(
-                                    write.ty,
-                                    vk::DescriptorType::UNIFORM_BUFFER
-                                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                                ) {
-                                    16 * 1024
-                                } else {
-                                    128 * 1024 * 1024
-                                }
-                            && size.is_multiple_of(4)
-                            && offset.is_multiple_of(u64::from(
-                                if matches!(
-                                    write.ty,
-                                    vk::DescriptorType::UNIFORM_BUFFER
-                                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                                ) {
-                                    r.capabilities
-                                        .limits()
-                                        .min_uniform_buffer_offset_alignment
-                                        .max(16)
-                                } else {
-                                    r.capabilities
-                                        .limits()
-                                        .min_storage_buffer_offset_alignment
-                                        .max(4)
-                                },
-                            ))
-                            && offset.checked_add(size).is_some_and(|end| end <= b.size)
-                            && b.usage.contains(
-                                if matches!(
-                                    write.ty,
-                                    vk::DescriptorType::UNIFORM_BUFFER
-                                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                                ) {
-                                    vk::BufferUsageFlags::UNIFORM_BUFFER
-                                } else {
-                                    vk::BufferUsageFlags::STORAGE_BUFFER
-                                },
-                            )
-                    }),
-                    DescriptorBinding::Sampler(sampler) => {
-                        r.resources.samplers.contains_key(&sampler)
-                    }
-                    DescriptorBinding::Image {
-                        view,
-                        sampler,
-                        layout,
-                    } => {
-                        matches!(
-                            layout,
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                                | vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                | vk::ImageLayout::GENERAL
-                        ) && r
-                            .resources
-                            .views
-                            .get(&view)
-                            .and_then(|view| r.resources.images.get(&view.image))
-                            .is_some_and(|image| {
-                                image.usage.contains(
-                                    if write.ty == vk::DescriptorType::STORAGE_IMAGE {
-                                        vk::ImageUsageFlags::STORAGE
-                                    } else if write.ty == vk::DescriptorType::INPUT_ATTACHMENT {
-                                        vk::ImageUsageFlags::INPUT_ATTACHMENT
-                                    } else {
-                                        vk::ImageUsageFlags::SAMPLED
-                                    },
-                                )
-                            })
-                            && (write.ty != vk::DescriptorType::STORAGE_IMAGE
-                                || (layout == vk::ImageLayout::GENERAL
-                                    && r.resources
-                                        .views
-                                        .get(&view)
-                                        .is_some_and(|view| view.components == [0, 1, 2, 3])))
-                            && (write.ty != vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-                                || r.resources.samplers.contains_key(&sampler))
-                    }
-                });
-                if let Some(set) = r.resources.descriptor_sets.get_mut(&write.set) {
-                    let binding =
-                        descriptor_write_binding(set, write.binding, write.element, write.ty);
-                    set.cached_group = None;
-                    if let (true, Some(binding), Some(value)) = (valid, binding, write.value) {
-                        set.bindings.insert(binding, value);
-                    } else {
-                        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                            eprintln!(
-                                "[SGFX Vulkan] invalid descriptor write: set={:?} binding={} element={} type={:?} value={:?} valid_resource={valid} resolved_binding={binding:?}",
-                                write.set, write.binding, write.element, write.ty, write.value
-                            );
-                        }
-                        set.invalid = true;
-                    }
-                }
-            }
+            apply_descriptor_writes(r, owned_writes);
             for (src, src_binding, dst, dst_binding, valid) in owned_copies {
                 let source = r
                     .resources
@@ -2653,7 +2810,9 @@ fn sampler_descriptor(
         || i.s_type != vk::StructureType::SAMPLER_CREATE_INFO
         || !i.p_next.is_null()
         || !i.flags.is_empty()
-        || i.anisotropy_enable != vk::FALSE
+        || !matches!(i.anisotropy_enable, vk::FALSE | vk::TRUE)
+        || (i.anisotropy_enable == vk::TRUE
+            && (!i.max_anisotropy.is_finite() || !(1.0..=16.0).contains(&i.max_anisotropy)))
         || i.unnormalized_coordinates != vk::FALSE
         || !matches!(i.compare_enable, vk::FALSE | vk::TRUE)
         || i.mip_lod_bias != 0.0
@@ -2707,6 +2866,12 @@ fn sampler_descriptor(
         i.max_lod,
     )
     .map_err(failure)?
+    .with_anisotropy(if i.anisotropy_enable == vk::TRUE {
+        i.max_anisotropy.ceil() as u8
+    } else {
+        1
+    })
+    .map_err(failure)?
     .with_compare(if i.compare_enable != vk::FALSE {
         Some(crate::images::compare(i.compare_op)?)
     } else {
@@ -2730,6 +2895,9 @@ unsafe extern "system" fn create_sampler(
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         let desc = sampler_descriptor(i, !allocator.is_null())?;
         let handle = crate::api::with_device(device, move |r| {
+            if desc.anisotropy() > 1 && !r.capabilities.supports_anisotropy_16() {
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
             let id = r.table.define_sampler(desc).map_err(failure)?.id();
             let handle = vk::Sampler::from_raw(crate::api::next_id());
             r.resources.samplers.insert(handle, id);
@@ -2999,6 +3167,68 @@ mod tests {
     }
 
     #[test]
+    fn r32_texel_fetch_preserves_signed_bits_and_default_channels() {
+        let words = include_bytes!("../tests/assets/texel-buffer.vert.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let module = normalize_spirv(words).unwrap();
+        let shader = sgfx_codegen_virgl::programmable::compile_shader(
+            &module,
+            ir::ShaderStage::Vertex,
+            "main",
+        )
+        .unwrap();
+        assert_eq!(shader.storage_buffers.len(), 1);
+        assert!(shader.tgsi.contains("BUFFER"));
+    }
+    #[test]
+    fn fragment_output_arrays_expand_to_distinct_attachment_locations() {
+        let words = include_bytes!("../tests/assets/output-array.frag.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let module = normalize_spirv(words).unwrap();
+        let shader = sgfx_codegen_virgl::programmable::compile_shader(
+            &module,
+            ir::ShaderStage::Fragment,
+            "main",
+        )
+        .unwrap();
+        assert_eq!(shader.output_locations, [0, 1]);
+    }
+    #[test]
+    fn point_size_and_vec4_varying_roundtrip() {
+        let words = include_bytes!("../tests/assets/point-varying.vert.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        normalize_spirv(words).unwrap();
+    }
+    #[test]
+    fn scalar_color_and_fragment_depth_roundtrip() {
+        let words = include_bytes!("../tests/assets/scalar-depth.frag.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        normalize_spirv(words).unwrap();
+    }
+    #[test]
+    fn shader_draw_parameters_and_flat_instance_varyings_normalize() {
+        let words = include_bytes!("../tests/assets/requirements.vert.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let module = normalize_spirv(words).unwrap();
+        let shader = sgfx_codegen_virgl::programmable::compile_shader(
+            &module,
+            ir::ShaderStage::Vertex,
+            "main",
+        )
+        .unwrap();
+        assert!(shader.first_instance_register.is_some());
+    }
+    #[test]
     fn nonzero_border_and_unimplemented_sampler_controls_are_rejected() {
         for color in [
             vk::BorderColor::FLOAT_OPAQUE_BLACK,
@@ -3012,7 +3242,11 @@ mod tests {
             );
         }
         for info in [
-            decal_sampler().anisotropy_enable(true).max_anisotropy(2.0),
+            decal_sampler()
+                .anisotropy_enable(true)
+                .max_anisotropy(f32::NAN),
+            decal_sampler().anisotropy_enable(true).max_anisotropy(0.0),
+            decal_sampler().anisotropy_enable(true).max_anisotropy(17.0),
             decal_sampler().mip_lod_bias(0.5),
             decal_sampler().unnormalized_coordinates(true),
             decal_sampler().address_mode_w(vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE),
@@ -3708,7 +3942,7 @@ mod tests {
     }
 
     #[test]
-    fn spirv_round_trip_rejects_the_point_size_interface_layout_regression() {
+    fn spirv_round_trip_repairs_the_point_size_interface_layout_regression() {
         // An authored gl_PerVertex block with Position and PointSize, plus a
         // separate color output. Naga 24 validates the input but its writer/
         // parser round trip produces an undersized private output structure.
@@ -3761,10 +3995,15 @@ mod tests {
         )
         .validate(&input)
         .unwrap();
-        assert_eq!(
-            normalize_spirv(words),
-            Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
-        );
+        let module = normalize_spirv(words).unwrap();
+        let shader = sgfx_codegen_virgl::programmable::compile_shader(
+            &module,
+            ir::ShaderStage::Vertex,
+            "main",
+        )
+        .unwrap();
+        assert!(shader.tgsi.contains("PSIZE"));
+        assert!(shader.tgsi.contains("GENERIC[0]"));
     }
 
     #[test]

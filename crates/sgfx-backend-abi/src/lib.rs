@@ -204,6 +204,16 @@ pub const GPU_TIMESTAMPS: u64 = 262144;
 /// No shared memory, atomics, storage images or mixed graphics/compute stream.
 /// Advertise only after native dispatch and GPU-written readback are verified.
 pub const COMPUTE_BUFFERS: u64 = 524288;
+/// Anisotropic samplers through sixteen, including the sampler-row wire extension.
+pub const SAMPLER_ANISOTROPY_16: u64 = 1048576;
+/// Nonzero per-instance divisors, including the DIVS resource-row tail.
+pub const VERTEX_ATTRIBUTE_DIVISORS: u64 = 2097152;
+/// Shader BaseVertex/BaseInstance/DrawIndex and draw-index command opcode 29.
+pub const SHADER_DRAW_PARAMETERS: u64 = 4194304;
+/// Native D32 uploads, copies, readback and attachment clears.
+pub const DEPTH_TRANSFERS: u64 = 8388608;
+/// RGBA16F and RGBA32F sampled render targets, with native packed transfers.
+pub const FLOAT_COLOR_ATTACHMENTS: u64 = 1 << 24;
 /// Optional timing extension; existing v2 table layouts remain unchanged.
 pub const TIMESTAMP_ENTRY: &[u8] = b"sgfx_backend_get_timestamp_api_v2\0";
 #[repr(C)]

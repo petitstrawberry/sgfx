@@ -69,6 +69,15 @@ impl Runtime {
     /// Drop an entire idle logical epoch once no live Vulkan object contains
     /// its IDs. Never recycle IDs while any Vulkan resource still owns them.
     pub fn reclaim_idle_resources(&mut self) {
+        let sets = &mut self.resources.descriptor_sets;
+        self.resources.pushed_set_owners.retain(|handle, owner| {
+            if owner.strong_count() == 0 {
+                sets.remove(handle);
+                false
+            } else {
+                true
+            }
+        });
         if self.resources.has_live_ir_objects() || !self.in_flight.is_empty() {
             return;
         }

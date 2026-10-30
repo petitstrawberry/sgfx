@@ -600,6 +600,8 @@ pub(crate) enum IrBlendOp {
     Add,
     Subtract,
     ReverseSubtract,
+    Min,
+    Max,
 }
 
 /// Independent portable blend component.
@@ -655,6 +657,7 @@ pub(crate) struct IrDepthState {
 /// Persistent pipeline slot and its immutable portable state.
 #[derive(Clone, Copy)]
 pub(crate) struct IrPipelineState {
+    pub(crate) depth_bias: [u32; 2],
     pub(crate) slot: usize,
     pub(crate) fragment: IrFragmentProgram,
     pub(crate) blend: IrBlendState,
@@ -693,6 +696,7 @@ pub(crate) struct IrSamplerState {
     pub(crate) min_lod: f32,
     pub(crate) max_lod: f32,
     pub(crate) compare: Option<crate::ir::CompareFunction>,
+    pub(crate) anisotropy: u8,
 }
 
 /// Draw-uniform constants sent to the GPU without CPU vertex transformation.
@@ -705,6 +709,7 @@ pub(crate) struct IrUniforms {
 /// One private non-indexed draw in an ordered IR submission.
 #[derive(Clone)]
 pub(crate) struct IrDraw {
+    pub(crate) draw_index: u32,
     pub(crate) programmable: Option<Rc<IrProgrammableDraw>>,
     pub(crate) start_vertex: usize,
     pub(crate) instance_count: u32,
@@ -733,6 +738,7 @@ pub(crate) fn draw_count_valid(draw: &IrDraw) -> bool {
             draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(2)
         }
         Some(crate::ir::PrimitiveTopology::LineStrip) => draw.vertex_count >= 2,
+        Some(crate::ir::PrimitiveTopology::PointList) => draw.vertex_count != 0,
         _ => draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(3),
     }
 }
@@ -869,13 +875,15 @@ pub(crate) enum IrTextureFormat {
     R8,
     Rg8,
     Depth32Float,
+    Rgba16Float,
+    Rgba32Float,
 }
 
 impl IrTextureFormat {
     pub(crate) const fn storage_format(self, native_narrow: bool) -> Self {
         match self {
             Self::R8 | Self::Rg8 if native_narrow => self,
-            Self::Depth32Float => self,
+            Self::Depth32Float | Self::Rgba16Float | Self::Rgba32Float => self,
             _ => Self::Bgra8,
         }
     }
@@ -884,6 +892,8 @@ impl IrTextureFormat {
         match self {
             Self::R8 => 1,
             Self::Rg8 => 2,
+            Self::Rgba16Float => 8,
+            Self::Rgba32Float => 16,
             _ => 4,
         }
     }

@@ -250,10 +250,16 @@ pub(super) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
         }};
     }
     match name.to_bytes() {
-        b"vkCreateRenderPass2KHR" => entry!(create, vk::PFN_vkCreateRenderPass2),
-        b"vkCmdBeginRenderPass2KHR" => entry!(begin, vk::PFN_vkCmdBeginRenderPass2),
-        b"vkCmdNextSubpass2KHR" => entry!(next, vk::PFN_vkCmdNextSubpass2),
-        b"vkCmdEndRenderPass2KHR" => entry!(end, vk::PFN_vkCmdEndRenderPass2),
+        b"vkCreateRenderPass2" | b"vkCreateRenderPass2KHR" => {
+            entry!(create, vk::PFN_vkCreateRenderPass2)
+        }
+        b"vkCmdBeginRenderPass2" | b"vkCmdBeginRenderPass2KHR" => {
+            entry!(begin, vk::PFN_vkCmdBeginRenderPass2)
+        }
+        b"vkCmdNextSubpass2" | b"vkCmdNextSubpass2KHR" => entry!(next, vk::PFN_vkCmdNextSubpass2),
+        b"vkCmdEndRenderPass2" | b"vkCmdEndRenderPass2KHR" => {
+            entry!(end, vk::PFN_vkCmdEndRenderPass2)
+        }
         _ => None,
     }
 }

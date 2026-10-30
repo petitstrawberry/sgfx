@@ -83,6 +83,22 @@ impl Drop for Owner {
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities(u64);
 impl Capabilities {
+    /// Native floating-point RGBA render targets and transfers.
+    pub fn supports_float_color(self) -> bool {
+        self.0 & abi::FLOAT_COLOR_ATTACHMENTS != 0
+    }
+    pub fn supports_depth_transfers(self) -> bool {
+        self.0 & abi::DEPTH_TRANSFERS != 0
+    }
+    pub fn supports_shader_draw_parameters(self) -> bool {
+        self.0 & abi::SHADER_DRAW_PARAMETERS != 0
+    }
+    pub fn supports_vertex_divisors(self) -> bool {
+        self.0 & abi::VERTEX_ATTRIBUTE_DIVISORS != 0
+    }
+    pub fn supports_anisotropy_16(self) -> bool {
+        self.0 & abi::SAMPLER_ANISOTROPY_16 != 0
+    }
     pub fn supports_compute_buffers(self) -> bool {
         self.0 & abi::COMPUTE_BUFFERS != 0
     }

@@ -126,6 +126,9 @@ pub(super) fn read(rt: &mut Runtime, read: &Read) -> VkResult<()> {
             if vertices == 0 || instances == 0 {
                 continue;
             }
+            if rt.capabilities.supports_shader_draw_parameters() {
+                commands.push(ir::OwnedCommand::SetDrawIndex(index));
+            }
             commands.push(if d.indexed {
                 ir::OwnedCommand::DrawIndexedInstanced {
                     index_count: vertices,

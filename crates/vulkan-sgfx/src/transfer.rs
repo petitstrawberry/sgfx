@@ -17,14 +17,30 @@ pub(crate) struct ImageReadbackRegion {
 }
 
 impl ImageReadbackRegion {
+    #[cfg(test)]
     pub(crate) fn new(
         extent: vk::Extent3D,
         bytes_per_pixel: u32,
         buffer_size: u64,
         region: &vk::BufferImageCopy,
     ) -> Result<Self, vk::Result> {
+        Self::with_aspect(
+            extent,
+            bytes_per_pixel,
+            buffer_size,
+            region,
+            vk::ImageAspectFlags::COLOR,
+        )
+    }
+    pub(crate) fn with_aspect(
+        extent: vk::Extent3D,
+        bytes_per_pixel: u32,
+        buffer_size: u64,
+        region: &vk::BufferImageCopy,
+        aspect: vk::ImageAspectFlags,
+    ) -> Result<Self, vk::Result> {
         let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
-        if region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
+        if region.image_subresource.aspect_mask != aspect
             || region.image_subresource.base_array_layer != 0
             || region.image_subresource.layer_count != 1
             || extent.depth != 1
@@ -37,7 +53,7 @@ impl ImageReadbackRegion {
         let y = u32::try_from(region.image_offset.y).map_err(|_| invalid)?;
         let width = region.image_extent.width;
         let height = region.image_extent.height;
-        if !matches!(bytes_per_pixel, 1 | 2 | 4)
+        if !matches!(bytes_per_pixel, 1 | 2 | 4 | 8 | 16)
             || width == 0
             || height == 0
             || x.checked_add(width).is_none_or(|end| end > extent.width)
@@ -157,7 +173,8 @@ pub(crate) fn copy_image(
     if src.format != dst.format
         || !matches!(
             src.format,
-            vk::Format::B8G8R8A8_UNORM
+            vk::Format::D32_SFLOAT
+                | vk::Format::B8G8R8A8_UNORM
                 | vk::Format::R8G8B8A8_UNORM
                 | vk::Format::A8B8G8R8_UNORM_PACK32
                 | vk::Format::B8G8R8A8_SRGB
@@ -165,6 +182,8 @@ pub(crate) fn copy_image(
                 | vk::Format::A8B8G8R8_SRGB_PACK32
                 | vk::Format::R8_UNORM
                 | vk::Format::R8G8_UNORM
+                | vk::Format::R16G16B16A16_SFLOAT
+                | vk::Format::R32G32B32A32_SFLOAT
         )
         || src.array_layers != 1
         || dst.array_layers != 1
@@ -176,7 +195,7 @@ pub(crate) fn copy_image(
                 offset: vk::Offset3D,
                 extent: vk::Extent3D| {
         let image_extent = image.mip_extent(subresource.mip_level)?;
-        if subresource.aspect_mask != vk::ImageAspectFlags::COLOR
+        if subresource.aspect_mask != crate::images::image_aspect(image.format)
             || subresource.mip_level != 0
             || subresource.base_array_layer != 0
             || subresource.layer_count != 1
@@ -394,7 +413,6 @@ pub(crate) fn upload(
     if !buffer.usage.contains(vk::BufferUsageFlags::TRANSFER_SRC)
         || !target.usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
         || !target.usable()
-        || target.format == vk::Format::D32_SFLOAT
     {
         return Err(invalid);
     }
@@ -406,7 +424,7 @@ pub(crate) fn upload(
         .ok_or(unsupported)?;
     let mut ops = Vec::with_capacity(regions.len());
     for region in regions {
-        if region.image_subresource.aspect_mask != vk::ImageAspectFlags::COLOR
+        if region.image_subresource.aspect_mask != crate::images::image_aspect(target.format)
             || region.image_subresource.layer_count == 0
             || region
                 .image_subresource

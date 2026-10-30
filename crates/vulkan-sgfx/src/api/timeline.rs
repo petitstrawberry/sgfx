@@ -174,9 +174,11 @@ pub(super) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
         }};
     }
     match name.to_bytes() {
-        b"vkGetSemaphoreCounterValueKHR" => entry!(counter, vk::PFN_vkGetSemaphoreCounterValue),
-        b"vkSignalSemaphoreKHR" => entry!(signal, vk::PFN_vkSignalSemaphore),
-        b"vkWaitSemaphoresKHR" => entry!(wait, vk::PFN_vkWaitSemaphores),
+        b"vkGetSemaphoreCounterValue" | b"vkGetSemaphoreCounterValueKHR" => {
+            entry!(counter, vk::PFN_vkGetSemaphoreCounterValue)
+        }
+        b"vkSignalSemaphore" | b"vkSignalSemaphoreKHR" => entry!(signal, vk::PFN_vkSignalSemaphore),
+        b"vkWaitSemaphores" | b"vkWaitSemaphoresKHR" => entry!(wait, vk::PFN_vkWaitSemaphores),
         _ => None,
     }
 }

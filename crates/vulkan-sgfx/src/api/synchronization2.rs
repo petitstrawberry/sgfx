@@ -36,7 +36,12 @@ pub(super) fn execute(
         );
         return Ok(());
     }
-    for submission in submit_owned(rt, std::mem::take(ops))? {
+    for submission in submit_owned(rt, std::mem::take(ops)).inspect_err(|error| {
+        eprintln!(
+            "[SGFX Vulkan] control-point submission {:?}: {error:?}",
+            std::mem::discriminant(action)
+        )
+    })? {
         wait_submission(rt, &submission)?;
     }
     // Earlier packets may have no operations in this command buffer. Their
@@ -46,7 +51,8 @@ pub(super) fn execute(
         return Err(vk::Result::ERROR_DEVICE_LOST);
     }
     match action {
-        Action::IndirectRead(read) => indirect::read(rt, read)?,
+        Action::IndirectRead(read) => indirect::read(rt, read)
+            .inspect_err(|error| eprintln!("[SGFX Vulkan] indirect argument read: {error:?}"))?,
         Action::Query(action) => queries::execute(rt, ops, action)?,
         Action::IndirectDraw(_) => unreachable!(),
         Action::Barrier => {}

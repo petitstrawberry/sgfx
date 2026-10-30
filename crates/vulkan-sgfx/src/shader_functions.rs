@@ -139,6 +139,164 @@ pub(crate) fn specialize(module: &mut naga::Module) -> Result<(), vk::Result> {
     Ok(())
 }
 
+// SPIR-V allows output arrays starting at a location. Naga's stage-IO
+// validator requires one scalar/vector member per location instead.
+pub(crate) fn flatten_fragment_output_arrays(module: &mut naga::Module) -> Result<(), vk::Result> {
+    for entry in &mut module.entry_points {
+        if entry.stage != naga::ShaderStage::Fragment {
+            continue;
+        }
+        let Some(result) = &mut entry.function.result else {
+            continue;
+        };
+        let (members, structure) = match &module.types[result.ty].inner {
+            TypeInner::Struct { members, .. } => (members.clone(), true),
+            _ => (
+                vec![naga::StructMember {
+                    name: None,
+                    ty: result.ty,
+                    binding: result.binding.clone(),
+                    offset: 0,
+                }],
+                false,
+            ),
+        };
+        if !members
+            .iter()
+            .any(|m| matches!(module.types[m.ty].inner, TypeInner::Array { .. }))
+        {
+            continue;
+        }
+        let mut flattened = Vec::new();
+        let mut paths = Vec::new();
+        for (index, member) in members.into_iter().enumerate() {
+            let path = if structure {
+                vec![index as u32]
+            } else {
+                Vec::new()
+            };
+            if let TypeInner::Array {
+                base,
+                size: naga::ArraySize::Constant(count),
+                ..
+            } = module.types[member.ty].inner
+            {
+                let Some(naga::Binding::Location {
+                    location,
+                    second_blend_source,
+                    interpolation,
+                    sampling,
+                }) = member.binding
+                else {
+                    return Err(UNSUPPORTED);
+                };
+                if count.get() > 8 || location.checked_add(count.get()).is_none_or(|end| end > 8) {
+                    return Err(UNSUPPORTED);
+                }
+                for i in 0..count.get() {
+                    let mut element = path.clone();
+                    element.push(i);
+                    paths.push(element);
+                    flattened.push(naga::StructMember {
+                        name: None,
+                        ty: base,
+                        binding: Some(naga::Binding::Location {
+                            location: location + i,
+                            second_blend_source,
+                            interpolation,
+                            sampling,
+                        }),
+                        offset: flattened.len() as u32 * 16,
+                    });
+                }
+            } else {
+                paths.push(path);
+                flattened.push(naga::StructMember {
+                    offset: flattened.len() as u32 * 16,
+                    ..member
+                });
+            }
+        }
+        let ty = module.types.insert(
+            naga::Type {
+                name: None,
+                inner: TypeInner::Struct {
+                    span: flattened.len() as u32 * 16,
+                    members: flattened,
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        result.ty = ty;
+        result.binding = None;
+        flatten_returns(
+            &mut entry.function.expressions,
+            &mut entry.function.body,
+            ty,
+            &paths,
+        );
+    }
+    Ok(())
+}
+fn flatten_returns(
+    expressions: &mut naga::Arena<Expression>,
+    block: &mut naga::Block,
+    ty: Handle<naga::Type>,
+    paths: &[Vec<u32>],
+) {
+    for statement in block.iter_mut() {
+        match statement {
+            Statement::Block(b) => flatten_returns(expressions, b, ty, paths),
+            Statement::If { accept, reject, .. } => {
+                flatten_returns(expressions, accept, ty, paths);
+                flatten_returns(expressions, reject, ty, paths);
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                flatten_returns(expressions, body, ty, paths);
+                flatten_returns(expressions, continuing, ty, paths);
+            }
+            Statement::Switch { cases, .. } => {
+                for c in cases {
+                    flatten_returns(expressions, &mut c.body, ty, paths);
+                }
+            }
+            Statement::Return { value: Some(value) } => {
+                let start = expressions.len();
+                let components = paths
+                    .iter()
+                    .map(|path| {
+                        let mut v = *value;
+                        for &index in path {
+                            v = expressions.append(
+                                Expression::AccessIndex { base: v, index },
+                                naga::Span::UNDEFINED,
+                            );
+                        }
+                        v
+                    })
+                    .collect();
+                let value = expressions.append(
+                    Expression::Compose { ty, components },
+                    naga::Span::UNDEFINED,
+                );
+                let mut replacement = naga::Block::new();
+                replacement.push(
+                    Statement::Emit(expressions.range_from(start)),
+                    naga::Span::UNDEFINED,
+                );
+                replacement.push(
+                    Statement::Return { value: Some(value) },
+                    naga::Span::UNDEFINED,
+                );
+                *statement = Statement::Block(replacement);
+            }
+            _ => {}
+        }
+    }
+}
+
 // Vulkan permits fewer fragment components than the attachment stores. WGPU
 // requires enough components for its target format; fill unspecified channels
 // with zero (alpha one) while retaining every value produced by the shader.

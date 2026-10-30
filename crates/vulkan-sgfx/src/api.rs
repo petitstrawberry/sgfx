@@ -2,11 +2,13 @@ pub(crate) mod bootstrap;
 mod buffer_operations;
 mod buffer_views;
 mod core11;
+mod core12;
 pub(crate) mod descriptor_template;
 pub(crate) mod dynamic_rendering;
 mod dynamic_states;
 mod indirect;
 mod maintenance1;
+mod push_descriptors;
 mod queries;
 mod queue;
 mod render_pass2;
@@ -587,6 +589,13 @@ unsafe fn device_chain_supported(
                 let f = &*next.cast::<vk::PhysicalDeviceFeatures2<'_>>();
                 core_device_features_supported(&f.features, supported_features)
             }
+            vk::StructureType::PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT => {
+                let f = &*next.cast::<vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT<'_>>();
+                matches!(
+                    f.vertex_attribute_instance_rate_divisor,
+                    vk::FALSE | vk::TRUE
+                ) && f.vertex_attribute_instance_rate_zero_divisor == vk::FALSE
+            }
             vk::StructureType::PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES => {
                 let f = &*next.cast::<vk::PhysicalDeviceHostQueryResetFeatures<'_>>();
                 matches!(f.host_query_reset, vk::FALSE | vk::TRUE)
@@ -656,10 +665,10 @@ unsafe fn device_chain_supported(
                     f.variable_pointers,
                     f.protected_memory,
                     f.sampler_ycbcr_conversion,
-                    f.shader_draw_parameters,
                 ]
                 .into_iter()
                 .all(|value| value == vk::FALSE)
+                    && matches!(f.shader_draw_parameters, vk::FALSE | vk::TRUE)
             }
             vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => {
                 crate::properties2::core12_request_supported(
@@ -692,7 +701,7 @@ unsafe fn device_chain_supported(
             }
             vk::StructureType::PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES => {
                 let features = &*next.cast::<vk::PhysicalDeviceShaderDrawParametersFeatures<'_>>();
-                features.shader_draw_parameters == vk::FALSE
+                matches!(features.shader_draw_parameters, vk::FALSE | vk::TRUE)
             }
             _ => false,
         };
@@ -719,6 +728,8 @@ unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
                 vk::KHR_SYNCHRONIZATION2_NAME,
                 vk::KHR_DYNAMIC_RENDERING_NAME,
                 vk::KHR_DRAW_INDIRECT_COUNT_NAME,
+                vk::EXT_VERTEX_ATTRIBUTE_DIVISOR_NAME,
+                vk::KHR_PUSH_DESCRIPTOR_NAME,
                 vk::EXT_HOST_QUERY_RESET_NAME,
             ]
             .contains(&name)
@@ -801,6 +812,32 @@ pub(crate) unsafe extern "system" fn create_device(
         .unwrap_or_default();
     let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
     while let Some(base) = node.as_ref() {
+        let draw_requested = match base.s_type {
+            vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_1_FEATURES => {
+                (*node.cast::<vk::PhysicalDeviceVulkan11Features<'_>>()).shader_draw_parameters
+            }
+            vk::StructureType::PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES => {
+                (*node.cast::<vk::PhysicalDeviceShaderDrawParametersFeatures<'_>>())
+                    .shader_draw_parameters
+            }
+            _ => vk::FALSE,
+        };
+        if draw_requested != vk::FALSE
+            && (draw_requested != vk::TRUE
+                || !adapter.capabilities().supports_shader_draw_parameters())
+        {
+            return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        }
+
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT
+            && (*node.cast::<vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT<'_>>())
+                .vertex_attribute_instance_rate_divisor
+                == vk::TRUE
+            && !adapter.capabilities().supports_vertex_divisors()
+        {
+            return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        }
+
         if base.s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES {
             let features = &*node.cast::<vk::PhysicalDeviceVulkan12Features<'_>>();
             let supported = crate::properties2::core12_features(physical);
@@ -1269,6 +1306,7 @@ enum RecordedCommand {
         first: u32,
         sets: Vec<vk::DescriptorSet>,
         dynamic_offsets: Vec<u32>,
+        pushed: Option<Arc<()>>,
     },
     Dispatch {
         x: u32,
@@ -1319,6 +1357,12 @@ enum RecordedCommand {
     ClearAttachments {
         attachments: Vec<vk::ClearAttachment>,
         rects: Vec<vk::ClearRect>,
+    },
+    ClearDepthImage {
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        depth: f32,
+        ranges: Vec<vk::ImageSubresourceRange>,
     },
     ClearColorImage {
         image: vk::Image,
@@ -1551,6 +1595,7 @@ impl Recording {
             }
             RecordedCommand::CopyImageToBuffer { .. }
             | RecordedCommand::ClearColorImage { .. }
+            | RecordedCommand::ClearDepthImage { .. }
             | RecordedCommand::BlitImage { .. }
             | RecordedCommand::CopyImage { .. }
             | RecordedCommand::CopyBuffer { .. }
@@ -1696,6 +1741,7 @@ impl RecordedCommand {
                 first,
                 sets,
                 dynamic_offsets,
+                ..
             } => {
                 if first
                     .checked_add(sets.len() as u32)
@@ -1856,6 +1902,20 @@ impl RecordedCommand {
             Self::ClearAttachments { attachments, rects } => {
                 render_passes::clear_attachments(rec, attachments, rects)?;
             }
+            Self::ClearDepthImage {
+                image,
+                layout,
+                depth,
+                ranges,
+            } => {
+                if rec.render.is_some() {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                rec.ops.extend(crate::clear::depth_commands(
+                    rt, *image, *layout, *depth, ranges,
+                )?);
+                rec.used_images.push(*image);
+            }
             Self::ClearColorImage {
                 image,
                 layout,
@@ -1925,6 +1985,9 @@ impl RecordedCommand {
                 first,
                 first_instance,
             } => {
+                if rt.capabilities.supports_shader_draw_parameters() {
+                    rec.ops.push(ir::OwnedCommand::SetDrawIndex(0));
+                }
                 if first_instance.checked_add(*instances).is_none() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
@@ -1952,6 +2015,9 @@ impl RecordedCommand {
                 base_vertex,
                 first_instance,
             } => {
+                if rt.capabilities.supports_shader_draw_parameters() {
+                    rec.ops.push(ir::OwnedCommand::SetDrawIndex(0));
+                }
                 if first_instance.checked_add(*instances).is_none() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
@@ -2024,7 +2090,8 @@ impl RecordedCommand {
                     || !image_data.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                     || !matches!(
                         image_data.format,
-                        vk::Format::R8G8B8A8_UNORM
+                        vk::Format::D32_SFLOAT
+                            | vk::Format::R8G8B8A8_UNORM
                             | vk::Format::B8G8R8A8_UNORM
                             | vk::Format::A8B8G8R8_UNORM_PACK32
                             | vk::Format::R8G8B8A8_SRGB
@@ -2032,6 +2099,8 @@ impl RecordedCommand {
                             | vk::Format::A8B8G8R8_SRGB_PACK32
                             | vk::Format::R8_UNORM
                             | vk::Format::R8G8_UNORM
+                            | vk::Format::R16G16B16A16_SFLOAT
+                            | vk::Format::R32G32B32A32_SFLOAT
                     )
                 {
                     return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -2041,8 +2110,8 @@ impl RecordedCommand {
                     let bytes_per_pixel = crate::images::texture_format(image_data.format)
                         .and_then(|format| format.bytes_per_pixel())
                         .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
-                    let readback = crate::transfer::ImageReadbackRegion::new(
-                        extent, bytes_per_pixel, buffer_data.size, region,
+                    let readback = crate::transfer::ImageReadbackRegion::with_aspect(
+                        extent, bytes_per_pixel, buffer_data.size, region, crate::images::image_aspect(image_data.format),
                     ).inspect_err(|error| {
                         if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                             eprintln!("[SGFX Vulkan] image readback region rejected: {error:?} format={:?} extent={extent:?} buffer_size={} region={region:?}", image_data.format, buffer_data.size);
@@ -2869,6 +2938,7 @@ unsafe extern "system" fn cmd_bind_descriptor_sets(
             first,
             sets: copied,
             dynamic_offsets,
+            pushed: None,
         },
     )
 }
@@ -3007,6 +3077,32 @@ unsafe extern "system" fn cmd_clear_attachments(
     }
 }
 
+unsafe extern "system" fn cmd_clear_depth_image(
+    command: vk::CommandBuffer,
+    image: vk::Image,
+    layout: vk::ImageLayout,
+    value: *const vk::ClearDepthStencilValue,
+    count: u32,
+    ranges: *const vk::ImageSubresourceRange,
+) {
+    let result = (|| {
+        let depth = value
+            .as_ref()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+            .depth;
+        let ranges = slice(ranges, count)?.to_vec();
+        Ok(RecordedCommand::ClearDepthImage {
+            image,
+            layout,
+            depth,
+            ranges,
+        })
+    })();
+    match result {
+        Ok(command_data) => record(command, command_data),
+        Err(error) => record_error(command, error),
+    }
+}
 unsafe extern "system" fn cmd_clear_color_image(
     command: vk::CommandBuffer,
     image: vk::Image,
@@ -4166,9 +4262,7 @@ fn submit_owned_batch(
     }
     let commands = profile_work("submit::record_ir", || {
         owned.record(&rt.table).map_err(|error| {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                trace_owned_recording_failure(&rt.table, &owned, error);
-            }
+            trace_owned_recording_failure(&rt.table, &owned, error);
             crate::resources::failure(error)
         })
     })?;
@@ -4661,6 +4755,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdNextSubpass" => entry!(cmd_next_subpass),
         b"vkCmdEndRenderPass" => entry!(cmd_end_render_pass),
         b"vkCmdCopyImageToBuffer" => entry!(cmd_copy_image_to_buffer),
+        b"vkCmdClearDepthStencilImage" => entry!(cmd_clear_depth_image),
         b"vkCmdClearColorImage" => entry!(cmd_clear_color_image),
         b"vkCmdClearAttachments" => entry!(cmd_clear_attachments),
         b"vkCmdCopyBuffer" => entry!(cmd_copy_buffer),
@@ -4719,7 +4814,9 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkGetImageScarletHandleSGFX" => {
             entry!(crate::scarlet_image::vkGetImageScarletHandleSGFX)
         }
-        _ => descriptor_template::lookup(name)
+        _ => core12::lookup(name)
+            .or_else(|| push_descriptors::lookup(name))
+            .or_else(|| descriptor_template::lookup(name))
             .or_else(|| dynamic_states::lookup(name))
             .or_else(|| buffer_views::lookup(name))
             .or_else(|| render_pass2::lookup(name))
@@ -5700,6 +5797,8 @@ mod tests {
         assert!(!supported(&mut indexing, &mut draw));
         indexing.descriptor_binding_partially_bound = vk::FALSE;
         draw.shader_draw_parameters = vk::TRUE;
+        assert!(supported(&mut indexing, &mut draw));
+        draw.shader_draw_parameters = 2;
         assert!(!supported(&mut indexing, &mut draw));
     }
 
@@ -6120,6 +6219,7 @@ mod owned_descriptor_tests {
             first: 0,
             sets,
             dynamic_offsets: Vec::new(),
+            pushed: None,
         }
     }
 

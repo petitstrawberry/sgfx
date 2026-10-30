@@ -741,11 +741,17 @@ impl Context {
         if matches!(spec.format, IrTextureFormat::Depth32Float) {
             usage &= !GPU_IMAGE_USAGE_RENDER_TARGET;
             usage |= GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT;
-        } else {
-            usage |= GPU_IMAGE_USAGE_TRANSFER_SRC;
         }
+        usage |= GPU_IMAGE_USAGE_TRANSFER_SRC;
         if usage == 0 {
             return Err(HandleError::InvalidParameter);
+        }
+        if matches!(
+            spec.format,
+            IrTextureFormat::Rgba16Float | IrTextureFormat::Rgba32Float
+        ) && !self.capabilities().supports_float_color()
+        {
+            return Err(HandleError::Unsupported);
         }
         let storage_format = spec
             .format
@@ -754,6 +760,8 @@ impl Context {
             IrTextureFormat::R8 => gpu_raw::GPU_IMAGE_FORMAT_R8_UNORM,
             IrTextureFormat::Rg8 => gpu_raw::GPU_IMAGE_FORMAT_RG8_UNORM,
             IrTextureFormat::Depth32Float => GPU_IMAGE_FORMAT_DEPTH32_FLOAT,
+            IrTextureFormat::Rgba16Float => 6, // GPU_IMAGE_FORMAT_RGBA16_FLOAT
+            IrTextureFormat::Rgba32Float => 7, // GPU_IMAGE_FORMAT_RGBA32_FLOAT
             _ => GPU_IMAGE_FORMAT_BGRA8_UNORM,
         };
         let raw = self.device.raw.create_layered_image_with_format_and_usage(
@@ -861,10 +869,13 @@ impl Context {
         if resources.context_handle != self.handle_id()
             || !matches!(
                 spec.format,
-                IrTextureFormat::Bgra8
+                IrTextureFormat::Depth32Float
+                    | IrTextureFormat::Bgra8
                     | IrTextureFormat::Rgba8
                     | IrTextureFormat::R8
                     | IrTextureFormat::Rg8
+                    | IrTextureFormat::Rgba16Float
+                    | IrTextureFormat::Rgba32Float
             )
             || !self.device.capabilities.supports_image_readback()
         {
@@ -898,7 +909,14 @@ impl Context {
         while y < spec.height {
             let height = (spec.height - y).min(rows);
             let rect = GpuImageBgraRect::new(0, y, spec.width, height);
-            if native_narrow {
+            if native_narrow
+                || matches!(
+                    spec.format,
+                    IrTextureFormat::Depth32Float
+                        | IrTextureFormat::Rgba16Float
+                        | IrTextureFormat::Rgba32Float
+                )
+            {
                 self.raw
                     .readback_image(&texture.raw, pixels, stride, rect)?;
             } else {
@@ -2387,6 +2405,8 @@ impl Queue {
                         | IrTextureFormat::Rgba8
                         | IrTextureFormat::R8
                         | IrTextureFormat::Rg8
+                        | IrTextureFormat::Rgba16Float
+                        | IrTextureFormat::Rgba32Float
                 )
                 || spec.width != target.width
                 || spec.height != target.height
@@ -3379,6 +3399,7 @@ fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmissio
         .try_reserve_exact(1)
         .map_err(|_| HandleError::OutOfResources)?;
     draws.push(IrDraw {
+        draw_index: 0,
         programmable: None,
         start_vertex: 0,
         instance_count: 1,
@@ -3387,6 +3408,7 @@ fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmissio
         vertex_count: 6,
         vertex_buffer: None,
         pipeline: IrPipelineState {
+            depth_bias: [0; 2],
             slot: IR_BLIT_PIPELINE_SLOT,
             fragment: IrFragmentProgram::TextureRgba,
             blend: IrBlendState {
@@ -3412,6 +3434,7 @@ fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmissio
             min_lod: copy.source_mip as f32,
             max_lod: copy.source_mip as f32,
             compare: None,
+            anisotropy: 1,
         }),
         uniforms: IrUniforms {
             transform: [
@@ -3492,6 +3515,7 @@ fn ir_pipeline<'resources>(
 fn ir_sampler_states_equal(left: IrSamplerState, right: IrSamplerState) -> bool {
     left.slot == right.slot
         && left.compare == right.compare
+        && left.anisotropy == right.anisotropy
         && ir_filter_modes_equal(left.min_filter, right.min_filter)
         && ir_filter_modes_equal(left.mag_filter, right.mag_filter)
         && ir_filter_modes_equal(left.mip_filter, right.mip_filter)
@@ -3556,7 +3580,14 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
     for (slot, layout) in programmable.pipeline.vertex_buffers.iter().enumerate() {
         let binding = draw.vertex_buffers[slot].ok_or(HandleError::InvalidParameter)?;
         uploaded_ir_buffer(resources, binding.buffer)?;
-        let elements = if programmable.index_buffer.is_some() {
+        let elements = if layout.step_mode() == crate::ir::VertexStepMode::Instance {
+            u64::from(
+                draw.instance_count
+                    .checked_sub(1)
+                    .ok_or(HandleError::InvalidParameter)?
+                    / layout.instance_divisor(),
+            ) + 1
+        } else if programmable.index_buffer.is_some() {
             1
         } else {
             end as u64
@@ -3633,6 +3664,7 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
 
 fn ir_pipeline_states_equal(left: IrPipelineState, right: IrPipelineState) -> bool {
     left.slot == right.slot
+        && left.depth_bias == right.depth_bias
         && ir_fragment_programs_equal(left.fragment, right.fragment)
         && ir_blend_states_equal(left.blend, right.blend)
         && left.color_write_mask == right.color_write_mask
@@ -3733,14 +3765,13 @@ fn validate_ir_draw(
     draw: &IrDraw,
     vertices_len: usize,
 ) -> HandleResult<()> {
-    if let Some([x, y, width, height, min_depth, max_depth]) = draw.viewport {
-        if crate::ir::Viewport::new(x, y, width, height, min_depth, max_depth).is_err()
+    if let Some([x, y, width, height, min_depth, max_depth]) = draw.viewport
+        && (crate::ir::Viewport::new(x, y, width, height, min_depth, max_depth).is_err()
             || x + width > target_width as f32
             || y.min(y + height) < 0.0
-            || y.max(y + height) > target_height as f32
-        {
-            return Err(HandleError::InvalidParameter);
-        }
+            || y.max(y + height) > target_height as f32)
+    {
+        return Err(HandleError::InvalidParameter);
     }
     if draw.programmable.is_some() {
         if !super::driver::draw_count_valid(draw)
@@ -3958,6 +3989,8 @@ fn ir_storage_pipe_format(format: IrTextureFormat, native_narrow: bool) -> u32 {
         IrTextureFormat::R8 => VIRGL_FORMAT_R8_UNORM,
         IrTextureFormat::Rg8 => VIRGL_FORMAT_R8G8_UNORM,
         IrTextureFormat::Depth32Float => VIRGL_FORMAT_Z32_FLOAT,
+        IrTextureFormat::Rgba16Float => 94,
+        IrTextureFormat::Rgba32Float => 31,
         _ => VIRGL_FORMAT_B8G8R8A8_UNORM,
     }
 }
@@ -4726,7 +4759,11 @@ fn push_programmable_vertex_elements(
         push_dword(commands, attribute.offset());
         push_dword(
             commands,
-            u32::from(layout.step_mode() == crate::ir::VertexStepMode::Instance),
+            if layout.step_mode() == crate::ir::VertexStepMode::Instance {
+                layout.instance_divisor()
+            } else {
+                0
+            },
         );
         push_dword(commands, *slot as u32);
         push_dword(
@@ -4742,6 +4779,15 @@ fn push_programmable_vertex_elements(
                 // VIRGL_FORMAT_R16G16_UINT from the shared VirGL protocol.
                 crate::ir::VertexFormat::Uint16x2 => 186,
                 crate::ir::VertexFormat::Sint16x4 => 192,
+                crate::ir::VertexFormat::Sint16x2 => 190,
+                crate::ir::VertexFormat::Snorm8x4 => 77,
+                crate::ir::VertexFormat::Uint32x2 => 194,
+                crate::ir::VertexFormat::Uint32x3 => 195,
+                crate::ir::VertexFormat::Uint32x4 => 196,
+                crate::ir::VertexFormat::Sint32x2 => 198,
+                crate::ir::VertexFormat::Sint32x3 => 199,
+                crate::ir::VertexFormat::Sint32x4 => 200,
+
                 crate::ir::VertexFormat::Float16x2 => 92,
                 crate::ir::VertexFormat::Float16x4 => 94,
                 crate::ir::VertexFormat::Snorm10_10_10_2 => 173,
@@ -4759,7 +4805,7 @@ struct ProgrammableBindings {
     pipeline: Option<(u32, u32, u32, u32)>,
     vertex_buffers: Option<[(u32, u32, u32); 8]>,
     constants: Option<Rc<[IrConstantBuffer]>>,
-    first_instance: Option<u32>,
+    first_instance: Option<[u32; 3]>,
     vertex_constants: Vec<u32>,
     fragment_constants: Vec<u32>,
     textures: Vec<((u32, u32), (u32, u32))>,
@@ -4771,14 +4817,14 @@ fn push_programmable_constants(
     commands: &mut Vec<u8>,
     constants: &Rc<[IrConstantBuffer]>,
     first_instance_register: Option<u32>,
-    first_instance: u32,
+    draw_parameters: [u32; 3],
     bindings: &mut ProgrammableBindings,
 ) -> HandleResult<()> {
     let constants_unchanged = bindings.constants.as_ref().is_some_and(|previous| {
         Rc::ptr_eq(previous, constants) || previous.as_ref() == constants.as_ref()
     });
     let instance_unchanged =
-        first_instance_register.is_none_or(|_| bindings.first_instance == Some(first_instance));
+        first_instance_register.is_none_or(|_| bindings.first_instance == Some(draw_parameters));
     if constants_unchanged && instance_unchanged {
         return Ok(());
     }
@@ -4820,7 +4866,12 @@ fn push_programmable_constants(
                 .map_err(|_| HandleError::OutOfResources)?;
             bindings.vertex_constants.resize(end, 0);
         }
-        bindings.vertex_constants[start..end].copy_from_slice(&[first_instance, 0, 0, 0]);
+        bindings.vertex_constants[start..end].copy_from_slice(&[
+            draw_parameters[0],
+            draw_parameters[1],
+            draw_parameters[2],
+            0,
+        ]);
     }
     if (!constants_unchanged || !instance_unchanged) && !bindings.vertex_constants.is_empty() {
         push_constant_words(commands, PIPE_SHADER_VERTEX, &bindings.vertex_constants)?;
@@ -4829,7 +4880,7 @@ fn push_programmable_constants(
         push_constant_words(commands, PIPE_SHADER_FRAGMENT, &bindings.fragment_constants)?;
     }
     bindings.constants = Some(Rc::clone(constants));
-    bindings.first_instance = first_instance_register.map(|_| first_instance);
+    bindings.first_instance = first_instance_register.map(|_| draw_parameters);
     Ok(())
 }
 
@@ -4947,7 +4998,13 @@ fn push_programmable_draw(
         commands,
         &programmable.constants,
         first_instance_register,
-        draw.first_instance,
+        [
+            draw.first_instance,
+            programmable
+                .index_buffer
+                .map_or(draw.start_vertex as u32, |b| b.base_vertex as u32),
+            draw.draw_index,
+        ],
         bindings,
     )?;
     for binding in programmable.storage_buffers.iter() {
@@ -5078,7 +5135,7 @@ fn push_buffer_sampler_view(
         193, /* R32_UINT */
         0,
         (size / 4 - 1) as u32,
-        0 | (1 << 3) | (2 << 6) | (3 << 9),
+        (1 << 3) | (2 << 6) | (3 << 9),
     ] {
         push_dword(commands, word);
     }
@@ -5126,14 +5183,19 @@ fn push_ir_pipeline(commands: &mut Vec<u8>, pipeline: &IrPipeline) {
     push_dword(commands, pipeline.rasterizer_handle);
     push_dword(
         commands,
-        ir_rasterizer_flags(pipeline.state.cull_mode, pipeline.state.front_face),
+        ir_rasterizer_flags(pipeline.state.cull_mode, pipeline.state.front_face)
+            | if pipeline.state.depth_bias.map(f32::from_bits) != [0.0; 2] {
+                1 << 20
+            } else {
+                0
+            },
     );
     push_float(commands, 1.0);
     push_dword(commands, 0);
     push_dword(commands, 0);
     push_float(commands, 1.0);
-    push_float(commands, 0.0);
-    push_float(commands, 0.0);
+    push_dword(commands, pipeline.state.depth_bias[0]);
+    push_dword(commands, pipeline.state.depth_bias[1]);
     push_float(commands, 0.0);
     if let (Some(handle), Some(depth)) = (pipeline.dsa_handle, pipeline.state.depth) {
         push_ir_dsa(commands, handle, depth);
@@ -5180,6 +5242,7 @@ fn push_ir_sampler(commands: &mut Vec<u8>, sampler: &IrSampler) {
             | (ir_filter_mode(state.min_filter) << 9)
             | (ir_filter_mode(state.mip_filter) << 11)
             | (ir_filter_mode(state.mag_filter) << 13)
+            | (u32::from(state.anisotropy) << 20)
             | (u32::from(state.compare.is_some()) << 15)
             | (state.compare.map_or(0, |compare| match compare {
                 crate::ir::CompareFunction::Never => 0,
@@ -5499,11 +5562,17 @@ fn submit_ir_texture_inline_write(
             (upload.texture.width >> upload.mip_level).max(1),
             (upload.texture.height >> upload.mip_level).max(1),
         )
-        || upload.texture.format == IrTextureFormat::Depth32Float
         || !matches!(
             upload.storage_format,
-            IrTextureFormat::Bgra8 | IrTextureFormat::R8 | IrTextureFormat::Rg8
+            IrTextureFormat::Bgra8
+                | IrTextureFormat::R8
+                | IrTextureFormat::Rg8
+                | IrTextureFormat::Depth32Float
+                | IrTextureFormat::Rgba16Float
+                | IrTextureFormat::Rgba32Float
         )
+        || upload.texture.format == IrTextureFormat::Depth32Float
+            && upload.storage_format != IrTextureFormat::Depth32Float
         || upload.storage_format != IrTextureFormat::Bgra8
             && upload.storage_format != upload.texture.format
         || upload.pixels.len() != byte_len
@@ -5608,6 +5677,8 @@ fn ir_blend_op(operation: IrBlendOp) -> u32 {
         IrBlendOp::Add => PIPE_BLEND_ADD,
         IrBlendOp::Subtract => PIPE_BLEND_SUBTRACT,
         IrBlendOp::ReverseSubtract => PIPE_BLEND_REVERSE_SUBTRACT,
+        IrBlendOp::Min => 3, // PIPE_BLEND_MIN
+        IrBlendOp::Max => 4, // PIPE_BLEND_MAX
     }
 }
 
@@ -5831,6 +5902,7 @@ fn push_instanced_draw_parameters(
             PIPE_PRIM_LINES
         }
         crate::ir::PrimitiveTopology::LineStrip if vertex_count >= 2 => PIPE_PRIM_LINE_STRIP,
+        crate::ir::PrimitiveTopology::PointList if vertex_count > 0 => 0, // PIPE_PRIM_POINTS
         _ => return Err(HandleError::InvalidParameter),
     };
     push_dword(commands, command_header(VIRGL_CCMD_DRAW_VBO, 0, 12));
@@ -6039,6 +6111,7 @@ mod tests {
             dsa_handle: Some(23),
             initialized: Cell::new(false),
             state: IrPipelineState {
+                depth_bias: [0; 2],
                 slot: 17 + IR_PROGRAMMABLE_PIPELINE_SLOTS,
                 fragment: IrFragmentProgram::Solid,
                 blend: IrBlendState {
@@ -6276,6 +6349,7 @@ mod tests {
                 min_lod: 0.0,
                 max_lod: 1000.0,
                 compare: None,
+                anisotropy: 1,
             },
         };
         let mut bytes = Vec::new();
@@ -6492,6 +6566,7 @@ mod tests {
         for (topology, token, valid, invalid) in [
             (crate::ir::PrimitiveTopology::LineList, 1, 4, 3),
             (crate::ir::PrimitiveTopology::LineStrip, 3, 3, 1),
+            (crate::ir::PrimitiveTopology::PointList, 0, 1, 0),
         ] {
             for indexed in [false, true] {
                 let mut commands = Vec::new();
@@ -6755,23 +6830,25 @@ mod tests {
         let mut bindings = ProgrammableBindings::default();
         let mut commands = Vec::new();
         let first = constants(7);
-        push_programmable_constants(&mut commands, &first, None, 0, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &first, None, [0; 3], &mut bindings).unwrap();
         let encoded = commands.clone();
         let storage = bindings.vertex_constants.as_ptr();
-        push_programmable_constants(&mut commands, &first, None, 0, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &first, None, [0; 3], &mut bindings).unwrap();
         let separate_owner = constants(7);
         assert!(!Rc::ptr_eq(&first, &separate_owner));
-        push_programmable_constants(&mut commands, &separate_owner, None, 0, &mut bindings)
+        push_programmable_constants(&mut commands, &separate_owner, None, [0; 3], &mut bindings)
             .unwrap();
         assert_eq!(commands, encoded);
         commands.clear();
-        push_programmable_constants(&mut commands, &constants(9), None, 0, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants(9), None, [0; 3], &mut bindings)
+            .unwrap();
         assert_eq!(bindings.vertex_constants.as_ptr(), storage);
         assert_eq!(&bindings.vertex_constants, &[0, 0, 0, 0, 9, 9, 9, 9]);
         assert_eq!(first[0].words.as_slice(), &[7; 4]);
         let mut fresh_packet = ProgrammableBindings::default();
         commands.clear();
-        push_programmable_constants(&mut commands, &first, None, 0, &mut fresh_packet).unwrap();
+        push_programmable_constants(&mut commands, &first, None, [0; 3], &mut fresh_packet)
+            .unwrap();
         assert_eq!(commands, encoded);
     }
 
@@ -6785,10 +6862,12 @@ mod tests {
         .into();
         let mut bindings = ProgrammableBindings::default();
         let mut commands = Vec::new();
-        push_programmable_constants(&mut commands, &constants, Some(2), 3, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants, Some(2), [3, 0, 0], &mut bindings)
+            .unwrap();
         assert_eq!(&bindings.vertex_constants[8..12], &[3, 0, 0, 0]);
         commands.clear();
-        push_programmable_constants(&mut commands, &constants, Some(2), 5, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants, Some(2), [5, 0, 0], &mut bindings)
+            .unwrap();
         let words = dwords(&commands);
         assert_eq!(
             words[0],
@@ -6797,7 +6876,8 @@ mod tests {
         assert_eq!(&words[1..3], &[PIPE_SHADER_VERTEX, 0]);
         assert_eq!(&words[11..15], &[5, 0, 0, 0]);
         commands.clear();
-        push_programmable_constants(&mut commands, &constants, Some(2), 5, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants, Some(2), [5, 0, 0], &mut bindings)
+            .unwrap();
         assert!(commands.is_empty());
     }
 
@@ -7163,6 +7243,7 @@ mod tests {
             rasterizer_handle: 32,
             dsa_handle: None,
             state: IrPipelineState {
+                depth_bias: [0; 2],
                 slot: 0,
                 fragment: IrFragmentProgram::Solid,
                 blend,

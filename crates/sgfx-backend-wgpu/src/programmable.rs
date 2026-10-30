@@ -345,6 +345,7 @@ impl Resources {
         let desc = self
             .resources
             .programmable_render_pipeline(self.resources.programmable_render_pipeline_ref(id)?)?;
+        validate_depth_bias(desc.raster())?;
         let locations = desc
             .vertex_buffers()
             .iter()
@@ -378,6 +379,13 @@ impl Resources {
             desc.layout(),
             raw::ShaderStages::VERTEX | raw::ShaderStages::FRAGMENT,
         )?;
+        if desc
+            .vertex_buffers()
+            .iter()
+            .any(|layout| layout.instance_divisor() != 1)
+        {
+            return Err(Error::Unsupported(UnsupportedFeature::VertexDivisor));
+        }
         let attributes = desc
             .vertex_buffers()
             .iter()
@@ -452,6 +460,7 @@ impl Resources {
                             }
                             ir::PrimitiveTopology::LineList => raw::PrimitiveTopology::LineList,
                             ir::PrimitiveTopology::LineStrip => raw::PrimitiveTopology::LineStrip,
+                            ir::PrimitiveTopology::PointList => raw::PrimitiveTopology::PointList,
                             ir::PrimitiveTopology::TriangleFan => {
                                 return Err(Error::Unsupported(UnsupportedFeature::TriangleFan));
                             }
@@ -474,7 +483,7 @@ impl Resources {
                             depth_write_enabled: depth.write_enabled(),
                             depth_compare: compare_function(depth.compare()),
                             stencil: Default::default(),
-                            bias: Default::default(),
+                            bias: raw_depth_bias(desc.raster()),
                         })
                         .or_else(|| {
                             has_depth.then_some(raw::DepthStencilState {

@@ -200,12 +200,15 @@ pub fn compile_shader(
 pub fn validate_shader_module(desc: &ShaderModuleDesc) -> Result<()> {
     validate_module(&parse_shader_module(desc)?).map(|_| ())
 }
+
 fn parse_shader_module(desc: &ShaderModuleDesc) -> Result<naga::Module> {
     match desc.source() {
         ShaderSource::Wgsl(source) => naga::front::wgsl::parse_str(source)
             .map_err(|error| ShaderCompileError(error.emit_to_string(source))),
         ShaderSource::SpirV(words) => naga::front::spv::Frontend::new(
-            words.iter().copied(),
+            sgfx_core::ir::spirv_compat::naga24_spirv(words)
+                .map_err(|_| unsupported("SPIR-V adapter"))?
+                .into_iter(),
             &naga::front::spv::Options {
                 adjust_coordinate_space: false,
                 strict_capabilities: true,
@@ -230,7 +233,12 @@ fn uses_instance_index(
     ty: Handle<naga::Type>,
     binding: Option<&Binding>,
 ) -> bool {
-    if matches!(binding, Some(Binding::BuiltIn(BuiltIn::InstanceIndex))) {
+    if matches!(
+        binding,
+        Some(Binding::BuiltIn(
+            BuiltIn::InstanceIndex | BuiltIn::BaseInstance | BuiltIn::BaseVertex | BuiltIn::DrawID
+        ))
+    ) {
         return true;
     }
     match &module.types[ty].inner {
@@ -310,7 +318,7 @@ struct Value {
     shape: Shape,
     lanes: Vec<Lane>,
     writable: bool,
-    indirect: Option<Box<IndirectRead>>,
+    indirect: Option<Box<IndirectAccess>>,
 }
 
 enum LoopControl {
@@ -318,7 +326,7 @@ enum LoopControl {
     Continuing,
 }
 #[derive(Clone, Debug)]
-struct IndirectRead {
+struct IndirectAccess {
     elements: Vec<Value>,
     index: Lane,
 }
@@ -329,7 +337,7 @@ impl Value {
             .indirect
             .as_ref()
             .map(|read| {
-                Ok::<_, ShaderCompileError>(Box::new(IndirectRead {
+                Ok::<_, ShaderCompileError>(Box::new(IndirectAccess {
                     elements: read
                         .elements
                         .iter()
@@ -623,6 +631,28 @@ impl<'a> Compiler<'a> {
             }
             return self.compute_store(inner, *slot, *metadata, offset, value);
         }
+        if let Some(access) = &pointer.indirect {
+            if !pointer.writable {
+                return Err(unsupported("read-only indirect store"));
+            }
+            // Snapshot before updating any candidate: source and destination may
+            // alias. Out-of-range indices leave every candidate unchanged.
+            let value = self.snapshot(value)?;
+            for (i, element) in access.elements.iter().enumerate() {
+                let index = self.immediate(Literal::U32(i as u32))?;
+                let condition = self.allocate(Shape::Scalar(K::Bool), false)?;
+                self.instruction(
+                    "USEQ",
+                    &condition.lanes[0],
+                    &[&access.index, &index.lanes[0]],
+                )?;
+                self.instructions
+                    .push(format!("UIF {}", condition.lanes[0].src()));
+                self.store(element, &value)?;
+                self.instructions.push("ENDIF".into());
+            }
+            return Ok(());
+        }
         if !pointer.writable || pointer.lanes.len() != value.lanes.len() {
             return Err(unsupported("store target"));
         }
@@ -803,8 +833,12 @@ impl<'a> Compiler<'a> {
                     let format = match (scalar, shape.len()) {
                         (IoScalar::Sint, 1) => VertexFormat::Sint32,
                         (IoScalar::Uint, 1) => VertexFormat::Uint32,
-                        (IoScalar::Uint, 2) => VertexFormat::Uint16x2,
-                        (IoScalar::Sint, 4) => VertexFormat::Sint16x4,
+                        (IoScalar::Uint, 2) => VertexFormat::Uint32x2,
+                        (IoScalar::Uint, 3) => VertexFormat::Uint32x3,
+                        (IoScalar::Uint, 4) => VertexFormat::Uint32x4,
+                        (IoScalar::Sint, 2) => VertexFormat::Sint32x2,
+                        (IoScalar::Sint, 3) => VertexFormat::Sint32x3,
+                        (IoScalar::Sint, 4) => VertexFormat::Sint32x4,
                         (IoScalar::Float, 1) => VertexFormat::Float32,
                         (IoScalar::Float, 2) => VertexFormat::Float32x2,
                         (IoScalar::Float, 3) => VertexFormat::Float32x3,
@@ -855,6 +889,21 @@ impl<'a> Compiler<'a> {
                     .push("DCL IN[16], POSITION, LINEAR".into());
                 "IN[16]".into()
             }
+            Binding::BuiltIn(BuiltIn::FragDepth)
+                if !input && self.stage == ShaderStage::Fragment =>
+            {
+                self.declarations.push("DCL OUT[16], POSITION".into());
+                return Ok(Value {
+                    shape,
+                    lanes: vec![Lane {
+                        register: "OUT[16]".into(),
+                        component: 2,
+                        constant_byte: None,
+                    }],
+                    writable: true,
+                    indirect: None,
+                });
+            }
             Binding::BuiltIn(BuiltIn::PointSize) if !input && self.stage == ShaderStage::Vertex => {
                 // Location outputs occupy OUT[1..16]; do not alias a varying.
                 // This preserves an explicit SPIR-V point-size output even for
@@ -878,6 +927,28 @@ impl<'a> Compiler<'a> {
                 let value = self.allocate(Shape::Scalar(K::Bool), false)?;
                 self.instruction("FSLT", &value.lanes[0], &[&zero.lanes[0], &face])?;
                 return Ok(value);
+            }
+            Binding::BuiltIn(
+                builtin @ (BuiltIn::BaseInstance | BuiltIn::BaseVertex | BuiltIn::DrawID),
+            ) if input && self.stage == ShaderStage::Vertex => {
+                let register = self
+                    .first_instance_register
+                    .ok_or_else(|| unsupported("draw parameters constant"))?;
+                let component = match builtin {
+                    BuiltIn::BaseInstance => 0,
+                    BuiltIn::BaseVertex => 1,
+                    _ => 2,
+                };
+                return Ok(Value {
+                    shape,
+                    lanes: vec![Lane {
+                        register: format!("CONST[{register}]"),
+                        component,
+                        constant_byte: None,
+                    }],
+                    writable: false,
+                    indirect: None,
+                });
             }
             Binding::BuiltIn(BuiltIn::VertexIndex)
                 if input && self.stage == ShaderStage::Vertex =>
@@ -1628,8 +1699,8 @@ impl<'a> Compiler<'a> {
                             .shape
                             .clone(),
                         lanes: Vec::new(),
-                        writable: false,
-                        indirect: Some(Box::new(IndirectRead {
+                        writable: base.writable,
+                        indirect: Some(Box::new(IndirectAccess {
                             elements,
                             index: index.lanes[0].clone(),
                         })),
@@ -1860,6 +1931,30 @@ impl<'a> Compiler<'a> {
                         return Err(unsupported("array/cube comparison LOD"));
                     }
                 }
+                let mut gradients = None;
+                if let naga::SampleLevel::Gradient { x, y } = level {
+                    let mut registers = Vec::new();
+                    for handle in [x, y] {
+                        let source = self.expression(frame, handle)?;
+                        if source.shape.kind()? != K::Float || source.lanes.len() != components {
+                            return Err(unsupported("sampling gradient shape"));
+                        }
+                        self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
+                        let gradient = self.allocate(Shape::Vector(K::Float, 4), false)?;
+                        for i in 0..4 {
+                            self.instruction(
+                                "MOV",
+                                &gradient.lanes[i],
+                                &[source.lanes.get(i).unwrap_or(&zero.lanes[0])],
+                            )?;
+                        }
+                        registers.push(gradient.lanes[0].register.clone());
+                    }
+                    gradients = Some(format!(
+                        "{}, {}, {}",
+                        coords.lanes[0].register, registers[0], registers[1]
+                    ));
+                }
                 let opcode = match level {
                     naga::SampleLevel::Auto if self.stage == ShaderStage::Fragment => "TEX",
                     naga::SampleLevel::Zero => "TXL",
@@ -1873,9 +1968,14 @@ impl<'a> Compiler<'a> {
                         self.instruction("MOV", &coords.lanes[3], &[&lod.lanes[0]])?;
                         "TXB"
                     }
+                    naga::SampleLevel::Gradient { .. } => "TXD",
                     _ => return Err(unsupported("sampling level/gradients")),
                 };
-                self.texture_instruction(opcode, slot, target, &coords, shape, !depth)?
+                if let Some(sources) = gradients {
+                    self.texture_instruction_sources(opcode, slot, target, &sources, shape, !depth)?
+                } else {
+                    self.texture_instruction(opcode, slot, target, &coords, shape, !depth)?
+                }
             }
             E::ImageLoad {
                 image,
@@ -2336,11 +2436,29 @@ impl<'a> Compiler<'a> {
         shape: Shape,
         color: bool,
     ) -> Result<Value> {
+        self.texture_instruction_sources(
+            opcode,
+            slot,
+            target,
+            &coords.lanes[0].register,
+            shape,
+            color,
+        )
+    }
+    fn texture_instruction_sources(
+        &mut self,
+        opcode: &str,
+        slot: u32,
+        target: &str,
+        sources: &str,
+        shape: Shape,
+        color: bool,
+    ) -> Result<Value> {
         self.temp_lanes = self.temp_lanes.div_ceil(4) * 4;
         let result = self.allocate(Shape::Vector(K::Float, 4), false)?;
         self.instructions.push(format!(
             "{opcode} {}, {}, SAMP[{slot}], {target}",
-            result.lanes[0].register, coords.lanes[0].register
+            result.lanes[0].register, sources
         ));
         if color {
             self.decode_srgb_view(&result, slot)?;
@@ -2580,6 +2698,17 @@ impl<'a> Compiler<'a> {
                 }
             }
             return Ok(result);
+        }
+        if matches!(fun, M::Radians | M::Degrees) {
+            if a.shape.kind()? != K::Float {
+                return Err(unsupported("angle conversion type"));
+            }
+            let factor = self.immediate(Literal::F32(if fun == M::Radians {
+                core::f32::consts::PI / 180.0
+            } else {
+                180.0 / core::f32::consts::PI
+            }))?;
+            return self.binary(B::Multiply, &a, &factor, shape);
         }
         if fun == M::Fma {
             let b = b.ok_or_else(|| unsupported("fma operands"))?;

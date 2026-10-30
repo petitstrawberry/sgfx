@@ -308,6 +308,8 @@ pub enum OwnedCommand {
     SetSampler(SamplerId),
     /// Set fixed render pipeline uniforms.
     SetUniforms(DrawUniforms),
+    /// Logical index within a multi-draw operation.
+    SetDrawIndex(u32),
     /// Set or reset the render scissor.
     SetScissor(Option<PixelRect>),
     /// Set the viewport for subsequent draws.
@@ -605,6 +607,7 @@ impl OwnedCommandBuffer {
                             OwnedCommand::SetSampler(sampler) => {
                                 pass.set_sampler(resources.sampler_ref(*sampler)?)?;
                             }
+                            OwnedCommand::SetDrawIndex(index) => pass.set_draw_index(*index)?,
                             OwnedCommand::SetUniforms(uniforms) => pass.set_uniforms(*uniforms)?,
                             OwnedCommand::SetScissor(scissor) => pass.set_scissor(*scissor)?,
                             OwnedCommand::SetViewport(viewport) => pass.set_viewport(*viewport)?,

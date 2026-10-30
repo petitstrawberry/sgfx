@@ -389,7 +389,7 @@ unsafe extern "system" fn enumerate_instance_version(out: *mut u32) -> vk::Resul
     let Some(out) = out.as_mut() else {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     };
-    *out = vk::API_VERSION_1_1;
+    *out = vk::API_VERSION_1_2;
     vk::Result::SUCCESS
 }
 
@@ -432,7 +432,7 @@ pub(crate) unsafe extern "system" fn create_instance(
         if version != 0
             && (vk::api_version_variant(version) != 0
                 || vk::api_version_major(version) != 1
-                || vk::api_version_minor(version) > 1)
+                || vk::api_version_minor(version) > 2)
         {
             return vk::Result::ERROR_INCOMPATIBLE_DRIVER;
         }
@@ -459,7 +459,7 @@ pub(crate) unsafe extern "system" fn create_instance(
         .as_ref()
         .map_or(vk::API_VERSION_1_0, |info| {
             info.api_version
-                .clamp(vk::API_VERSION_1_0, vk::API_VERSION_1_1)
+                .clamp(vk::API_VERSION_1_0, vk::API_VERSION_1_2)
         });
     let record = InstanceRecord {
         api_version,
@@ -652,6 +652,14 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
                 vk::KHR_DRAW_INDIRECT_COUNT_SPEC_VERSION,
             ),
             (
+                vk::EXT_VERTEX_ATTRIBUTE_DIVISOR_NAME,
+                vk::EXT_VERTEX_ATTRIBUTE_DIVISOR_SPEC_VERSION,
+            ),
+            (
+                vk::KHR_PUSH_DESCRIPTOR_NAME,
+                vk::KHR_PUSH_DESCRIPTOR_SPEC_VERSION,
+            ),
+            (
                 vk::EXT_HOST_QUERY_RESET_NAME,
                 vk::EXT_HOST_QUERY_RESET_SPEC_VERSION,
             ),
@@ -660,6 +668,14 @@ fn device_extensions() -> &'static [(&'static CStr, u32)] {
     #[cfg(target_os = "scarlet")]
     {
         &[
+            (
+                vk::KHR_PUSH_DESCRIPTOR_NAME,
+                vk::KHR_PUSH_DESCRIPTOR_SPEC_VERSION,
+            ),
+            (
+                vk::EXT_VERTEX_ATTRIBUTE_DIVISOR_NAME,
+                vk::EXT_VERTEX_ATTRIBUTE_DIVISOR_SPEC_VERSION,
+            ),
             (crate::scarlet_image::DEVICE_EXTENSION_NAME, 1),
             (vk::KHR_SWAPCHAIN_NAME, vk::KHR_SWAPCHAIN_SPEC_VERSION),
             (vk::KHR_MAINTENANCE1_NAME, vk::KHR_MAINTENANCE1_SPEC_VERSION),
@@ -874,6 +890,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_features(
         let mut features = vk::PhysicalDeviceFeatures::default();
         if let Some(adapter) = physical_adapter(physical) {
             let capabilities = adapter.capabilities();
+            features.sampler_anisotropy = u32::from(capabilities.supports_anisotropy_16());
             features.occlusion_query_precise = u32::from(adapter.query_support() & 2 != 0);
             features.pipeline_statistics_query = u32::from(adapter.query_support() & 4 != 0);
             features.multi_draw_indirect = u32::from(capabilities.supports_programmable_graphics());
@@ -905,7 +922,16 @@ pub(crate) unsafe extern "system" fn get_physical_device_properties(
         let limits = capabilities.limits();
         properties.api_version =
             if cfg!(target_os = "scarlet") && info.backend() == sgfx::BackendKind::ScarletVirgl {
-                vk::API_VERSION_1_1
+                if capabilities.supports_shader_draw_parameters()
+                    && capabilities.supports_vertex_divisors()
+                    && capabilities.supports_anisotropy_16()
+                    && capabilities.supports_compute()
+                    && capabilities.supports_depth_transfers()
+                {
+                    vk::API_VERSION_1_2
+                } else {
+                    vk::API_VERSION_1_1
+                }
             } else {
                 vk::API_VERSION_1_0
             };
@@ -934,6 +960,11 @@ pub(crate) unsafe extern "system" fn get_physical_device_properties(
         let compute = capabilities.supports_compute();
         let graphics = capabilities.supports_graphics();
         properties.limits = vk::PhysicalDeviceLimits {
+            max_sampler_anisotropy: if capabilities.supports_anisotropy_16() {
+                16.0
+            } else {
+                1.0
+            },
             max_draw_indirect_count: 4096,
             timestamp_period: if adapter.supports_timestamps() {
                 1.0
@@ -1067,6 +1098,9 @@ pub(crate) unsafe extern "system" fn get_physical_device_properties(
             min_uniform_buffer_offset_alignment: u64::from(
                 limits.min_uniform_buffer_offset_alignment.max(16),
             ),
+            min_texel_buffer_offset_alignment: u64::from(
+                limits.min_storage_buffer_offset_alignment.max(4),
+            ),
             min_storage_buffer_offset_alignment: u64::from(
                 limits.min_storage_buffer_offset_alignment.max(4),
             ),
@@ -1182,6 +1216,16 @@ pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
         return;
     };
     let capabilities = adapter.capabilities();
+    if matches!(
+        format,
+        vk::Format::R16G16B16A16_SFLOAT | vk::Format::R32G32B32A32_SFLOAT
+    ) && capabilities.supports_float_color()
+    {
+        properties.optimal_tiling_features = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+    }
     let srgb = matches!(
         format,
         vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
@@ -1264,20 +1308,36 @@ pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
             properties.optimal_tiling_features |= feature;
         }
     }
+    if capabilities.supports_storage_buffers()
+        && matches!(
+            format,
+            vk::Format::R32_SINT | vk::Format::R32_UINT | vk::Format::R32_SFLOAT
+        )
+    {
+        properties.buffer_features |= vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER;
+    }
     if capabilities.supports_extended_vertex_formats()
         && matches!(
             format,
             vk::Format::R32_SINT
                 | vk::Format::R32_UINT
+                | vk::Format::R32G32_UINT
+                | vk::Format::R32G32B32_UINT
+                | vk::Format::R32G32B32A32_UINT
+                | vk::Format::R32G32_SINT
+                | vk::Format::R32G32B32_SINT
+                | vk::Format::R32G32B32A32_SINT
                 | vk::Format::R16G16_SFLOAT
                 | vk::Format::R16G16_UINT
+                | vk::Format::R16G16_SINT
+                | vk::Format::R8G8B8A8_SNORM
                 | vk::Format::R16G16B16A16_SFLOAT
                 | vk::Format::R16G16B16A16_SINT
                 | vk::Format::A2B10G10R10_SNORM_PACK32
                 | vk::Format::A8B8G8R8_UNORM_PACK32
         )
     {
-        properties.buffer_features = vk::FormatFeatureFlags::VERTEX_BUFFER;
+        properties.buffer_features |= vk::FormatFeatureFlags::VERTEX_BUFFER;
     }
     if capabilities.supports_vertex_buffers()
         && matches!(
@@ -1289,7 +1349,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_format_properties(
                 | vk::Format::R8G8B8A8_UNORM
         )
     {
-        properties.buffer_features = vk::FormatFeatureFlags::VERTEX_BUFFER;
+        properties.buffer_features |= vk::FormatFeatureFlags::VERTEX_BUFFER;
     }
     unsafe { *output = properties };
 }
@@ -1312,6 +1372,14 @@ pub(crate) unsafe extern "system" fn get_physical_device_image_format_properties
     };
     let capabilities = adapter.capabilities();
     let mut supported_usage = crate::images::extended_image_usage(format, flags);
+    if matches!(
+        format,
+        vk::Format::R16G16B16A16_SFLOAT | vk::Format::R32G32B32A32_SFLOAT
+    ) && !capabilities.supports_float_color()
+    {
+        supported_usage = vk::ImageUsageFlags::empty();
+    }
+
     if !capabilities.supports_storage_images() {
         supported_usage &= !vk::ImageUsageFlags::STORAGE;
     }
@@ -1368,6 +1436,9 @@ pub(crate) unsafe extern "system" fn get_physical_device_image_format_properties
     } else if format == vk::Format::D32_SFLOAT && !capabilities.supports_depth32_attachment() {
         supported_usage = vk::ImageUsageFlags::empty();
     }
+    if format == vk::Format::D32_SFLOAT && !capabilities.supports_depth_transfers() {
+        supported_usage &= !(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST);
+    }
     if supported_usage.is_empty()
         || !(image_type == vk::ImageType::TYPE_2D
             || (image_type == vk::ImageType::TYPE_1D
@@ -1401,10 +1472,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_image_format_properties
                 },
                 depth: 1,
             },
-            max_mip_levels: if usage.intersects(
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-            ) {
+            max_mip_levels: if usage.intersects(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT) {
                 1
             } else {
                 capabilities
@@ -1414,7 +1482,7 @@ pub(crate) unsafe extern "system" fn get_physical_device_image_format_properties
             },
             max_array_layers: capabilities.limits().max_image_array_layers,
             sample_counts: vk::SampleCountFlags::TYPE_1,
-            max_resource_size: u64::from(max_dimension).pow(2) * 4 * 2,
+            max_resource_size: crate::resources::MAX_ALLOCATION,
         }
     };
     vk::Result::SUCCESS
@@ -1528,7 +1596,7 @@ mod tests {
                 enumerate_instance_version(&mut version),
                 vk::Result::SUCCESS
             );
-            assert_eq!(version, vk::API_VERSION_1_1);
+            assert_eq!(version, vk::API_VERSION_1_2);
             let application = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
             let mut instance = vk::Instance::null();
             assert_eq!(
@@ -1655,7 +1723,7 @@ mod tests {
                 ),
                 vk::Result::SUCCESS
             );
-            assert_eq!(image.max_mip_levels, 1);
+            assert!(image.max_mip_levels > 1);
             assert_eq!(
                 get_physical_device_image_format_properties(
                     physical,
@@ -1714,6 +1782,7 @@ mod tests {
             assert_eq!(
                 formats.buffer_features,
                 vk::FormatFeatureFlags::VERTEX_BUFFER
+                    | vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER
             );
             assert!(formats.optimal_tiling_features.is_empty());
 

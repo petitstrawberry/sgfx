@@ -51,6 +51,86 @@ mod resource_limits;
 const WORDS: usize = 256;
 const BYTES: u64 = (WORDS * size_of::<u32>()) as u64;
 
+#[test]
+#[ignore = "requires a native GPU"]
+fn pushed_descriptors_snapshot_templates_partial_updates_and_replay() {
+    let c = Context::new();
+    let compute = Compute::configured(&c, true);
+    let first = Storage::new(&c);
+    let second = Storage::new(&c);
+    unsafe {
+        let push = ash::khr::push_descriptor::Device::new(&c.instance, &c.device);
+        let entries = [vk::DescriptorUpdateTemplateEntry::default()
+            .dst_binding(0)
+            .descriptor_count(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .offset(0)
+            .stride(size_of::<vk::DescriptorBufferInfo>())];
+        let template = c
+            .device
+            .create_descriptor_update_template(
+                &vk::DescriptorUpdateTemplateCreateInfo::default()
+                    .descriptor_update_entries(&entries)
+                    .template_type(vk::DescriptorUpdateTemplateType::PUSH_DESCRIPTORS_KHR)
+                    .pipeline_bind_point(vk::PipelineBindPoint::COMPUTE)
+                    .pipeline_layout(compute.layout)
+                    .set(0),
+                None,
+            )
+            .unwrap();
+        c.device
+            .begin_command_buffer(c.command, &Default::default())
+            .unwrap();
+        c.device
+            .cmd_bind_pipeline(c.command, vk::PipelineBindPoint::COMPUTE, compute.pipeline);
+        let mut data = [vk::DescriptorBufferInfo::default()
+            .buffer(first.buffer)
+            .range(BYTES)];
+        push.cmd_push_descriptor_set(
+            c.command,
+            vk::PipelineBindPoint::COMPUTE,
+            compute.layout,
+            0,
+            &[vk::WriteDescriptorSet::default()
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&data)],
+        );
+        data[0].buffer = second.buffer;
+        // Empty pushes retain all defined bindings. Caller data was snapshotted.
+        push.cmd_push_descriptor_set(
+            c.command,
+            vk::PipelineBindPoint::COMPUTE,
+            compute.layout,
+            0,
+            &[],
+        );
+        c.device.cmd_dispatch(c.command, 4, 1, 1);
+        push.cmd_push_descriptor_set_with_template(
+            c.command,
+            template,
+            compute.layout,
+            0,
+            data.as_ptr().cast(),
+        );
+        data[0].buffer = vk::Buffer::null();
+        std::hint::black_box(&data);
+        c.device.cmd_dispatch(c.command, 4, 1, 1);
+        c.device.end_command_buffer(c.command).unwrap();
+        let expected = (0..WORDS as u32).map(|i| i * 3 + 7).collect::<Vec<_>>();
+        for _ in 0..2 {
+            let fence = c.device.create_fence(&Default::default(), None).unwrap();
+            c.submit(fence).unwrap();
+            c.device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            assert_eq!(first.read(), expected);
+            assert_eq!(second.read(), expected);
+            c.device.destroy_fence(fence, None);
+        }
+        c.reset();
+        c.device.destroy_descriptor_update_template(template, None);
+    }
+}
+
 struct Context {
     device: ash::Device,
     queue: vk::Queue,
@@ -150,11 +230,15 @@ impl Context {
                 .multi_draw_indirect(true)
                 .draw_indirect_first_instance(true);
             let extensions = [
+                vk::KHR_PUSH_DESCRIPTOR_NAME.as_ptr(),
                 vk::KHR_DYNAMIC_RENDERING_NAME.as_ptr(),
                 vk::KHR_DRAW_INDIRECT_COUNT_NAME.as_ptr(),
                 vk::KHR_SYNCHRONIZATION2_NAME.as_ptr(),
             ];
-            let mut info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+            let base_extensions = [vk::KHR_PUSH_DESCRIPTOR_NAME.as_ptr()];
+            let mut info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queues)
+                .enabled_extension_names(&base_extensions);
             if synchronization2 {
                 info = info
                     .enabled_features(&indirect_features)
@@ -358,6 +442,9 @@ struct Compute<'a> {
 
 impl<'a> Compute<'a> {
     fn new(context: &'a Context) -> Self {
+        Self::configured(context, false)
+    }
+    fn configured(context: &'a Context, pushed: bool) -> Self {
         let module = naga::front::wgsl::parse_str(include_str!("assets/fill.wgsl")).unwrap();
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -387,7 +474,13 @@ impl<'a> Compute<'a> {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)];
             let descriptor_layout = device
                 .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .bindings(&bindings)
+                        .flags(if pushed {
+                            vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+                        } else {
+                            vk::DescriptorSetLayoutCreateFlags::empty()
+                        }),
                     None,
                 )
                 .unwrap();
@@ -412,24 +505,29 @@ impl<'a> Compute<'a> {
                     None,
                 )
                 .unwrap()[0];
-            let sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)];
-            let pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&sizes),
-                    None,
-                )
-                .unwrap();
-            let set = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&layouts),
-                )
-                .unwrap()[0];
+            let (pool, set) = if pushed {
+                (vk::DescriptorPool::null(), vk::DescriptorSet::null())
+            } else {
+                let sizes = [vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)];
+                let pool = device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .max_sets(1)
+                            .pool_sizes(&sizes),
+                        None,
+                    )
+                    .unwrap();
+                let set = device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(pool)
+                            .set_layouts(&layouts),
+                    )
+                    .unwrap()[0];
+                (pool, set)
+            };
             Self {
                 context,
                 shader,

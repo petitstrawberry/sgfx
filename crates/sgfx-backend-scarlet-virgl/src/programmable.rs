@@ -180,6 +180,8 @@ fn compile_pipeline(
                 | TextureFormat::Rgba8Unorm
                 | TextureFormat::R8Unorm
                 | TextureFormat::Rg8Unorm
+                | TextureFormat::Rgba16Float
+                | TextureFormat::Rgba32Float
         )
     }) {
         return Err(IrSubmitError::Unsupported(
@@ -193,6 +195,7 @@ fn compile_pipeline(
             | PrimitiveTopology::TriangleFan
             | PrimitiveTopology::LineList
             | PrimitiveTopology::LineStrip
+            | PrimitiveTopology::PointList
     ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PrimitiveTopology,
@@ -279,8 +282,17 @@ fn compile_pipeline(
             .find(|attribute| attribute.location() == input.location)
             .ok_or(ir::Error::InvalidDescriptor)?;
         let scalar = match attribute.format() {
-            VertexFormat::Sint32 | VertexFormat::Sint16x4 => IoScalar::Sint,
-            VertexFormat::Uint32 | VertexFormat::Uint16x2 => IoScalar::Uint,
+            VertexFormat::Sint32
+            | VertexFormat::Sint16x4
+            | VertexFormat::Sint16x2
+            | VertexFormat::Sint32x2
+            | VertexFormat::Sint32x3
+            | VertexFormat::Sint32x4 => IoScalar::Sint,
+            VertexFormat::Uint32
+            | VertexFormat::Uint16x2
+            | VertexFormat::Uint32x2
+            | VertexFormat::Uint32x3
+            | VertexFormat::Uint32x4 => IoScalar::Uint,
             VertexFormat::Float32
             | VertexFormat::Float32x2
             | VertexFormat::Float32x3
@@ -288,6 +300,7 @@ fn compile_pipeline(
             | VertexFormat::Float16x2
             | VertexFormat::Float16x4
             | VertexFormat::Unorm8x4
+            | VertexFormat::Snorm8x4
             | VertexFormat::Snorm10_10_10_2 => IoScalar::Float,
         };
         // Vertex fetch supplies a four-component value independently of the
@@ -521,7 +534,7 @@ impl Context {
         }
         let reference = resources.resources.texture_ref(id)?;
         let descriptor = resources.resources.texture(reference)?;
-        if descriptor.mip_level_count() != 1 || descriptor.array_layer_count() != 1 {
+        if descriptor.array_layer_count() != 1 {
             return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
         }
         if !descriptor.usage().contains(TextureUsage::COPY_SRC) {
@@ -529,17 +542,29 @@ impl Context {
         }
         if !matches!(
             descriptor.format(),
-            TextureFormat::Bgra8Unorm
+            TextureFormat::Depth32Float
+                | TextureFormat::Bgra8Unorm
                 | TextureFormat::Rgba8Unorm
                 | TextureFormat::R8Unorm
                 | TextureFormat::Rg8Unorm
+                | TextureFormat::Rgba16Float
+                | TextureFormat::Rgba32Float
         ) {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::TargetFormat,
             ));
         }
-        let length =
-            usize::try_from(descriptor.byte_size()?).map_err(|_| IrSubmitError::OutOfMemory)?;
+        let length = usize::try_from(
+            u64::from(descriptor.extent().width())
+                * u64::from(descriptor.extent().height())
+                * u64::from(
+                    descriptor
+                        .format()
+                        .bytes_per_pixel()
+                        .ok_or(ir::Error::InvalidDescriptor)?,
+                ),
+        )
+        .map_err(|_| IrSubmitError::OutOfMemory)?;
         let mut output = Vec::new();
         output
             .try_reserve_exact(length)
@@ -564,7 +589,7 @@ impl Context {
         }
         let reference = resources.resources.texture_ref(id)?;
         let descriptor = resources.resources.texture(reference)?;
-        if descriptor.mip_level_count() != 1 || descriptor.array_layer_count() != 1 {
+        if descriptor.array_layer_count() != 1 {
             return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
         }
         if !descriptor.usage().contains(TextureUsage::COPY_SRC) {
@@ -572,17 +597,29 @@ impl Context {
         }
         if !matches!(
             descriptor.format(),
-            TextureFormat::Bgra8Unorm
+            TextureFormat::Depth32Float
+                | TextureFormat::Bgra8Unorm
                 | TextureFormat::Rgba8Unorm
                 | TextureFormat::R8Unorm
                 | TextureFormat::Rg8Unorm
+                | TextureFormat::Rgba16Float
+                | TextureFormat::Rgba32Float
         ) {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::TargetFormat,
             ));
         }
         let spec = texture_spec(reference, descriptor)?;
-        if descriptor.byte_size()? != bytes.len() as u64 {
+        if u64::from(descriptor.extent().width())
+            * u64::from(descriptor.extent().height())
+            * u64::from(
+                descriptor
+                    .format()
+                    .bytes_per_pixel()
+                    .ok_or(ir::Error::InvalidDescriptor)?,
+            )
+            != bytes.len() as u64
+        {
             return Err(ir::Error::OutOfBounds.into());
         }
         let narrow = matches!(spec.format, IrTextureFormat::R8 | IrTextureFormat::Rg8);
@@ -752,17 +789,28 @@ fn uniform_words(
     constant_words(bytes, binding.size.next_multiple_of(16) as usize)
 }
 
+pub(super) struct DrawParameters {
+    pub first: u32,
+    pub count: u32,
+    pub base_vertex: Option<i32>,
+    pub instance_count: u32,
+    pub first_instance: u32,
+}
+
 #[cfg(feature = "programmable")]
 pub(super) fn decode_draw(
     resources: &IrResources,
     pending: &PendingBuffers,
     pass: &mut ActivePass<'_>,
-    first: u32,
-    count: u32,
-    base_vertex: Option<i32>,
-    instance_count: u32,
-    first_instance: u32,
+    parameters: DrawParameters,
 ) -> Result<IrDraw, IrSubmitError> {
+    let DrawParameters {
+        first,
+        count,
+        base_vertex,
+        instance_count,
+        first_instance,
+    } = parameters;
     let reference = pass.programmable.ok_or(ir::Error::PipelineNotSet)?;
     let pipeline = resources
         .resources
@@ -772,6 +820,7 @@ pub(super) fn decode_draw(
         PrimitiveTopology::TriangleStrip | PrimitiveTopology::TriangleFan => count >= 3,
         PrimitiveTopology::LineList => count > 0 && count.is_multiple_of(2),
         PrimitiveTopology::LineStrip => count >= 2,
+        PrimitiveTopology::PointList => count != 0,
     };
     if !valid_count {
         return Err(ir::Error::InvalidValue.into());
@@ -964,6 +1013,11 @@ pub(super) fn decode_draw(
                     };
                     let sampler = resources.resources.sampler_ref(sampler)?;
                     let desc = resources.resources.sampler(sampler)?;
+                    if desc.anisotropy() > 1
+                        && !resources.context.capabilities().supports_anisotropy_16()
+                    {
+                        return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Sampler));
+                    }
                     if desc.compare().is_some() != binding.comparison {
                         return Err(ir::Error::BindingLayoutMismatch.into());
                     }
@@ -1167,6 +1221,7 @@ pub(super) fn decode_draw(
         draw: Rc::clone(&programmable),
     });
     Ok(IrDraw {
+        draw_index: pass.draw_index,
         instance_count,
         first_instance,
         vertex_buffers,
@@ -1175,6 +1230,7 @@ pub(super) fn decode_draw(
         vertex_count: count as usize,
         vertex_buffer,
         pipeline: IrPipelineState {
+            depth_bias: raster.depth_bias().map(f32::to_bits),
             slot: reference.slot() + 256,
             fragment: IrFragmentProgram::Solid,
             blend: color_target_blend(pipeline.color_targets().next().unwrap()).0,
@@ -1244,8 +1300,10 @@ fn vertex_fetch_range(
         ir::VertexStepMode::Vertex => (maximum_vertex, 0),
         ir::VertexStepMode::Instance => (
             first_instance
-                .checked_add(instance_count)
-                .and_then(|end| end.checked_sub(1))
+                .checked_add(
+                    instance_count.checked_sub(1).ok_or(ir::Error::Overflow)?
+                        / layout.instance_divisor(),
+                )
                 .ok_or(ir::Error::Overflow)?,
             first_instance,
         ),
@@ -1256,7 +1314,7 @@ fn vertex_fetch_range(
         .ok_or(ir::Error::Overflow)?;
     // Host VirGL draw packets use base_instance=0. The existing TGSI constant
     // supplies Vulkan's firstInstance to the shader builtin; advance only the
-    // per-instance buffer here so its hardware divisor-one fetch matches it.
+    // per-instance buffer here so the hardware fetch starts at the requested first instance.
     let binding_offset = offset
         .checked_add(u64::from(base) * u64::from(layout.stride()))
         .ok_or(ir::Error::Overflow)?;
@@ -1268,11 +1326,7 @@ pub(super) fn decode_draw(
     _resources: &IrResources,
     _pending: &PendingBuffers,
     _pass: &mut ActivePass<'_>,
-    _first: u32,
-    _count: u32,
-    _base_vertex: Option<i32>,
-    _instance_count: u32,
-    _first_instance: u32,
+    _parameters: DrawParameters,
 ) -> Result<IrDraw, IrSubmitError> {
     Err(IrSubmitError::Unsupported(
         UnsupportedIrFeature::ProgrammableExecution,
@@ -1883,6 +1937,11 @@ mod tests {
             vertex_fetch_range(&instance, 0, 1000, 2, 2, 12).unwrap(),
             (48, 24)
         );
+        let divided = instance.clone().with_instance_divisor(2).unwrap();
+        assert_eq!(
+            vertex_fetch_range(&divided, 16, 100, 2, 5, 12).unwrap(),
+            (76, 40)
+        );
         assert!(vertex_fetch_range(&instance, 0, 0, u32::MAX, 2, 12).is_err());
         assert!(vertex_fetch_range(&instance, u64::MAX - 4, 0, 2, 2, 12).is_err());
     }
@@ -2046,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn admits_ordered_transfer_barriers_but_rejects_shader_write_barriers() {
+    fn admits_ordered_transfer_and_retired_compute_buffer_barriers() {
         let table = ResourceTable::new();
         let buffer = table
             .define_buffer(
@@ -2063,16 +2122,12 @@ mod tests {
             after: ir::BufferAccess::Vertex,
         })
         .unwrap();
-        assert!(matches!(
-            validate_barrier(ir::ResourceBarrier::Buffer {
-                buffer,
-                before: ir::BufferAccess::StorageReadWrite,
-                after: ir::BufferAccess::Vertex
-            }),
-            Err(IrSubmitError::Unsupported(
-                UnsupportedIrFeature::ExplicitBarrier
-            ))
-        ));
+        validate_barrier(ir::ResourceBarrier::Buffer {
+            buffer,
+            before: ir::BufferAccess::StorageReadWrite,
+            after: ir::BufferAccess::Vertex,
+        })
+        .unwrap();
     }
     #[test]
     fn narrow_color_readback_preserves_rendered_channels_and_omits_transport_padding() {

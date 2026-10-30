@@ -48,7 +48,10 @@ fn error(e: virgl::IrSubmitError) -> i32 {
     use virgl::IrSubmitError as E;
     match e {
         E::OutOfMemory | E::SubmissionTooLarge => abi::OUT_OF_MEMORY,
-        E::Unsupported(_) | E::ShaderCompile(_) => abi::UNSUPPORTED,
+        cause @ (E::Unsupported(_) | E::ShaderCompile(_)) => {
+            eprintln!("[SGFX VirGL] unsupported operation: {cause:?}");
+            abi::UNSUPPORTED
+        }
         E::InvalidIr(_)
         | E::ResourceTableMismatch
         | E::ContextMismatch
@@ -111,6 +114,21 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
             .and_then(|c| c.timestamp_ns())
             .is_ok();
         let flags = (if timing { abi::GPU_TIMESTAMPS } else { 0 })
+            | if c.supports_anisotropy_16() {
+                abi::SAMPLER_ANISOTROPY_16
+            } else {
+                0
+            }
+            | if c.supports_float_color() {
+                abi::FLOAT_COLOR_ATTACHMENTS
+            } else {
+                0
+            }
+            | if c.supports_depth_transfers() {
+                abi::DEPTH_TRANSFERS
+            } else {
+                0
+            }
             | if device.supports_compute() {
                 abi::COMPUTE_BUFFERS
             } else {
@@ -139,6 +157,8 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
             | if c.supports_depth() { abi::DEPTH } else { 0 }
             | if c.supports_programmable_graphics() {
                 abi::PROGRAMMABLE_GRAPHICS
+                    | abi::VERTEX_ATTRIBUTE_DIVISORS
+                    | abi::SHADER_DRAW_PARAMETERS
             } else {
                 0
             }

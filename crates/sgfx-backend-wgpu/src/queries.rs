@@ -175,6 +175,7 @@ impl Queue {
                 }
                 ir::PrimitiveTopology::LineList => vertices / 2,
                 ir::PrimitiveTopology::LineStrip => vertices.saturating_sub(1),
+                ir::PrimitiveTopology::PointList => vertices,
             };
             q.assembly[0] = q.assembly[0].wrapping_add(u64::from(vertices) * u64::from(instances));
             q.assembly[1] =

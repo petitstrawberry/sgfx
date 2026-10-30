@@ -4,6 +4,7 @@ use super::*;
 pub(crate) struct Template {
     entries: Vec<vk::DescriptorUpdateTemplateEntry>,
     types: BTreeMap<u32, vk::DescriptorType>,
+    target: Option<(vk::PipelineBindPoint, vk::PipelineLayout, u32)>,
 }
 fn element_size(ty: vk::DescriptorType) -> Option<usize> {
     match ty {
@@ -37,7 +38,11 @@ unsafe extern "system" fn create(
             || i.s_type != vk::StructureType::DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO
             || !i.p_next.is_null()
             || !i.flags.is_empty()
-            || i.template_type != vk::DescriptorUpdateTemplateType::DESCRIPTOR_SET
+            || !matches!(
+                i.template_type,
+                vk::DescriptorUpdateTemplateType::DESCRIPTOR_SET
+                    | vk::DescriptorUpdateTemplateType::PUSH_DESCRIPTORS_KHR
+            )
         {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
@@ -47,13 +52,32 @@ unsafe extern "system" fn create(
         )?
         .to_vec();
         let layout = i.descriptor_set_layout;
+        let target = (i.template_type == vk::DescriptorUpdateTemplateType::PUSH_DESCRIPTORS_KHR)
+            .then_some((i.pipeline_bind_point, i.pipeline_layout, i.set));
         let handle = with_device(device, move |rt| {
-            let types = rt
-                .resources
-                .set_layout_types
-                .get(&layout)
-                .cloned()
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            let types = if let Some((point, pipeline, set)) = target {
+                if !matches!(
+                    point,
+                    vk::PipelineBindPoint::GRAPHICS | vk::PipelineBindPoint::COMPUTE
+                ) {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                let (index, desc) = rt
+                    .resources
+                    .pipeline_push_sets
+                    .get(&pipeline)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                if *index != set {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                desc.types.clone()
+            } else {
+                rt.resources
+                    .set_layout_types
+                    .get(&layout)
+                    .cloned()
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+            };
             for entry in &entries {
                 let size = element_size(entry.descriptor_type)
                     .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
@@ -79,9 +103,14 @@ unsafe extern "system" fn create(
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
             let handle = vk::DescriptorUpdateTemplate::from_raw(next_id());
-            rt.resources
-                .descriptor_templates
-                .insert(handle, Template { entries, types });
+            rt.resources.descriptor_templates.insert(
+                handle,
+                Template {
+                    entries,
+                    types,
+                    target,
+                },
+            );
             Ok(handle)
         })?;
         *out = handle;
@@ -112,11 +141,12 @@ unsafe extern "system" fn update(
                 .get(&template)
                 .cloned()
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if rt
-                .resources
-                .descriptor_sets
-                .get(&set)
-                .is_none_or(|s| s.types != t.types)
+            if t.target.is_some()
+                || rt
+                    .resources
+                    .descriptor_sets
+                    .get(&set)
+                    .is_none_or(|s| s.types != t.types)
             {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
@@ -177,6 +207,77 @@ unsafe extern "system" fn update(
         });
     }
 }
+pub(super) unsafe extern "system" fn push_template(
+    command: vk::CommandBuffer,
+    template: vk::DescriptorUpdateTemplate,
+    layout: vk::PipelineLayout,
+    set: u32,
+    data: *const std::ffi::c_void,
+) {
+    let result = (|| {
+        let d = driver(command.as_raw(), Kind::Command)?;
+        let t = call(&d, move |rt| {
+            let t = rt
+                .resources
+                .descriptor_templates
+                .get(&template)
+                .cloned()
+                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            let (_, original, index) = t.target.ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+            if index != set
+                || !super::push_descriptors::compatible(rt, original, layout, set as usize)
+            {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            Ok(t)
+        })?;
+        if data.is_null() && !t.entries.is_empty() {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        let mut writes = Vec::new();
+        for entry in &t.entries {
+            for index in 0..entry.descriptor_count {
+                let ptr = data
+                    .cast::<u8>()
+                    .add(entry.offset + entry.stride * index as usize);
+                let value = if matches!(
+                    entry.descriptor_type,
+                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER
+                ) {
+                    let b = ptr.cast::<vk::DescriptorBufferInfo>().read_unaligned();
+                    crate::resources::DescriptorBinding::Buffer {
+                        buffer: b.buffer,
+                        offset: b.offset,
+                        range: b.range,
+                    }
+                } else {
+                    let i = ptr.cast::<vk::DescriptorImageInfo>().read_unaligned();
+                    if entry.descriptor_type == vk::DescriptorType::SAMPLER {
+                        crate::resources::DescriptorBinding::Sampler(i.sampler)
+                    } else {
+                        crate::resources::DescriptorBinding::Image {
+                            view: i.image_view,
+                            sampler: i.sampler,
+                            layout: i.image_layout,
+                        }
+                    }
+                };
+                writes.push(crate::resources::Write {
+                    set: vk::DescriptorSet::null(),
+                    binding: entry.dst_binding + index,
+                    element: 0,
+                    ty: entry.descriptor_type,
+                    value: Some(value),
+                });
+            }
+        }
+        super::push_descriptors::push_owned(command, t.target.unwrap().0, layout, set, writes)
+    })();
+    if let Err(error) = result {
+        record_error(command, error);
+    }
+}
+
 pub(super) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
     macro_rules! entry {
         ($f:ident,$ty:ty) => {{

@@ -6,6 +6,97 @@ use sgfx::ir;
 const INVALID: vk::Result = vk::Result::ERROR_INITIALIZATION_FAILED;
 const UNSUPPORTED: vk::Result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
 
+pub(crate) fn discarded_color(
+    rt: &mut crate::runtime::Runtime,
+    width: u32,
+    height: u32,
+) -> Result<ir::TextureId, vk::Result> {
+    Ok(
+        if let Some(&id) = rt.resources.depth_clear_colors.get(&(width, height)) {
+            id
+        } else {
+            let desc = ir::TextureDesc::new(
+                ir::TextureFormat::Bgra8Unorm,
+                ir::Extent2D::new(width, height).map_err(crate::resources::failure)?,
+                ir::TextureUsage::RENDER_ATTACHMENT,
+            )
+            .map_err(crate::resources::failure)?;
+            let id = rt
+                .table
+                .define_texture(desc)
+                .map_err(crate::resources::failure)?
+                .id();
+            rt.resources.depth_clear_colors.insert((width, height), id);
+            id
+        },
+    )
+}
+
+pub(crate) fn depth_commands(
+    rt: &mut crate::runtime::Runtime,
+    handle: vk::Image,
+    layout: vk::ImageLayout,
+    depth: f32,
+    ranges: &[vk::ImageSubresourceRange],
+) -> Result<Vec<ir::OwnedCommand>, vk::Result> {
+    let image = rt.resources.images.get(&handle).ok_or(INVALID)?;
+    if !image.usable()
+        || image.format != vk::Format::D32_SFLOAT
+        || !image.usage.contains(vk::ImageUsageFlags::TRANSFER_DST)
+        || !matches!(
+            layout,
+            vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_DST_OPTIMAL
+        )
+        || !depth.is_finite()
+        || !(0.0..=1.0).contains(&depth)
+        || ranges.is_empty()
+    {
+        return Err(INVALID);
+    }
+    if ranges.iter().any(|r| {
+        r.aspect_mask != vk::ImageAspectFlags::DEPTH
+            || r.base_mip_level != 0
+            || r.base_array_layer != 0
+            || !matches!(r.level_count, 1 | vk::REMAINING_MIP_LEVELS)
+            || !matches!(r.layer_count, 1 | vk::REMAINING_ARRAY_LAYERS)
+    }) {
+        return Err(UNSUPPORTED);
+    }
+    let (target, width, height) = (image.id, image.extent.width, image.extent.height);
+    // The portable pass has a color target. Reuse one private, discarded color
+    // attachment per size while the real depth attachment receives the GPU clear.
+    let color = discarded_color(rt, width, height)?;
+    let barrier = |before, after| {
+        ir::OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::Texture {
+            texture: target,
+            before,
+            after,
+        })
+    };
+    Ok(vec![
+        barrier(
+            ir::TextureAccess::CopyDestination,
+            ir::TextureAccess::RenderAttachment,
+        ),
+        ir::OwnedCommand::BeginRenderPass(ir::OwnedRenderPassDesc {
+            target: color,
+            area: ir::PixelRect::new(0, 0, width, height).map_err(crate::resources::failure)?,
+            load: ir::LoadOp::DontCare,
+            store: ir::StoreOp::DontCare,
+            depth: Some(ir::OwnedDepthAttachment {
+                target,
+                load: ir::DepthLoadOp::Clear(depth),
+                store: ir::StoreOp::Store,
+            }),
+        }),
+        ir::OwnedCommand::EndRenderPass,
+        barrier(
+            ir::TextureAccess::RenderAttachment,
+            ir::TextureAccess::CopyDestination,
+        ),
+    ])
+}
+
 pub(crate) fn color_commands(
     image: &Image,
     layout: vk::ImageLayout,
@@ -30,6 +121,8 @@ pub(crate) fn color_commands(
                 | vk::Format::B8G8R8A8_UNORM
                 | vk::Format::R8_UNORM
                 | vk::Format::R8G8_UNORM
+                | vk::Format::R16G16B16A16_SFLOAT
+                | vk::Format::R32G32B32A32_SFLOAT
         )
     {
         return Err(UNSUPPORTED);

@@ -155,6 +155,39 @@ unsafe extern "system" fn destroy_ycbcr(
 ) {
 }
 
+unsafe extern "system" fn set_mask(command: vk::CommandBuffer, mask: u32) {
+    if mask == 1 {
+        record(command, RecordedCommand::InertDynamicState);
+    } else {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+}
+unsafe extern "system" fn dispatch_base(
+    command: vk::CommandBuffer,
+    bx: u32,
+    by: u32,
+    bz: u32,
+    x: u32,
+    y: u32,
+    z: u32,
+) {
+    if [bx, by, bz] == [0; 3] {
+        cmd_dispatch(command, x, y, z);
+    } else {
+        record_error(command, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+    }
+}
+unsafe extern "system" fn peer_features(
+    _: vk::Device,
+    _: u32,
+    _: u32,
+    _: u32,
+    out: *mut vk::PeerMemoryFeatureFlags,
+) {
+    if let Some(out) = out.as_mut() {
+        *out = vk::PeerMemoryFeatureFlags::empty();
+    }
+}
 pub(super) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
     macro_rules! entry {
         ($f:path, $ty:ty) => {{
@@ -166,6 +199,11 @@ pub(super) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
     }
     unsafe {
         match name.to_bytes() {
+            b"vkCmdSetDeviceMask" => entry!(set_mask, vk::PFN_vkCmdSetDeviceMask),
+            b"vkCmdDispatchBase" => entry!(dispatch_base, vk::PFN_vkCmdDispatchBase),
+            b"vkGetDeviceGroupPeerMemoryFeatures" => {
+                entry!(peer_features, vk::PFN_vkGetDeviceGroupPeerMemoryFeatures)
+            }
             b"vkGetBufferMemoryRequirements2" | b"vkGetBufferMemoryRequirements2KHR" => {
                 entry!(buffer_requirements, vk::PFN_vkGetBufferMemoryRequirements2)
             }

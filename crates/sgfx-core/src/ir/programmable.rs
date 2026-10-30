@@ -653,6 +653,11 @@ impl ProgrammableRenderPipelineDesc {
         self.blend
     }
     /// Return face culling and winding.
+    /// Replace the immutable face, winding and depth-bias state.
+    pub fn with_raster_state(mut self, raster: RasterState) -> Self {
+        self.raster = raster;
+        self
+    }
     pub const fn raster(&self) -> RasterState {
         self.raster
     }

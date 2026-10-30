@@ -806,11 +806,6 @@ fn unsupported_shaders_fail_instead_of_emitting_a_compatibility_shader() {
             ShaderStage::Vertex,
             "resource address space",
         ),
-        (
-            "@vertex fn main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{var a=array<vec4<f32>,2>(vec4<f32>(0.0),vec4<f32>(1.0));a[i]=vec4<f32>(2.0);return a[0];}",
-            ShaderStage::Vertex,
-            "store target",
-        ),
     ];
     for (source, stage, reason) in cases {
         let error = compile_shader(&wgsl(source), stage, "main").unwrap_err();
@@ -1227,4 +1222,58 @@ fn scalar_float_vertex_input_keeps_one_lane_and_float_reflection() {
         assert_eq!(input.scalar, IoScalar::Float);
         assert!(shader.tgsi.contains("DCL IN[1]"));
     }
+}
+
+#[test]
+fn angle_conversions_and_fragment_depth_use_float_multiplication_and_position_z() {
+    let source = wgsl(
+        r#"
+        struct Result { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }
+        @fragment fn main(@builtin(position) p: vec4<f32>) -> Result {
+            let angle = degrees(radians(p.xy));
+            return Result(vec4<f32>(angle, 0.0, 1.0), p.z * 0.5);
+        }
+    "#,
+    );
+    let shader = compile_shader(&source, ShaderStage::Fragment, "main").unwrap();
+    assert!(shader.tgsi.contains("DCL OUT[16], POSITION"));
+    assert!(shader.tgsi.contains("OUT[16].z"));
+    assert!(shader.tgsi.matches("MUL ").count() >= 3);
+}
+
+#[test]
+fn dynamic_local_composite_stores_preserve_writable_pointer_components() {
+    let source = wgsl(
+        r#"
+        @fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+            var values = array<vec2<f32>, 4>(vec2<f32>(1.0), vec2<f32>(2.0), vec2<f32>(3.0), vec2<f32>(4.0));
+            let i = u32(p.x) & 3u;
+            values[i].y = values[(i+1u)&3u].x + 7.0;
+            return vec4<f32>(values[i], 0.0, 1.0);
+        }
+    "#,
+    );
+    let shader = compile_shader(&source, ShaderStage::Fragment, "main").unwrap();
+    assert!(shader.tgsi.matches("UIF ").count() >= 4);
+    assert!(shader.tgsi.contains("USEQ "));
+}
+
+#[test]
+fn explicit_sampling_gradients_keep_both_derivative_vectors() {
+    let source = wgsl(
+        r#"
+        @group(0) @binding(0) var image: texture_2d<f32>;
+        @group(0) @binding(1) var filtering: sampler;
+        @fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+            return textureSampleGrad(image, filtering, uv, vec2<f32>(0.125, 0.0), vec2<f32>(0.0, 0.25));
+        }
+    "#,
+    );
+    let shader = compile_shader(&source, ShaderStage::Fragment, "main").unwrap();
+    let line = shader
+        .tgsi
+        .lines()
+        .find(|line| line.contains(": TXD "))
+        .unwrap();
+    assert_eq!(line.matches(',').count(), 5);
 }

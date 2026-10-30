@@ -52,3 +52,6 @@ pub use resource::{ChromaLocation, YcbcrConversion, YcbcrMatrix, YcbcrRange};
 /// Versioned zero-copy command boundary for dynamic backends.
 #[cfg(feature = "backend-abi")]
 pub mod abi;
+
+/// Shader-format interoperability without backend execution policy.
+pub mod spirv_compat;

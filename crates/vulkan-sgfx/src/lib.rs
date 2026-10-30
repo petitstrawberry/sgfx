@@ -72,3 +72,5 @@ pub mod scarlet_surface;
     all(target_os = "linux", feature = "scarlet-wsi")
 ))]
 mod sws_wsi;
+
+mod texel_buffers;

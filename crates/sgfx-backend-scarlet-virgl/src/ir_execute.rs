@@ -862,6 +862,7 @@ enum ExecutionTarget {
 }
 
 struct ActivePass<'r> {
+    draw_index: u32,
     preserves_contents: bool,
     attachment: TextureRef<'r>,
     additional_attachments: Vec<TextureRef<'r>>,
@@ -1462,6 +1463,8 @@ impl ExecutionPlan {
                                 | TextureFormat::Rgba8Unorm
                                 | TextureFormat::R8Unorm
                                 | TextureFormat::Rg8Unorm
+                                | TextureFormat::Rgba16Float
+                                | TextureFormat::Rgba32Float
                         )
                         || !source_rect.is_within(source_extent)
                         || !destination_rect.is_within(destination_extent)
@@ -1579,6 +1582,8 @@ impl ExecutionPlan {
                             | TextureFormat::Rgba8Unorm
                             | TextureFormat::R8Unorm
                             | TextureFormat::Rg8Unorm
+                            | TextureFormat::Rgba16Float
+                            | TextureFormat::Rgba32Float
                     ) {
                         return Err(IrSubmitError::Unsupported(
                             UnsupportedIrFeature::TargetFormat,
@@ -1613,6 +1618,8 @@ impl ExecutionPlan {
                                 | TextureFormat::Rgba8Unorm
                                 | TextureFormat::R8Unorm
                                 | TextureFormat::Rg8Unorm
+                                | TextureFormat::Rgba16Float
+                                | TextureFormat::Rgba32Float
                         ) {
                             return Err(IrSubmitError::Unsupported(
                                 UnsupportedIrFeature::TargetFormat,
@@ -1641,6 +1648,7 @@ impl ExecutionPlan {
                         None
                     };
                     active = Some(ActivePass {
+                        draw_index: 0,
                         preserves_contents: pass_preserves_contents(*desc),
                         attachment: desc.target(),
                         additional_attachments,
@@ -1794,7 +1802,15 @@ impl ExecutionPlan {
                     active_pass_mut(&mut active)?.texture = Some(*reference)
                 }
                 Command::SetSampler(reference) => {
+                    if resources.resources.sampler(*reference)?.anisotropy() > 1
+                        && !resources.context.capabilities().supports_anisotropy_16()
+                    {
+                        return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Sampler));
+                    }
                     active_pass_mut(&mut active)?.sampler = Some(*reference)
+                }
+                Command::SetDrawIndex(index) => {
+                    active_pass_mut(&mut active)?.draw_index = *index;
                 }
                 Command::SetUniforms(value) => {
                     active_pass_mut(&mut active)?.uniforms = Some(*value)
@@ -1833,11 +1849,13 @@ impl ExecutionPlan {
                         resources,
                         &pending_buffers,
                         pass,
-                        *first_vertex,
-                        *vertex_count,
-                        None,
-                        *instance_count,
-                        *first_instance,
+                        programmable::DrawParameters {
+                            first: *first_vertex,
+                            count: *vertex_count,
+                            base_vertex: None,
+                            instance_count: *instance_count,
+                            first_instance: *first_instance,
+                        },
                     )?;
                     pass.submission.draws.push(draw);
                 }
@@ -1853,11 +1871,13 @@ impl ExecutionPlan {
                         resources,
                         &pending_buffers,
                         pass,
-                        *first_index,
-                        *index_count,
-                        Some(*base_vertex),
-                        *instance_count,
-                        *first_instance,
+                        programmable::DrawParameters {
+                            first: *first_index,
+                            count: *index_count,
+                            base_vertex: Some(*base_vertex),
+                            instance_count: *instance_count,
+                            first_instance: *first_instance,
+                        },
                     )?;
                     pass.submission.draws.push(draw);
                 }
@@ -1871,11 +1891,13 @@ impl ExecutionPlan {
                             resources,
                             &pending_buffers,
                             pass,
-                            *first_vertex,
-                            *vertex_count,
-                            None,
-                            1,
-                            0,
+                            programmable::DrawParameters {
+                                first: *first_vertex,
+                                count: *vertex_count,
+                                base_vertex: None,
+                                instance_count: 1,
+                                first_instance: 0,
+                            },
                         )?;
                         pass.submission.draws.push(draw);
                         continue;
@@ -1900,11 +1922,13 @@ impl ExecutionPlan {
                             resources,
                             &pending_buffers,
                             pass,
-                            *first_index,
-                            *index_count,
-                            Some(*base_vertex),
-                            1,
-                            0,
+                            programmable::DrawParameters {
+                                first: *first_index,
+                                count: *index_count,
+                                base_vertex: Some(*base_vertex),
+                                instance_count: 1,
+                                first_instance: 0,
+                            },
                         )?;
                         pass.submission.draws.push(draw);
                         continue;
@@ -2319,6 +2343,7 @@ fn append_draw(pass: &mut ActivePass<'_>, draw: DecodedDraw) -> Result<(), IrSub
         .try_reserve(1)
         .map_err(|_| IrSubmitError::OutOfMemory)?;
     pass.submission.draws.push(IrDraw {
+        draw_index: 0,
         instance_count: 1,
         first_instance: 0,
         vertex_buffers: [None; 8],
@@ -2685,7 +2710,11 @@ fn pipeline_info(
     };
     if !matches!(
         target,
-        TextureFormat::Bgra8Unorm | TextureFormat::R8Unorm | TextureFormat::Rg8Unorm
+        TextureFormat::Bgra8Unorm
+            | TextureFormat::R8Unorm
+            | TextureFormat::Rg8Unorm
+            | TextureFormat::Rgba16Float
+            | TextureFormat::Rgba32Float
     ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PipelineTargetFormat,
@@ -2739,6 +2768,7 @@ fn pipeline_info(
     }
     Ok(PipelineInfo {
         state: IrPipelineState {
+            depth_bias: raster.depth_bias().map(f32::to_bits),
             slot: reference.slot(),
             fragment: fragment_program(fragment),
             blend,
@@ -2824,6 +2854,7 @@ fn sampler_state(descriptor: SamplerDesc, slot: usize) -> IrSamplerState {
         min_lod: descriptor.min_lod(),
         max_lod: descriptor.max_lod(),
         compare: descriptor.compare(),
+        anisotropy: descriptor.anisotropy(),
         min_filter: match descriptor.min_filter() {
             FilterMode::Nearest => IrFilterMode::Nearest,
             FilterMode::Linear => IrFilterMode::Linear,
@@ -3123,11 +3154,6 @@ fn convert_texture_upload(
     write: TextureWrite<'_>,
     native_narrow: bool,
 ) -> Result<IrTextureUpload, IrSubmitError> {
-    if matches!(texture.format, IrTextureFormat::Depth32Float) {
-        return Err(IrSubmitError::Unsupported(
-            UnsupportedIrFeature::TextureUpload,
-        ));
-    }
     let destination = write.destination();
     if write.array_layer() >= texture.array_layers
         || write.mip_level() >= texture.mip_levels
@@ -3145,7 +3171,9 @@ fn convert_texture_upload(
                 IrTextureFormat::R8 => 1,
                 IrTextureFormat::Rg8 => 2,
                 IrTextureFormat::Bgra8 | IrTextureFormat::Rgba8 => 4,
-                IrTextureFormat::Depth32Float => unreachable!(),
+                IrTextureFormat::Depth32Float => 4,
+                IrTextureFormat::Rgba16Float => 8,
+                IrTextureFormat::Rgba32Float => 16,
             })
         })
         .ok_or(IrSubmitError::InvalidVertexData)?;
@@ -3201,7 +3229,9 @@ fn convert_texture_upload(
                     pixels.extend_from_slice(&[0, pixel[1], pixel[0], 255]);
                 }
             }
-            IrTextureFormat::Depth32Float => unreachable!(),
+            IrTextureFormat::Depth32Float
+            | IrTextureFormat::Rgba16Float
+            | IrTextureFormat::Rgba32Float => pixels.extend_from_slice(source),
         }
     }
     Ok(IrTextureUpload {
@@ -3311,6 +3341,8 @@ fn blend_component(component: BlendComponent) -> IrBlendComponent {
             BlendOp::Add => IrBlendOp::Add,
             BlendOp::Subtract => IrBlendOp::Subtract,
             BlendOp::ReverseSubtract => IrBlendOp::ReverseSubtract,
+            BlendOp::Min => IrBlendOp::Min,
+            BlendOp::Max => IrBlendOp::Max,
         },
     }
 }
@@ -3374,6 +3406,8 @@ fn texture_spec(
             TextureFormat::R8Unorm => IrTextureFormat::R8,
             TextureFormat::Rg8Unorm => IrTextureFormat::Rg8,
             TextureFormat::Depth32Float => IrTextureFormat::Depth32Float,
+            TextureFormat::Rgba16Float => IrTextureFormat::Rgba16Float,
+            TextureFormat::Rgba32Float => IrTextureFormat::Rgba32Float,
         },
     })
 }
@@ -3694,6 +3728,7 @@ mod tests {
             operation: IrBlendOp::Add,
         };
         IrDraw {
+            draw_index: 0,
             instance_count: 1,
             first_instance: 0,
             vertex_buffers: [None; 8],
@@ -3702,6 +3737,7 @@ mod tests {
             vertex_count,
             vertex_buffer: None,
             pipeline: IrPipelineState {
+                depth_bias: [0; 2],
                 slot: 0,
                 fragment: IrFragmentProgram::VertexColor,
                 blend: IrBlendState {

@@ -76,6 +76,9 @@ pub struct Capabilities {
     texture_arrays: bool,
     depth_sampling: bool,
     native_narrow_color: bool,
+    anisotropy_16: bool,
+    depth_transfers: bool,
+    float_color: bool,
 }
 
 impl Capabilities {
@@ -91,6 +94,21 @@ impl Capabilities {
             && info.execution_support & GPU_EXECUTION_SUPPORT_QUEUE != 0;
         Self {
             rendering,
+            float_color: rendering
+                && info
+                    .backend_info_bytes()
+                    .get(16..20)
+                    .is_some_and(|b| u32::from_le_bytes(b.try_into().unwrap()) & 2 != 0),
+            depth_transfers: rendering
+                && info
+                    .backend_info_bytes()
+                    .get(16..20)
+                    .is_some_and(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) & 1 != 0),
+            anisotropy_16: rendering
+                && info.backend_info_bytes().get(12..16).is_some_and(|bytes| {
+                    let bits = u32::from_le_bytes(bytes.try_into().unwrap());
+                    (16.0f32.to_bits()..f32::INFINITY.to_bits()).contains(&bits)
+                }),
             presentation: rendering
                 && info.execution_support & GPU_EXECUTION_SUPPORT_PRESENTATION != 0,
             image_upload: rendering
@@ -107,6 +125,19 @@ impl Capabilities {
             native_narrow_color: rendering
                 && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_NATIVE_NARROW_COLOR != 0,
         }
+    }
+
+    /// True only when the host capability reports at least sixteen-way anisotropy.
+    /// Whether both native floating-point RGBA render-target formats are available.
+    pub const fn supports_float_color(&self) -> bool {
+        self.float_color
+    }
+    pub const fn supports_depth_transfers(&self) -> bool {
+        self.depth_transfers
+    }
+
+    pub const fn supports_anisotropy_16(&self) -> bool {
+        self.anisotropy_16
     }
 
     /// Return whether R8/RG8 storage and typed transfers are native.
