@@ -2,6 +2,7 @@
 //! `--copy-only` runs the async vertex-copy pixel contract directly, skipping
 //! the parent coordinator, low-level fixture, and timing benchmarks.
 //! `--import-overlap-only` checks same-context resize/session lifetime with a retained old-size image.
+//! `--import-refresh-only` checks one persistent cross-context import across eight producer updates.
 //! `--program-churn-only` checks 512 native shader/pipeline generations and retained receipts.
 //! `--narrow-only` checks native R8/RG8 upload, copies, sampling, mips and RT blending.
 // /init has no inherited stdio handles. Use the native bootstrap console for
@@ -494,6 +495,78 @@ mod import_overlap_scene {
 }
 
 #[cfg(any(target_os = "scarlet", test))]
+mod import_refresh_scene {
+    use super::import_overlap_scene as viewport;
+    use sgfx::ir::*;
+
+    pub const GENERATIONS: usize = 8;
+    pub const BASE: [u8; 4] = [0, 0, 255, 255];
+    const UPDATES: [[u8; 4]; GENERATIONS - 1] = [
+        [0, 255, 0, 255],
+        [255, 0, 0, 255],
+        [0, 255, 255, 255],
+        [255, 0, 255, 255],
+        [255, 255, 0, 255],
+        [255, 255, 255, 255],
+        [0, 0, 0, 255],
+    ];
+
+    fn bgra_color(bgra: [u8; 4]) -> Color {
+        Color::rgba(
+            f32::from(bgra[2]) / 255.0,
+            f32::from(bgra[1]) / 255.0,
+            f32::from(bgra[0]) / 255.0,
+            f32::from(bgra[3]) / 255.0,
+        )
+        .unwrap()
+    }
+
+    pub fn producer<'r>(
+        table: &'r ResourceTable,
+        target: TextureId,
+        generation: usize,
+    ) -> CommandBuffer<'r, 'static> {
+        let (area, color) = if generation == 0 {
+            (
+                PixelRect::new(0, 0, viewport::WIDTH, viewport::HEIGHT).unwrap(),
+                BASE,
+            )
+        } else {
+            (
+                PixelRect::new(generation as u32, 1, 1, viewport::HEIGHT - 2).unwrap(),
+                UPDATES[generation - 1],
+            )
+        };
+        let mut encoder = CommandEncoder::new(table);
+        encoder
+            .begin_render_pass(
+                RenderPassDesc::new(
+                    table,
+                    table.texture_ref(target).unwrap(),
+                    area,
+                    LoadOp::Clear(bgra_color(color)),
+                    StoreOp::Store,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .end()
+            .unwrap();
+        encoder.finish().unwrap()
+    }
+
+    pub fn expected(generation: usize) -> Vec<[u8; 4]> {
+        let mut pixels = vec![BASE; (viewport::WIDTH * viewport::HEIGHT) as usize];
+        for update in 1..=generation {
+            for y in 1..viewport::HEIGHT - 1 {
+                pixels[(y * viewport::WIDTH + update as u32) as usize] = UPDATES[update - 1];
+            }
+        }
+        pixels
+    }
+}
+
+#[cfg(any(target_os = "scarlet", test))]
 mod program_churn {
     use sgfx::{
         backend::{Completion, CompletionStatus},
@@ -973,6 +1046,79 @@ mod native {
         );
     }
 
+    fn import_refresh_contract() {
+        use super::{import_overlap_scene as scene, import_refresh_scene as refresh};
+        let device = sgfx::Device::open("/dev/gpu0").unwrap();
+        let producer_context = device.create_context().unwrap();
+        let consumer_context = device.create_context().unwrap();
+
+        let producer_table = Rc::new(ResourceTable::new());
+        let producer_target = scene::target(&producer_table, scene::WIDTH, scene::HEIGHT);
+        let mut producer = producer_context
+            .create_mapped_target_session(producer_table.clone(), &[producer_target])
+            .unwrap();
+
+        // Import before the producer's first draw. The consumer retains this
+        // exact attachment and sampler view for every generation below.
+        let lease = producer
+            .image(producer_target)
+            .unwrap()
+            .shared_handle()
+            .duplicate()
+            .unwrap();
+        let consumer_table = Rc::new(ResourceTable::new());
+        let consumer_scene = scene::define(&consumer_table, scene::WIDTH, scene::HEIGHT);
+        let mut consumer = consumer_context
+            .create_mapped_target_session(consumer_table.clone(), &[consumer_scene.target])
+            .unwrap();
+        consumer
+            .import_shared_bgra_texture(consumer_scene.source, lease)
+            .unwrap();
+
+        let vertices = scene::vertices();
+        let mut pixels = vec![0xa5; (scene::WIDTH * scene::HEIGHT * 4) as usize];
+        for generation in 0..refresh::GENERATIONS {
+            let producer_commands = refresh::producer(&producer_table, producer_target, generation);
+            complete(&retry_submit(&mut producer, &producer_commands));
+            drop(producer_commands);
+
+            let consumer_commands = scene::draw(&consumer_table, &consumer_scene, &vertices);
+            complete(&retry_submit(&mut consumer, &consumer_commands));
+            drop(consumer_commands);
+
+            pixels.fill(0xa5);
+            consumer
+                .readback_bgra(
+                    consumer_scene.target,
+                    &mut pixels,
+                    scene::WIDTH * 4,
+                    PixelRect::new(0, 0, scene::WIDTH, scene::HEIGHT).unwrap(),
+                )
+                .unwrap();
+            let expected = refresh::expected(generation);
+            for (index, (actual, expected)) in
+                pixels.chunks_exact(4).zip(expected.iter()).enumerate()
+            {
+                assert_eq!(
+                    actual,
+                    expected.as_slice(),
+                    "import refresh pixel mismatch: generation={generation} index={index}"
+                );
+            }
+            println!(
+                "SGFX_IMPORT_REFRESH_PIXELS_OK generation={generation} import_count=1 release_count=0 sampler_view=retained pixels={}",
+                scene::WIDTH * scene::HEIGHT
+            );
+        }
+
+        drop(consumer);
+        drop(producer);
+        println!(
+            "SGFX_IMPORT_REFRESH_ONLY_OK generations={} producer_context=1 consumer_context=1 import_count=1 release_count=0 sampler_view=retained",
+            refresh::GENERATIONS
+        );
+    }
+
     fn narrow_texture_contract() {
         use super::narrow_texture_scene as scene;
         let info = gpu_raw::Gpu::open("/dev/gpu0")
@@ -1174,6 +1320,10 @@ mod native {
         }
         if std::env::args().any(|arg| arg == "--import-overlap-only") {
             import_overlap_contract();
+            return;
+        }
+        if std::env::args().any(|arg| arg == "--import-refresh-only") {
+            import_refresh_contract();
             return;
         }
         if std::env::args().any(|arg| arg == "--narrow-only") {
@@ -1432,6 +1582,7 @@ fn main() {
                 || arg == "--copy-only"
                 || arg == "--narrow-only"
                 || arg == "--import-overlap-only"
+                || arg == "--import-refresh-only"
                 || arg == "--program-churn-only"
         }) {
             for program in ["/bin/sgfx-probe", "/bin/sgfx-legacy-smoke"] {
@@ -1501,6 +1652,31 @@ mod tests {
             let table = ResourceTable::new();
             let objects = scene::define(&table, width, height);
             scene::draw(&table, &objects, &scene::vertices());
+        }
+    }
+
+    #[test]
+    fn import_refresh_scene_passes_real_ir_validation() {
+        use super::{import_overlap_scene as scene, import_refresh_scene as refresh};
+        let producer = ResourceTable::new();
+        let target = scene::target(&producer, scene::WIDTH, scene::HEIGHT);
+        for generation in 0..refresh::GENERATIONS {
+            refresh::producer(&producer, target, generation);
+        }
+
+        let consumer = ResourceTable::new();
+        let objects = scene::define(&consumer, scene::WIDTH, scene::HEIGHT);
+        for generation in 0..refresh::GENERATIONS {
+            scene::draw(&consumer, &objects, &scene::vertices());
+            let pixels = refresh::expected(generation);
+            assert_eq!(
+                pixels.len(),
+                (scene::WIDTH * scene::HEIGHT) as usize,
+                "refresh generation extent"
+            );
+            if generation > 0 {
+                assert_ne!(pixels, refresh::expected(generation - 1));
+            }
         }
     }
 
