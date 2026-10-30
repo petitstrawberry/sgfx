@@ -145,11 +145,19 @@ const IR_VERTEX_BUFFER_BYTES: usize = MAX_IR_VERTICES * 10 * core::mem::size_of:
 const IR_BUFFER_SLOTS: usize = crate::ir::MAX_BUFFERS;
 const IR_TEXTURE_SLOTS: usize = crate::ir::MAX_TEXTURES;
 const IR_SAMPLER_SLOTS: usize = 256;
-const IR_PIPELINE_SLOTS: usize = 512;
+pub(crate) const IR_PROGRAMMABLE_PIPELINE_OFFSET: usize = crate::ir::MAX_RENDER_PIPELINES;
+const IR_PROGRAMMABLE_PIPELINE_SLOTS: usize = crate::ir::MAX_PROGRAMMABLE_RENDER_PIPELINES;
+const IR_PIPELINE_SLOTS: usize = IR_PROGRAMMABLE_PIPELINE_OFFSET + IR_PROGRAMMABLE_PIPELINE_SLOTS;
 // Internal transfer draws cannot collide with public IR resource slots.
 const IR_BLIT_PIPELINE_SLOT: usize = IR_PIPELINE_SLOTS;
 const IR_BLIT_SAMPLER_SLOT: usize = IR_SAMPLER_SLOTS;
-const IR_PROGRAMMABLE_PIPELINE_SLOTS: usize = 256;
+
+fn programmable_pipeline_alias(slot: usize) -> HandleResult<usize> {
+    if slot >= IR_PROGRAMMABLE_PIPELINE_SLOTS {
+        return Err(HandleError::InvalidParameter);
+    }
+    Ok(IR_PROGRAMMABLE_PIPELINE_OFFSET + slot)
+}
 
 type SharedScheduler = Rc<RefCell<Option<Arc<NativeScheduler>>>>;
 
@@ -1474,7 +1482,7 @@ impl IrResources {
         if self.context_handle != context.handle_id() || slot >= self.programmable_pipelines.len() {
             return Err(HandleError::InvalidParameter);
         }
-        let fixed_slot = slot + IR_PROGRAMMABLE_PIPELINE_SLOTS;
+        let fixed_slot = programmable_pipeline_alias(slot)?;
         if self.programmable_pipelines[slot].is_none() && self.pipelines[fixed_slot].is_none() {
             return Ok(());
         }
@@ -3637,7 +3645,7 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
         .as_ref()
         .ok_or(HandleError::InvalidParameter)?;
     if programmable.pipeline.slot >= resources.programmable_pipelines.len()
-        || draw.pipeline.slot != programmable.pipeline.slot + IR_PROGRAMMABLE_PIPELINE_SLOTS
+        || draw.pipeline.slot != programmable_pipeline_alias(programmable.pipeline.slot)?
         || draw.texture.is_some()
         || draw.sampler.is_some()
     {
@@ -6195,6 +6203,31 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_pipeline_capacity_keeps_alias_offset_distinct_from_programmable_capacity() {
+        let fixed: Vec<Option<()>> = empty_slots(IR_PIPELINE_SLOTS + 1).unwrap();
+        let programmable: Vec<Option<()>> = empty_slots(IR_PROGRAMMABLE_PIPELINE_SLOTS).unwrap();
+        assert_eq!(IR_PROGRAMMABLE_PIPELINE_OFFSET, 256);
+        assert_eq!(programmable.len(), 512);
+        assert_eq!(fixed.len(), 769);
+        for (slot, alias) in [(0, 256), (255, 511), (256, 512), (333, 589), (511, 767)] {
+            assert_eq!(programmable_pipeline_alias(slot), Ok(alias));
+            assert!(programmable.get(slot).is_some());
+            assert!(fixed.get(alias).is_some());
+            assert!(alias >= crate::ir::MAX_RENDER_PIPELINES);
+            assert!(alias < IR_BLIT_PIPELINE_SLOT);
+        }
+        for slot in [512, usize::MAX] {
+            assert_eq!(
+                programmable_pipeline_alias(slot),
+                Err(HandleError::InvalidParameter)
+            );
+            assert!(programmable.get(slot).is_none());
+        }
+        assert_eq!(IR_BLIT_PIPELINE_SLOT, 768);
+        assert!(fixed.get(IR_BLIT_PIPELINE_SLOT).is_some());
+    }
+
     #[cfg(feature = "backend-abi")]
     #[test]
     fn idle_poll_without_dispatch_state_rejects_uncertain_cleanup() {
@@ -6249,7 +6282,7 @@ mod tests {
             initialized: Cell::new(false),
             state: IrPipelineState {
                 depth_bias: [0; 2],
-                slot: 17 + IR_PROGRAMMABLE_PIPELINE_SLOTS,
+                slot: 17 + IR_PROGRAMMABLE_PIPELINE_OFFSET,
                 fragment: IrFragmentProgram::Solid,
                 blend: IrBlendState {
                     color: replace,

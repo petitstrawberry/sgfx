@@ -6208,7 +6208,7 @@ mod tests {
     #[cfg(feature = "programmable")]
     fn programmable_draw(pipeline: &Rc<driver::IrProgrammablePipeline>, marker: usize) -> IrDraw {
         let mut draw = draw(0, 3, marker);
-        draw.pipeline.slot = pipeline.slot + 256;
+        draw.pipeline.slot = pipeline.slot + crate::virgl::IR_PROGRAMMABLE_PIPELINE_OFFSET;
         draw.vertex_buffer = Some(IrVertexBufferBinding {
             buffer: IrBufferSpec {
                 slot: 1,

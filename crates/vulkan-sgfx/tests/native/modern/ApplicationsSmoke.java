@@ -324,6 +324,68 @@ public class ApplicationsSmoke {
   vkDestroyPipelineLayout(d,layout,null);vkDestroyShaderModule(d,vs,null);vkDestroyShaderModule(d,fs,null);
   System.out.println("FLOAT_COLOR_NATIVE PASS RGBA16F RGBA32F GPU clear draw additive blend raw readback 128 exact components negative and above-one values");
  }}
+ // Model a reload with two complete generations alive: 480 distinct IR pipelines,
+ // including B's slots above 256. Static one-pixel scissors also detect aliasing.
+ static void graphicsReload(VkDevice d,VkQueue q,long pool){
+  long started=System.nanoTime(),vs=0,layout=0,image=0,memory=0,view=0;
+  long[][] pipelines=new long[3][240];long[] fs=new long[3],output=new long[2];
+  try(MemoryStack s=MemoryStack.stackPush()){
+   LongBuffer h=s.mallocLong(1);
+   try{
+    vs=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_vertex_shader,"#version 450\nvoid main(){vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));gl_Position=vec4(p[gl_VertexIndex],0,1);}");
+    String[] colors={"1,0,0,1","0,1,0,1","0,0,1,1"};
+    for(int bank=0;bank<3;bank++)fs[bank]=shader(d,org.lwjgl.util.shaderc.Shaderc.shaderc_glsl_fragment_shader,"#version 450\nlayout(location=0) out vec4 color;void main(){color=vec4("+colors[bank]+");}");
+    check(vkCreatePipelineLayout(d,VkPipelineLayoutCreateInfo.calloc(s).sType$Default(),null,h),"reload layout");layout=h.get(0);
+    check(vkCreateImage(d,VkImageCreateInfo.calloc(s).sType$Default().imageType(VK_IMAGE_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM).extent(e->e.set(32,16,1)).mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT).tiling(VK_IMAGE_TILING_OPTIMAL).usage(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT),null,h),"reload image");image=h.get(0);
+    VkMemoryRequirements r=VkMemoryRequirements.calloc(s);vkGetImageMemoryRequirements(d,image,r);check(vkAllocateMemory(d,VkMemoryAllocateInfo.calloc(s).sType$Default().allocationSize(r.size()).memoryTypeIndex(Integer.numberOfTrailingZeros(r.memoryTypeBits())),null,h),"reload memory");memory=h.get(0);check(vkBindImageMemory(d,image,memory,0),"reload bind");
+    check(vkCreateImageView(d,VkImageViewCreateInfo.calloc(s).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(VK_FORMAT_R8G8B8A8_UNORM).subresourceRange(a->a.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1)),null,h),"reload view");view=h.get(0);
+    output=buffer(d,2048,VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    VkPipelineShaderStageCreateInfo.Buffer stages=VkPipelineShaderStageCreateInfo.calloc(2,s);stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vs).pName(s.UTF8("main"));stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).pName(s.UTF8("main"));
+    VkRect2D.Buffer scissor=VkRect2D.calloc(1,s).extent(e->e.set(1,1));
+    VkGraphicsPipelineCreateInfo.Buffer info=VkGraphicsPipelineCreateInfo.calloc(1,s).sType$Default().pNext(VkPipelineRenderingCreateInfo.calloc(s).sType$Default().pColorAttachmentFormats(s.ints(VK_FORMAT_R8G8B8A8_UNORM)).address()).layout(layout).pStages(stages)
+     .pVertexInputState(VkPipelineVertexInputStateCreateInfo.calloc(s).sType$Default()).pInputAssemblyState(VkPipelineInputAssemblyStateCreateInfo.calloc(s).sType$Default().topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST))
+     .pViewportState(VkPipelineViewportStateCreateInfo.calloc(s).sType$Default().pViewports(VkViewport.calloc(1,s).width(32).height(16).minDepth(0).maxDepth(1)).pScissors(scissor))
+     .pRasterizationState(VkPipelineRasterizationStateCreateInfo.calloc(s).sType$Default().polygonMode(VK_POLYGON_MODE_FILL).cullMode(VK_CULL_MODE_NONE).lineWidth(1)).pMultisampleState(VkPipelineMultisampleStateCreateInfo.calloc(s).sType$Default().rasterizationSamples(VK_SAMPLE_COUNT_1_BIT))
+     .pColorBlendState(VkPipelineColorBlendStateCreateInfo.calloc(s).sType$Default().pAttachments(VkPipelineColorBlendAttachmentState.calloc(1,s).colorWriteMask(15)));
+    for(int bank=0;bank<3;bank++){
+     if(bank==2)for(int i=0;i<240;i++){vkDestroyPipeline(d,pipelines[0][i],null);pipelines[0][i]=0;}
+     stages.get(1).module(fs[bank]);
+     for(int i=0;i<240;i++){
+      scissor.offset().set((bank==1?16:0)+i%16,i/16);
+      check(vkCreateGraphicsPipelines(d,0,info,null,h),"reload pipeline bank="+bank+" index="+i);pipelines[bank][i]=h.get(0);
+     }
+     // Draw every live pipeline, not just low-slot representatives. B remains
+     // live and is drawn last again after all 240 A slots have been reused by C.
+     if(bank>=1)graphicsReloadPixels(d,q,pool,image,view,output,pipelines[bank==1?0:2],pipelines[1],bank-1);
+    }
+   }finally{
+    for(long[] bank:pipelines)for(long pipeline:bank)if(pipeline!=0)vkDestroyPipeline(d,pipeline,null);
+    if(output[0]!=0)vkDestroyBuffer(d,output[0],null);if(output[1]!=0)vkFreeMemory(d,output[1],null);
+    if(view!=0)vkDestroyImageView(d,view,null);if(image!=0)vkDestroyImage(d,image,null);if(memory!=0)vkFreeMemory(d,memory,null);
+    if(layout!=0)vkDestroyPipelineLayout(d,layout,null);if(vs!=0)vkDestroyShaderModule(d,vs,null);for(long module:fs)if(module!=0)vkDestroyShaderModule(d,module,null);
+   }
+  }
+  System.out.println("GRAPHICS_RELOAD_NATIVE PASS live_peak=480 generations=240+240 replacements=240 draws=960 exact_pixels=1024 target=32x16 readback_bytes=2048 elapsed_ms="+(System.nanoTime()-started)/1_000_000);
+ }
+ static void graphicsReloadPixels(VkDevice d,VkQueue q,long pool,long image,long view,long[] output,long[] left,long[] survivors,int round){try(MemoryStack s=MemoryStack.stackPush()){
+  PointerBuffer p=s.mallocPointer(1);check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"reload commands");VkCommandBuffer c=new VkCommandBuffer(p.get(0),d);
+  try{
+   check(vkBeginCommandBuffer(c,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"reload begin");
+   VkImageMemoryBarrier.Buffer barrier=VkImageMemoryBarrier.calloc(1,s).sType$Default().oldLayout(round==0?VK_IMAGE_LAYOUT_UNDEFINED:VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).srcAccessMask(round==0?0:VK_ACCESS_TRANSFER_READ_BIT).dstAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT).image(image).srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).subresourceRange(a->a.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
+   vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,0,null,null,barrier);
+   vkCmdBeginRenderingKHR(c,VkRenderingInfo.calloc(s).sType$Default().renderArea(a->a.extent(e->e.set(32,16))).layerCount(1).pColorAttachments(VkRenderingAttachmentInfo.calloc(1,s).sType$Default().imageView(view).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE).clearValue(a->a.color(v->v.float32(3,1)))));
+   for(long[] bank:new long[][]{left,survivors})for(long pipeline:bank){vkCmdBindPipeline(c,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);vkCmdDraw(c,3,1,0,0);}vkCmdEndRenderingKHR(c);
+   barrier.oldLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL).srcAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT);vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,null,null,barrier);
+   vkCmdCopyImageToBuffer(c,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output[0],VkBufferImageCopy.calloc(1,s).imageSubresource(a->a.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).imageExtent(e->e.set(32,16,1)));
+   vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,VkMemoryBarrier.calloc(1,s).sType$Default().srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_HOST_READ_BIT),null,null);
+   check(vkEndCommandBuffer(c),"reload end");check(vkQueueSubmit(q,VkSubmitInfo.calloc(s).sType$Default().pCommandBuffers(s.pointers(c)),0),"reload submit round="+round);check(vkQueueWaitIdle(q),"reload idle round="+round);
+   check(vkMapMemory(d,output[1],0,2048,0,p),"reload readback");
+   try{
+    IntBuffer pixels=MemoryUtil.memByteBuffer(p.get(0),2048).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();
+    for(int y=0;y<16;y++)for(int x=0;x<32;x++){int want=y==15?0xff000000:x>=16?0xff00ff00:round==0?0xff0000ff:0xffff0000;int got=pixels.get(y*32+x);if(got!=want)throw new AssertionError("reload pixel round="+round+" x="+x+" y="+y+" got="+Integer.toHexString(got)+" expected="+Integer.toHexString(want));}
+   }finally{vkUnmapMemory(d,output[1]);}
+  }finally{vkFreeCommandBuffers(d,pool,c);}
+ }}
  public static void main(String[] args)throws Exception{
   if(SDLVersion.SDL_GetVersion()<3004000)throw new AssertionError("SDL dependency loading");
   VK.create("/lib/libvulkan.so.1");
@@ -401,7 +463,7 @@ public class ApplicationsSmoke {
    vkResetQueryPoolEXT(device,query,0,1);if(vkGetQueryPoolResults(device,query,0,1,stamps,16,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)!=VK_NOT_READY)throw new AssertionError("host reset availability");
    vkDestroyQueryPool(device,query,null);
    }else System.out.println("QUERY_NATIVE_UNAVAILABLE PASS timestampValidBits=0 query pool rejected");
-   boundedBarriers(device,queue,pool);vmaAllocations(device,queue,pool);compute(device,queue,pool);graphics(device,queue,pool);depthTransfers(device,queue,pool);mipTargets(device,queue,pool);floatTargets(device,queue,pool);capabilityCapacity(device,queue,pool);
+   boundedBarriers(device,queue,pool);vmaAllocations(device,queue,pool);compute(device,queue,pool);graphicsReload(device,queue,pool);graphics(device,queue,pool);depthTransfers(device,queue,pool);mipTargets(device,queue,pool);floatTargets(device,queue,pool);capabilityCapacity(device,queue,pool);
    vkDestroyFence(device,fence,null);vkDestroySemaphore(device,binary,null);vkDestroySemaphore(device,timeline,null);vkDestroyEvent(device,event,null);vkDestroyCommandPool(device,pool,null);
    for(int i=0;i<2;i++){vkDestroyBuffer(device,buffers[i],null);vkFreeMemory(device,memories[i],null);}
    vkDestroyDevice(device,null);vkDestroyInstance(instance,null);VK.destroy();

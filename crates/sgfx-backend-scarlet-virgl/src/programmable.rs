@@ -1262,7 +1262,7 @@ pub(super) fn decode_draw(
         vertex_buffer,
         pipeline: IrPipelineState {
             depth_bias: raster.depth_bias().map(f32::to_bits),
-            slot: reference.slot() + 256,
+            slot: reference.slot() + crate::virgl::IR_PROGRAMMABLE_PIPELINE_OFFSET,
             fragment: IrFragmentProgram::Solid,
             blend: color_target_blend(pipeline.color_targets().next().unwrap()).0,
             color_write_mask: color_target_blend(pipeline.color_targets().next().unwrap()).1,
