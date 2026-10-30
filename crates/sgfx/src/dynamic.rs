@@ -191,6 +191,13 @@ impl Device {
         self.capabilities
     }
     /// Whether this plugin provides the optional low-level queue/resource API.
+    pub(crate) fn query_support(&self) -> u32 {
+        self.owner
+            .library
+            .query
+            .as_ref()
+            .map_or(0, |api| unsafe { (api.support)(self.owner.raw) })
+    }
     pub(crate) fn supports_timestamps(&self) -> bool {
         self.owner.library.timestamp.is_some() && self.capabilities.0 & abi::GPU_TIMESTAMPS != 0
     }
@@ -220,6 +227,26 @@ pub struct Context {
     owner: Owner,
 }
 impl Context {
+    pub(crate) fn begin_query(&self, kind: u32, mask: u32) -> Result<()> {
+        let api = self
+            .owner
+            .library
+            .query
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        status(unsafe { (api.begin)(self.owner.raw, kind, mask) })
+    }
+    pub(crate) fn end_query(&self, kind: u32, count: usize) -> Result<Vec<u64>> {
+        let api = self
+            .owner
+            .library
+            .query
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        let mut values = alloc::vec![0;count];
+        status(unsafe { (api.end)(self.owner.raw, kind, values.as_mut_ptr(), count) })?;
+        Ok(values)
+    }
     pub(crate) fn timestamp_ns(&self) -> Result<u64> {
         let api = self
             .owner

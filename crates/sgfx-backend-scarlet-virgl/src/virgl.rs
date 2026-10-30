@@ -153,7 +153,7 @@ const IR_PROGRAMMABLE_PIPELINE_SLOTS: usize = 256;
 
 type SharedScheduler = Rc<RefCell<Option<Arc<NativeScheduler>>>>;
 
-fn wait_scheduled(scheduler: &SharedScheduler) -> HandleResult<()> {
+pub(crate) fn wait_scheduled(scheduler: &SharedScheduler) -> HandleResult<()> {
     let scheduler = scheduler.borrow().clone();
     scheduler
         .as_ref()
@@ -351,7 +351,7 @@ DCL TEMP[0]\n\
   4: END\n";
 
 pub(crate) struct Device {
-    raw: RawGpu,
+    pub(crate) raw: RawGpu,
     dialect: RawDialect,
     capabilities: Capabilities,
 }
@@ -416,16 +416,20 @@ impl Device {
             cleanup_failed: Rc::new(Cell::new(false)),
             next_object_handle: Cell::new(FIRST_DYNAMIC_OBJECT_HANDLE),
             scheduler: Rc::new(RefCell::new(None)),
+            #[cfg(feature = "std")]
+            queries: Default::default(),
         })
     }
 }
 
 pub(crate) struct Context {
-    device: Rc<Device>,
-    raw: Rc<RawContext>,
+    pub(crate) device: Rc<Device>,
+    pub(crate) raw: Rc<RawContext>,
     cleanup_failed: Rc<Cell<bool>>,
     next_object_handle: Cell<u32>,
-    scheduler: SharedScheduler,
+    pub(crate) scheduler: SharedScheduler,
+    #[cfg(feature = "std")]
+    pub(crate) queries: crate::queries::Scopes,
 }
 
 impl Context {
@@ -1201,7 +1205,7 @@ impl Context {
         self.raw.as_handle().as_raw()
     }
 
-    fn allocate_object_handle(&self) -> HandleResult<u32> {
+    pub(crate) fn allocate_object_handle(&self) -> HandleResult<u32> {
         let handle = self.next_object_handle.get();
         let next_handle = handle.checked_add(1).ok_or(HandleError::OutOfResources)?;
         if handle == 0 {
@@ -1216,7 +1220,7 @@ pub(crate) struct Queue {
     context: Rc<RawContext>,
     cleanup_failed: Rc<Cell<bool>>,
     raw: Arc<RawQueue>,
-    scheduler: SharedScheduler,
+    pub(crate) scheduler: SharedScheduler,
     context_handle: i32,
     composition_vertex_buffer: RawBuffer,
     composition_vertex_resource_id: u32,
@@ -3808,7 +3812,7 @@ fn validate_ir_draw(
     Ok(())
 }
 
-fn resource_id_from_token(token: u64) -> HandleResult<u32> {
+pub(crate) fn resource_id_from_token(token: u64) -> HandleResult<u32> {
     u32::try_from(token)
         .ok()
         .filter(|&resource_id| resource_id != 0)
@@ -3918,11 +3922,11 @@ fn append_composition_quad(
     Ok(())
 }
 
-fn command_header(command: u32, object: u32, payload_dwords: u32) -> u32 {
+pub(crate) fn command_header(command: u32, object: u32, payload_dwords: u32) -> u32 {
     command | (object << 8) | (payload_dwords << 16)
 }
 
-fn push_dword(commands: &mut Vec<u8>, value: u32) {
+pub(crate) fn push_dword(commands: &mut Vec<u8>, value: u32) {
     commands.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -4266,7 +4270,7 @@ fn push_ir_sampler_view_swizzled(
     push_dword(commands, swizzle);
 }
 
-fn push_destroy_object(commands: &mut Vec<u8>, object: u32, handle: u32) {
+pub(crate) fn push_destroy_object(commands: &mut Vec<u8>, object: u32, handle: u32) {
     push_dword(
         commands,
         command_header(VIRGL_CCMD_DESTROY_OBJECT, object, 1),

@@ -154,6 +154,9 @@ struct Driver {
     dynamic_rendering_enabled: bool,
     host_query_reset_enabled: bool,
     timestamps: bool,
+    query_support: u32,
+    occlusion_precise_enabled: bool,
+    pipeline_statistics_enabled: bool,
     multi_draw_indirect_enabled: bool,
     indirect_first_instance_enabled: bool,
     indirect_count_enabled: bool,
@@ -784,6 +787,7 @@ pub(crate) unsafe extern "system" fn create_device(
     let mut dynamic_rendering_enabled = false;
     let mut host_query_reset_enabled = false;
     let timestamps = adapter.supports_timestamps();
+    let query_support = adapter.query_support();
     let mut enabled_core = info
         .p_enabled_features
         .as_ref()
@@ -850,7 +854,7 @@ pub(crate) unsafe extern "system" fn create_device(
         return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
     }
     if host_query_reset_enabled
-        && (!timestamps
+        && ((!timestamps && query_support == 0)
             || !slice(
                 info.pp_enabled_extension_names,
                 info.enabled_extension_count,
@@ -984,6 +988,9 @@ pub(crate) unsafe extern "system" fn create_device(
         dynamic_rendering_enabled,
         host_query_reset_enabled,
         timestamps,
+        query_support,
+        occlusion_precise_enabled: enabled_core.occlusion_query_precise == vk::TRUE,
+        pipeline_statistics_enabled: enabled_core.pipeline_statistics_query == vk::TRUE,
         multi_draw_indirect_enabled: enabled_core.multi_draw_indirect == vk::TRUE,
         indirect_first_instance_enabled: enabled_core.draw_indirect_first_instance == vk::TRUE,
         indirect_count_enabled: slice(
@@ -1166,6 +1173,7 @@ struct Recording {
     error: Option<vk::Result>,
     render_active: bool,
     render_dynamic: bool,
+    active_queries: BTreeMap<u32, (Arc<queries::Pool>, u32, bool)>,
     // Submit snapshots share immutable recorded data across the calling and
     // device threads. Re-recording uses copy-on-write instead of changing an
     // outstanding snapshot's commands.
@@ -1397,6 +1405,7 @@ impl Recording {
             error: None,
             render_active: false,
             render_dynamic: false,
+            active_queries: Default::default(),
             commands: Arc::default(),
         }
     }
@@ -1413,6 +1422,52 @@ impl Recording {
             return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
         }
         match command {
+            RecordedCommand::Query(
+                queries::Action::Reset(ref pool, first, count)
+                | queries::Action::Copy {
+                    ref pool,
+                    first,
+                    count,
+                    ..
+                },
+            ) if self.active_queries.values().any(|(p, i, _)| {
+                Arc::ptr_eq(p, pool)
+                    && *i >= first
+                    && u64::from(*i) < u64::from(first) + u64::from(count)
+            }) =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::Query(queries::Action::Begin(ref pool, index)) => {
+                if self.active_queries.contains_key(&pool.kind) {
+                    self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                self.active_queries
+                    .insert(pool.kind, (pool.clone(), index, self.render_active));
+            }
+            RecordedCommand::Query(queries::Action::End(ref pool, index)) => {
+                if !self
+                    .active_queries
+                    .get(&pool.kind)
+                    .is_some_and(|(p, i, inside)| {
+                        Arc::ptr_eq(p, pool) && *i == index && *inside == self.render_active
+                    })
+                {
+                    self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                self.active_queries.remove(&pool.kind);
+            }
+            RecordedCommand::EndRenderPass
+            | RecordedCommand::EndRendering
+            | RecordedCommand::NextSubpass
+                if self.active_queries.values().any(|(_, _, inside)| *inside) =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             RecordedCommand::BeginRendering(_) if self.render_active => {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -2724,7 +2779,10 @@ unsafe extern "system" fn end_command_buffer(command: vk::CommandBuffer) -> vk::
     let mut recording = recording
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if recording.state != RecordingState::Recording || recording.render_active {
+    if recording.state != RecordingState::Recording
+        || recording.render_active
+        || !recording.active_queries.is_empty()
+    {
         recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED)
     }
     if let Some(error) = recording.error {
@@ -5376,6 +5434,9 @@ mod tests {
             dynamic_rendering_enabled: true,
             host_query_reset_enabled: false,
             timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
             multi_draw_indirect_enabled: false,
             indirect_first_instance_enabled: false,
             indirect_count_enabled: false,
@@ -5454,6 +5515,9 @@ mod tests {
             dynamic_rendering_enabled: true,
             host_query_reset_enabled: false,
             timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
             multi_draw_indirect_enabled: false,
             indirect_first_instance_enabled: false,
             indirect_count_enabled: false,
@@ -5516,6 +5580,9 @@ mod tests {
             dynamic_rendering_enabled: true,
             host_query_reset_enabled: false,
             timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
             multi_draw_indirect_enabled: false,
             indirect_first_instance_enabled: false,
             indirect_count_enabled: false,
@@ -5714,6 +5781,9 @@ mod fence_notification_tests {
             dynamic_rendering_enabled: true,
             host_query_reset_enabled: false,
             timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
             multi_draw_indirect_enabled: false,
             indirect_first_instance_enabled: false,
             indirect_count_enabled: false,
@@ -5961,6 +6031,9 @@ mod owned_descriptor_tests {
                 dynamic_rendering_enabled: false,
                 host_query_reset_enabled: false,
                 timestamps: false,
+                query_support: 0,
+                occlusion_precise_enabled: false,
+                pipeline_statistics_enabled: false,
                 multi_draw_indirect_enabled: false,
                 indirect_first_instance_enabled: false,
                 indirect_count_enabled: false,

@@ -56,6 +56,18 @@ pub(crate) enum Context {
 
 impl Context {
     #[cfg(feature = "std")]
+    pub(crate) fn begin_query(&self, kind: u32, mask: u32) -> HandleResult<()> {
+        match self {
+            Self::Virgl(c) => c.begin_query(kind, mask),
+        }
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn end_query(&self, kind: u32, count: usize) -> HandleResult<Vec<u64>> {
+        match self {
+            Self::Virgl(c) => c.end_query(kind, count),
+        }
+    }
+    #[cfg(feature = "std")]
     pub(crate) fn timestamp_ns(&self) -> HandleResult<u64> {
         match self {
             Self::Virgl(c) => c.timestamp_ns(),

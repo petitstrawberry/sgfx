@@ -78,3 +78,62 @@ fn gpu_timestamps_preserve_availability_stride_copy_and_host_reset() {
         d.destroy_query_pool(pool, None);
     }
 }
+
+#[test]
+#[ignore = "requires the built ICD and a native GPU"]
+fn unsupported_statistics_and_precise_queries_are_not_enabled_silently() {
+    let c = Context::configured(true);
+    unsafe {
+        let physical = c.instance.enumerate_physical_devices().unwrap()[0];
+        let features = c.instance.get_physical_device_features(physical);
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(0)
+            .queue_priorities(&[1.0])];
+        if features.pipeline_statistics_query == vk::FALSE {
+            let requested = vk::PhysicalDeviceFeatures::default().pipeline_statistics_query(true);
+            assert!(matches!(
+                c.instance.create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default()
+                        .queue_create_infos(&queues)
+                        .enabled_features(&requested),
+                    None
+                ),
+                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+            ));
+            assert_eq!(
+                c.device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::PIPELINE_STATISTICS)
+                        .query_count(1)
+                        .pipeline_statistics(
+                            vk::QueryPipelineStatisticFlags::FRAGMENT_SHADER_INVOCATIONS
+                        ),
+                    None
+                ),
+                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+            );
+        }
+        if features.occlusion_query_precise == vk::FALSE {
+            let pool = c
+                .device
+                .create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::OCCLUSION)
+                        .query_count(1),
+                    None,
+                )
+                .unwrap();
+            c.device
+                .begin_command_buffer(c.command, &Default::default())
+                .unwrap();
+            c.device
+                .cmd_begin_query(c.command, pool, 0, vk::QueryControlFlags::PRECISE);
+            assert_eq!(
+                c.device.end_command_buffer(c.command),
+                Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+            );
+            c.device.destroy_query_pool(pool, None);
+        }
+    }
+}

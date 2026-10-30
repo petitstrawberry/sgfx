@@ -159,6 +159,7 @@ pub struct LoadedBackend {
     pub ycbcr: Option<abi::YcbcrApi>,
     pub program_release: Option<abi::ProgramReleaseApi>,
     pub timestamp: Option<abi::TimestampApi>,
+    pub query: Option<abi::QueryApi>,
     pub name: String,
     pub gpu_backend: String,
     /// Absolute path passed to the loader for this driver.
@@ -302,6 +303,34 @@ unsafe fn load_timestamp(library: *mut c_void) -> Result<Option<abi::TimestampAp
     }
 }
 
+#[cfg(any(unix, target_os = "scarlet"))]
+unsafe fn load_query(library: *mut c_void) -> Result<Option<abi::QueryApi>, Error> {
+    let address = unsafe { dlsym(library, abi::QUERY_ENTRY.as_ptr().cast()) };
+    if address.is_null() {
+        let _ = unsafe { dlerror() };
+        return Ok(None);
+    }
+    let get: abi::GetQueryApi = unsafe { core::mem::transmute(address) };
+    let mut table = core::mem::MaybeUninit::<abi::QueryApi>::uninit();
+    if unsafe {
+        get(
+            abi::VERSION,
+            core::mem::size_of::<abi::QueryApi>(),
+            table.as_mut_ptr(),
+        )
+    } != abi::OK
+    {
+        return Err(Error("query API negotiation failed".into()));
+    }
+    let table = unsafe { table.assume_init() };
+    if table.version != abi::VERSION
+        || (table.size as usize) < core::mem::size_of::<abi::QueryApi>()
+    {
+        return Err(Error("invalid query API".into()));
+    }
+    Ok(Some(table))
+}
+
 impl LoadedBackend {
     pub fn load(manifest: &Manifest) -> Result<Arc<Self>, Error> {
         let path = platform::absolute(&manifest.library)?;
@@ -416,6 +445,7 @@ impl LoadedBackend {
             }
             Some(table)
         };
+        let query = unsafe { load_query(library) }?;
         let timestamp = unsafe { load_timestamp(library) }?;
         let ycbcr = unsafe { load_ycbcr(library) }?;
         let program_release = unsafe { load_program_release(library) }?;
@@ -425,6 +455,7 @@ impl LoadedBackend {
             ycbcr,
             program_release,
             timestamp,
+            query,
             name,
             gpu_backend,
             library: library_path,
@@ -697,5 +728,13 @@ mod tests {
         assert_eq!(sample, 42);
         assert!(negotiate_timestamp(timestamp_table::<1, 16>).is_err());
         assert!(negotiate_timestamp(timestamp_table::<2, 8>).is_err());
+    }
+    #[cfg(any(unix, target_os = "scarlet"))]
+    #[test]
+    fn absent_scoped_query_extension_preserves_existing_backend_loading() {
+        let process = unsafe { dlopen(core::ptr::null(), 2) };
+        assert!(!process.is_null());
+        assert!(unsafe { load_query(process) }.unwrap().is_none());
+        assert!(unsafe { dlerror() }.is_null());
     }
 }

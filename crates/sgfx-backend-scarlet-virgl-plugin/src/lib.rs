@@ -604,3 +604,73 @@ pub unsafe extern "C" fn sgfx_backend_get_timestamp_api_v2(
     };
     abi::OK
 }
+
+unsafe extern "C" fn query_support(p: abi::Object) -> u32 {
+    let Ok(d) = (unsafe { object::<virgl::Device>(p) }) else {
+        return 0;
+    };
+    let mut support = 0;
+    // Optional protocols are tested on isolated contexts: a host rejecting a
+    // statistics object must never poison the actual rendering context.
+    for kind in 0..2 {
+        if let Ok(c) = d.create_context() {
+            let mask = if kind == 0 { 0 } else { 0x7ff };
+            let count = if kind == 0 { 1 } else { 11 };
+            if c.begin_query(kind, mask)
+                .and_then(|_| c.end_query(kind, count))
+                .is_ok()
+            {
+                support |= if kind == 0 { 1 } else { 4 };
+            }
+        }
+    }
+    support
+}
+unsafe extern "C" fn begin_query(p: abi::Object, kind: u32, mask: u32) -> i32 {
+    status((|| {
+        unsafe { object::<virgl::Context>(p) }?
+            .begin_query(kind, mask)
+            .map_err(handle_error)
+    })())
+}
+unsafe extern "C" fn end_query(p: abi::Object, kind: u32, out: *mut u64, count: usize) -> i32 {
+    if out.is_null() || count == 0 || count > 11 {
+        return abi::INVALID;
+    }
+    status((|| {
+        let values = unsafe { object::<virgl::Context>(p) }?
+            .end_query(kind, count)
+            .map_err(handle_error)?;
+        if values.len() != count {
+            return Err(abi::INVALID);
+        }
+        unsafe { core::ptr::copy_nonoverlapping(values.as_ptr(), out, count) };
+        Ok(())
+    })())
+}
+/// Negotiate scoped query counters without changing existing ABI v2 tables.
+/// # Safety
+/// Output points to writable aligned QueryApi storage of at least `size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sgfx_backend_get_query_api_v2(
+    version: u32,
+    size: usize,
+    out: *mut abi::QueryApi,
+) -> i32 {
+    if version != abi::VERSION || size < core::mem::size_of::<abi::QueryApi>() {
+        return abi::ABI_MISMATCH;
+    }
+    if out.is_null() {
+        return abi::INVALID;
+    }
+    unsafe {
+        out.write(abi::QueryApi {
+            version: abi::VERSION,
+            size: core::mem::size_of::<abi::QueryApi>() as u32,
+            support: query_support,
+            begin: begin_query,
+            end: end_query,
+        })
+    };
+    abi::OK
+}

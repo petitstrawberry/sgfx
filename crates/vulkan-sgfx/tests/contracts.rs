@@ -121,7 +121,10 @@ impl Context {
                 vk::PhysicalDeviceHostQueryResetFeatures::default().host_query_reset(true);
             let mut rendering =
                 vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+            let supported = instance.get_physical_device_features(physical);
             let indirect_features = vk::PhysicalDeviceFeatures::default()
+                .occlusion_query_precise(supported.occlusion_query_precise == vk::TRUE)
+                .pipeline_statistics_query(supported.pipeline_statistics_query == vk::TRUE)
                 .multi_draw_indirect(true)
                 .draw_indirect_first_instance(true);
             let extensions = [

@@ -197,8 +197,32 @@ v2 timing table preserves existing backend ABI layouts. Metal samples its GPU
 clock after retiring prior commands; other WGPU backends use timestamp queries.
 VirGL uses timestamp query objects and CPU-visible query-result buffers, requiring
 Scarlet kernel `b229d6d007fbdf8e3b9a130c3feeaf94ee8019e9` or later. Older kernels,
-missing timing tables and unusable host timers leave valid bits and host-reset
-support at zero. Occlusion and pipeline-statistics queries remain unsupported.
+missing timing tables and unusable host timers leave timestamp valid bits at zero.
+Host query reset remains available when another query type is implemented.
+
+Occlusion pools support `vkCmdBeginQuery`/`vkCmdEndQuery`, availability, reset,
+32/64-bit reads and strided copies. WGPU and native VirGL currently expose only
+non-precise results: zero means no sample passed, and nonzero means visible.
+`occlusionQueryPrecise` remains false; `PRECISE` is rejected. Query scopes survive
+pass splits used by indirect draws, timestamp writes and attachment preservation.
+Nested queries of the same type, mismatched ends, resetting/copying active slots,
+open queries at command-buffer end and invalid render-pass/subpass boundaries
+are rejected during recording.
+
+Pipeline-statistics pools are enabled only when the backend supplies statistics.
+Results contain requested counters in increasing Vulkan bit order, followed by
+availability when requested. Native VirGL uses one host query per selected
+counter. Its optional protocols are probed on isolated contexts so rejecting a
+statistics object cannot poison the application's render context; such hosts
+can log the rejected probe. WGPU uses hardware VS/clipper/fragment/compute
+counters and exact submitted IA vertex/primitive counts; GS/tessellation counters
+are zero because those shader stages are not exposed. Queries aggregate all
+contributing passes, excluding backend-generated clear draws. The optional
+scoped-query ABI table leaves existing v2 table layouts unchanged. Metal does
+not expose WGPU pipeline-statistics queries, and this macOS OpenGL host rejects
+the native statistics protocol, so `pipelineStatisticsQuery` remains false here.
+`PARTIAL` results and indexed/secondary-command-buffer query variants are outside
+this bounded profile.
 
 Vulkan 1.0 descriptor update rules apply: updating a set already bound in a
 recording or executable command buffer invalidates that buffer. Reset and
@@ -347,7 +371,7 @@ and verify the chosen Mesa driver. The Linux check also used
   FIFO mode and opaque composition. Windows presentation is through Wine's
   Win32-to-Wayland driver and Box64's native Vulkan wrapper. Direct3D/DXVK,
   general games, other platform surfaces, secondary command buffers, descriptor indexing,
-  compiled pipeline-cache payloads, occlusion/pipeline-statistics queries, legacy device-event commands, sparse resources, external memory, multisampling,
+  compiled pipeline-cache payloads, precise occlusion, legacy device-event commands, sparse resources, external memory, multisampling,
   indirect dispatch, partial/flipped/converting blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent
@@ -515,3 +539,24 @@ replaced with CPU time. Reproduction sources, hashes and logs are retained in
 | AArch64 ICD | `625f58b4a6d01f09e3bcb94085d5cba33cdb67ee7cf1058c571d85e04d31b3db` |
 | HVF guest log | `81c4dc7858b2c5e9ee1cd48aa6046f38e28baeaf9c6bc612935e0d6186335965` |
 | Query-buffer kernel Image | `4c335ca8f0dbee755fcd14abdc490c7ab62195ca597f64dfc82f30fc46fd199c` |
+
+
+## Scoped query validation
+
+On 2026-10-30 all 35 opt-in Metal GPU contract tests passed, including visible
+indirect drawing versus an empty occlusion scope, pass splitting, 32/64-bit
+results, availability and buffer copies. The native AArch64 HVF/OpenJDK test
+also passes visible/empty scopes around normal and indexed indirect-count draws,
+result copies, host reads and host resets, while retaining 128 exact pixel
+comparisons. Unsupported precise/statistics features are rejected explicitly.
+This host cannot exercise positive pipeline-statistics results; their hardware
+path remains unverified here. The conditional graphics contract checks IA, VS
+and fragment counters on backends that expose the feature.
+
+
+| Scoped-query native artifact | SHA-256 |
+| --- | --- |
+| AArch64 ICD | `d59c80831c5fa4606f474aaff39239a2484ce38b34c2e595581c36d0a3d78723` |
+| HVF guest log | `87421c1fe93e98e54a70e909edd40573702d60a0dfd835c62cc3b72fcb42c859` |
+
+Full receipts and logs are retained under `target/vulkan-next/scoped-summary.json`.

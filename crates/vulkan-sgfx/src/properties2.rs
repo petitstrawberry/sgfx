@@ -84,7 +84,7 @@ unsafe extern "system" fn features(
                     (*node.cast::<vk::PhysicalDeviceHostQueryResetFeatures<'_>>())
                         .host_query_reset = u32::from(
                         crate::instance::physical_adapter(physical)
-                            .is_some_and(|a| a.supports_timestamps()),
+                            .is_some_and(|a| a.supports_timestamps() || a.query_support() != 0),
                     );
                 }
                 if tag == vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES {

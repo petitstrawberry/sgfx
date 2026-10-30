@@ -54,6 +54,8 @@ mod dispatch;
 mod driver;
 mod ir_execute;
 mod packets;
+#[cfg(feature = "std")]
+mod queries;
 mod scheduler;
 mod virgl;
 
@@ -258,6 +260,14 @@ pub struct Context {
 
 impl Context {
     /// Return an actual GPU timestamp in nanoseconds after prior context work.
+    #[cfg(feature = "std")]
+    pub fn begin_query(&self, kind: u32, mask: u32) -> HandleResult<()> {
+        self.backend.begin_query(kind, mask)
+    }
+    #[cfg(feature = "std")]
+    pub fn end_query(&self, kind: u32, count: usize) -> HandleResult<Vec<u64>> {
+        self.backend.end_query(kind, count)
+    }
     #[cfg(feature = "std")]
     pub fn timestamp_ns(&self) -> HandleResult<u64> {
         self.backend.timestamp_ns()

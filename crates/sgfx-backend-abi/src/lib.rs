@@ -214,6 +214,22 @@ pub struct TimestampApi {
 const _: () = assert!(core::mem::size_of::<TimestampApi>() == 16);
 pub type GetTimestampApi = unsafe extern "C" fn(u32, usize, *mut TimestampApi) -> i32;
 
+/// Optional scoped GPU counters. Kind 0 is occlusion, kind 1 pipeline statistics.
+/// Counter masks/results use Vulkan pipeline-statistic bit order (11 counters).
+pub const QUERY_ENTRY: &[u8] = b"sgfx_backend_get_query_api_v2\0";
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QueryApi {
+    pub version: u32,
+    pub size: u32,
+    /// Device object -> support bits: occlusion=1, precise=2, statistics=4.
+    pub support: unsafe extern "C" fn(Object) -> u32,
+    pub begin: unsafe extern "C" fn(Object, u32, u32) -> i32,
+    pub end: unsafe extern "C" fn(Object, u32, *mut u64, usize) -> i32,
+}
+const _: () = assert!(core::mem::size_of::<QueryApi>() == 32);
+pub type GetQueryApi = unsafe extern "C" fn(u32, usize, *mut QueryApi) -> i32;
+
 /// Optional v2 extension for low-level API frontends, including Vulkan. The
 /// original mapped-session table remains binary compatible. Resolve once at
 /// load time; all objects below belong to the same loaded backend.

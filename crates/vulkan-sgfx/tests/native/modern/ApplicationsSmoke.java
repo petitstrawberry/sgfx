@@ -10,7 +10,7 @@ import static org.lwjgl.vulkan.EXTHostQueryReset.*;
 import static org.lwjgl.vulkan.KHRDynamicRendering.*;
 import static org.lwjgl.vulkan.KHRDrawIndirectCount.*;
 public class ApplicationsSmoke {
- static boolean timing;
+ static boolean timing,statistics;
  static void check(int r,String op){if(r!=VK_SUCCESS)throw new AssertionError(op+" "+r);}
  static long shader(VkDevice d,int kind,String text){
   long compiler=org.lwjgl.util.shaderc.Shaderc.shaderc_compiler_initialize();
@@ -44,28 +44,41 @@ public class ApplicationsSmoke {
   check(vkCreateGraphicsPipelines(d,0,info,null,h),"dynamic pipeline");long pipeline=h.get(0);
   long[] args=buffer(d,64,VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),counter=buffer(d,4,VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),vertices=buffer(d,24,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),indices=buffer(d,8,VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT),output=buffer(d,512,VK_BUFFER_USAGE_TRANSFER_DST_BIT);
   if(timing)check(vkCreateQueryPool(d,VkQueryPoolCreateInfo.calloc(s).sType$Default().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(2),null,h),"graphics queries");long queries=timing?h.get(0):0;
+  check(vkCreateQueryPool(d,VkQueryPoolCreateInfo.calloc(s).sType$Default().queryType(VK_QUERY_TYPE_OCCLUSION).queryCount(2),null,h),"occlusion pool");long visibility=h.get(0);
+  int statMask=VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT|VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT|VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT|VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+  int statResult=vkCreateQueryPool(d,VkQueryPoolCreateInfo.calloc(s).sType$Default().queryType(VK_QUERY_TYPE_PIPELINE_STATISTICS).queryCount(1).pipelineStatistics(statMask),null,h);
+  if(statistics)check(statResult,"statistics pool");else if(statResult!=VK_ERROR_FEATURE_NOT_PRESENT)throw new AssertionError("unsupported statistics accepted");long counters=statistics?h.get(0):0;
   for(int indexed=0;indexed<2;indexed++){
    check(vkAllocateCommandBuffers(d,VkCommandBufferAllocateInfo.calloc(s).sType$Default().commandPool(pool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1),p),"graphics commands");VkCommandBuffer cmd=new VkCommandBuffer(p.get(0),d);
-   check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"graphics begin");if(timing)vkCmdResetQueryPool(cmd,queries,0,2);
+   check(vkBeginCommandBuffer(cmd,VkCommandBufferBeginInfo.calloc(s).sType$Default()),"graphics begin");if(timing)vkCmdResetQueryPool(cmd,queries,0,2);vkCmdResetQueryPool(cmd,visibility,0,2);if(statistics){vkCmdResetQueryPool(cmd,counters,0,1);vkCmdBeginQuery(cmd,counters,0,0);}
    vkCmdUpdateBuffer(cmd,vertices[0],0,s.floats(-1,-1,3,-1,-1,3));vkCmdUpdateBuffer(cmd,indices[0],0,s.shorts((short)1,(short)2,(short)3,(short)0));vkCmdUpdateBuffer(cmd,counter[0],0,s.ints(1));vkCmdUpdateBuffer(cmd,args[0],0,indexed==0?s.ints(3,1,0,0,0,0,0,0):s.ints(3,1,0,-1,0,0,0,0,0,0));
    VkImageMemoryBarrier2.Buffer barrier=VkImageMemoryBarrier2.calloc(1,s).sType$Default().oldLayout(indexed==0?VK_IMAGE_LAYOUT_UNDEFINED:VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).srcStageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR).dstStageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR).srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).image(image).subresourceRange(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1));
    vkCmdPipelineBarrier2KHR(cmd,VkDependencyInfo.calloc(s).sType$Default().pImageMemoryBarriers(barrier));
    VkRenderingAttachmentInfo.Buffer attachment=VkRenderingAttachmentInfo.calloc(1,s).sType$Default().imageView(view).imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR).storeOp(VK_ATTACHMENT_STORE_OP_STORE).clearValue(c->c.color(v->v.float32(0,1).float32(3,1)));
    vkCmdBeginRenderingKHR(cmd,VkRenderingInfo.calloc(s).sType$Default().renderArea(r->r.extent(e->e.set(8,8))).layerCount(1).pColorAttachments(attachment));
    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);vkCmdBindVertexBuffers(cmd,0,s.longs(vertices[0]),s.longs(0));if(timing)vkCmdWriteTimestamp2KHR(cmd,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,queries,0);
+   vkCmdBeginQuery(cmd,visibility,0,0);
    if(indexed==0)vkCmdDrawIndirectCountKHR(cmd,args[0],0,counter[0],0,2,16);else{vkCmdBindIndexBuffer(cmd,indices[0],0,VK_INDEX_TYPE_UINT16);vkCmdDrawIndexedIndirectCountKHR(cmd,args[0],0,counter[0],0,2,20);}
-   if(timing)vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,queries,1);vkCmdEndRenderingKHR(cmd);
+   vkCmdEndQuery(cmd,visibility,0);vkCmdBeginQuery(cmd,visibility,1,0);vkCmdEndQuery(cmd,visibility,1);
+   if(timing)vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,queries,1);vkCmdEndRenderingKHR(cmd);if(statistics)vkCmdEndQuery(cmd,counters,0);
    barrier.oldLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL).srcStageMask(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR).dstStageMask(VK_PIPELINE_STAGE_2_COPY_BIT_KHR).srcAccessMask(VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR).dstAccessMask(VK_ACCESS_2_TRANSFER_READ_BIT_KHR);vkCmdPipelineBarrier2KHR(cmd,VkDependencyInfo.calloc(s).sType$Default().pImageMemoryBarriers(barrier));
    vkCmdCopyImageToBuffer(cmd,image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output[0],VkBufferImageCopy.calloc(1,s).imageSubresource(r->r.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1)).imageExtent(e->e.set(8,8,1)));
    if(timing)vkCmdCopyQueryPoolResults(cmd,queries,0,2,output[0],256,24,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+   vkCmdCopyQueryPoolResults(cmd,visibility,0,2,output[0],320,24,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
    check(vkEndCommandBuffer(cmd),"graphics end");check(vkQueueSubmit2KHR(queue,VkSubmitInfo2.calloc(1,s).sType$Default().pCommandBufferInfos(VkCommandBufferSubmitInfo.calloc(1,s).sType$Default().commandBuffer(cmd)),0),"graphics submit");check(vkQueueWaitIdle(queue),"graphics idle");
    check(vkMapMemory(d,output[1],0,512,0,p),"graphics readback");ByteBuffer pixels=MemoryUtil.memByteBuffer(p.get(0),512).order(ByteOrder.LITTLE_ENDIAN);
    for(int y=0;y<8;y++)for(int x=0;x<8;x++){int expected=x>=2&&x<6&&y>=2&&y<6?0xff00ff00:0xff0000ff;if(pixels.getInt((y*8+x)*4)!=expected)throw new AssertionError("pixel "+x+","+y+" indexed="+indexed+" value="+Integer.toHexString(pixels.getInt((y*8+x)*4)));}
    if(timing&&(pixels.getLong(280)<=pixels.getLong(256)||pixels.getLong(264)!=1||pixels.getLong(288)!=1))throw new AssertionError("graphics query copy "+pixels.getLong(256)+".."+pixels.getLong(280));
+   if(pixels.getLong(320)==0||pixels.getLong(328)!=1||pixels.getLong(344)!=0||pixels.getLong(352)!=1)throw new AssertionError("occlusion visible/empty "+pixels.getLong(320)+","+pixels.getLong(344));
+   LongBuffer samples=s.mallocLong(4);check(vkGetQueryPoolResults(d,visibility,0,2,samples,16,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT),"occlusion host results");if(samples.get(0)!=pixels.getLong(320)||samples.get(1)!=1||samples.get(2)!=0||samples.get(3)!=1)throw new AssertionError("occlusion copy mismatch");
+   vkResetQueryPoolEXT(d,visibility,0,1);if(vkGetQueryPoolResults(d,visibility,0,1,samples,16,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)!=VK_NOT_READY)throw new AssertionError("occlusion host reset");
+   if(statistics){LongBuffer stats=s.mallocLong(5);check(vkGetQueryPoolResults(d,counters,0,1,stats,40,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT|VK_QUERY_RESULT_WAIT_BIT),"statistics results");if(stats.get(0)!=3||stats.get(1)!=1||stats.get(2)==0||stats.get(3)==0||stats.get(4)!=1)throw new AssertionError("statistics values");}
    vkUnmapMemory(d,output[1]);vkFreeCommandBuffers(d,pool,cmd);
   }
+  vkDestroyQueryPool(d,visibility,null);if(statistics)vkDestroyQueryPool(d,counters,null);
   if(timing)vkDestroyQueryPool(d,queries,null);for(long[] b:new long[][]{args,counter,vertices,indices,output}){vkDestroyBuffer(d,b[0],null);vkFreeMemory(d,b[1],null);}
   vkDestroyPipeline(d,pipeline,null);vkDestroyPipelineLayout(d,layout,null);vkDestroyImageView(d,view,null);vkDestroyImage(d,image,null);vkFreeMemory(d,memory,null);vkDestroyShaderModule(d,vs,null);vkDestroyShaderModule(d,fs,null);
+  System.out.println("SCOPED_QUERIES_NATIVE PASS occlusion visible empty copy host-reset statistics_supported="+statistics);
   System.out.println("MODERN_GRAPHICS_NATIVE PASS dynamic rendering GPU-written indirect count indexed baseVertex=-1 pixels=128 timestamp_supported="+timing+"");
  }}
 
@@ -82,10 +95,11 @@ public class ApplicationsSmoke {
    if(!support.synchronization2())throw new AssertionError("sync2 query");
    VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeature=VkPhysicalDeviceTimelineSemaphoreFeatures.calloc(s).sType$Default().timelineSemaphore(true);
    vkGetPhysicalDeviceQueueFamilyProperties(physical,n,null);VkQueueFamilyProperties.Buffer families=VkQueueFamilyProperties.calloc(n.get(0),s);vkGetPhysicalDeviceQueueFamilyProperties(physical,n,families);timing=families.get(0).timestampValidBits()!=0;
-   VkPhysicalDeviceHostQueryResetFeatures hostReset=VkPhysicalDeviceHostQueryResetFeatures.calloc(s).sType$Default().hostQueryReset(timing);timelineFeature.pNext(hostReset.address());support.pNext(timelineFeature.address());
+   VkPhysicalDeviceFeatures hardware=VkPhysicalDeviceFeatures.calloc(s);vkGetPhysicalDeviceFeatures(physical,hardware);statistics=hardware.pipelineStatisticsQuery();
+   VkPhysicalDeviceHostQueryResetFeatures hostReset=VkPhysicalDeviceHostQueryResetFeatures.calloc(s).sType$Default().hostQueryReset(true);timelineFeature.pNext(hostReset.address());support.pNext(timelineFeature.address());
    VkDeviceQueueCreateInfo.Buffer queues=VkDeviceQueueCreateInfo.calloc(1,s).sType$Default().queueFamilyIndex(0).pQueuePriorities(s.floats(1));
    VkPhysicalDeviceDynamicRenderingFeatures rendering=VkPhysicalDeviceDynamicRenderingFeatures.calloc(s).sType$Default().dynamicRendering(true);hostReset.pNext(rendering.address());
-   VkDeviceCreateInfo di=VkDeviceCreateInfo.calloc(s).sType$Default().pNext(support.address()).pQueueCreateInfos(queues).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(s).multiDrawIndirect(true).drawIndirectFirstInstance(true)).ppEnabledExtensionNames(s.pointers(s.UTF8(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME),s.UTF8(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME),s.UTF8(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME),s.UTF8(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME),s.UTF8(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME)));
+   VkDeviceCreateInfo di=VkDeviceCreateInfo.calloc(s).sType$Default().pNext(support.address()).pQueueCreateInfos(queues).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(s).multiDrawIndirect(true).drawIndirectFirstInstance(true).pipelineStatisticsQuery(statistics)).ppEnabledExtensionNames(s.pointers(s.UTF8(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME),s.UTF8(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME),s.UTF8(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME),s.UTF8(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME),s.UTF8(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME)));
    check(vkCreateDevice(physical,di,null,p),"device");VkDevice device=new VkDevice(p.get(0),physical,di);vkGetDeviceQueue(device,0,0,p);VkQueue queue=new VkQueue(p.get(0),device);
    long[] buffers=new long[2],memories=new long[2];
    for(int i=0;i<2;i++){

@@ -60,6 +60,15 @@ fn vertex_storage(context: &Context, bytes: u64) -> Storage<'_> {
 }
 
 fn vertex_contract(instanced: bool, dynamic: bool, indirect: bool, indexed: bool) {
+    query_vertex_contract(instanced, dynamic, indirect, indexed, false)
+}
+fn query_vertex_contract(
+    instanced: bool,
+    dynamic: bool,
+    indirect: bool,
+    indexed: bool,
+    measured: bool,
+) {
     let context = if dynamic || indirect {
         Context::configured(true)
     } else {
@@ -364,6 +373,41 @@ fn vertex_contract(instanced: bool, dynamic: bool, indirect: bool, indexed: bool
             )
             .unwrap()[0];
         context.reset();
+        let supported = context.instance.get_physical_device_features(
+            context.instance.enumerate_physical_devices().unwrap()[0],
+        );
+        let occlusion = if measured {
+            Some(
+                d.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::OCCLUSION)
+                        .query_count(2),
+                    None,
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let stats = if measured && supported.pipeline_statistics_query == vk::TRUE {
+            Some(
+                d.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::PIPELINE_STATISTICS)
+                        .query_count(1)
+                        .pipeline_statistics(
+                            vk::QueryPipelineStatisticFlags::INPUT_ASSEMBLY_VERTICES
+                                | vk::QueryPipelineStatisticFlags::INPUT_ASSEMBLY_PRIMITIVES
+                                | vk::QueryPipelineStatisticFlags::VERTEX_SHADER_INVOCATIONS
+                                | vk::QueryPipelineStatisticFlags::FRAGMENT_SHADER_INVOCATIONS,
+                        ),
+                    None,
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
         d.begin_command_buffer(context.command, &Default::default())
             .unwrap();
         let arguments = Storage::with_usage(
@@ -378,6 +422,13 @@ fn vertex_contract(instanced: bool, dynamic: bool, indirect: bool, indexed: bool
             &context,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         );
+        if let Some(pool) = occlusion {
+            d.cmd_reset_query_pool(context.command, pool, 0, 2);
+        }
+        if let Some(pool) = stats {
+            d.cmd_reset_query_pool(context.command, pool, 0, 1);
+            d.cmd_begin_query(context.command, pool, 0, vk::QueryControlFlags::empty());
+        }
         if indirect {
             let count = if instanced { 6u32 } else { 12 };
             let instances = if instanced { 2 } else { 1 };
@@ -419,6 +470,18 @@ fn vertex_contract(instanced: bool, dynamic: bool, indirect: bool, indexed: bool
                     .render_area(area)
                     .clear_values(&clears),
                 vk::SubpassContents::INLINE,
+            );
+        }
+        if let Some(pool) = occlusion {
+            d.cmd_begin_query(
+                context.command,
+                pool,
+                0,
+                if supported.occlusion_query_precise == vk::TRUE {
+                    vk::QueryControlFlags::PRECISE
+                } else {
+                    vk::QueryControlFlags::empty()
+                },
             );
         }
         d.cmd_bind_pipeline(context.command, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -463,12 +526,34 @@ fn vertex_contract(instanced: bool, dynamic: bool, indirect: bool, indexed: bool
                 );
             }
         }
+        if let Some(pool) = occlusion {
+            d.cmd_end_query(context.command, pool, 0);
+            d.cmd_begin_query(context.command, pool, 1, vk::QueryControlFlags::empty());
+            d.cmd_end_query(context.command, pool, 1);
+        }
         if dynamic {
             dynamic_api.cmd_end_rendering(context.command);
         } else {
             d.cmd_end_render_pass(context.command);
         }
 
+        if let Some(pool) = stats {
+            d.cmd_end_query(context.command, pool, 0);
+        }
+        if let Some(pool) = occlusion {
+            d.cmd_copy_query_pool_results(
+                context.command,
+                pool,
+                0,
+                2,
+                output.buffer,
+                256,
+                24,
+                vk::QueryResultFlags::TYPE_64
+                    | vk::QueryResultFlags::WITH_AVAILABILITY
+                    | vk::QueryResultFlags::WAIT,
+            );
+        }
         d.cmd_copy_image_to_buffer(
             context.command,
             image,
@@ -492,6 +577,55 @@ fn vertex_contract(instanced: bool, dynamic: bool, indirect: bool, indexed: bool
             .unwrap();
         context.submit(fence).unwrap();
         d.wait_for_fences(&[fence], true, 5_000_000_000).unwrap();
+        if let Some(pool) = occlusion {
+            let flags = vk::QueryResultFlags::TYPE_64
+                | vk::QueryResultFlags::WITH_AVAILABILITY
+                | vk::QueryResultFlags::WAIT;
+            let mut values = [[0u64; 3]; 2];
+            d.get_query_pool_results(pool, 0, &mut values, flags)
+                .unwrap();
+            if supported.occlusion_query_precise == vk::TRUE {
+                assert_eq!(values[0][0], 64);
+            } else {
+                assert!(values[0][0] > 0);
+            }
+            assert_eq!(values[0][1], 1);
+            assert_eq!(values[1][..2], [0, 1]);
+            let bytes = output.read();
+            assert_eq!(
+                u64::from(bytes[64]) | (u64::from(bytes[65]) << 32),
+                values[0][0]
+            );
+            assert_eq!(bytes[66], 1);
+            assert_eq!(bytes[70], 0);
+            assert_eq!(bytes[72], 1);
+            let mut narrow = [[0u32; 2]; 2];
+            d.get_query_pool_results(
+                pool,
+                0,
+                &mut narrow,
+                vk::QueryResultFlags::WITH_AVAILABILITY,
+            )
+            .unwrap();
+            assert_eq!(narrow[0], [values[0][0] as u32, 1]);
+            d.destroy_query_pool(pool, None);
+        }
+        if let Some(pool) = stats {
+            let mut values = [[0u64; 5]; 1];
+            d.get_query_pool_results(
+                pool,
+                0,
+                &mut values,
+                vk::QueryResultFlags::TYPE_64
+                    | vk::QueryResultFlags::WITH_AVAILABILITY
+                    | vk::QueryResultFlags::WAIT,
+            )
+            .unwrap();
+            assert_eq!(&values[0][..2], &[12, 4]);
+            assert!(values[0][2] > 0 && values[0][3] > 0);
+            assert_eq!(values[0][4], 1);
+            d.destroy_query_pool(pool, None);
+        }
         let pixels = output.read();
         for y in 0..8 {
             for x in 0..8 {
@@ -535,4 +669,10 @@ fn gpu_written_indirect_count_preserves_first_instance_and_attachments() {
 #[ignore = "requires the built ICD and a native GPU"]
 fn gpu_written_indexed_indirect_preserves_signed_vertex_offset() {
     vertex_contract(true, true, true, true);
+}
+
+#[test]
+#[ignore = "requires the built ICD and a native GPU"]
+fn scoped_occlusion_and_statistics_measure_indirect_draws_and_empty_scopes() {
+    query_vertex_contract(true, true, true, true, true);
 }

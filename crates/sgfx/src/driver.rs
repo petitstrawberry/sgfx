@@ -211,6 +211,7 @@ pub struct Adapter {
     capabilities: Capabilities,
     backend: AdapterBackend,
     timestamps: bool,
+    query_support: u32,
 }
 
 impl fmt::Debug for Adapter {
@@ -226,6 +227,9 @@ impl fmt::Debug for Adapter {
 
 impl Adapter {
     /// Whether this adapter supplies actual GPU timestamps in nanoseconds.
+    pub const fn query_support(&self) -> u32 {
+        self.query_support
+    }
     pub const fn supports_timestamps(&self) -> bool {
         self.timestamps
     }
@@ -372,6 +376,56 @@ impl Device {
             DeviceBackend::ScarletVirgl(context) => context.timestamp_ns().map_err(Error::from),
             #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
             DeviceBackend::Dynamic(context) => context.timestamp_ns().map_err(Error::from),
+        }
+    }
+
+    pub fn begin_query(&self, kind: u32, mask: u32) -> Result<()> {
+        match &self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            DeviceBackend::Wgpu(device) => {
+                device.context.begin_query(kind, mask).map_err(Error::Wgpu)
+            }
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                sgfx_dynamic_virgl
+            ))]
+            DeviceBackend::ScarletVirgl(context) => {
+                context.begin_query(kind, mask).map_err(Error::from)
+            }
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            DeviceBackend::Dynamic(context) => context.begin_query(kind, mask).map_err(Error::from),
+        }
+    }
+
+    pub fn end_query(&self, kind: u32, count: usize) -> Result<Vec<u64>> {
+        match &self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            DeviceBackend::Wgpu(device) => device
+                .context
+                .end_query(kind)
+                .and_then(|values| {
+                    if values.len() == count {
+                        Ok(values)
+                    } else {
+                        Err(sgfx_backend_wgpu::Error::InvalidState)
+                    }
+                })
+                .map_err(Error::Wgpu),
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                sgfx_dynamic_virgl
+            ))]
+            DeviceBackend::ScarletVirgl(context) => {
+                context.end_query(kind, count).map_err(Error::from)
+            }
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            DeviceBackend::Dynamic(context) => context.end_query(kind, count).map_err(Error::from),
         }
     }
 
@@ -1322,6 +1376,14 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
             let depth = adapter.get_texture_format_features(wgpu::TextureFormat::Depth32Float);
             Adapter {
                 timestamps: adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+                query_support: 1 | if adapter
+                    .features()
+                    .contains(wgpu::Features::PIPELINE_STATISTICS_QUERY)
+                {
+                    4
+                } else {
+                    0
+                },
                 ordinal: 0,
                 info: AdapterInfo {
                     name: raw_info.name,
@@ -1420,7 +1482,8 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
     let required_features = adapter.features()
         & (wgpu::Features::PUSH_CONSTANTS
             | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
-            | wgpu::Features::TIMESTAMP_QUERY);
+            | wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::PIPELINE_STATISTICS_QUERY);
     required_limits.max_push_constant_size =
         if required_features.contains(wgpu::Features::PUSH_CONSTANTS) {
             adapter_limits
@@ -1537,6 +1600,7 @@ fn discover_dynamic_adapters(preference: BackendPreference) -> Vec<Adapter> {
         };
         adapters.push(Adapter {
             timestamps: device.supports_timestamps(),
+            query_support: device.query_support(),
             ordinal: 0,
             info: AdapterInfo {
                 name: format!("Scarlet {} GPU {index}", device.backend_name()),

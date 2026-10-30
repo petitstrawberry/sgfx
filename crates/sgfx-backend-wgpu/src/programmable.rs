@@ -664,10 +664,14 @@ impl Queue {
         encoder: &mut raw::CommandEncoder,
         commands: &[Command<'_, '_>],
     ) -> Result<()> {
+        let query_sets = self.query_sets(true)?;
         let mut pass = encoder.begin_compute_pass(&raw::ComputePassDescriptor {
             label: Some("sgfx compute pass"),
             timestamp_writes: None,
         });
+        if let Some(set) = &query_sets.statistics {
+            pass.begin_pipeline_statistics_query(set, 0);
+        }
         let mut current_pipeline: Option<Arc<ComputePipeline>> = None;
         let mut bind_groups: Vec<(u32, Arc<raw::BindGroup>)> = Vec::new();
         for command in commands {
@@ -720,6 +724,11 @@ impl Queue {
                 _ => return Err(Error::InvalidState),
             }
         }
+        if query_sets.statistics.is_some() {
+            pass.end_pipeline_statistics_query();
+        }
+        drop(pass);
+        self.resolve_queries(encoder, query_sets)?;
         Ok(())
     }
 }

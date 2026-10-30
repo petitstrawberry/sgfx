@@ -874,6 +874,8 @@ pub(crate) unsafe extern "system" fn get_physical_device_features(
         let mut features = vk::PhysicalDeviceFeatures::default();
         if let Some(adapter) = physical_adapter(physical) {
             let capabilities = adapter.capabilities();
+            features.occlusion_query_precise = u32::from(adapter.query_support() & 2 != 0);
+            features.pipeline_statistics_query = u32::from(adapter.query_support() & 4 != 0);
             features.multi_draw_indirect = u32::from(capabilities.supports_programmable_graphics());
             features.draw_indirect_first_instance = features.multi_draw_indirect;
             // The Scarlet VirGL backend preserves each color target's blend

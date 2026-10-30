@@ -21,6 +21,7 @@ use sgfx_core::backend::{CommandSubmitter, SubmitError};
 mod blit;
 mod completion;
 mod programmable;
+mod queries;
 mod readback;
 mod vertex_input;
 pub use completion::Submission;
@@ -200,6 +201,7 @@ impl Device {
     pub fn create_context(&self) -> Context {
         Context {
             device: self.clone(),
+            queries: Default::default(),
         }
     }
 
@@ -226,6 +228,7 @@ impl Device {
 #[derive(Clone)]
 pub struct Context {
     device: Device,
+    queries: Arc<std::sync::Mutex<queries::State>>,
 }
 
 impl Context {
@@ -1568,12 +1571,13 @@ impl Queue {
                 depth_ops,
                 stencil_ops: None,
             });
+        let query_sets = self.query_sets(false)?;
         let mut render_pass = encoder.begin_render_pass(&raw::RenderPassDescriptor {
             label: Some("sgfx wgpu render pass"),
             color_attachments: &color_attachments,
             depth_stencil_attachment: depth_attachment,
             timestamp_writes: None,
-            occlusion_query_set: None,
+            occlusion_query_set: query_sets.occlusion.as_ref(),
         });
         render_pass.set_scissor_rect(
             desc.area().x(),
@@ -1583,6 +1587,12 @@ impl Queue {
         );
         if let (Some(color), Some(pipeline)) = (partial_clear_color, clear_pipeline.as_ref()) {
             self.encode_color_clear(&mut render_pass, pipeline, color);
+        }
+        if query_sets.occlusion.is_some() {
+            render_pass.begin_occlusion_query(0);
+        }
+        if let Some(set) = &query_sets.statistics {
+            render_pass.begin_pipeline_statistics_query(set, 0);
         }
         let mut state = PassState {
             pipeline: None,
@@ -1708,6 +1718,14 @@ impl Queue {
                     first_vertex,
                 } => {
                     self.encode_draw(&mut render_pass, &state, *vertex_count, *first_vertex, 0..1)?;
+                    self.assembly_query(
+                        *vertex_count,
+                        1,
+                        state
+                            .programmable
+                            .as_ref()
+                            .map_or(ir::PrimitiveTopology::TriangleList, |p| p.topology),
+                    )?;
                 }
                 Command::DrawIndexed {
                     index_count,
@@ -1722,6 +1740,14 @@ impl Queue {
                         *base_vertex,
                         0..1,
                     )?;
+                    self.assembly_query(
+                        *index_count,
+                        1,
+                        state
+                            .programmable
+                            .as_ref()
+                            .map_or(ir::PrimitiveTopology::TriangleList, |p| p.topology),
+                    )?;
                 }
                 Command::DrawInstanced {
                     vertex_count,
@@ -1735,6 +1761,14 @@ impl Queue {
                         *vertex_count,
                         *first_vertex,
                         *first_instance..*first_instance + *instance_count,
+                    )?;
+                    self.assembly_query(
+                        *vertex_count,
+                        *instance_count,
+                        state
+                            .programmable
+                            .as_ref()
+                            .map_or(ir::PrimitiveTopology::TriangleList, |p| p.topology),
                     )?;
                 }
                 Command::DrawIndexedInstanced {
@@ -1752,10 +1786,26 @@ impl Queue {
                         *base_vertex,
                         *first_instance..*first_instance + *instance_count,
                     )?;
+                    self.assembly_query(
+                        *index_count,
+                        *instance_count,
+                        state
+                            .programmable
+                            .as_ref()
+                            .map_or(ir::PrimitiveTopology::TriangleList, |p| p.topology),
+                    )?;
                 }
                 _ => return Err(Error::InvalidState),
             }
         }
+        if query_sets.occlusion.is_some() {
+            render_pass.end_occlusion_query();
+        }
+        if query_sets.statistics.is_some() {
+            render_pass.end_pipeline_statistics_query();
+        }
+        drop(render_pass);
+        self.resolve_queries(encoder, query_sets)?;
         Ok(())
     }
 
