@@ -2107,23 +2107,23 @@ impl Queue {
         if uploaded_revision == Some(spec.revision) {
             return Ok(());
         }
-        let range = ir_buffer_upload_range(uploaded_revision, spec.revision, bytes.len(), update)?;
+        let ranges =
+            ir_buffer_upload_ranges(uploaded_revision, spec.revision, bytes.len(), update)?;
         #[cfg(feature = "profile-submissions")]
         let prepare_started = std::time::Instant::now();
         self.prepare_ir_upload_arena(context, resources, mode)?;
 
         const INLINE_WRITE_FIXED_BYTES: usize = 12 * core::mem::size_of::<u32>();
         const BUFFER_COPY_BYTES: usize = 14 * core::mem::size_of::<u32>();
+        let fixed_bytes = INLINE_WRITE_FIXED_BYTES
+            + if mode.is_tracked() {
+                BUFFER_COPY_BYTES
+            } else {
+                0
+            };
         let max_payload = self
             .max_command_size()
-            .checked_sub(
-                INLINE_WRITE_FIXED_BYTES
-                    + if mode.is_tracked() {
-                        BUFFER_COPY_BYTES
-                    } else {
-                        0
-                    },
-            )
+            .checked_sub(fixed_bytes)
             .map(|bytes| bytes & !(core::mem::size_of::<u32>() - 1))
             .filter(|bytes| *bytes > 0)
             .ok_or(HandleError::InvalidParameter)?;
@@ -2135,23 +2135,27 @@ impl Queue {
         // every packet succeeds, a later submission must repair the full
         // initialized shadow. Tracked rejection restores its cache snapshot.
         ir_buffer(context, resources, spec)?.uploaded_revision = None;
-        let mut offset = range.start;
-        while offset < range.end {
-            mode.prepare_packet(self.max_command_size())?;
-            let end = offset.saturating_add(max_payload).min(range.end);
-            let chunk = bytes
-                .get(offset..end)
-                .ok_or(HandleError::InvalidParameter)?;
-            commands.clear();
-            push_ir_buffer_upload(
-                &mut commands,
-                resource_id,
-                u32::try_from(offset).map_err(|_| HandleError::InvalidParameter)?,
-                chunk,
-                mode,
-            )?;
-            mode.submit(&self.raw, &commands)?;
-            offset = end;
+        for range in ranges.as_slice() {
+            let mut offset = range.start;
+            while offset < range.end {
+                let end = offset.saturating_add(max_payload).min(range.end);
+                let chunk = bytes
+                    .get(offset..end)
+                    .ok_or(HandleError::InvalidParameter)?;
+                // Rotate before choosing arena offsets, but reserve only this
+                // packet's bytes so small intervals share a native chunk.
+                mode.prepare_packet(fixed_bytes + chunk.len())?;
+                commands.clear();
+                push_ir_buffer_upload(
+                    &mut commands,
+                    resource_id,
+                    u32::try_from(offset).map_err(|_| HandleError::InvalidParameter)?,
+                    chunk,
+                    mode,
+                )?;
+                mode.submit(&self.raw, &commands)?;
+                offset = end;
+            }
         }
         let buffer = ir_buffer(context, resources, spec)?;
         buffer.uploaded_revision = Some(spec.revision);
@@ -2165,16 +2169,22 @@ impl Queue {
                 use std::io::Write;
                 let _ = writeln!(
                     std::io::stderr().lock(),
-                    "SGFX_VIRGL_BUFFER_UPLOAD stage=prepared tracked={} slot={} physical_revision={:?} target_revision={} delta_base={:?} upload_start={} upload_bytes={} shadow_bytes={} prepare_us={}",
+                    "SGFX_VIRGL_BUFFER_UPLOAD stage=prepared tracked={} slot={} physical_revision={:?} target_revision={} delta_base={:?} upload_start={} upload_bytes={} shadow_bytes={} prepare_us={} intervals={} upload_span_bytes={}",
                     mode.is_tracked(),
                     spec.slot,
                     uploaded_revision,
                     spec.revision,
                     update.map(|update| update.previous_revision),
-                    range.start,
-                    range.len(),
+                    ranges.as_slice()[0].start,
+                    ranges
+                        .as_slice()
+                        .iter()
+                        .map(|range| range.len())
+                        .sum::<usize>(),
                     bytes.len(),
                     prepare_us,
+                    ranges.as_slice().len(),
+                    ranges.as_slice().last().unwrap().end - ranges.as_slice()[0].start,
                 );
             }
         }
@@ -5741,6 +5751,56 @@ fn ir_address_mode(address: IrAddressMode) -> u32 {
     }
 }
 
+enum BufferUploadRanges<'a> {
+    Single(core::ops::Range<usize>),
+    Sparse(&'a [core::ops::Range<usize>]),
+}
+
+impl BufferUploadRanges<'_> {
+    fn as_slice(&self) -> &[core::ops::Range<usize>] {
+        match self {
+            Self::Single(range) => core::slice::from_ref(range),
+            Self::Sparse(ranges) => ranges,
+        }
+    }
+}
+
+fn ir_buffer_upload_ranges(
+    uploaded_revision: Option<u64>,
+    revision: u64,
+    length: usize,
+    update: Option<&IrBufferUpdate>,
+) -> HandleResult<BufferUploadRanges<'_>> {
+    let envelope = ir_buffer_upload_range(uploaded_revision, revision, length, update)?;
+    let Some(update) = update else {
+        return Ok(BufferUploadRanges::Single(envelope));
+    };
+    if uploaded_revision != Some(update.previous_revision) || update.previous_revision >= revision {
+        return Ok(BufferUploadRanges::Single(envelope));
+    }
+    let Some(intervals) = &update.intervals else {
+        return Ok(BufferUploadRanges::Single(envelope));
+    };
+    let ranges = intervals.ranges();
+    if ranges.is_empty() {
+        return Ok(BufferUploadRanges::Single(0..length));
+    }
+    if ranges.len() > crate::driver::MAX_BUFFER_DIRTY_INTERVALS
+        || ranges.first().unwrap().start != envelope.start
+        || ranges.last().unwrap().end != envelope.end
+        || ranges.iter().any(|range| {
+            range.start >= range.end
+                || range.end > length
+                || !range.start.is_multiple_of(4)
+                || !range.end.is_multiple_of(4)
+        })
+        || ranges.windows(2).any(|pair| pair[0].end >= pair[1].start)
+    {
+        return Err(HandleError::InvalidParameter);
+    }
+    Ok(BufferUploadRanges::Sparse(ranges))
+}
+
 /// A cumulative delta is safe only on its exact physical base revision.
 fn ir_buffer_upload_range(
     uploaded_revision: Option<u64>,
@@ -6341,6 +6401,7 @@ mod tests {
         let update = IrBufferUpdate {
             previous_revision: 8,
             range: 5..11,
+            intervals: None,
         };
         assert_eq!(
             ir_buffer_upload_range(Some(8), 9, 4096, Some(&update)).unwrap(),
@@ -6367,6 +6428,7 @@ mod tests {
         let update = IrBufferUpdate {
             previous_revision: 8,
             range: 5..37,
+            intervals: None,
         };
         let bytes: Vec<u8> = (0..64).collect();
         let range = ir_buffer_upload_range(Some(8), 11, bytes.len(), Some(&update)).unwrap();
@@ -6400,9 +6462,71 @@ mod tests {
             let invalid = IrBufferUpdate {
                 previous_revision: 8,
                 range,
+                intervals: None,
             };
             assert!(ir_buffer_upload_range(Some(8), 11, bytes.len(), Some(&invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn distant_dirty_words_upload_eight_bytes_and_preserve_the_gap() {
+        let mut update = IrBufferUpdate::sparse(7, 4..8);
+        let next = IrBufferUpdate::sparse(8, 4092..4096);
+        let mut latest = next;
+        latest.merge_previous(&update);
+        update = latest;
+        let ranges = ir_buffer_upload_ranges(Some(7), 9, 8192, Some(&update)).unwrap();
+        assert_eq!(ranges.as_slice(), &[4..8, 4092..4096]);
+        let mut physical = vec![3_u8; 8192];
+        let mut target = physical.clone();
+        target[4..8].fill(9);
+        target[4092..4096].fill(7);
+        let mut payload_bytes = 0;
+        for range in ranges.as_slice() {
+            let mut packet = Vec::new();
+            push_ir_buffer_inline_write(
+                &mut packet,
+                17,
+                range.start as u32,
+                &target[range.clone()],
+            )
+            .unwrap();
+            let words = dwords(&packet);
+            let start = words[6] as usize;
+            let length = words[9] as usize;
+            payload_bytes += length;
+            physical[start..start + length].copy_from_slice(&packet[48..]);
+        }
+        assert_eq!(payload_bytes, 8);
+        assert_eq!(physical, target);
+        assert!(physical[8..4092].iter().all(|byte| *byte == 3));
+        for base in [None, Some(6), Some(8), Some(10)] {
+            let repair = ir_buffer_upload_ranges(base, 9, 8192, Some(&update)).unwrap();
+            assert_eq!(repair.as_slice().len(), 1);
+            assert_eq!(repair.as_slice()[0], 0..8192);
+        }
+        let legacy = IrBufferUpdate {
+            previous_revision: 7,
+            range: 4..4096,
+            intervals: None,
+        };
+        let ranges = ir_buffer_upload_ranges(Some(7), 9, 8192, Some(&legacy)).unwrap();
+        assert_eq!(ranges.as_slice().len(), 1);
+        assert_eq!(ranges.as_slice()[0], 4..4096);
+        update.range = 0..8192; // An inconsistent envelope must not hide lost intervals.
+        assert!(ir_buffer_upload_ranges(Some(7), 9, 8192, Some(&update)).is_err());
+    }
+
+    #[test]
+    fn interval_overflow_forces_complete_physical_repair() {
+        let mut update = IrBufferUpdate::sparse(7, 0..4);
+        for index in 1..=crate::driver::MAX_BUFFER_DIRTY_INTERVALS {
+            update.include_range(index * 8..index * 8 + 4);
+        }
+        assert!(update.intervals.as_ref().unwrap().ranges().is_empty());
+        let ranges = ir_buffer_upload_ranges(Some(7), 9, 8192, Some(&update)).unwrap();
+        assert_eq!(ranges.as_slice().len(), 1);
+        assert_eq!(ranges.as_slice()[0], 0..8192);
     }
 
     #[test]

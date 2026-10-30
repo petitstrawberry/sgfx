@@ -545,11 +545,124 @@ pub(crate) struct IrBufferSpec {
 }
 
 /// Cumulative byte changes since `previous_revision`, an exact physical base.
-/// The range covers every accepted CPU update through the current revision.
+/// `range` is the compatible envelope. Optional intervals omit unwritten gaps;
+/// an empty interval list requires full repair after tracking overflows.
 #[derive(Clone)]
 pub(crate) struct IrBufferUpdate {
     pub(crate) previous_revision: u64,
     pub(crate) range: core::ops::Range<usize>,
+    pub(crate) intervals: Option<IrBufferIntervals>,
+}
+
+pub(crate) const MAX_BUFFER_DIRTY_INTERVALS: usize = 128;
+
+/// Nonempty lists always reserve the complete bound before admission. This
+/// permits cumulative merging at accepted publication without allocating.
+pub(crate) struct IrBufferIntervals {
+    ranges: Vec<core::ops::Range<usize>>,
+}
+
+impl Clone for IrBufferIntervals {
+    fn clone(&self) -> Self {
+        let mut ranges = Vec::new();
+        if !self.ranges.is_empty() && ranges.try_reserve_exact(MAX_BUFFER_DIRTY_INTERVALS).is_ok() {
+            ranges.extend_from_slice(&self.ranges);
+        }
+        // Allocation failure conservatively produces the full-repair marker.
+        Self { ranges }
+    }
+}
+
+impl IrBufferIntervals {
+    fn new(range: core::ops::Range<usize>) -> Self {
+        let mut intervals = Self { ranges: Vec::new() };
+        if intervals
+            .ranges
+            .try_reserve_exact(MAX_BUFFER_DIRTY_INTERVALS)
+            .is_ok()
+            && let Some(range) = Self::aligned(range)
+        {
+            intervals.ranges.push(range);
+        }
+        intervals
+    }
+
+    fn aligned(range: core::ops::Range<usize>) -> Option<core::ops::Range<usize>> {
+        (range.start < range.end).then_some(())?;
+        Some((range.start & !3)..(range.end.checked_add(3)? & !3))
+    }
+
+    pub(crate) fn ranges(&self) -> &[core::ops::Range<usize>] {
+        &self.ranges
+    }
+
+    fn include(&mut self, range: core::ops::Range<usize>) {
+        if self.ranges.is_empty() {
+            return; // Full repair remains sticky until accepted preparation.
+        }
+        let Some(mut range) = Self::aligned(range) else {
+            self.ranges.clear();
+            return;
+        };
+        let first = self.ranges.partition_point(|old| old.end < range.start);
+        let last = first + self.ranges[first..].partition_point(|old| old.start <= range.end);
+        if first < last {
+            range.start = range.start.min(self.ranges[first].start);
+            range.end = range.end.max(self.ranges[last - 1].end);
+            self.ranges.drain(first..last);
+        } else if self.ranges.len() == MAX_BUFFER_DIRTY_INTERVALS {
+            self.ranges.clear();
+            return;
+        }
+        debug_assert!(self.ranges.capacity() >= MAX_BUFFER_DIRTY_INTERVALS);
+        self.ranges.insert(first, range);
+    }
+}
+
+impl IrBufferUpdate {
+    pub(crate) fn sparse(previous_revision: u64, range: core::ops::Range<usize>) -> Self {
+        Self {
+            previous_revision,
+            intervals: Some(IrBufferIntervals::new(range.clone())),
+            range,
+        }
+    }
+
+    pub(crate) fn include_range(&mut self, range: core::ops::Range<usize>) {
+        self.range.start = self.range.start.min(range.start);
+        self.range.end = self.range.end.max(range.end);
+        if let Some(intervals) = &mut self.intervals {
+            intervals.include(range);
+        }
+    }
+
+    /// Called only when the earlier delta ends at our immediate predecessor.
+    /// All storage is already reserved, including on the publication path.
+    pub(crate) fn merge_previous(&mut self, previous: &Self) {
+        self.previous_revision = previous.previous_revision;
+        self.range.start = self.range.start.min(previous.range.start);
+        self.range.end = self.range.end.max(previous.range.end);
+        if previous
+            .intervals
+            .as_ref()
+            .is_some_and(|ranges| ranges.ranges.is_empty())
+        {
+            if let Some(intervals) = &mut self.intervals {
+                intervals.ranges.clear();
+            } else {
+                self.intervals = Some(IrBufferIntervals { ranges: Vec::new() });
+            }
+        } else if let Some(intervals) = &mut self.intervals {
+            if let Some(earlier) = &previous.intervals {
+                for range in &earlier.ranges {
+                    intervals.include(range.clone());
+                }
+            } else {
+                intervals.include(previous.range.clone());
+            }
+        }
+        // A general planner's absent interval list keeps the envelope fallback.
+    }
 }
 
 /// One draw's binding into a persistent canonical vertex buffer.
@@ -1025,7 +1138,7 @@ mod tests {
         GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_QUEUE, GPU_RESULT_SUCCESS, GpuQueryInfo,
     };
 
-    use super::Device;
+    use super::{Device, IrBufferUpdate, MAX_BUFFER_DIRTY_INTERVALS};
     use crate::{BACKEND_ID, matches_backend_id};
 
     #[test]
@@ -1035,6 +1148,75 @@ mod tests {
         assert!(!matches_backend_id(b"apple-agx"));
         assert!(!matches_backend_id(b""));
         assert!(!matches_backend_id(b"software"));
+    }
+
+    #[test]
+    fn dirty_intervals_align_coalesce_and_merge_without_allocating() {
+        let mut update = IrBufferUpdate::sparse(7, 5..6);
+        let pointer = update.intervals.as_ref().unwrap().ranges.as_ptr();
+        update.include_range(8..9);
+        update.include_range(20..21);
+        assert_eq!(
+            update.intervals.as_ref().unwrap().ranges(),
+            &[4..12, 20..24]
+        );
+        update.include_range(13..17);
+        assert_eq!(update.intervals.as_ref().unwrap().ranges().len(), 1);
+        assert_eq!(update.intervals.as_ref().unwrap().ranges()[0], 4..24);
+        assert_eq!(update.range, 5..21);
+        let earlier = IrBufferUpdate::sparse(5, 40..44);
+        update.merge_previous(&earlier);
+        assert_eq!(update.previous_revision, 5);
+        assert_eq!(
+            update.intervals.as_ref().unwrap().ranges(),
+            &[4..24, 40..44]
+        );
+        assert_eq!(update.intervals.as_ref().unwrap().ranges.as_ptr(), pointer);
+        let mut cloned = update.clone();
+        let pointer = cloned.intervals.as_ref().unwrap().ranges.as_ptr();
+        cloned.include_range(100..104);
+        assert_eq!(cloned.intervals.as_ref().unwrap().ranges.as_ptr(), pointer);
+        assert_eq!(cloned.intervals.as_ref().unwrap().ranges().len(), 3);
+        assert_eq!(update.intervals.as_ref().unwrap().ranges().len(), 2);
+    }
+
+    #[test]
+    fn dirty_interval_overflow_is_sticky_and_general_plans_keep_the_envelope() {
+        let mut update = IrBufferUpdate::sparse(7, 0..4);
+        for index in 1..MAX_BUFFER_DIRTY_INTERVALS {
+            update.include_range(index * 8..index * 8 + 4);
+        }
+        assert_eq!(
+            update.intervals.as_ref().unwrap().ranges().len(),
+            MAX_BUFFER_DIRTY_INTERVALS
+        );
+        let pointer = update.intervals.as_ref().unwrap().ranges.as_ptr();
+        // A touching interval at capacity still coalesces without overflow.
+        update.include_range(1020..1024);
+        assert_eq!(
+            update.intervals.as_ref().unwrap().ranges().len(),
+            MAX_BUFFER_DIRTY_INTERVALS
+        );
+        update.include_range(1032..1036);
+        assert!(update.intervals.as_ref().unwrap().ranges().is_empty());
+        update.include_range(0..2048);
+        assert!(update.intervals.as_ref().unwrap().ranges().is_empty());
+        assert_eq!(update.intervals.as_ref().unwrap().ranges.as_ptr(), pointer);
+        let mut next = IrBufferUpdate::sparse(8, 4096..4100);
+        next.merge_previous(&update);
+        assert_eq!(next.previous_revision, 7);
+        assert!(next.intervals.as_ref().unwrap().ranges().is_empty());
+
+        let mut general = IrBufferUpdate {
+            previous_revision: 9,
+            range: 5000..5004,
+            intervals: None,
+        };
+        general.merge_previous(&IrBufferUpdate::sparse(8, 4000..4004));
+        assert!(general.intervals.is_none());
+        assert_eq!(general.range, 4000..5004);
+        general.merge_previous(&update);
+        assert!(general.intervals.as_ref().unwrap().ranges().is_empty());
     }
 
     #[test]

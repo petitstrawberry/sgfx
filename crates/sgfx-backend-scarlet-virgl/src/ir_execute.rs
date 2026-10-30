@@ -580,9 +580,7 @@ impl BufferShadow {
             && update.previous_revision == self.revision
             && previous.previous_revision < self.revision
         {
-            update.previous_revision = previous.previous_revision;
-            update.range.start = update.range.start.min(previous.range.start);
-            update.range.end = update.range.end.max(previous.range.end);
+            update.merge_previous(previous);
         }
         update
     }
@@ -897,8 +895,7 @@ impl<'a> BufferOnlyPlan<'a> {
             .map_err(|_| IrSubmitError::OutOfMemory)?;
         if let Some(update) = self.updates.iter_mut().find(|update| update.slot == slot) {
             update.length = update.length.max(end);
-            update.upload.range.start = update.upload.range.start.min(changed.start);
-            update.upload.range.end = update.upload.range.end.max(changed.end);
+            update.upload.include_range(changed.clone());
         } else {
             let shadow = &shadows[slot];
             let revision = shadow
@@ -912,10 +909,7 @@ impl<'a> BufferOnlyPlan<'a> {
                 slot,
                 revision,
                 length: end.max(shadow.bytes.as_ref().map_or(0, Vec::len)),
-                upload: driver::IrBufferUpdate {
-                    previous_revision: shadow.revision,
-                    range: changed.clone(),
-                },
+                upload: driver::IrBufferUpdate::sparse(shadow.revision, changed.clone()),
                 fresh: None,
             });
         }
@@ -1131,6 +1125,7 @@ impl PendingBuffers {
                     upload: driver::IrBufferUpdate {
                         previous_revision,
                         range: changed,
+                        intervals: None,
                     },
                 });
                 self.updates.last_mut().ok_or(IrSubmitError::OutOfMemory)?
@@ -4471,6 +4466,7 @@ mod tests {
             upload: Some(driver::IrBufferUpdate {
                 previous_revision: 6,
                 range: 0..4,
+                intervals: None,
             }),
         }
     }
@@ -4969,6 +4965,105 @@ mod tests {
         assert_eq!(shadows[0].revision, 11);
         assert_eq!(shadows[0].upload.as_ref().unwrap().previous_revision, 10);
         assert_eq!(shadows[0].upload.as_ref().unwrap().range, 56..60);
+    }
+
+    #[test]
+    fn sparse_intervals_survive_accepted_revisions_and_rejected_preparation() {
+        let mut shadows = [range_test_shadow(vec![3; 65536])];
+        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
+        let pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
+        for offset in [4, 60000] {
+            let mut plan = BufferOnlyPlan::default();
+            plan.write(&shadows, 0, offset, Cow::Borrowed(&[9; 4]))
+                .unwrap();
+            plan.reserve(&mut shadows)
+                .unwrap()
+                .publish(&mut shadows, Ok(()))
+                .unwrap();
+        }
+        let (bytes, upload) = shadows[0].for_draw(None).unwrap();
+        let upload = upload.unwrap();
+        assert_eq!(upload.previous_revision, 7);
+        assert_eq!(shadows[0].revision, 9);
+        assert_eq!(upload.range, 4..60004);
+        assert_eq!(
+            upload.intervals.as_ref().unwrap().ranges(),
+            &[4..8, 60000..60004]
+        );
+        assert_eq!(
+            upload
+                .intervals
+                .as_ref()
+                .unwrap()
+                .ranges()
+                .iter()
+                .map(|range| range.len())
+                .sum::<usize>(),
+            8
+        );
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert!(bytes[8..60000].iter().all(|byte| *byte == 3));
+        for busy in [false, true] {
+            let mut plan = BufferOnlyPlan::default();
+            plan.write(&shadows, 0, 30000, Cow::Borrowed(&[7; 4]))
+                .unwrap();
+            let prepared = plan.reserve(&mut shadows).unwrap();
+            let error = if busy {
+                IrSubmitError::Backend(HandleError::OutOfResources)
+            } else {
+                IrSubmitError::InvalidVertexData
+            };
+            assert!(prepared.publish(&mut shadows, Err(error)).is_err());
+            assert_eq!(shadows[0].revision, 9);
+            assert_eq!(&shadows[0].bytes.as_ref().unwrap()[30000..30004], &[3; 4]);
+            assert_eq!(
+                shadows[0]
+                    .upload
+                    .as_ref()
+                    .unwrap()
+                    .intervals
+                    .as_ref()
+                    .unwrap()
+                    .ranges(),
+                &[4..8, 60000..60004]
+            );
+        }
+        assert!(
+            commit_prepared_buffer_updates(
+                &mut shadows,
+                Vec::new(),
+                &[0],
+                Err(IrSubmitError::Backend(HandleError::OutOfResources))
+            )
+            .is_err()
+        );
+        assert_eq!(
+            shadows[0]
+                .upload
+                .as_ref()
+                .unwrap()
+                .intervals
+                .as_ref()
+                .unwrap()
+                .ranges(),
+            &[4..8, 60000..60004]
+        );
+        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
+        assert!(shadows[0].upload.is_none());
+        let mut next = BufferOnlyPlan::default();
+        next.write(&shadows, 0, 32000, Cow::Borrowed(&[6; 4]))
+            .unwrap();
+        next.reserve(&mut shadows)
+            .unwrap()
+            .publish(&mut shadows, Ok(()))
+            .unwrap();
+        let upload = shadows[0].upload.as_ref().unwrap();
+        assert_eq!(upload.previous_revision, 9);
+        assert_eq!(upload.intervals.as_ref().unwrap().ranges().len(), 1);
+        assert_eq!(upload.intervals.as_ref().unwrap().ranges()[0], 32000..32004);
+        shadows[0].clear();
+        assert!(shadows[0].upload.is_none());
+        assert_eq!(shadows[0].revision, 0);
     }
 
     #[test]

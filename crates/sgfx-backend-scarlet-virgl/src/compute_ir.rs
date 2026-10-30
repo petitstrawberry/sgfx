@@ -644,13 +644,20 @@ mod tests {
     #[test]
     fn compute_shadow_replacement_discards_graphics_delta_and_validation() {
         let mut shadow = BufferShadow::default();
-        shadow.replace(
-            vec![3; 64],
-            9,
-            Some(driver::IrBufferUpdate {
-                previous_revision: 8,
-                range: 4..8,
-            }),
+        let mut upload = driver::IrBufferUpdate::sparse(8, 4..8);
+        upload.include_range(20..24);
+        shadow.replace(vec![3; 64], 9, Some(upload));
+        assert_eq!(
+            shadow
+                .upload
+                .as_ref()
+                .unwrap()
+                .intervals
+                .as_ref()
+                .unwrap()
+                .ranges()
+                .len(),
+            2
         );
         let mut canonical_revision = Some(9);
         let mut computed = vec![3; 64];
