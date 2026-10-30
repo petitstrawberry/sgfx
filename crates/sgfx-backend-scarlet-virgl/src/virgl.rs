@@ -26,11 +26,11 @@ use std::{
 use crate::completion::SubmitMode;
 use crate::dispatch::NativeScheduler;
 use crate::driver::{
-    IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrBufferUpdate,
-    IrCompareFunction, IrConstantBuffer, IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram,
-    IrFrontFace, IrPipelineState, IrProgrammablePipeline, IrSamplerState, IrSubmission,
-    IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload, IrUniforms, IrVertex,
-    MAX_IR_VERTICES,
+    IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSource, IrBufferSpec,
+    IrBufferUpdate, IrCompareFunction, IrConstantBuffer, IrCullMode, IrDraw, IrFilterMode,
+    IrFragmentProgram, IrFrontFace, IrPipelineState, IrProgrammablePipeline, IrSamplerState,
+    IrSubmission, IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload, IrUniforms,
+    IrVertex, MAX_IR_VERTICES,
 };
 use crate::packets::UPLOAD_ARENA_COUNT;
 use crate::{
@@ -2086,7 +2086,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         spec: IrBufferSpec,
-        bytes: &[u8],
+        source: &IrBufferSource<'_>,
         update: Option<&IrBufferUpdate>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
@@ -2094,9 +2094,9 @@ impl Queue {
             || resources.context_handle != context.handle_id()
             || spec.size == 0
             || spec.size > u64::from(u32::MAX)
-            || bytes.is_empty()
-            || !bytes.len().is_multiple_of(core::mem::size_of::<u32>())
-            || u64::try_from(bytes.len()).map_or(true, |length| length > spec.size)
+            || source.len() == 0
+            || !source.len().is_multiple_of(core::mem::size_of::<u32>())
+            || u64::try_from(source.len()).map_or(true, |length| length > spec.size)
         {
             return Err(HandleError::InvalidParameter);
         }
@@ -2108,7 +2108,7 @@ impl Queue {
             return Ok(());
         }
         let ranges =
-            ir_buffer_upload_ranges(uploaded_revision, spec.revision, bytes.len(), update)?;
+            ir_buffer_upload_ranges(uploaded_revision, spec.revision, source.len(), update)?;
         #[cfg(feature = "profile-submissions")]
         let prepare_started = std::time::Instant::now();
         self.prepare_ir_upload_arena(context, resources, mode)?;
@@ -2131,6 +2131,20 @@ impl Queue {
         commands
             .try_reserve_exact(self.max_command_size())
             .map_err(|_| HandleError::OutOfResources)?;
+        let scratch_capacity = if matches!(source, IrBufferSource::Contiguous(_)) {
+            0
+        } else {
+            ranges
+                .as_slice()
+                .iter()
+                .map(|range| range.len().min(max_payload))
+                .max()
+                .unwrap_or(0)
+        };
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(scratch_capacity)
+            .map_err(|_| HandleError::OutOfResources)?;
         // A failed synchronous prefix may have changed physical bytes. Until
         // every packet succeeds, a later submission must repair the full
         // initialized shadow. Tracked rejection restores its cache snapshot.
@@ -2139,9 +2153,13 @@ impl Queue {
             let mut offset = range.start;
             while offset < range.end {
                 let end = offset.saturating_add(max_payload).min(range.end);
-                let chunk = bytes
-                    .get(offset..end)
-                    .ok_or(HandleError::InvalidParameter)?;
+                let chunk = if let Some(bytes) = source.direct_range(offset..end) {
+                    bytes
+                } else {
+                    scratch.resize(end - offset, 0);
+                    source.copy_range(offset..end, &mut scratch)?;
+                    &scratch
+                };
                 // Rotate before choosing arena offsets, but reserve only this
                 // packet's bytes so small intervals share a native chunk.
                 mode.prepare_packet(fixed_bytes + chunk.len())?;
@@ -2165,7 +2183,7 @@ impl Queue {
             // Include tiny deltas into large native buffers, without logging
             // every small uniform upload or unchanged draw binding. Tracked
             // bytes are staged here; final checkpoint acceptance is separate.
-            if bytes.len() >= 1024 * 1024 || prepare_us >= 50_000 {
+            if source.len() >= 1024 * 1024 || prepare_us >= 50_000 {
                 use std::io::Write;
                 let _ = writeln!(
                     std::io::stderr().lock(),
@@ -2181,7 +2199,7 @@ impl Queue {
                         .iter()
                         .map(|range| range.len())
                         .sum::<usize>(),
-                    bytes.len(),
+                    source.len(),
                     prepare_us,
                     ranges.as_slice().len(),
                     ranges.as_slice().last().unwrap().end - ranges.as_slice()[0].start,
@@ -2547,14 +2565,13 @@ impl Queue {
                     let mut setup = Vec::new();
                     push_programmable_pipeline(&mut setup, native)?;
                     for range in command_packet_ranges(&setup, self.max_command_size())? {
-                        mode.prepare_packet(self.max_command_size())?;
+                        mode.prepare_packet(range.len())?;
                         mode.submit(&self.raw, &setup[range])?;
                     }
                     native.initialized.set(true);
                 }
             }
         }
-        mode.prepare_packet(self.max_command_size())?;
         if !submission.vertices.is_empty() {
             self.prepare_ir_upload_arena(context, resources, mode)?;
         }
@@ -2770,14 +2787,16 @@ impl Queue {
                 )?;
             }
         }
-        if !submission.vertices.is_empty() {
+        let vertex_upload = if !submission.vertices.is_empty() {
             push_ir_inline_write(
                 &mut commands,
                 resources.vertex_resource_id,
                 &submission.vertices,
-                mode,
-            )?;
-        }
+                mode.is_tracked(),
+            )?
+        } else {
+            None
+        };
 
         // Re-emitting the complete state for every draw used to make a pass
         // exceed the queue's 64 KiB opaque-command limit even when the vertex
@@ -2933,6 +2952,17 @@ impl Queue {
 
         for upload in &submission.texture_uploads {
             self.upload_ir_texture(context, resources, upload.texture, upload, mode)?;
+        }
+        // Choose the staging range only after uploads and exact packet sizing.
+        // Reserving the transport maximum here used to force one native fence
+        // per pass, even for a few hundred bytes of drawing commands. Choosing
+        // the arena earlier also let intervening texture packets rotate it.
+        mode.prepare_packet(commands.len())?;
+        if let Some(upload) = vertex_upload {
+            let (resource, offset) = mode
+                .upload_range(upload.byte_len)?
+                .ok_or(HandleError::InvalidParameter)?;
+            upload.bind(&mut commands, resource, offset);
         }
         mode.submit(&self.raw, &commands)?;
         if !resources.initialized.get() {
@@ -5424,12 +5454,33 @@ fn push_ir_clear_surface(
     Ok(())
 }
 
+struct PendingVertexUpload {
+    inline_start: usize,
+    copy_start: usize,
+    byte_len: u32,
+}
+
+impl PendingVertexUpload {
+    fn bind(self, commands: &mut [u8], resource: u32, offset: u32) {
+        // Both command records were emitted together below. Patch only their
+        // staging source; the vertex payload and final destination stay put.
+        for (word, value) in [
+            (self.inline_start + 4, resource),
+            (self.inline_start + 24, offset),
+            (self.copy_start + 24, resource),
+            (self.copy_start + 32, offset),
+        ] {
+            commands[word..word + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    }
+}
+
 fn push_ir_inline_write(
     commands: &mut Vec<u8>,
     resource_id: u32,
     vertices: &[IrVertex],
-    mode: &mut SubmitMode,
-) -> HandleResult<()> {
+    staged: bool,
+) -> HandleResult<Option<PendingVertexUpload>> {
     let components = vertices
         .len()
         .checked_mul(10)
@@ -5440,17 +5491,16 @@ fn push_ir_inline_write(
         .checked_mul(40)
         .and_then(|length| u32::try_from(length).ok())
         .ok_or(HandleError::InvalidParameter)?;
+    let inline_start = commands.len();
     push_dword(
         commands,
         command_header(VIRGL_CCMD_RESOURCE_INLINE_WRITE, 0, 11 + components),
     );
-    let upload = mode.upload_range(byte_len)?;
-    let (upload_resource, upload_offset) = upload.unwrap_or((resource_id, 0));
-    push_dword(commands, upload_resource);
+    push_dword(commands, resource_id);
     for _ in 0..4 {
         push_dword(commands, 0);
     }
-    push_dword(commands, upload_offset);
+    push_dword(commands, 0);
     for _ in 0..2 {
         push_dword(commands, 0);
     }
@@ -5468,17 +5518,16 @@ fn push_ir_inline_write(
             push_float(commands, component);
         }
     }
-    if upload.is_some() {
-        push_ir_buffer_copy(
-            commands,
-            resource_id,
-            0,
-            upload_resource,
-            upload_offset,
+    if staged {
+        let copy_start = commands.len();
+        push_ir_buffer_copy(commands, resource_id, 0, resource_id, 0, byte_len);
+        return Ok(Some(PendingVertexUpload {
+            inline_start,
+            copy_start,
             byte_len,
-        );
+        }));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn push_ir_buffer_upload(
@@ -7298,6 +7347,69 @@ mod tests {
         }
         assert_eq!(&recovered[..source.len()], source.as_bytes());
         assert!(recovered[source.len()..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn staged_vertex_packets_share_chunks_without_aliasing_and_rotate_after_texture_uploads() {
+        let mut packets = crate::packets::Packets::new(512);
+        // A preceding texture packet has already consumed half this chunk.
+        packets.append(&[0x7b; 256]).unwrap();
+        let vertex = IrVertex {
+            position: [1.0, 2.0, 3.0, 4.0],
+            secondary: [5.0, 6.0, 7.0, 8.0],
+            tertiary: [9.0, 10.0],
+        };
+        let mut encoded = Vec::new();
+        for _ in 0..3 {
+            let mut commands = Vec::new();
+            let upload = push_ir_inline_write(&mut commands, 17, &[vertex], true)
+                .unwrap()
+                .unwrap();
+            packets.prepare(commands.len()).unwrap();
+            let (arena, offset) = packets.upload_range(upload.byte_len).unwrap();
+            upload.bind(&mut commands, 100 + arena as u32, offset);
+            let words = dwords(&commands);
+            // Inline writes and GPU copies must use the same disjoint source.
+            assert_eq!(words[1], 100 + arena as u32);
+            assert_eq!(words[6], offset);
+            assert_eq!(words[23], 17);
+            assert_eq!(words[28], 100 + arena as u32);
+            assert_eq!(words[30], offset);
+            assert_eq!(words[33], 40);
+            assert_eq!(
+                &commands[48..88],
+                &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,]
+                    .map(f32::to_ne_bytes)
+                    .concat()
+            );
+            encoded.push((arena, offset));
+            packets.append(&commands).unwrap();
+        }
+        assert_eq!(encoded, [(0, 0), (1, 0), (1, 40)]);
+        let chunks = packets.finish().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].arena, Some(0));
+        assert_eq!(chunks[1].arena, Some(1));
+        assert_eq!(chunks[0].bytes.len(), 400);
+        assert_eq!(chunks[1].bytes.len(), 288);
+    }
+
+    #[test]
+    fn synchronous_vertex_packet_writes_final_buffer_without_staging_copy() {
+        let vertex = IrVertex {
+            position: [0.0; 4],
+            secondary: [0.0; 4],
+            tertiary: [0.0; 2],
+        };
+        let mut commands = Vec::new();
+        assert!(
+            push_ir_inline_write(&mut commands, 17, &[vertex], false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(commands.len(), 88);
+        assert_eq!(dwords(&commands)[1], 17);
+        assert_eq!(dwords(&commands)[6], 0);
     }
 
     #[test]

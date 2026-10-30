@@ -714,11 +714,10 @@ fn buffer_spec(
     buffer: BufferRef<'_>,
 ) -> Result<IrBufferSpec, IrSubmitError> {
     let descriptor = resources.resources.buffer(buffer)?;
-    let bytes = pending.bytes(resources, buffer)?;
-    if descriptor.size() > u64::from(u32::MAX)
-        || bytes.as_slice().is_empty()
-        || !bytes.as_slice().len().is_multiple_of(4)
-    {
+    let length = pending
+        .plan
+        .length(&resources.buffer_shadows, buffer.slot())?;
+    if descriptor.size() > u64::from(u32::MAX) || length == 0 || !length.is_multiple_of(4) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::VertexBuffer,
         ));
@@ -1122,13 +1121,20 @@ pub(super) fn decode_draw(
                     return Err(ir::Error::BindingLayoutMismatch.into());
                 };
                 let buffer = resources.resources.buffer_ref(buffer)?;
-                let bytes = pending.bytes(resources, buffer)?;
-                let words = uniform_words(binding, bytes.as_slice(), offset, size).inspect_err(|_error| {
+                if offset > u64::from(u32::MAX) {
+                    return Err(ir::Error::OutOfBounds.into());
+                }
+                let start = usize::try_from(offset).map_err(|_| ir::Error::Overflow)?;
+                let end = start
+                    .checked_add(binding.required_size as usize)
+                    .ok_or(ir::Error::Overflow)?;
+                let bytes = pending.range(resources, buffer, start..end)?;
+                let words = uniform_words(binding, bytes.as_ref(), 0, size).inspect_err(|_error| {
                     #[cfg(feature = "std")]
                     if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                         eprintln!(
                             "[SGFX VirGL] uniform snapshot failed: {_error:?} stage={:?} group={} binding={} declared_bytes={} required_bytes={} bound_bytes={size} offset={offset} available={}",
-                            shader.stage, binding.group, binding.binding, binding.size, binding.required_size, bytes.as_slice().len(),
+                            shader.stage, binding.group, binding.binding, binding.size, binding.required_size, bytes.len(),
                         );
                     }
                 })?;
@@ -1149,7 +1155,6 @@ pub(super) fn decode_draw(
         .ok_or(ir::Error::Overflow)?;
     let index_buffer = if let Some(base_vertex) = base_vertex {
         let (buffer, offset, format) = pass.index_buffer.ok_or(ir::Error::IndexBufferNotSet)?;
-        let bytes = pending.bytes(resources, buffer)?;
         let size = format.byte_size();
         let start = offset
             .checked_add(u64::from(first) * size)
@@ -1157,13 +1162,12 @@ pub(super) fn decode_draw(
         let end = start
             .checked_add(u64::from(count) * size)
             .ok_or(ir::Error::Overflow)?;
-        let range = bytes
-            .as_slice()
-            .get(
-                usize::try_from(start).map_err(|_| ir::Error::Overflow)?
-                    ..usize::try_from(end).map_err(|_| ir::Error::Overflow)?,
-            )
-            .ok_or(ir::Error::OutOfBounds)?;
+        let range = pending.range(
+            resources,
+            buffer,
+            usize::try_from(start).map_err(|_| ir::Error::Overflow)?
+                ..usize::try_from(end).map_err(|_| ir::Error::Overflow)?,
+        )?;
         maximum_vertex = 0;
         for index in range.chunks_exact(size as usize) {
             let index = match format {
@@ -1189,7 +1193,9 @@ pub(super) fn decode_draw(
     let mut vertex_buffers = [None; 8];
     for (slot, layout) in pipeline.vertex_buffers().iter().enumerate() {
         let (buffer, offset) = pass.vertex_buffers[slot].ok_or(ir::Error::VertexBufferNotSet)?;
-        let bytes = pending.bytes(resources, buffer)?;
+        let length = pending
+            .plan
+            .length(&resources.buffer_shadows, buffer.slot())?;
         let attribute_end = layout
             .attributes()
             .iter()
@@ -1204,13 +1210,13 @@ pub(super) fn decode_draw(
             instance_count,
             attribute_end,
         )?;
-        if end > bytes.as_slice().len() as u64 {
+        if end > length as u64 {
             #[cfg(feature = "std")]
             if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                 eprintln!(
                     "[SGFX VirGL] vertex shadow out of bounds: slot={slot} offset={offset} maximum_vertex={maximum_vertex} first_instance={first_instance} instance_count={instance_count} stride={} attribute_end={attribute_end} end={end} available={}",
                     layout.stride(),
-                    bytes.as_slice().len(),
+                    length,
                 );
             }
             return Err(ir::Error::OutOfBounds.into());

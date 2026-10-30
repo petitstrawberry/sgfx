@@ -13,10 +13,11 @@ use sgfx_core::backend::SubmitError;
 
 use crate::completion::SubmitMode;
 use crate::driver::{
-    self, IrAddressMode, IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec,
-    IrCompareFunction, IrCullMode, IrDepthState, IrDraw, IrFilterMode, IrFragmentProgram,
-    IrFrontFace, IrPipelineState, IrRect, IrSamplerState, IrSubmission, IrTextureFormat,
-    IrTextureUpload, IrUniforms, IrVertex, IrVertexBufferBinding, MAX_IR_VERTICES,
+    self, IrAddressMode, IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferOverlay,
+    IrBufferSource, IrBufferSpec, IrCompareFunction, IrCullMode, IrDepthState, IrDraw,
+    IrFilterMode, IrFragmentProgram, IrFrontFace, IrPipelineState, IrRect, IrSamplerState,
+    IrSubmission, IrTextureFormat, IrTextureUpload, IrUniforms, IrVertex, IrVertexBufferBinding,
+    MAX_IR_VERTICES,
 };
 use crate::ir::{
     self, AddressMode, BlendComponent, BlendFactor, BlendOp, BlendState, BufferRef, BufferUsage,
@@ -543,6 +544,23 @@ fn ensure_submission_usable(failed: bool) -> Result<(), IrSubmitError> {
     }
 }
 
+fn validate_ir_submission_state(
+    usable: Result<(), IrSubmitError>,
+    same_table: bool,
+    resource_context_id: i32,
+    context_id: i32,
+    queue_context_id: i32,
+) -> Result<(), IrSubmitError> {
+    usable?;
+    if !same_table {
+        return Err(IrSubmitError::ResourceTableMismatch);
+    }
+    if resource_context_id != context_id || queue_context_id != resource_context_id {
+        return Err(IrSubmitError::ContextMismatch);
+    }
+    Ok(())
+}
+
 // A failed fenced cleanup may have destroyed an accepted prefix. Never
 // restore cached CREATE flags or retry its object ids in the same resources.
 fn run_retirement(
@@ -589,16 +607,11 @@ impl BufferShadow {
         *self = Self::default();
     }
 
+    #[cfg(test)]
     fn for_draw<'a>(
         &'a self,
-        pending: Option<&'a BufferShadowUpdate>,
+        _pending: Option<&'a BufferRangeUpdate>,
     ) -> Result<(&'a [u8], Option<driver::IrBufferUpdate>), IrSubmitError> {
-        if let Some(update) = pending {
-            return Ok((
-                &update.bytes,
-                Some(self.merged_upload(update.upload.clone())),
-            ));
-        }
         Ok((
             self.bytes
                 .as_deref()
@@ -608,29 +621,23 @@ impl BufferShadow {
     }
 }
 
+#[cfg(test)]
 fn commit_buffer_updates(
     shadows: &mut [BufferShadow],
-    updates: Vec<BufferShadowUpdate>,
+    plan: BufferOnlyPlan<'_>,
     acceptance: Result<(), IrSubmitError>,
 ) -> Result<(), IrSubmitError> {
-    // A tracked checkpoint can reject or report Busy after planning. Neither
-    // result may replace the accepted bytes, revision, or retained delta.
-    acceptance?;
-    for update in updates {
-        if let Some(shadow) = shadows.get_mut(update.slot) {
-            shadow.replace(update.bytes, update.revision, Some(update.upload));
-        }
-    }
-    Ok(())
+    plan.reserve(shadows)?.publish(shadows, acceptance)
 }
 
+#[cfg(test)]
 fn commit_prepared_buffer_updates(
     shadows: &mut [BufferShadow],
-    updates: Vec<BufferShadowUpdate>,
+    plan: BufferOnlyPlan<'_>,
     prepared: &[usize],
     acceptance: Result<(), IrSubmitError>,
 ) -> Result<(), IrSubmitError> {
-    commit_buffer_updates(shadows, updates, acceptance)?;
+    plan.reserve(shadows)?.publish(shadows, acceptance)?;
     // Preparation only staged packets. Clear the accumulated range after the
     // final checkpoint accepts them, including when preparation skipped an
     // already-current physical buffer. Busy/rejection retain the entire chain.
@@ -642,15 +649,9 @@ fn commit_prepared_buffer_updates(
     Ok(())
 }
 
-struct BufferShadowUpdate {
-    slot: usize,
-    revision: u64,
-    bytes: Vec<u8>,
-    upload: driver::IrBufferUpdate,
-}
-
-struct PendingBuffers {
-    updates: Vec<BufferShadowUpdate>,
+#[derive(Default)]
+struct PendingBuffers<'a> {
+    plan: BufferOnlyPlan<'a>,
     canonical_validations: Vec<(usize, u64)>,
 }
 
@@ -675,8 +676,9 @@ struct BufferRangeUpdate {
     fresh: Option<Vec<u8>>,
 }
 
-/// Buffer-only streams have no physical upload before their checkpoint. Keep
-/// accepted shadows intact while validating an ordered, sparse write overlay.
+/// Ordered writes layered over accepted shadows. The base stays immutable until
+/// publication, so both buffer-only and drawing streams can avoid copying the
+/// complete resource for a tiny update.
 #[derive(Default)]
 struct BufferOnlyPlan<'a> {
     updates: Vec<BufferRangeUpdate>,
@@ -695,8 +697,9 @@ impl<'a> BufferOnlyPlan<'a> {
             return Ok(None);
         }
         let mut plan = Self::default();
-        // Preflight before staging anything: mixed streams keep the general
-        // execution path and its validation/materialization ordering.
+        // Preflight before staging anything. The fast path is selected only for
+        // pure buffer streams; mixed streams carry this overlay through the
+        // general render plan instead of copying their persistent shadows.
         for preflight in [true, false] {
             #[cfg(feature = "backend-abi")]
             let mut sequence = commands.command_reader();
@@ -800,6 +803,57 @@ impl<'a> BufferOnlyPlan<'a> {
         }
     }
 
+    fn length(&self, shadows: &[BufferShadow], slot: usize) -> Result<usize, IrSubmitError> {
+        let shadow_len = shadows
+            .get(slot)
+            .and_then(|shadow| shadow.bytes.as_ref())
+            .map_or(0, Vec::len);
+        Ok(self
+            .updates
+            .iter()
+            .find(|update| update.slot == slot)
+            .map_or(shadow_len, |update| update.length.max(shadow_len)))
+    }
+
+    fn source<'s>(
+        &'s self,
+        shadow: &'s BufferShadow,
+        slot: usize,
+        overlays: &'s mut Vec<IrBufferOverlay<'s>>,
+    ) -> Result<IrBufferSource<'s>, IrSubmitError> {
+        let shadow_len = shadow.bytes.as_ref().map_or(0, Vec::len);
+        let length = self
+            .updates
+            .iter()
+            .find(|update| update.slot == slot)
+            .map_or(shadow_len, |update| update.length.max(shadow_len));
+        let overlays_start = overlays.len();
+        for write in &self.writes {
+            if write.slot == slot {
+                let bytes = write.bytes();
+                overlays
+                    .try_reserve(1)
+                    .map_err(|_| IrSubmitError::OutOfMemory)?;
+                overlays.push(IrBufferOverlay {
+                    range: write.start..write.start + bytes.len(),
+                    bytes,
+                });
+            }
+        }
+        if overlays.len() == overlays_start {
+            return shadow
+                .bytes
+                .as_deref()
+                .map(IrBufferSource::Contiguous)
+                .ok_or(IrSubmitError::InvalidVertexData);
+        }
+        Ok(IrBufferSource::Sparse {
+            base: shadow.bytes.as_deref(),
+            overlays: &overlays[overlays_start..],
+            len: length,
+        })
+    }
+
     fn copy(
         &mut self,
         shadows: &[BufferShadow],
@@ -826,7 +880,7 @@ impl<'a> BufferOnlyPlan<'a> {
         shadows: &[BufferShadow],
         slot: usize,
         start: usize,
-        data: &[u8],
+        data: &'a [u8],
     ) -> Result<Option<core::ops::Range<usize>>, IrSubmitError> {
         let end = start
             .checked_add(data.len())
@@ -947,6 +1001,28 @@ impl<'a> BufferOnlyPlan<'a> {
 }
 
 impl PreparedBufferOnlyPlan<'_> {
+    fn update_for_slot(&self, slot: usize) -> Option<&BufferRangeUpdate> {
+        self.0.updates.iter().find(|update| update.slot == slot)
+    }
+
+    fn source<'s>(
+        &'s self,
+        shadow: &'s BufferShadow,
+        slot: usize,
+        overlays: &'s mut Vec<IrBufferOverlay<'s>>,
+    ) -> Result<IrBufferSource<'s>, IrSubmitError> {
+        self.0.source(shadow, slot, overlays)
+    }
+
+    fn upload_for_slot(
+        &self,
+        shadow: &BufferShadow,
+        slot: usize,
+    ) -> Option<driver::IrBufferUpdate> {
+        self.update_for_slot(slot)
+            .map(|update| shadow.merged_upload(update.upload.clone()))
+    }
+
     fn publish(
         self,
         shadows: &mut [BufferShadow],
@@ -1027,36 +1103,20 @@ fn changed_buffer_bytes(
     Ok((start + prefix).min(previous.len())..end - suffix)
 }
 
-enum BufferBytes<'pending, 'resource> {
-    Pending(&'pending [u8]),
-    Persistent(&'resource [u8]),
-}
-
-impl BufferBytes<'_, '_> {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Pending(bytes) => bytes,
-            Self::Persistent(bytes) => bytes,
-        }
-    }
-}
-
-impl PendingBuffers {
+impl<'a> PendingBuffers<'a> {
     fn new() -> Self {
-        Self {
-            updates: Vec::new(),
-            canonical_validations: Vec::new(),
-        }
+        Self::default()
     }
 
     fn write(
         &mut self,
-        resources: &IrResources,
+        table: &ResourceTable,
+        shadows: &[BufferShadow],
         buffer: BufferRef<'_>,
         offset: u64,
-        data: &[u8],
+        data: &'a [u8],
     ) -> Result<(), IrSubmitError> {
-        let descriptor = resources.resources().buffer(buffer)?;
+        let descriptor = table.buffer(buffer)?;
         if !descriptor.usage().contains(BufferUsage::COPY_DST) {
             return Err(IrSubmitError::InvalidIr(ir::Error::InvalidUsage));
         }
@@ -1069,91 +1129,20 @@ impl PendingBuffers {
         }
         let start = usize::try_from(offset).map_err(|_| IrSubmitError::InvalidVertexData)?;
         let slot = buffer.slot();
-        self.write_bytes(
-            slot,
-            resources.buffer_revision(slot)?,
-            resources.shadow(buffer)?,
-            start,
-            data,
-        )
-    }
-
-    fn write_bytes(
-        &mut self,
-        slot: usize,
-        previous_revision: u64,
-        previous: Option<&[u8]>,
-        start: usize,
-        data: &[u8],
-    ) -> Result<(), IrSubmitError> {
-        let write_end = start
-            .checked_add(data.len())
-            .ok_or(IrSubmitError::InvalidVertexData)?;
-        let current = self
-            .updates
-            .iter()
-            .find(|update| update.slot == slot)
-            .map(|update| update.bytes.as_slice())
-            .or(previous);
-        if current.and_then(|bytes| bytes.get(start..write_end)) == Some(data) {
-            // Buffer shadows are authoritative for this backend. An identical
-            // write retains its revision and needs no subsequent GPU upload.
-            return Ok(());
-        }
-        let changed = changed_buffer_bytes(current, start, data)?;
-        let update =
-            if let Some(update) = self.updates.iter_mut().find(|update| update.slot == slot) {
-                update.upload.range.start = update.upload.range.start.min(changed.start);
-                update.upload.range.end = update.upload.range.end.max(changed.end);
-                update
-            } else {
-                let bytes = if let Some(previous) = previous {
-                    Vec::from(previous)
-                } else {
-                    Vec::new()
-                };
-                let revision = previous_revision
-                    .checked_add(1)
-                    .ok_or(IrSubmitError::OutOfMemory)?;
-                self.updates
-                    .try_reserve(1)
-                    .map_err(|_| IrSubmitError::OutOfMemory)?;
-                self.updates.push(BufferShadowUpdate {
-                    slot,
-                    revision,
-                    bytes,
-                    upload: driver::IrBufferUpdate {
-                        previous_revision,
-                        range: changed,
-                        intervals: None,
-                    },
-                });
-                self.updates.last_mut().ok_or(IrSubmitError::OutOfMemory)?
-            };
-        let bytes = &mut update.bytes;
-        if bytes.len() < write_end {
-            bytes
-                .try_reserve_exact(write_end - bytes.len())
-                .map_err(|_| IrSubmitError::OutOfMemory)?;
-            bytes.resize(write_end, 0);
-        }
-        let destination = bytes
-            .get_mut(start..write_end)
-            .ok_or(IrSubmitError::InvalidVertexData)?;
-        destination.copy_from_slice(data);
-        Ok(())
+        self.plan.write(shadows, slot, start, Cow::Borrowed(data))
     }
 
     fn copy(
         &mut self,
-        resources: &IrResources,
-        source: BufferRef<'_>,
-        source_offset: u64,
-        destination: BufferRef<'_>,
-        destination_offset: u64,
+        table: &ResourceTable,
+        shadows: &[BufferShadow],
+        source: (BufferRef<'_>, u64),
+        destination: (BufferRef<'_>, u64),
         size: u64,
     ) -> Result<(), IrSubmitError> {
-        let descriptor = resources.resources().buffer(source)?;
+        let (source, source_offset) = source;
+        let (destination, destination_offset) = destination;
+        let descriptor = table.buffer(source)?;
         if !descriptor.usage().contains(BufferUsage::COPY_SRC) {
             return Err(ir::Error::InvalidUsage.into());
         }
@@ -1161,38 +1150,48 @@ impl PendingBuffers {
         if end > descriptor.size() {
             return Err(ir::Error::OutOfBounds.into());
         }
-        let mut copied = Vec::new();
-        copied
-            .try_reserve_exact(usize::try_from(size).map_err(|_| ir::Error::Overflow)?)
-            .map_err(|_| IrSubmitError::OutOfMemory)?;
-        copied.resize(size as usize, 0);
-        if let Ok(source_bytes) = self.bytes(resources, source) {
-            let bytes = source_bytes.as_slice();
-            let start = usize::try_from(source_offset).map_err(|_| ir::Error::Overflow)?;
-            if start < bytes.len() {
-                let count = copied.len().min(bytes.len() - start);
-                copied[..count].copy_from_slice(&bytes[start..start + count]);
-            }
-        }
-        self.write(resources, destination, destination_offset, &copied)
+        let source_start = usize::try_from(source_offset).map_err(|_| ir::Error::Overflow)?;
+        let destination_start =
+            usize::try_from(destination_offset).map_err(|_| ir::Error::Overflow)?;
+        let size = usize::try_from(size).map_err(|_| ir::Error::Overflow)?;
+        self.plan.copy(
+            shadows,
+            source.slot(),
+            source_start,
+            destination.slot(),
+            destination_start,
+            size,
+        )
     }
 
-    fn bytes<'pending, 'resource, 'r>(
-        &'pending self,
-        resources: &'resource IrResources,
+    fn range<'resources, 'r>(
+        &'resources self,
+        resources: &'resources IrResources,
         buffer: BufferRef<'r>,
-    ) -> Result<BufferBytes<'pending, 'resource>, IrSubmitError> {
-        if let Some(update) = self
-            .updates
-            .iter()
-            .find(|update| update.slot == buffer.slot())
-        {
-            return Ok(BufferBytes::Pending(&update.bytes));
+        range: core::ops::Range<usize>,
+    ) -> Result<Cow<'resources, [u8]>, IrSubmitError> {
+        let slot = buffer.slot();
+        let length = self.plan.length(&resources.buffer_shadows, slot)?;
+        if range.start > range.end || range.end > length {
+            return Err(IrSubmitError::InvalidVertexData);
         }
-        resources
-            .shadow(buffer)?
-            .map(BufferBytes::Persistent)
-            .ok_or(IrSubmitError::InvalidVertexData)
+        let base = resources.shadow(buffer)?;
+        let overlaps = self.plan.writes.iter().any(|write| {
+            write.slot == slot
+                && write.start < range.end
+                && write.start + write.bytes().len() > range.start
+        });
+        if !overlaps && let Some(bytes) = base.and_then(|bytes| bytes.get(range.clone())) {
+            return Ok(Cow::Borrowed(bytes));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(range.len())
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        bytes.resize(range.len(), 0);
+        self.plan
+            .read_range(&resources.buffer_shadows, slot, range.start, &mut bytes);
+        Ok(Cow::Owned(bytes))
     }
 
     fn revision(
@@ -1200,7 +1199,8 @@ impl PendingBuffers {
         resources: &IrResources,
         buffer: BufferRef<'_>,
     ) -> Result<u64, IrSubmitError> {
-        self.updates
+        self.plan
+            .updates
             .iter()
             .find(|update| update.slot == buffer.slot())
             .map(|update| update.revision)
@@ -1231,12 +1231,31 @@ impl PendingBuffers {
         }
         Ok(())
     }
+
+    fn validate_canonical(
+        &self,
+        resources: &IrResources,
+        buffer: BufferRef<'_>,
+    ) -> Result<(), IrSubmitError> {
+        let slot = buffer.slot();
+        let length = self.plan.length(&resources.buffer_shadows, slot)?;
+        if length == 0 || !length.is_multiple_of(40) {
+            return Err(IrSubmitError::InvalidVertexData);
+        }
+        let mut record = [0u8; 40];
+        for start in (0..length).step_by(40) {
+            self.plan
+                .read_range(&resources.buffer_shadows, slot, start, &mut record);
+            validate_canonical_record(&record)?;
+        }
+        Ok(())
+    }
 }
 
-struct ExecutionPlan {
+struct ExecutionPlan<'a> {
     has_content_preserving_pass: bool,
     events: Vec<ExecutionEvent>,
-    buffer_updates: Vec<BufferShadowUpdate>,
+    buffer_updates: BufferOnlyPlan<'a>,
     canonical_validations: Vec<(usize, u64)>,
 }
 
@@ -1271,7 +1290,7 @@ mod submission_profile {
         staged_bytes: u128,
         updates: usize,
         update_bytes: u128,
-        shadow_clone_bytes: u128,
+        pub(super) shadow_clone_bytes: u128,
         dirty_bytes: u128,
         largest_update_bytes: usize,
         passes: usize,
@@ -1321,18 +1340,12 @@ mod submission_profile {
             self.advance_at(phase, Instant::now());
         }
 
-        pub(super) fn record_plan(&mut self, plan: &ExecutionPlan, shadows: &[BufferShadow]) {
-            self.updates = plan.buffer_updates.len();
-            for update in &plan.buffer_updates {
-                self.update_bytes += update.bytes.len() as u128;
+        pub(super) fn record_plan(&mut self, plan: &ExecutionPlan<'_>, _shadows: &[BufferShadow]) {
+            self.updates = plan.buffer_updates.updates.len();
+            for update in &plan.buffer_updates.updates {
+                self.update_bytes += update.length as u128;
                 self.dirty_bytes += update.upload.range.len() as u128;
-                self.largest_update_bytes = self.largest_update_bytes.max(update.bytes.len());
-                // The first changed write clones this persistent shadow once.
-                // Count metadata only; never inspect or format buffer contents.
-                self.shadow_clone_bytes += shadows[update.slot]
-                    .bytes
-                    .as_ref()
-                    .map_or(0, |bytes| bytes.len() as u128);
+                self.largest_update_bytes = self.largest_update_bytes.max(update.length);
             }
             for event in &plan.events {
                 if let ExecutionEvent::Pass(pass) = event {
@@ -1414,10 +1427,11 @@ mod submission_profile {
     #[cfg(test)]
     mod tests {
         use super::super::PendingBuffers;
-        use super::*;
+        use super::{Profile, *};
+        use alloc::borrow::Cow;
 
         #[test]
-        fn plan_counts_full_shadow_copies_separately_from_dirty_ranges() {
+        fn mixed_plan_keeps_sparse_ranges_without_cloning_shadow() {
             let shadows = vec![
                 BufferShadow {
                     bytes: Some(vec![1; 4096]),
@@ -1428,16 +1442,21 @@ mod submission_profile {
             ];
             let mut pending = PendingBuffers::new();
             pending
-                .write_bytes(0, 1, shadows[0].bytes.as_deref(), 1024, &[2; 2])
+                .plan
+                .write(&shadows, 0, 1024, Cow::Borrowed(&[2; 2]))
                 .unwrap();
             pending
-                .write_bytes(0, 1, shadows[0].bytes.as_deref(), 2048, &[2])
+                .plan
+                .write(&shadows, 0, 2048, Cow::Borrowed(&[2]))
                 .unwrap();
-            pending.write_bytes(1, 0, None, 4, &[9; 4]).unwrap();
+            pending
+                .plan
+                .write(&shadows, 1, 4, Cow::Borrowed(&[9; 4]))
+                .unwrap();
             let plan = ExecutionPlan {
                 has_content_preserving_pass: false,
                 events: Vec::new(),
-                buffer_updates: pending.updates,
+                buffer_updates: pending.plan,
                 canonical_validations: Vec::new(),
             };
             let mut profile = Profile::new(3, true);
@@ -1445,7 +1464,7 @@ mod submission_profile {
             assert_eq!(profile.commands, 3);
             assert_eq!(profile.updates, 2);
             assert_eq!(profile.update_bytes, 4104);
-            assert_eq!(profile.shadow_clone_bytes, 4096);
+            assert_eq!(profile.shadow_clone_bytes, 0);
             assert_eq!(profile.dirty_bytes, 1025 + 8);
             assert_eq!(profile.largest_update_bytes, 4096);
             assert_eq!((profile.passes, profile.draws), (0, 0));
@@ -1538,6 +1557,103 @@ struct ActivePass<'r> {
     scissor: Option<ir::PixelRect>,
     viewport: Option<ir::Viewport>,
     push_constants: [[u8; 128]; 2],
+}
+
+/// Resource operations needed while lowering commands. This remains separate
+/// from GPU ownership so replay planning can be tested without constructing a
+/// native context.
+trait PlanResourceAccess {
+    fn table(&self) -> &ResourceTable;
+    fn buffer_shadows(&self) -> &[BufferShadow];
+    fn mapped_image(&self, texture: TextureRef<'_>) -> Result<Rc<Image>, IrSubmitError>;
+    fn is_image_mapped(&self, texture: TextureId) -> bool;
+    fn supports_anisotropy_16(&self) -> bool;
+    fn compiled_pipeline(
+        &self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError>;
+    fn decode_draw_vertices(
+        &self,
+        pending: &mut PendingBuffers<'_>,
+        pass: &ActivePass<'_>,
+        first_vertex: u32,
+        vertex_count: u32,
+    ) -> Result<DecodedDraw, IrSubmitError>;
+    fn decode_indexed_draw_vertices(
+        &self,
+        pending: &PendingBuffers<'_>,
+        pass: &ActivePass<'_>,
+        first_index: u32,
+        index_count: u32,
+        base_vertex: i32,
+    ) -> Result<DecodedDraw, IrSubmitError>;
+    #[cfg(feature = "programmable")]
+    fn decode_programmable_draw(
+        &self,
+        pending: &PendingBuffers<'_>,
+        pass: &mut ActivePass<'_>,
+        parameters: programmable::DrawParameters,
+    ) -> Result<IrDraw, IrSubmitError>;
+}
+
+impl PlanResourceAccess for IrResources {
+    fn table(&self) -> &ResourceTable {
+        self.resources.as_ref()
+    }
+
+    fn buffer_shadows(&self) -> &[BufferShadow] {
+        &self.buffer_shadows
+    }
+
+    fn mapped_image(&self, texture: TextureRef<'_>) -> Result<Rc<Image>, IrSubmitError> {
+        IrResources::mapped_image(self, texture)
+    }
+
+    fn is_image_mapped(&self, texture: TextureId) -> bool {
+        self.images.iter().any(|mapping| mapping.texture == texture)
+    }
+
+    fn supports_anisotropy_16(&self) -> bool {
+        self.context.capabilities().supports_anisotropy_16()
+    }
+
+    fn compiled_pipeline(
+        &self,
+        id: ir::ProgrammableRenderPipelineId,
+    ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
+        IrResources::compiled_pipeline(self, id)
+    }
+
+    fn decode_draw_vertices(
+        &self,
+        pending: &mut PendingBuffers<'_>,
+        pass: &ActivePass<'_>,
+        first_vertex: u32,
+        vertex_count: u32,
+    ) -> Result<DecodedDraw, IrSubmitError> {
+        decode_draw_vertices(self, pending, pass, first_vertex, vertex_count)
+    }
+
+    fn decode_indexed_draw_vertices(
+        &self,
+        pending: &PendingBuffers<'_>,
+        pass: &ActivePass<'_>,
+        first_index: u32,
+        index_count: u32,
+        base_vertex: i32,
+    ) -> Result<DecodedDraw, IrSubmitError> {
+        decode_indexed_draw_vertices(self, pending, pass, first_index, index_count, base_vertex)
+    }
+
+    #[cfg(feature = "programmable")]
+    fn decode_programmable_draw(
+        &self,
+        pending: &PendingBuffers<'_>,
+        pass: &mut ActivePass<'_>,
+        parameters: programmable::DrawParameters,
+    ) -> Result<IrDraw, IrSubmitError> {
+        programmable::decode_draw(self, pending, pass, parameters)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1671,6 +1787,21 @@ struct PipelineInfo {
 }
 
 impl Queue {
+    fn validate_ir_submission<'r, 'data>(
+        &self,
+        context: &Context,
+        resources: &IrResources,
+        commands: &CommandBuffer<'r, 'data>,
+    ) -> Result<(), IrSubmitError> {
+        validate_ir_submission_state(
+            resources.ensure_usable(),
+            core::ptr::eq(resources.resources(), commands.resources()),
+            resources.context_id,
+            context.backend.context_id(),
+            self.backend.context_id(),
+        )
+    }
+
     /// Validate, materialize new resources, and asynchronously submit logical IR.
     ///
     /// New physical resources are created using Scarlet's existing synchronous
@@ -1713,12 +1844,50 @@ impl Queue {
         if compute::contains_compute(commands).map_err(SubmitError::Rejected)? {
             return self.submit_compute_async(context, resources, commands);
         }
+        self.validate_ir_submission(context, resources, commands)
+            .map_err(SubmitError::Rejected)?;
         #[cfg(feature = "profile-submissions")]
         let mut profile = SubmissionProfile::new(commands.command_count(), true);
         let limit = self
             .backend
             .check_async_support()
             .map_err(|error| SubmitError::Rejected(IrSubmitError::Backend(error)))?;
+        let mut mode = SubmitMode::tracked();
+        mode.set_limit(limit);
+        if let Some(plan) = BufferOnlyPlan::from_commands(
+            resources.resources(),
+            &resources.buffer_shadows,
+            commands,
+        )
+        .map_err(SubmitError::Rejected)?
+        {
+            #[cfg(feature = "profile-submissions")]
+            profile.record_buffer_only(&plan);
+            let result = (|| {
+                let prepared = plan.reserve(&mut resources.buffer_shadows)?;
+                #[cfg(feature = "profile-submissions")]
+                profile.enter(SubmissionPhase::EventsCheckpoint);
+                let acceptance = self
+                    .backend
+                    .checkpoint(&mut mode)
+                    .map_err(IrSubmitError::Backend);
+                #[cfg(feature = "profile-submissions")]
+                profile.enter(SubmissionPhase::Retire);
+                prepared.publish(&mut resources.buffer_shadows, acceptance)
+            })();
+            let result = mode.finish(result);
+            #[cfg(feature = "profile-submissions")]
+            {
+                profile.outcome = match &result {
+                    Ok(_) => "accepted",
+                    Err(SubmitError::Busy) => "busy",
+                    Err(SubmitError::Rejected(_)) => "rejected",
+                    Err(SubmitError::Failed { .. }) => "failed",
+                    Err(_) => "error",
+                };
+            }
+            return result;
+        }
         let snapshot = resources
             .backend
             .snapshot()
@@ -1733,8 +1902,6 @@ impl Queue {
                 .iter()
                 .map(|mapping| mapping.image.backend.ir_surface_initialized()),
         );
-        let mut mode = SubmitMode::tracked();
-        mode.set_limit(limit);
         let result = self.submit_ir_with(
             context,
             resources,
@@ -1833,35 +2000,7 @@ impl Queue {
     ) -> Result<(), IrSubmitError> {
         #[cfg(feature = "profile-submissions")]
         profile.enter(SubmissionPhase::Plan);
-        resources.ensure_usable()?;
-        if !core::ptr::eq(resources.resources(), commands.resources()) {
-            return Err(IrSubmitError::ResourceTableMismatch);
-        }
-        if resources.context_id != context.backend.context_id()
-            || self.backend.context_id() != resources.context_id
-        {
-            return Err(IrSubmitError::ContextMismatch);
-        }
-        if mode.is_tracked()
-            && let Some(plan) = BufferOnlyPlan::from_commands(
-                resources.resources(),
-                &resources.buffer_shadows,
-                commands,
-            )?
-        {
-            #[cfg(feature = "profile-submissions")]
-            profile.record_buffer_only(&plan);
-            let prepared = plan.reserve(&mut resources.buffer_shadows)?;
-            #[cfg(feature = "profile-submissions")]
-            profile.enter(SubmissionPhase::EventsCheckpoint);
-            let acceptance = self
-                .backend
-                .checkpoint(mode)
-                .map_err(IrSubmitError::Backend);
-            #[cfg(feature = "profile-submissions")]
-            profile.enter(SubmissionPhase::Retire);
-            return prepared.publish(&mut resources.buffer_shadows, acceptance);
-        }
+        self.validate_ir_submission(context, resources, commands)?;
         let plan = ExecutionPlan::from_commands(
             resources,
             commands,
@@ -1878,6 +2017,13 @@ impl Queue {
             ));
         }
         plan.validate_transport_chunks()?;
+        let ExecutionPlan {
+            has_content_preserving_pass: _,
+            events,
+            buffer_updates,
+            mut canonical_validations,
+        } = plan;
+        let prepared_buffer_updates = buffer_updates.reserve(&mut resources.buffer_shadows)?;
         #[cfg(feature = "profile-submissions")]
         profile.enter(SubmissionPhase::Materialize);
         register_mapped_images(context, resources)?;
@@ -1885,7 +2031,7 @@ impl Queue {
             // First-use allocation is explicitly synchronous. Do it for the
             // whole stream before sending anything, so later lazy resources
             // cannot drain uploads/draws accepted earlier in this same call.
-            for event in &plan.events {
+            for event in &events {
                 match event {
                     ExecutionEvent::Upload(texture, _) => self.backend.materialize_ir_texture(
                         &context.backend,
@@ -1924,7 +2070,7 @@ impl Queue {
         #[cfg(feature = "profile-submissions")]
         profile.enter(SubmissionPhase::PrepareBuffers);
         let mut prepared_buffers = Vec::new();
-        for event in &plan.events {
+        for event in &events {
             let ExecutionEvent::Pass(pass) = event else {
                 continue;
             };
@@ -1950,22 +2096,21 @@ impl Queue {
                     if prepared_buffers.contains(&binding.slot) {
                         continue;
                     }
-                    let update = plan
-                        .buffer_updates
-                        .iter()
-                        .find(|update| update.slot == binding.slot);
-                    let (bytes, upload) = resources
+                    let shadow = resources
                         .buffer_shadows
                         .get(binding.slot)
-                        .ok_or(IrSubmitError::InvalidVertexData)?
-                        .for_draw(update)?;
+                        .ok_or(IrSubmitError::InvalidVertexData)?;
+                    let mut overlays = Vec::new();
+                    let source =
+                        prepared_buffer_updates.source(shadow, binding.slot, &mut overlays)?;
+                    let upload = prepared_buffer_updates.upload_for_slot(shadow, binding.slot);
                     #[cfg(feature = "profile-submissions")]
-                    profile.record_prepared(bytes.len());
+                    profile.record_prepared(source.len());
                     self.backend.prepare_ir_buffer(
                         &context.backend,
                         &mut resources.backend,
                         binding,
-                        bytes,
+                        &source,
                         upload.as_ref(),
                         mode,
                     )?;
@@ -1976,26 +2121,10 @@ impl Queue {
                 }
             }
         }
-        // Synchronous uploads are already visible: preserve the existing
-        // failure/retry revision policy. Tracked submission commits shadows
-        // only on full acceptance; Busy/Rejected must not change the logical
-        // contents. An accepted partial failure invalidates the entire cache.
-        let ExecutionPlan {
-            has_content_preserving_pass: _,
-            events,
-            mut buffer_updates,
-            mut canonical_validations,
-        } = plan;
-        if !mode.is_tracked() {
-            #[cfg(feature = "profile-submissions")]
-            profile.enter(SubmissionPhase::Retire);
-            commit_buffer_updates(
-                &mut resources.buffer_shadows,
-                core::mem::take(&mut buffer_updates),
-                Ok(()),
-            )?;
-            resources.commit_canonical_validations(core::mem::take(&mut canonical_validations));
-        }
+        // Keep accepted shadows untouched until every synchronous preparation
+        // succeeded, or until the tracked native/logical checkpoint accepted
+        // the complete stream. Preparation storage was reserved above, before
+        // either path could mutate backend resource state.
         #[cfg(feature = "profile-submissions")]
         profile.enter(SubmissionPhase::EventsCheckpoint);
         for event in &events {
@@ -2043,22 +2172,26 @@ impl Queue {
                 .map_err(IrSubmitError::Backend);
             #[cfg(feature = "profile-submissions")]
             profile.enter(SubmissionPhase::Retire);
-            commit_prepared_buffer_updates(
-                &mut resources.buffer_shadows,
-                buffer_updates,
-                &prepared_buffers,
-                acceptance,
-            )?;
+            prepared_buffer_updates.publish(&mut resources.buffer_shadows, acceptance)?;
+            for &slot in &prepared_buffers {
+                if let Some(shadow) = resources.buffer_shadows.get_mut(slot) {
+                    shadow.upload = None;
+                }
+            }
             resources.commit_canonical_validations(canonical_validations);
         } else {
-            // Synchronous mode has no deferred checkpoint: every preparation
-            // and event has now returned success. Preserve deltas on failures.
-            commit_prepared_buffer_updates(
-                &mut resources.buffer_shadows,
-                Vec::new(),
-                &prepared_buffers,
-                Ok(()),
-            )?;
+            // All synchronous preparations and events succeeded. A later error
+            // cannot make the CPU contents newer, so publish only at this point.
+            // If an earlier synchronous attempt failed after preparing some buffers,
+            // their physical revision is newer than this retained base; the next
+            // preparation detects that mismatch and performs a full bounded repair.
+            prepared_buffer_updates.publish(&mut resources.buffer_shadows, Ok(()))?;
+            for &slot in &prepared_buffers {
+                if let Some(shadow) = resources.buffer_shadows.get_mut(slot) {
+                    shadow.upload = None;
+                }
+            }
+            resources.commit_canonical_validations(core::mem::take(&mut canonical_validations));
         }
         #[cfg(feature = "profile-submissions")]
         profile.enter(SubmissionPhase::Retire);
@@ -2099,7 +2232,7 @@ fn register_mapped_images(
     Ok(())
 }
 
-impl ExecutionPlan {
+impl<'plan> ExecutionPlan<'plan> {
     fn validate_transport_chunks(&self) -> Result<(), IrSubmitError> {
         for event in &self.events {
             let ExecutionEvent::Pass(pass) = event else {
@@ -2138,11 +2271,14 @@ impl ExecutionPlan {
         Ok(())
     }
 
-    fn from_commands<'r, 'data>(
-        resources: &IrResources,
+    fn from_commands<'r, 'data, R: PlanResourceAccess + ?Sized>(
+        resources: &R,
         commands: &CommandBuffer<'r, 'data>,
         native_narrow: bool,
-    ) -> Result<Self, IrSubmitError> {
+    ) -> Result<ExecutionPlan<'plan>, IrSubmitError>
+    where
+        'data: 'plan,
+    {
         // Reject the complete unsupported stream before resolving images,
         // building buffer shadows, materializing resources, or submitting work.
         // A valid programmable stream is not malformed fixed-function IR.
@@ -2164,7 +2300,9 @@ impl ExecutionPlan {
             };
             return Err(IrSubmitError::Unsupported(unsupported));
         }
-        let mut pending_buffers = PendingBuffers::new();
+        let table = resources.table();
+        let buffer_shadows = resources.buffer_shadows();
+        let mut pending_buffers: PendingBuffers<'plan> = PendingBuffers::new();
         let mut events = Vec::new();
         let mut active = None;
         let mut seen_pass = false;
@@ -2194,8 +2332,8 @@ impl ExecutionPlan {
                     filter,
                     flips,
                 } if active.is_none() => {
-                    let source_desc = resources.resources().texture(*source)?;
-                    let destination_desc = resources.resources().texture(*destination)?;
+                    let source_desc = table.texture(*source)?;
+                    let destination_desc = table.texture(*destination)?;
                     let source_extent = source_desc.mip_extent(*source_mip)?;
                     let destination_extent = destination_desc.mip_extent(*destination_mip)?;
                     if !source_desc.usage().contains(TextureUsage::COPY_SRC)
@@ -2251,8 +2389,8 @@ impl ExecutionPlan {
                     destination,
                     destination_rect,
                 } if active.is_none() => {
-                    let source_desc = resources.resources().texture(*source)?;
-                    let destination_desc = resources.resources().texture(*destination)?;
+                    let source_desc = table.texture(*source)?;
+                    let destination_desc = table.texture(*destination)?;
                     if !source_desc.usage().contains(TextureUsage::COPY_SRC)
                         || !destination_desc.usage().contains(TextureUsage::COPY_DST)
                         || source_desc.format() != destination_desc.format()
@@ -2290,10 +2428,10 @@ impl ExecutionPlan {
                     offset,
                     data,
                 } if !seen_pass && active.is_none() => {
-                    pending_buffers.write(resources, *buffer, *offset, data)?;
+                    pending_buffers.write(table, buffer_shadows, *buffer, *offset, data)?;
                 }
                 Command::WriteTexture { texture, write } if active.is_none() => {
-                    let descriptor = resources.resources().texture(*texture)?;
+                    let descriptor = table.texture(*texture)?;
                     if !descriptor.usage().contains(TextureUsage::COPY_DST) {
                         return Err(IrSubmitError::InvalidIr(ir::Error::InvalidUsage));
                     }
@@ -2303,11 +2441,7 @@ impl ExecutionPlan {
                             UnsupportedIrFeature::TargetUsage,
                         ));
                     }
-                    if resources
-                        .images
-                        .iter()
-                        .any(|mapping| mapping.texture == texture.id())
-                    {
+                    if resources.is_image_mapped(texture.id()) {
                         return Err(IrSubmitError::Unsupported(
                             UnsupportedIrFeature::TextureUpload,
                         ));
@@ -2321,7 +2455,7 @@ impl ExecutionPlan {
                     ));
                 }
                 Command::BeginRenderPass(desc) if active.is_none() => {
-                    let descriptor = resources.resources().texture(desc.target())?;
+                    let descriptor = table.texture(desc.target())?;
                     if !matches!(
                         descriptor.format(),
                         TextureFormat::Bgra8Unorm
@@ -2357,7 +2491,7 @@ impl ExecutionPlan {
                     let mut additional_attachments = Vec::new();
                     let mut additional_colors = Vec::new();
                     for attachment in desc.color_attachments().skip(1) {
-                        let descriptor = resources.resources().texture(attachment.target())?;
+                        let descriptor = table.texture(attachment.target())?;
                         if !matches!(
                             descriptor.format(),
                             TextureFormat::Bgra8Unorm
@@ -2388,7 +2522,7 @@ impl ExecutionPlan {
                     }
                     let depth_attachment = desc.depth_attachment();
                     let depth_spec = if let Some(depth) = depth_attachment {
-                        let depth_descriptor = resources.resources().texture(depth.target())?;
+                        let depth_descriptor = table.texture(depth.target())?;
                         Some(texture_spec(depth.target(), depth_descriptor)?)
                     } else {
                         None
@@ -2510,11 +2644,10 @@ impl ExecutionPlan {
                     size,
                 } if !seen_pass && active.is_none() => {
                     pending_buffers.copy(
-                        resources,
-                        *source,
-                        *source_offset,
-                        *destination,
-                        *destination_offset,
+                        table,
+                        buffer_shadows,
+                        (*source, *source_offset),
+                        (*destination, *destination_offset),
                         *size,
                     )?;
                 }
@@ -2548,8 +2681,8 @@ impl ExecutionPlan {
                     active_pass_mut(&mut active)?.texture = Some(*reference)
                 }
                 Command::SetSampler(reference) => {
-                    if resources.resources.sampler(*reference)?.anisotropy() > 1
-                        && !resources.context.capabilities().supports_anisotropy_16()
+                    if table.sampler(*reference)?.anisotropy() > 1
+                        && !resources.supports_anisotropy_16()
                     {
                         return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Sampler));
                     }
@@ -2572,7 +2705,7 @@ impl ExecutionPlan {
                 }
                 Command::SetViewport(value) => {
                     let pass = active_pass_mut(&mut active)?;
-                    let extent = resources.resources.texture(pass.attachment)?.extent();
+                    let extent = table.texture(pass.attachment)?.extent();
                     if !value.is_within(extent) {
                         #[cfg(feature = "std")]
                         if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
@@ -2591,8 +2724,7 @@ impl ExecutionPlan {
                     first_instance,
                 } => {
                     let pass = active_pass_mut(&mut active)?;
-                    let draw = programmable::decode_draw(
-                        resources,
+                    let draw = resources.decode_programmable_draw(
                         &pending_buffers,
                         pass,
                         programmable::DrawParameters {
@@ -2613,8 +2745,7 @@ impl ExecutionPlan {
                     first_instance,
                 } => {
                     let pass = active_pass_mut(&mut active)?;
-                    let draw = programmable::decode_draw(
-                        resources,
+                    let draw = resources.decode_programmable_draw(
                         &pending_buffers,
                         pass,
                         programmable::DrawParameters {
@@ -2633,8 +2764,7 @@ impl ExecutionPlan {
                 } => {
                     let pass = active_pass_mut(&mut active)?;
                     if pass.programmable.is_some() {
-                        let draw = programmable::decode_draw(
-                            resources,
+                        let draw = resources.decode_programmable_draw(
                             &pending_buffers,
                             pass,
                             programmable::DrawParameters {
@@ -2648,8 +2778,7 @@ impl ExecutionPlan {
                         pass.submission.draws.push(draw);
                         continue;
                     }
-                    let decoded = decode_draw_vertices(
-                        resources,
+                    let decoded = resources.decode_draw_vertices(
                         &mut pending_buffers,
                         pass,
                         *first_vertex,
@@ -2664,8 +2793,7 @@ impl ExecutionPlan {
                 } => {
                     let pass = active_pass_mut(&mut active)?;
                     if pass.programmable.is_some() {
-                        let draw = programmable::decode_draw(
-                            resources,
+                        let draw = resources.decode_programmable_draw(
                             &pending_buffers,
                             pass,
                             programmable::DrawParameters {
@@ -2679,8 +2807,7 @@ impl ExecutionPlan {
                         pass.submission.draws.push(draw);
                         continue;
                     }
-                    let decoded = decode_indexed_draw_vertices(
-                        resources,
+                    let decoded = resources.decode_indexed_draw_vertices(
                         &pending_buffers,
                         pass,
                         *first_index,
@@ -2704,7 +2831,7 @@ impl ExecutionPlan {
         Ok(Self {
             has_content_preserving_pass,
             events,
-            buffer_updates: pending_buffers.updates,
+            buffer_updates: pending_buffers.plan,
             canonical_validations: pending_buffers.canonical_validations,
         })
     }
@@ -2799,19 +2926,19 @@ fn decode_draw_vertices(
         let revision = pending_buffers.revision(resources, buffer)?;
         let needs_validation =
             pending_buffers.canonical_needs_validation(resources, buffer.slot(), revision);
-        {
-            let bytes = pending_buffers.bytes(resources, buffer)?;
-            validate_canonical_vertex_range(
-                resources.resources(),
-                bytes.as_slice(),
-                buffer,
-                offset,
-                first_vertex,
-                vertex_count,
-            )?;
-            if needs_validation {
-                validate_canonical_buffer(bytes.as_slice())?;
-            }
+        let length = pending_buffers
+            .plan
+            .length(&resources.buffer_shadows, buffer.slot())?;
+        validate_canonical_vertex_range(
+            resources.resources(),
+            length,
+            buffer,
+            offset,
+            first_vertex,
+            vertex_count,
+        )?;
+        if needs_validation {
+            pending_buffers.validate_canonical(resources, buffer)?;
         }
         if needs_validation {
             pending_buffers.mark_canonical_validated(buffer.slot(), revision)?;
@@ -2832,13 +2959,26 @@ fn decode_draw_vertices(
                 .map_err(|_| IrSubmitError::InvalidVertexData)?,
         }
     } else {
-        let bytes = pending_buffers.bytes(resources, buffer)?;
+        let stride = usize::try_from(info.stride).map_err(|_| IrSubmitError::InvalidVertexData)?;
+        let first = usize::try_from(first_vertex).map_err(|_| IrSubmitError::InvalidVertexData)?;
+        let count = usize::try_from(vertex_count).map_err(|_| IrSubmitError::InvalidVertexData)?;
+        let start = usize::try_from(offset)
+            .ok()
+            .and_then(|offset| first.checked_mul(stride)?.checked_add(offset))
+            .ok_or(IrSubmitError::InvalidVertexData)?;
+        let end = count
+            .checked_mul(stride)
+            .and_then(|length| start.checked_add(length))
+            .ok_or(IrSubmitError::InvalidVertexData)?;
+        let bytes = pending_buffers.range(resources, buffer, start..end)?;
         DecodedVertices::Inline(decode_vertices(
             resources.resources(),
-            bytes.as_slice(),
+            &bytes,
             buffer,
-            offset,
-            first_vertex,
+            // The range has already been sliced at the absolute source start.
+            // Decode coordinates are relative to that bounded slice.
+            0,
+            0,
             vertex_count,
             info,
         )?)
@@ -2869,7 +3009,7 @@ fn is_canonical_persistent_layout(info: PipelineInfo) -> bool {
 
 fn validate_canonical_vertex_range(
     resources: &ResourceTable,
-    bytes: &[u8],
+    logical_len: usize,
     buffer: BufferRef<'_>,
     vertex_offset: u64,
     first_vertex: u32,
@@ -2898,27 +3038,22 @@ fn validate_canonical_vertex_range(
     let end = start
         .checked_add(byte_count)
         .ok_or(IrSubmitError::InvalidVertexData)?;
-    bytes
-        .get(start..end)
-        .ok_or(IrSubmitError::InvalidVertexData)?;
+    if end > logical_len {
+        return Err(IrSubmitError::InvalidVertexData);
+    }
     Ok(())
 }
 
-fn validate_canonical_buffer(bytes: &[u8]) -> Result<(), IrSubmitError> {
-    if bytes.is_empty() || !bytes.len().is_multiple_of(40) {
-        return Err(IrSubmitError::InvalidVertexData);
-    }
-    for record in bytes.chunks_exact(40) {
-        for offset in [0, 4, 8, 12, 32, 36] {
-            if !read_f32(record, offset)?.is_finite() {
-                return Err(IrSubmitError::InvalidVertexData);
-            }
+fn validate_canonical_record(record: &[u8]) -> Result<(), IrSubmitError> {
+    for offset in [0, 4, 8, 12, 32, 36] {
+        if !read_f32(record, offset)?.is_finite() {
+            return Err(IrSubmitError::InvalidVertexData);
         }
-        for offset in [16, 20, 24, 28] {
-            let component = read_f32(record, offset)?;
-            if !component.is_finite() || !(0.0..=1.0).contains(&component) {
-                return Err(IrSubmitError::InvalidVertexData);
-            }
+    }
+    for offset in [16, 20, 24, 28] {
+        let component = read_f32(record, offset)?;
+        if !component.is_finite() || !(0.0..=1.0).contains(&component) {
+            return Err(IrSubmitError::InvalidVertexData);
         }
     }
     Ok(())
@@ -2944,8 +3079,6 @@ fn decode_indexed_draw_vertices(
     if !index_descriptor.usage().contains(BufferUsage::INDEX) {
         return Err(IrSubmitError::InvalidIr(ir::Error::InvalidUsage));
     }
-    let index_bytes = pending_buffers.bytes(resources, index_buffer)?;
-    let vertex_bytes = pending_buffers.bytes(resources, vertex_buffer)?;
     let index_size =
         usize::try_from(index_format.byte_size()).map_err(|_| IrSubmitError::InvalidVertexData)?;
     let first = usize::try_from(first_index).map_err(|_| IrSubmitError::InvalidVertexData)?;
@@ -2965,12 +3098,13 @@ fn decode_indexed_draw_vertices(
                 .ok_or(IrSubmitError::InvalidVertexData)?,
         )
         .ok_or(IrSubmitError::InvalidVertexData)?;
-    let encoded = index_bytes
-        .as_slice()
-        .get(start..end)
-        .ok_or(IrSubmitError::InvalidVertexData)?;
+    let encoded = pending_buffers.range(resources, index_buffer, start..end)?;
     let mut vertices = Vec::new();
     vertices
+        .try_reserve_exact(count)
+        .map_err(|_| IrSubmitError::OutOfMemory)?;
+    let mut resolved_indices = Vec::new();
+    resolved_indices
         .try_reserve_exact(count)
         .map_err(|_| IrSubmitError::OutOfMemory)?;
     for item in encoded.chunks_exact(index_size) {
@@ -2984,12 +3118,41 @@ fn decode_indexed_draw_vertices(
         }
         let vertex_index =
             usize::try_from(resolved).map_err(|_| IrSubmitError::InvalidVertexData)?;
+        resolved_indices.push(vertex_index);
+    }
+    let minimum = resolved_indices.iter().copied().min();
+    let maximum = resolved_indices.iter().copied().max();
+    let (vertex_slice, minimum) = match (minimum, maximum) {
+        (Some(minimum), Some(maximum)) => {
+            let stride =
+                usize::try_from(info.stride).map_err(|_| IrSubmitError::InvalidVertexData)?;
+            let byte_start = usize::try_from(vertex_offset)
+                .ok()
+                .and_then(|offset| minimum.checked_mul(stride)?.checked_add(offset))
+                .ok_or(IrSubmitError::InvalidVertexData)?;
+            let byte_end = maximum
+                .checked_add(1)
+                .and_then(|end| end.checked_mul(stride))
+                .and_then(|end| usize::try_from(vertex_offset).ok()?.checked_add(end))
+                .ok_or(IrSubmitError::InvalidVertexData)?;
+            (
+                Some(pending_buffers.range(resources, vertex_buffer, byte_start..byte_end)?),
+                minimum,
+            )
+        }
+        _ => (None, 0),
+    };
+    for vertex_index in resolved_indices {
+        let vertex_bytes = vertex_slice
+            .as_deref()
+            .ok_or(IrSubmitError::InvalidVertexData)?;
         vertices.push(decode_vertex(
             resources.resources(),
-            vertex_bytes.as_slice(),
+            vertex_bytes,
             vertex_buffer,
-            vertex_offset,
-            vertex_index,
+            // Source offsets were applied when taking vertex_slice.
+            0,
+            vertex_index - minimum,
             info,
         )?);
     }
@@ -3201,7 +3364,7 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
         render_area,
         vertices,
         draws,
-        texture_uploads,
+        mut texture_uploads,
     } = pass.submission;
     let mut chunks = Vec::new();
     let mut chunk_vertices = Vec::new();
@@ -3230,7 +3393,7 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                 core::mem::take(&mut chunk_vertices),
                 core::mem::take(&mut chunk_draws),
                 if first_chunk {
-                    texture_uploads.clone()
+                    core::mem::take(&mut texture_uploads)
                 } else {
                     Vec::new()
                 },
@@ -3274,7 +3437,7 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                         core::mem::take(&mut chunk_vertices),
                         core::mem::take(&mut chunk_draws),
                         if first_chunk {
-                            texture_uploads.clone()
+                            core::mem::take(&mut texture_uploads)
                         } else {
                             Vec::new()
                         },
@@ -3309,7 +3472,7 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
                         core::mem::take(&mut chunk_vertices),
                         core::mem::take(&mut chunk_draws),
                         if first_chunk {
-                            texture_uploads.clone()
+                            core::mem::take(&mut texture_uploads)
                         } else {
                             Vec::new()
                         },
@@ -4164,11 +4327,86 @@ fn materializable_texture(spec: driver::IrTextureSpec) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "profile-submissions")]
+    use super::submission_profile::Profile;
     use super::*;
     use crate::driver::{
         IrBlendComponent, IrBlendFactor, IrBlendOp, IrBlendState, IrCullMode, IrFragmentProgram,
         IrFrontFace,
     };
+
+    struct TestPlanResources<'a> {
+        table: &'a ResourceTable,
+        shadows: &'a [BufferShadow],
+    }
+
+    impl PlanResourceAccess for TestPlanResources<'_> {
+        fn table(&self) -> &ResourceTable {
+            self.table
+        }
+
+        fn buffer_shadows(&self) -> &[BufferShadow] {
+            self.shadows
+        }
+
+        fn mapped_image(&self, _texture: TextureRef<'_>) -> Result<Rc<Image>, IrSubmitError> {
+            Err(IrSubmitError::ImageNotMapped)
+        }
+
+        fn is_image_mapped(&self, _texture: TextureId) -> bool {
+            false
+        }
+
+        fn supports_anisotropy_16(&self) -> bool {
+            false
+        }
+
+        fn compiled_pipeline(
+            &self,
+            _id: ir::ProgrammableRenderPipelineId,
+        ) -> Result<Rc<driver::IrProgrammablePipeline>, IrSubmitError> {
+            Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::ProgrammableExecution,
+            ))
+        }
+
+        fn decode_draw_vertices(
+            &self,
+            _pending: &mut PendingBuffers<'_>,
+            _pass: &ActivePass<'_>,
+            _first_vertex: u32,
+            _vertex_count: u32,
+        ) -> Result<DecodedDraw, IrSubmitError> {
+            Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::CommandSequence,
+            ))
+        }
+
+        fn decode_indexed_draw_vertices(
+            &self,
+            _pending: &PendingBuffers<'_>,
+            _pass: &ActivePass<'_>,
+            _first_index: u32,
+            _index_count: u32,
+            _base_vertex: i32,
+        ) -> Result<DecodedDraw, IrSubmitError> {
+            Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::CommandSequence,
+            ))
+        }
+
+        #[cfg(feature = "programmable")]
+        fn decode_programmable_draw(
+            &self,
+            _pending: &PendingBuffers<'_>,
+            _pass: &mut ActivePass<'_>,
+            _parameters: programmable::DrawParameters,
+        ) -> Result<IrDraw, IrSubmitError> {
+            Err(IrSubmitError::Unsupported(
+                UnsupportedIrFeature::ProgrammableExecution,
+            ))
+        }
+    }
 
     #[test]
     fn cleanup_failure_after_a_destroy_prefix_blocks_retry_and_submission() {
@@ -4198,6 +4436,30 @@ mod tests {
             1,
             "an uncertain destroyed id must never be retired again"
         );
+    }
+
+    #[test]
+    fn fast_path_preflight_rejects_poison_foreign_table_and_context_mismatch() {
+        assert!(matches!(
+            validate_ir_submission_state(Err(IrSubmitError::SubmissionFailed), true, 7, 7, 7),
+            Err(IrSubmitError::SubmissionFailed)
+        ));
+        assert!(matches!(
+            validate_ir_submission_state(Ok(()), false, 7, 7, 7),
+            Err(IrSubmitError::ResourceTableMismatch)
+        ));
+        assert!(matches!(
+            validate_ir_submission_state(Ok(()), true, 7, 8, 7),
+            Err(IrSubmitError::ContextMismatch)
+        ));
+        assert!(matches!(
+            validate_ir_submission_state(Ok(()), true, 7, 7, 8),
+            Err(IrSubmitError::ContextMismatch)
+        ));
+        assert!(matches!(
+            validate_ir_submission_state(Ok(()), true, 7, 7, 7),
+            Ok(())
+        ));
     }
 
     #[test]
@@ -4358,35 +4620,56 @@ mod tests {
         let mut flushed = previous.clone();
         flushed[1025..1032].fill(9);
         let mut pending = PendingBuffers::new();
+        let shadows = [BufferShadow {
+            bytes: Some(previous.clone()),
+            revision: 7,
+            upload: None,
+        }];
         pending
-            .write_bytes(1, 7, Some(&previous), 0, &flushed)
+            .plan
+            .write(&shadows, 0, 0, Cow::Borrowed(&flushed))
             .unwrap();
-        assert_eq!(pending.updates[0].upload.range, 1025..1032);
+        assert_eq!(pending.plan.updates[0].upload.range, 1025..1032);
         pending
-            .write_bytes(1, 7, Some(&previous), 100, &[8, 3])
+            .plan
+            .write(&shadows, 0, 100, Cow::Borrowed(&[8, 3]))
             .unwrap();
-        let update = &pending.updates[0];
+        let update = &pending.plan.updates[0];
         assert_eq!(update.upload.range, 100..1032);
+        assert_eq!(
+            update.upload.intervals.as_ref().unwrap().ranges(),
+            &[100..104, 1024..1032]
+        );
         assert_eq!(update.upload.previous_revision, 7);
         assert_eq!(update.revision, 8);
-        assert_eq!(&update.bytes[101..1025], &previous[101..1025]);
-        assert_eq!(&update.bytes[1032..], &previous[1032..]);
+        let mut bytes = vec![0; 4096];
+        pending.plan.read_range(&shadows, 0, 0, &mut bytes);
+        assert_eq!(&bytes[101..1025], &previous[101..1025]);
+        assert_eq!(&bytes[1032..], &previous[1032..]);
     }
 
     #[test]
     fn shadow_growth_uploads_the_zero_filled_gap() {
         let mut pending = PendingBuffers::new();
+        let shadows = [BufferShadow {
+            bytes: Some(vec![1; 4]),
+            revision: 7,
+            upload: None,
+        }];
         pending
-            .write_bytes(1, 7, Some(&[1; 4]), 8, &[0; 4])
+            .plan
+            .write(&shadows, 0, 8, Cow::Borrowed(&[0; 4]))
             .unwrap();
-        assert_eq!(pending.updates[0].upload.range, 4..12);
-        assert_eq!(
-            pending.updates[0].bytes,
-            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]
-        );
+        assert_eq!(pending.plan.updates[0].upload.range, 4..12);
+        let mut bytes = [0; 12];
+        pending.plan.read_range(&shadows, 0, 0, &mut bytes);
+        assert_eq!(bytes, [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
         let mut initial = PendingBuffers::new();
-        initial.write_bytes(1, 0, None, 8, &[0; 4]).unwrap();
-        assert_eq!(initial.updates[0].upload.range, 0..12);
+        initial
+            .plan
+            .write(&[BufferShadow::default()], 0, 8, Cow::Borrowed(&[0; 4]))
+            .unwrap();
+        assert_eq!(initial.plan.updates[0].upload.range, 0..12);
     }
 
     #[test]
@@ -4410,53 +4693,84 @@ mod tests {
     fn identical_shadow_writes_keep_the_uploaded_revision() {
         let mut pending = PendingBuffers::new();
         let previous = [1, 2, 3, 4];
+        let shadows = [BufferShadow {
+            bytes: Some(previous.to_vec()),
+            revision: 9,
+            upload: None,
+        }];
         pending
-            .write_bytes(3, 9, Some(&previous), 1, &[2, 3])
+            .plan
+            .write(&shadows, 0, 1, Cow::Borrowed(&[2, 3]))
             .unwrap();
         pending
-            .write_bytes(3, 9, Some(&previous), 0, &previous)
+            .plan
+            .write(&shadows, 0, 0, Cow::Borrowed(&previous))
             .unwrap();
-        assert!(pending.updates.is_empty());
+        assert!(pending.plan.updates.is_empty());
     }
 
     #[test]
     fn ordered_shadow_writes_compare_against_the_pending_contents() {
         let mut pending = PendingBuffers::new();
         let previous = [1, 2, 3, 4];
+        let shadows = [BufferShadow {
+            bytes: Some(previous.to_vec()),
+            revision: 9,
+            upload: None,
+        }];
         pending
-            .write_bytes(3, 9, Some(&previous), 1, &[8, 9])
+            .plan
+            .write(&shadows, 0, 1, Cow::Borrowed(&[8, 9]))
             .unwrap();
-        let allocation = pending.updates[0].bytes.as_ptr();
+        let writes = pending.plan.writes.len();
         pending
-            .write_bytes(3, 9, Some(&previous), 1, &[8, 9])
+            .plan
+            .write(&shadows, 0, 1, Cow::Borrowed(&[8, 9]))
             .unwrap();
-        assert_eq!(pending.updates[0].bytes.as_ptr(), allocation);
-        assert_eq!(pending.updates[0].bytes, [1, 8, 9, 4]);
+        assert_eq!(pending.plan.writes.len(), writes);
         pending
-            .write_bytes(3, 9, Some(&previous), 2, &[3, 7])
+            .plan
+            .write(&shadows, 0, 2, Cow::Borrowed(&[3, 7]))
             .unwrap();
-        assert_eq!(pending.updates.len(), 1);
-        assert_eq!(pending.updates[0].revision, 10);
-        assert_eq!(pending.updates[0].bytes, [1, 8, 3, 7]);
+        assert_eq!(pending.plan.updates.len(), 1);
+        assert_eq!(pending.plan.updates[0].revision, 10);
+        let mut bytes = [0; 4];
+        pending.plan.read_range(&shadows, 0, 0, &mut bytes);
+        assert_eq!(bytes, [1, 8, 3, 7]);
         assert_eq!(previous, [1, 2, 3, 4]);
     }
 
     #[test]
     fn a_zero_write_without_a_shadow_still_materializes_buffer_storage() {
         let mut pending = PendingBuffers::new();
-        pending.write_bytes(2, 0, None, 4, &[0; 4]).unwrap();
-        assert_eq!(pending.updates[0].revision, 1);
-        assert_eq!(pending.updates[0].bytes, [0; 8]);
-        pending.write_bytes(2, 0, None, 0, &[0; 8]).unwrap();
-        assert_eq!(pending.updates.len(), 1);
+        let shadows = [BufferShadow::default()];
+        pending
+            .plan
+            .write(&shadows, 0, 4, Cow::Borrowed(&[0; 4]))
+            .unwrap();
+        assert_eq!(pending.plan.updates[0].revision, 1);
+        let mut bytes = [1; 8];
+        pending.plan.read_range(&shadows, 0, 0, &mut bytes);
+        assert_eq!(bytes, [0; 8]);
+        pending
+            .plan
+            .write(&shadows, 0, 0, Cow::Borrowed(&[0; 8]))
+            .unwrap();
+        assert_eq!(pending.plan.updates.len(), 1);
     }
 
-    fn shadow_write(shadow: &BufferShadow, offset: usize, data: &[u8]) -> Vec<BufferShadowUpdate> {
+    fn shadow_write(shadow: &BufferShadow, offset: usize, data: &[u8]) -> BufferOnlyPlan<'static> {
         let mut pending = PendingBuffers::new();
         pending
-            .write_bytes(0, shadow.revision, shadow.bytes.as_deref(), offset, data)
+            .plan
+            .write(
+                core::slice::from_ref(shadow),
+                0,
+                offset,
+                Cow::Owned(data.to_vec()),
+            )
             .unwrap();
-        pending.updates
+        pending.plan
     }
 
     fn range_test_shadow(bytes: Vec<u8>) -> BufferShadow {
@@ -4637,14 +4951,17 @@ mod tests {
     }
 
     #[test]
-    fn buffer_only_sparse_overlay_matches_general_shadow_planning() {
+    fn sparse_overlay_matches_an_independent_byte_model() {
         let mut shadows = [
             range_test_shadow(vec![3; 512]),
             range_test_shadow(vec![5; 1024]),
             BufferShadow::default(),
         ];
+        let mut expected: Vec<Vec<u8>> = shadows
+            .iter()
+            .map(|shadow| shadow.bytes.clone().unwrap_or_default())
+            .collect();
         let mut sparse = BufferOnlyPlan::default();
-        let mut dense = PendingBuffers::new();
         let mut seed = 42_u64;
         for index in 0..96 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -4654,16 +4971,9 @@ mod tests {
             let data = if index % 3 == 0 {
                 let source = (slot + 1) % 3;
                 let mut data = vec![0; size];
-                let source_bytes = dense
-                    .updates
-                    .iter()
-                    .find(|update| update.slot == source)
-                    .map(|update| update.bytes.as_slice())
-                    .or(shadows[source].bytes.as_deref())
-                    .unwrap_or(&[]);
-                if start < source_bytes.len() {
-                    let count = size.min(source_bytes.len() - start);
-                    data[..count].copy_from_slice(&source_bytes[start..start + count]);
+                if start < expected[source].len() {
+                    let count = size.min(expected[source].len() - start);
+                    data[..count].copy_from_slice(&expected[source][start..start + count]);
                 }
                 sparse
                     .copy(&shadows, source, start, slot, start, size)
@@ -4676,34 +4986,230 @@ mod tests {
                     .unwrap();
                 data
             };
-            dense
-                .write_bytes(
-                    slot,
-                    shadows[slot].revision,
-                    shadows[slot].bytes.as_deref(),
-                    start,
-                    &data,
-                )
-                .unwrap();
-        }
-        for update in &mut dense.updates {
-            update.upload = shadows[update.slot].merged_upload(update.upload.clone());
+            let end = start + data.len();
+            if expected[slot].len() < end {
+                expected[slot].resize(end, 0);
+            }
+            expected[slot][start..end].copy_from_slice(&data);
         }
         sparse
             .reserve(&mut shadows)
             .unwrap()
             .publish(&mut shadows, Ok(()))
             .unwrap();
-        for update in dense.updates {
-            let shadow = &shadows[update.slot];
-            assert_eq!(shadow.bytes.as_deref(), Some(update.bytes.as_slice()));
-            assert_eq!(shadow.revision, update.revision);
-            assert_eq!(shadow.upload.as_ref().unwrap().range, update.upload.range);
-            assert_eq!(
-                shadow.upload.as_ref().unwrap().previous_revision,
-                update.upload.previous_revision
-            );
+        for (shadow, expected) in shadows.iter().zip(expected) {
+            assert_eq!(shadow.bytes.as_deref(), Some(expected.as_slice()));
         }
+    }
+
+    #[test]
+    fn mixed_render_tiny_write_keeps_the_64_mib_shadow_allocation() {
+        const LENGTH: usize = 64 * 1024 * 1024;
+        let mut shadows = [range_test_shadow(vec![3; LENGTH])];
+        let pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
+        let mut pending = PendingBuffers::new();
+        pending
+            .plan
+            .write(&shadows, 0, LENGTH / 2, Cow::Borrowed(&[9; 4]))
+            .unwrap();
+        let plan = ExecutionPlan {
+            has_content_preserving_pass: false,
+            events: vec![ExecutionEvent::Pass(execution_pass(
+                Vec::new(),
+                vec![draw(0, 3, 0)],
+            ))],
+            buffer_updates: pending.plan,
+            canonical_validations: Vec::new(),
+        };
+        #[cfg(feature = "profile-submissions")]
+        {
+            let mut profile = Profile::new(1, true);
+            profile.record_plan(&plan, &shadows);
+            assert_eq!(profile.shadow_clone_bytes, 0);
+        }
+        let ExecutionPlan {
+            events,
+            buffer_updates,
+            ..
+        } = plan;
+        assert!(matches!(events.as_slice(), [ExecutionEvent::Pass(_)]));
+        let prepared = buffer_updates.reserve(&mut shadows).unwrap();
+        assert_eq!(shadows[0].bytes.as_ref().unwrap().as_ptr(), pointer);
+        assert_eq!(shadows[0].revision, 7);
+        assert_eq!(
+            &shadows[0].bytes.as_ref().unwrap()[LENGTH / 2..LENGTH / 2 + 4],
+            &[3; 4]
+        );
+        prepared.publish(&mut shadows, Ok(())).unwrap();
+        assert_eq!(shadows[0].bytes.as_ref().unwrap().as_ptr(), pointer);
+        assert_eq!(
+            &shadows[0].bytes.as_ref().unwrap()[LENGTH / 2..LENGTH / 2 + 4],
+            &[9; 4]
+        );
+        assert_eq!(shadows[0].revision, 8);
+    }
+
+    #[test]
+    fn owned_command_buffer_mixed_write_and_render_uses_the_sparse_plan() {
+        let table = ResourceTable::new();
+        let buffer_ref = table
+            .define_buffer(ir::BufferDesc::new(1024 * 1024, BufferUsage::COPY_DST).unwrap())
+            .unwrap();
+        let buffer_slot = buffer_ref.slot();
+        let buffer = buffer_ref.id();
+        let target = table
+            .define_texture(
+                TextureDesc::new(
+                    TextureFormat::Rgba8Unorm,
+                    ir::Extent2D::new(8, 8).unwrap(),
+                    TextureUsage::RENDER_ATTACHMENT,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .id();
+        let mut shadows: Vec<_> = (0..=buffer_slot).map(|_| BufferShadow::default()).collect();
+        shadows[buffer_slot] = range_test_shadow(vec![3; 1024 * 1024]);
+        let pointer = shadows[buffer_slot].bytes.as_ref().unwrap().as_ptr();
+
+        let recording = ir::OwnedCommandBuffer::new(vec![
+            ir::OwnedCommand::WriteBuffer {
+                buffer,
+                offset: 4096,
+                data: vec![9; 4],
+            },
+            ir::OwnedCommand::BeginRenderPass(ir::OwnedRenderPassDesc {
+                target,
+                area: ir::PixelRect::new(0, 0, 8, 8).unwrap(),
+                load: LoadOp::Clear(ir::Color::rgba(0.0, 0.0, 0.0, 1.0).unwrap()),
+                store: ir::StoreOp::Store,
+                depth: None,
+            }),
+            ir::OwnedCommand::EndRenderPass,
+        ]);
+        let commands = recording.record(&table).unwrap();
+        let planning = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        let plan = ExecutionPlan::from_commands(&planning, &commands, false)
+            .expect("lower owned mixed stream");
+        assert_eq!(plan.buffer_updates.updates.len(), 1);
+        assert_eq!(plan.buffer_updates.writes.len(), 1);
+        assert!(matches!(plan.events.as_slice(), [ExecutionEvent::Pass(_)]));
+
+        let prepared = plan
+            .buffer_updates
+            .reserve(&mut shadows)
+            .expect("reserve overlay");
+        assert_eq!(
+            shadows[buffer_slot].bytes.as_ref().unwrap().as_ptr(),
+            pointer
+        );
+        assert_eq!(
+            &shadows[buffer_slot].bytes.as_ref().unwrap()[4096..4100],
+            &[3; 4]
+        );
+        prepared.publish(&mut shadows, Ok(())).unwrap();
+        assert_eq!(
+            shadows[buffer_slot].bytes.as_ref().unwrap().as_ptr(),
+            pointer
+        );
+        assert_eq!(
+            &shadows[buffer_slot].bytes.as_ref().unwrap()[4096..4100],
+            &[9; 4]
+        );
+    }
+
+    #[test]
+    fn mixed_render_disjoint_writes_keep_both_sparse_ranges() {
+        const LENGTH: usize = 64 * 1024 * 1024;
+        let mut shadows = [range_test_shadow(vec![3; LENGTH])];
+        let mut pending = PendingBuffers::new();
+        pending
+            .plan
+            .write(&shadows, 0, 4, Cow::Borrowed(&[9; 4]))
+            .unwrap();
+        pending
+            .plan
+            .write(&shadows, 0, LENGTH - 8, Cow::Borrowed(&[7; 4]))
+            .unwrap();
+        let prepared = pending.plan.reserve(&mut shadows).unwrap();
+        let update = prepared.update_for_slot(0).unwrap();
+        assert_eq!(update.upload.range, 4..LENGTH - 4);
+        assert_eq!(
+            update.upload.intervals.as_ref().unwrap().ranges(),
+            &[4..8, LENGTH - 8..LENGTH - 4]
+        );
+        let mut overlays = Vec::new();
+        let source = prepared.source(&shadows[0], 0, &mut overlays).unwrap();
+        let mut gap = [0x55; 8];
+        source.copy_range(0..8, &mut gap).unwrap();
+        assert_eq!(gap, [3, 3, 3, 3, 9, 9, 9, 9]);
+        let mut tail = [0x55; 8];
+        source.copy_range(LENGTH - 8..LENGTH, &mut tail).unwrap();
+        assert_eq!(tail, [7, 7, 7, 7, 3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn mixed_render_rejection_preserves_shadow_bytes_revision_and_delta() {
+        let mut shadows = [range_test_shadow(vec![3; 64])];
+        let pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
+        let mut pending = PendingBuffers::new();
+        pending
+            .plan
+            .write(&shadows, 0, 20, Cow::Borrowed(&[7; 4]))
+            .unwrap();
+        let prepared = pending.plan.reserve(&mut shadows).unwrap();
+        assert!(
+            prepared
+                .publish(
+                    &mut shadows,
+                    Err(IrSubmitError::Backend(HandleError::OutOfResources))
+                )
+                .is_err()
+        );
+        assert_eq!(shadows[0].bytes.as_ref().unwrap().as_ptr(), pointer);
+        assert_eq!(&shadows[0].bytes.as_ref().unwrap()[20..24], &[3; 4]);
+        assert_eq!(shadows[0].revision, 7);
+        assert_eq!(shadows[0].upload.as_ref().unwrap().range, 0..4);
+    }
+
+    #[test]
+    fn sparse_source_full_repair_merges_base_gap_and_overlay() {
+        let shadow = BufferShadow {
+            bytes: Some(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            revision: 4,
+            upload: None,
+        };
+        let mut plan = BufferOnlyPlan::default();
+        plan.write(core::slice::from_ref(&shadow), 0, 2, Cow::Borrowed(&[9, 8]))
+            .unwrap();
+        plan.write(
+            core::slice::from_ref(&shadow),
+            0,
+            12,
+            Cow::Borrowed(&[7, 6]),
+        )
+        .unwrap();
+        let mut overlays = Vec::new();
+        let source = plan.source(&shadow, 0, &mut overlays).unwrap();
+        let mut repaired = vec![0; source.len()];
+        source.copy_range(0..source.len(), &mut repaired).unwrap();
+        assert_eq!(repaired, [1, 2, 9, 8, 5, 6, 7, 8, 0, 0, 0, 0, 7, 6]);
+    }
+
+    #[test]
+    fn sparse_source_uses_the_requested_nonzero_slot() {
+        let shadows = [BufferShadow::default(), range_test_shadow(vec![1; 4])];
+        let mut plan = BufferOnlyPlan::default();
+        plan.write(&shadows, 1, 8, Cow::Borrowed(&[9; 4])).unwrap();
+        let mut overlays = Vec::new();
+        let source = plan.source(&shadows[1], 1, &mut overlays).unwrap();
+        assert_eq!(source.len(), 12);
+        let mut bytes = [0; 12];
+        source.copy_range(0..12, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 1, 1, 1, 0, 0, 0, 0, 9, 9, 9, 9]);
     }
 
     #[cfg(feature = "backend-abi")]
@@ -4781,7 +5287,8 @@ mod tests {
         let original = vec![3; 4096];
         let initial = shadow_write(&shadows[0], 0, &original);
         commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
-        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, BufferOnlyPlan::default(), &[0], Ok(()))
+            .unwrap();
 
         // A full frontend snapshot changes only six bytes. This stream has no
         // draw, so its delta must survive publication until another stream uses it.
@@ -4802,9 +5309,9 @@ mod tests {
 
         // Empty control points and identical host snapshots must not erase the
         // last accepted delta or advance its revision.
-        commit_buffer_updates(&mut shadows, Vec::new(), Ok(())).unwrap();
+        commit_buffer_updates(&mut shadows, BufferOnlyPlan::default(), Ok(())).unwrap();
         let identical = shadow_write(&shadows[0], 0, &changed);
-        assert!(identical.is_empty());
+        assert!(identical.updates.is_empty());
         commit_buffer_updates(&mut shadows, identical, Ok(())).unwrap();
         let (_, upload) = shadows[0].for_draw(None).unwrap();
         assert_eq!(upload.unwrap().range, 5..11);
@@ -4816,20 +5323,23 @@ mod tests {
         let mut shadows = [BufferShadow::default()];
         let initial = shadow_write(&shadows[0], 0, &[3; 64]);
         commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
-        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, BufferOnlyPlan::default(), &[0], Ok(()))
+            .unwrap();
         let accepted = shadow_write(&shadows[0], 4, &[9; 4]);
         commit_buffer_updates(&mut shadows, accepted, Ok(())).unwrap();
 
         let pending = shadow_write(&shadows[0], 20, &[7; 4]);
-        let (bytes, upload) = shadows[0].for_draw(pending.first()).unwrap();
-        let upload = upload.unwrap();
+        let upload = shadows[0].merged_upload(pending.updates[0].upload.clone());
+        let mut bytes = vec![0; 64];
+        pending.read_range(&shadows, 0, 0, &mut bytes);
         assert_eq!(upload.previous_revision, 1);
         assert_eq!(upload.range, 4..24);
         assert_eq!(&bytes[4..8], &[9; 4]);
         assert_eq!(&bytes[20..24], &[7; 4]);
-        assert_eq!(pending[0].revision, 3);
+        assert_eq!(pending.updates[0].revision, 3);
 
-        let (accepted, upload) = shadows[0].for_draw(None).unwrap();
+        let accepted = shadows[0].bytes.as_deref().unwrap();
+        let upload = shadows[0].upload.clone();
         assert_eq!(&accepted[20..24], &[3; 4]);
         assert_eq!(upload.unwrap().range, 4..8);
         assert_eq!(shadows[0].revision, 2);
@@ -4840,7 +5350,8 @@ mod tests {
         let mut shadows = [BufferShadow::default()];
         let initial = shadow_write(&shadows[0], 0, &[3; 64]);
         commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
-        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, BufferOnlyPlan::default(), &[0], Ok(()))
+            .unwrap();
         let accepted = shadow_write(&shadows[0], 4, &[9; 4]);
         commit_buffer_updates(&mut shadows, accepted, Ok(())).unwrap();
         let accepted_bytes = shadows[0].bytes.clone().unwrap();
@@ -4882,7 +5393,8 @@ mod tests {
         let mut shadows = [BufferShadow::default()];
         let initial = shadow_write(&shadows[0], 0, &[3; 64]);
         commit_buffer_updates(&mut shadows, initial, Ok(())).unwrap();
-        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, BufferOnlyPlan::default(), &[0], Ok(()))
+            .unwrap();
         let first = shadow_write(&shadows[0], 4, &[9; 4]);
         commit_buffer_updates(&mut shadows, first, Ok(())).unwrap();
         let second = shadow_write(&shadows[0], 20, &[7; 4]);
@@ -4905,7 +5417,8 @@ mod tests {
             range_test_shadow(vec![3; 64]),
             range_test_shadow(vec![5; 64]),
         ];
-        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0, 1], Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, BufferOnlyPlan::default(), &[0, 1], Ok(()))
+            .unwrap();
         let mut first = BufferOnlyPlan::default();
         first.write(&shadows, 0, 4, Cow::Borrowed(&[9; 4])).unwrap();
         first.write(&shadows, 1, 8, Cow::Borrowed(&[8; 4])).unwrap();
@@ -4933,9 +5446,9 @@ mod tests {
             IrSubmitError::InvalidVertexData,
         ] {
             let pending = shadow_write(&shadows[0], 40, &[6; 4]);
-            let (_, upload) = shadows[0].for_draw(pending.first()).unwrap();
-            assert_eq!(upload.as_ref().unwrap().previous_revision, 7);
-            assert_eq!(upload.as_ref().unwrap().range, 4..44);
+            let upload = shadows[0].merged_upload(pending.updates[0].upload.clone());
+            assert_eq!(upload.previous_revision, 7);
+            assert_eq!(upload.range, 4..44);
             assert!(
                 commit_prepared_buffer_updates(&mut shadows, pending, &[0], Err(error)).is_err()
             );
@@ -4970,7 +5483,8 @@ mod tests {
     #[test]
     fn sparse_intervals_survive_accepted_revisions_and_rejected_preparation() {
         let mut shadows = [range_test_shadow(vec![3; 65536])];
-        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, BufferOnlyPlan::default(), &[0], Ok(()))
+            .unwrap();
         let pointer = shadows[0].bytes.as_ref().unwrap().as_ptr();
         for offset in [4, 60000] {
             let mut plan = BufferOnlyPlan::default();
@@ -5031,7 +5545,7 @@ mod tests {
         assert!(
             commit_prepared_buffer_updates(
                 &mut shadows,
-                Vec::new(),
+                BufferOnlyPlan::default(),
                 &[0],
                 Err(IrSubmitError::Backend(HandleError::OutOfResources))
             )
@@ -5048,7 +5562,8 @@ mod tests {
                 .ranges(),
             &[4..8, 60000..60004]
         );
-        commit_prepared_buffer_updates(&mut shadows, Vec::new(), &[0], Ok(())).unwrap();
+        commit_prepared_buffer_updates(&mut shadows, BufferOnlyPlan::default(), &[0], Ok(()))
+            .unwrap();
         assert!(shadows[0].upload.is_none());
         let mut next = BufferOnlyPlan::default();
         next.write(&shadows, 0, 32000, Cow::Borrowed(&[6; 4]))
@@ -5192,11 +5707,11 @@ mod tests {
         }
     }
 
-    fn plan_with_pass(pass: ExecutionPass) -> ExecutionPlan {
+    fn plan_with_pass(pass: ExecutionPass) -> ExecutionPlan<'static> {
         ExecutionPlan {
             has_content_preserving_pass: false,
             events: vec![ExecutionEvent::Pass(pass)],
-            buffer_updates: Vec::new(),
+            buffer_updates: BufferOnlyPlan::default(),
             canonical_validations: Vec::new(),
         }
     }

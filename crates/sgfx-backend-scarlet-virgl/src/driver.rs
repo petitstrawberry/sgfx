@@ -408,13 +408,13 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         buffer: IrBufferSpec,
-        bytes: &[u8],
+        source: &IrBufferSource<'_>,
         update: Option<&IrBufferUpdate>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
-                queue.prepare_ir_buffer(context, resources, buffer, bytes, update, mode)
+                queue.prepare_ir_buffer(context, resources, buffer, source, update, mode)
             }
         }
     }
@@ -552,6 +552,92 @@ pub(crate) struct IrBufferUpdate {
     pub(crate) previous_revision: u64,
     pub(crate) range: core::ops::Range<usize>,
     pub(crate) intervals: Option<IrBufferIntervals>,
+}
+
+/// One owned change layered over a buffer shadow's accepted base.
+pub(crate) struct IrBufferOverlay<'a> {
+    pub(crate) range: core::ops::Range<usize>,
+    pub(crate) bytes: &'a [u8],
+}
+
+/// Read-only source for a single logical buffer preparation. Sparse sources
+/// keep the accepted shadow untouched and materialize only the requested
+/// upload range into the backend's bounded scratch buffer.
+pub(crate) enum IrBufferSource<'a> {
+    Contiguous(&'a [u8]),
+    Sparse {
+        base: Option<&'a [u8]>,
+        overlays: &'a [IrBufferOverlay<'a>],
+        len: usize,
+    },
+}
+
+impl IrBufferSource<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Contiguous(bytes) => bytes.len(),
+            Self::Sparse { len, .. } => *len,
+        }
+    }
+
+    /// Copy an exact logical range, applying overlays in write order.
+    pub(crate) fn copy_range(
+        &self,
+        range: core::ops::Range<usize>,
+        destination: &mut [u8],
+    ) -> HandleResult<()> {
+        if range.len() != destination.len() || range.end > self.len() {
+            return Err(HandleError::InvalidParameter);
+        }
+        destination.fill(0);
+        match self {
+            Self::Contiguous(bytes) => {
+                let source = bytes
+                    .get(range.clone())
+                    .ok_or(HandleError::InvalidParameter)?;
+                destination.copy_from_slice(source);
+            }
+            Self::Sparse { base, overlays, .. } => {
+                if let Some(base) = base {
+                    copy_intersection(base, 0, range.clone(), destination);
+                }
+                for overlay in *overlays {
+                    copy_intersection(
+                        overlay.bytes,
+                        overlay.range.start,
+                        range.clone(),
+                        destination,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn direct_range(&self, range: core::ops::Range<usize>) -> Option<&[u8]> {
+        let Self::Contiguous(bytes) = self else {
+            return None;
+        };
+        bytes.get(range)
+    }
+}
+
+fn copy_intersection(
+    source: &[u8],
+    source_start: usize,
+    requested: core::ops::Range<usize>,
+    destination: &mut [u8],
+) {
+    let first = requested.start.max(source_start);
+    let last = requested.end.min(source_start.saturating_add(source.len()));
+    if first >= last {
+        return;
+    }
+    let destination_start = first - requested.start;
+    let source_offset = first - source_start;
+    let count = last - first;
+    destination[destination_start..destination_start + count]
+        .copy_from_slice(&source[source_offset..source_offset + count]);
 }
 
 pub(crate) const MAX_BUFFER_DIRTY_INTERVALS: usize = 128;
