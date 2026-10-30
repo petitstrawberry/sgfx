@@ -1,6 +1,6 @@
 //! Private Scarlet/VirGL resource and queue dispatch.
 
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{borrow::Cow, rc::Rc, vec::Vec};
 use gpu_raw::{Gpu, GpuQueryInfo};
 
 use crate::completion::SubmitMode;
@@ -328,7 +328,7 @@ impl Queue {
         &self,
         context: &Context,
         resources: &mut IrResources,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
@@ -360,7 +360,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         image: &Image,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources, image) {
@@ -378,7 +378,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         target: IrTextureSpec,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
@@ -393,7 +393,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         texture: IrTextureSpec,
-        upload: &IrTextureUpload,
+        upload: &IrTextureUpload<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
@@ -1042,12 +1042,13 @@ pub(crate) struct IrTextureBinding {
     pub(crate) sampler: Option<IrSamplerState>,
 }
 
-/// Tightly packed physical texture upload retained until stream validation succeeds.
+/// Tightly packed physical texture upload retained until encoding completes.
+/// Unchanged source bytes may be borrowed; asynchronous packets own their copy.
 #[derive(Clone)]
-pub(crate) struct IrTextureUpload {
+pub(crate) struct IrTextureUpload<'data> {
     pub(crate) texture: IrTextureSpec,
     pub(crate) destination: IrRect,
-    pub(crate) pixels: Vec<u8>,
+    pub(crate) pixels: Cow<'data, [u8]>,
     pub(crate) storage_format: IrTextureFormat,
     pub(crate) mip_level: u32,
     pub(crate) array_layer: u32,
@@ -1115,7 +1116,7 @@ pub(crate) struct IrTextureCopy {
 }
 
 /// Complete backend-neutral render submission for one mapped presentation target.
-pub(crate) struct IrSubmission {
+pub(crate) struct IrSubmission<'data> {
     pub(crate) clear_color: Option<[f32; 4]>,
     pub(crate) additional_colors: Vec<IrColorAttachment>,
     pub(crate) depth_attachment: Option<IrTextureSpec>,
@@ -1124,7 +1125,7 @@ pub(crate) struct IrSubmission {
     pub(crate) render_area: IrRect,
     pub(crate) vertices: Vec<IrVertex>,
     pub(crate) draws: Vec<IrDraw>,
-    pub(crate) texture_uploads: Vec<IrTextureUpload>,
+    pub(crate) texture_uploads: Vec<IrTextureUpload<'data>>,
 }
 
 /// One additional color output in a render pass.

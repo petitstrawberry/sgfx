@@ -1291,7 +1291,7 @@ impl<'a> PendingBuffers<'a> {
 
 struct ExecutionPlan<'a> {
     has_content_preserving_pass: bool,
-    events: Vec<ExecutionEvent>,
+    events: Vec<ExecutionEvent<'a>>,
     buffer_updates: BufferOnlyPlan<'a>,
     canonical_validations: Vec<(usize, u64)>,
 }
@@ -1623,15 +1623,15 @@ mod submission_profile {
 #[cfg(feature = "profile-submissions")]
 use submission_profile::{Phase as SubmissionPhase, Profile as SubmissionProfile};
 
-enum ExecutionEvent {
-    Upload(driver::IrTextureSpec, driver::IrTextureUpload),
+enum ExecutionEvent<'data> {
+    Upload(driver::IrTextureSpec, driver::IrTextureUpload<'data>),
     Copy(driver::IrTextureCopy),
-    Pass(ExecutionPass),
+    Pass(ExecutionPass<'data>),
 }
 
-struct ExecutionPass {
+struct ExecutionPass<'data> {
     target: ExecutionTarget,
-    submission: IrSubmission,
+    submission: IrSubmission<'data>,
 }
 
 #[derive(Clone)]
@@ -1647,7 +1647,7 @@ struct ActivePass<'r> {
     additional_attachments: Vec<TextureRef<'r>>,
     target: ExecutionTarget,
     depth_attachment: Option<TextureRef<'r>>,
-    submission: IrSubmission,
+    submission: IrSubmission<'static>,
     pipeline: Option<RenderPipelineRef<'r>>,
     programmable: Option<ir::ProgrammableRenderPipelineRef<'r>>,
     programmable_cache: Option<ProgrammableDrawCache<'r>>,
@@ -2178,6 +2178,9 @@ impl Queue {
         #[cfg(feature = "profile-submissions")]
         profile.enter(SubmissionPhase::PrepareBuffers);
         let mut prepared_buffers = Vec::new();
+        // Logical slots are bounded by MAX_BUFFERS. Keep the ordered vector
+        // for publication, but avoid scanning it for every draw binding.
+        let mut prepared_buffer_slots = [0u64; MAX_BUFFERS.div_ceil(64)];
         for event in &events {
             let ExecutionEvent::Pass(pass) = event else {
                 continue;
@@ -2201,7 +2204,12 @@ impl Queue {
                             .flat_map(|p| p.storage_buffers.iter().map(|b| b.buffer)),
                     );
                 for binding in bindings {
-                    if prepared_buffers.contains(&binding.slot) {
+                    let prepared_word = prepared_buffer_slots
+                        .get_mut(binding.slot / 64)
+                        .filter(|_| binding.slot < MAX_BUFFERS)
+                        .ok_or(IrSubmitError::InvalidVertexData)?;
+                    let prepared_mask = 1u64 << (binding.slot % 64);
+                    if *prepared_word & prepared_mask != 0 {
                         continue;
                     }
                     let shadow = resources
@@ -2226,6 +2234,7 @@ impl Queue {
                         .try_reserve(1)
                         .map_err(|_| IrSubmitError::OutOfMemory)?;
                     prepared_buffers.push(binding.slot);
+                    *prepared_word |= prepared_mask;
                 }
             }
         }
@@ -2956,10 +2965,10 @@ fn pass_preserves_contents(desc: ir::RenderPassDesc<'_>) -> bool {
     })
 }
 
-fn finish_pass(
-    pass: ExecutionPass,
+fn finish_pass<'data>(
+    pass: ExecutionPass<'data>,
     preserves_contents: bool,
-) -> Result<Vec<ExecutionPass>, IrSubmitError> {
+) -> Result<Vec<ExecutionPass<'data>>, IrSubmitError> {
     if pass.submission.draws.is_empty() && !submission_has_clear(&pass.submission) {
         return if preserves_contents {
             Ok(Vec::new())
@@ -2973,7 +2982,7 @@ fn finish_pass(
 }
 
 /// Return whether a draw-free pass still changes an attachment.
-fn submission_has_clear(submission: &IrSubmission) -> bool {
+fn submission_has_clear(submission: &IrSubmission<'_>) -> bool {
     submission.clear_color.is_some()
         || submission.clear_depth.is_some()
         || submission
@@ -3462,7 +3471,9 @@ fn programmable_chunk_bytes<'draw>(
     Some(bytes)
 }
 
-fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> {
+fn split_pass<'data>(
+    pass: ExecutionPass<'data>,
+) -> Result<Vec<ExecutionPass<'data>>, IrSubmitError> {
     let IrSubmission {
         clear_color,
         additional_colors,
@@ -3644,8 +3655,8 @@ fn split_pass(pass: ExecutionPass) -> Result<Vec<ExecutionPass>, IrSubmitError> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_pass_chunk(
-    chunks: &mut Vec<ExecutionPass>,
+fn push_pass_chunk<'data>(
+    chunks: &mut Vec<ExecutionPass<'data>>,
     target: &ExecutionTarget,
     clear_color: Option<[f32; 4]>,
     additional_colors: &[driver::IrColorAttachment],
@@ -3655,7 +3666,7 @@ fn push_pass_chunk(
     render_area: IrRect,
     vertices: Vec<IrVertex>,
     draws: Vec<IrDraw>,
-    texture_uploads: Vec<IrTextureUpload>,
+    texture_uploads: Vec<IrTextureUpload<'data>>,
     first: bool,
 ) -> Result<(), IrSubmitError> {
     let mut colors = Vec::new();
@@ -4166,11 +4177,11 @@ fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, IrSubmitError> {
         .ok_or(IrSubmitError::InvalidVertexData)
 }
 
-fn convert_texture_upload(
+fn convert_texture_upload<'data>(
     texture: driver::IrTextureSpec,
-    write: TextureWrite<'_>,
+    write: TextureWrite<'data>,
     native_narrow: bool,
-) -> Result<IrTextureUpload, IrSubmitError> {
+) -> Result<IrTextureUpload<'data>, IrSubmitError> {
     let destination = write.destination();
     if write.array_layer() >= texture.array_layers
         || write.mip_level() >= texture.mip_levels
@@ -4215,42 +4226,49 @@ fn convert_texture_upload(
         .and_then(|width| width.checked_mul(height))
         .and_then(|pixels| pixels.checked_mul(storage_format.bytes_per_texel()))
         .ok_or(IrSubmitError::OutOfMemory)?;
-    let mut pixels = Vec::new();
-    pixels
-        .try_reserve_exact(output_len)
-        .map_err(|_| IrSubmitError::OutOfMemory)?;
-    for row in 0..height {
-        let start = row
-            .checked_mul(source_stride)
-            .ok_or(IrSubmitError::InvalidVertexData)?;
-        let source = write
-            .data()
-            .get(start..start + tight)
-            .ok_or(IrSubmitError::InvalidVertexData)?;
-        match texture.format {
-            IrTextureFormat::Bgra8 => pixels.extend_from_slice(source),
-            IrTextureFormat::Rgba8 => {
-                for pixel in source.chunks_exact(4) {
-                    pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    let pixels = if texture.format == storage_format && source_stride == tight {
+        // The command payload outlives this plan and is copied into owned
+        // transport packets before asynchronous submission can retain it.
+        Cow::Borrowed(&write.data()[..output_len])
+    } else {
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(output_len)
+            .map_err(|_| IrSubmitError::OutOfMemory)?;
+        for row in 0..height {
+            let start = row
+                .checked_mul(source_stride)
+                .ok_or(IrSubmitError::InvalidVertexData)?;
+            let source = write
+                .data()
+                .get(start..start + tight)
+                .ok_or(IrSubmitError::InvalidVertexData)?;
+            match texture.format {
+                IrTextureFormat::Bgra8 => pixels.extend_from_slice(source),
+                IrTextureFormat::Rgba8 => {
+                    for pixel in source.chunks_exact(4) {
+                        pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                    }
                 }
-            }
-            IrTextureFormat::R8 if native_narrow => pixels.extend_from_slice(source),
-            IrTextureFormat::Rg8 if native_narrow => pixels.extend_from_slice(source),
-            IrTextureFormat::R8 => {
-                for value in source {
-                    pixels.extend_from_slice(&[0, 0, *value, 255]);
+                IrTextureFormat::R8 if native_narrow => pixels.extend_from_slice(source),
+                IrTextureFormat::Rg8 if native_narrow => pixels.extend_from_slice(source),
+                IrTextureFormat::R8 => {
+                    for value in source {
+                        pixels.extend_from_slice(&[0, 0, *value, 255]);
+                    }
                 }
-            }
-            IrTextureFormat::Rg8 => {
-                for pixel in source.chunks_exact(2) {
-                    pixels.extend_from_slice(&[0, pixel[1], pixel[0], 255]);
+                IrTextureFormat::Rg8 => {
+                    for pixel in source.chunks_exact(2) {
+                        pixels.extend_from_slice(&[0, pixel[1], pixel[0], 255]);
+                    }
                 }
+                IrTextureFormat::Depth32Float
+                | IrTextureFormat::Rgba16Float
+                | IrTextureFormat::Rgba32Float => pixels.extend_from_slice(source),
             }
-            IrTextureFormat::Depth32Float
-            | IrTextureFormat::Rgba16Float
-            | IrTextureFormat::Rgba32Float => pixels.extend_from_slice(source),
         }
-    }
+        Cow::Owned(pixels)
+    };
     Ok(IrTextureUpload {
         mip_level: write.mip_level(),
         array_layer: write.array_layer(),
@@ -4580,6 +4598,88 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_texture_uploads_borrow_exact_payload_and_repack_padded_rows() {
+        for format in [
+            IrTextureFormat::Bgra8,
+            IrTextureFormat::R8,
+            IrTextureFormat::Rg8,
+            IrTextureFormat::Depth32Float,
+            IrTextureFormat::Rgba16Float,
+            IrTextureFormat::Rgba32Float,
+        ] {
+            let spec = driver::IrTextureSpec {
+                slot: 0,
+                width: 3,
+                height: 2,
+                mip_levels: 1,
+                array_layers: 1,
+                cube: false,
+                sampled: true,
+                render_attachment: false,
+                copy_destination: true,
+                present: false,
+                format,
+            };
+            let row_bytes = 3 * format.bytes_per_texel();
+            // Trailing bytes must not become part of the physical payload.
+            let source: Vec<u8> = (0..row_bytes * 2 + 7).map(|i| (i * 37) as u8).collect();
+            let destination = ir::PixelRect::new(0, 0, 3, 2).unwrap();
+            for native_narrow in [false, true] {
+                if format.storage_format(native_narrow) != format {
+                    continue;
+                }
+                let write = TextureWrite::new(destination, row_bytes as u32, &source).unwrap();
+                let upload = convert_texture_upload(spec, write, native_narrow).unwrap();
+                assert!(matches!(upload.pixels, Cow::Borrowed(_)));
+                assert_eq!(upload.pixels.as_ptr(), source.as_ptr());
+                assert_eq!(upload.pixels.as_ref(), &source[..row_bytes * 2]);
+
+                let stride = row_bytes + 5;
+                let mut padded = alloc::vec![0xa5; stride + row_bytes];
+                padded[..row_bytes].copy_from_slice(&source[..row_bytes]);
+                padded[stride..].copy_from_slice(&source[row_bytes..row_bytes * 2]);
+                let write = TextureWrite::new(destination, stride as u32, &padded).unwrap();
+                let upload = convert_texture_upload(spec, write, native_narrow).unwrap();
+                assert!(matches!(upload.pixels, Cow::Owned(_)));
+                assert_eq!(upload.pixels.as_ref(), &source[..row_bytes * 2]);
+
+                let short =
+                    TextureWrite::new(destination, row_bytes as u32, &source[..row_bytes * 2 - 1])
+                        .unwrap();
+                assert!(convert_texture_upload(spec, short, native_narrow).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn rgba_texture_upload_owns_swizzled_pixels_for_tight_and_padded_rows() {
+        let spec = driver::IrTextureSpec {
+            slot: 0,
+            width: 1,
+            height: 2,
+            mip_levels: 1,
+            array_layers: 1,
+            cube: false,
+            sampled: true,
+            render_attachment: false,
+            copy_destination: true,
+            present: false,
+            format: IrTextureFormat::Rgba8,
+        };
+        for (stride, source) in [
+            (4, &[1, 2, 3, 4, 5, 6, 7, 8][..]),
+            (6, &[1, 2, 3, 4, 0xaa, 0xbb, 5, 6, 7, 8][..]),
+        ] {
+            let write =
+                TextureWrite::new(ir::PixelRect::new(0, 0, 1, 2).unwrap(), stride, source).unwrap();
+            let upload = convert_texture_upload(spec, write, true).unwrap();
+            assert!(matches!(upload.pixels, Cow::Owned(_)));
+            assert!(upload.storage_format == IrTextureFormat::Bgra8);
+            assert_eq!(upload.pixels.as_ref(), &[3, 2, 1, 4, 7, 6, 5, 8]);
+        }
+    }
+
+    #[test]
     fn narrow_upload_preserves_padded_rows_mip_layer_and_logical_channels() {
         for format in [IrTextureFormat::R8, IrTextureFormat::Rg8] {
             let bpp = format.bytes_per_texel();
@@ -4616,11 +4716,13 @@ mod tests {
             .with_mip_level(1)
             .with_array_layer(1);
             let native = convert_texture_upload(spec, write, true).unwrap();
+            assert!(matches!(native.pixels, Cow::Owned(_)));
             assert!(native.storage_format == format);
             assert_eq!(native.pixels, tight);
             assert_eq!((native.mip_level, native.array_layer), (1, 1));
             assert_eq!((native.destination.x, native.destination.y), (2, 3));
             let emulated = convert_texture_upload(spec, write, false).unwrap();
+            assert!(matches!(emulated.pixels, Cow::Owned(_)));
             assert!(emulated.storage_format == IrTextureFormat::Bgra8);
             for (pixel, logical) in emulated.pixels.chunks_exact(4).zip(tight.chunks_exact(bpp)) {
                 assert_eq!(
@@ -5856,7 +5958,7 @@ mod tests {
         }
     }
 
-    fn execution_pass(vertices: Vec<IrVertex>, draws: Vec<IrDraw>) -> ExecutionPass {
+    fn execution_pass(vertices: Vec<IrVertex>, draws: Vec<IrDraw>) -> ExecutionPass<'static> {
         ExecutionPass {
             target: ExecutionTarget::Internal(target()),
             submission: IrSubmission {
@@ -5894,7 +5996,7 @@ mod tests {
         }
     }
 
-    fn plan_with_pass(pass: ExecutionPass) -> ExecutionPlan<'static> {
+    fn plan_with_pass(pass: ExecutionPass<'static>) -> ExecutionPlan<'static> {
         ExecutionPlan {
             has_content_preserving_pass: false,
             events: vec![ExecutionEvent::Pass(pass)],

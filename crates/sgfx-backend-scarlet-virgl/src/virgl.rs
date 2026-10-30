@@ -1986,7 +1986,7 @@ impl Queue {
         &self,
         context: &Context,
         resources: &mut IrResources,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
     ) -> HandleResult<()> {
         for color in &submission.additional_colors {
             ir_texture(context, resources, color.texture)?;
@@ -2214,7 +2214,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         spec: IrTextureSpec,
-        upload: &IrTextureUpload,
+        upload: &IrTextureUpload<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
@@ -2354,7 +2354,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         target: IrTextureSpec,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if !target.render_attachment
@@ -2400,7 +2400,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         image: &Image,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         self.submit_ir_target(
@@ -2427,7 +2427,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         target: IrPassTarget,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
@@ -3411,7 +3411,7 @@ fn ir_texture<'resources>(
     Ok(texture)
 }
 
-fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmission> {
+fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmission<'static>> {
     let filter = copy.filter.ok_or(HandleError::InvalidParameter)?;
     if copy.destination_mip != 0
         || copy.source_mip >= 32
@@ -5620,7 +5620,7 @@ fn push_ir_buffer_inline_write(
 // VirGL's payload is 11 header words followed by tightly packed pixel bytes.
 fn submit_ir_texture_inline_write(
     resource_id: u32,
-    upload: &IrTextureUpload,
+    upload: &IrTextureUpload<'_>,
     max_command_size: usize,
     mut submit: impl FnMut(&[u8]) -> HandleResult<()>,
 ) -> HandleResult<()> {
@@ -7836,7 +7836,7 @@ mod tests {
         assert!(commands.is_empty());
     }
 
-    fn texture_upload(width: u32, height: u32) -> IrTextureUpload {
+    fn texture_upload(width: u32, height: u32) -> IrTextureUpload<'static> {
         IrTextureUpload {
             texture: IrTextureSpec {
                 slot: 0,
@@ -7860,11 +7860,17 @@ mod tests {
                 width,
                 height,
             },
-            pixels: (0..width * height * 4).map(|value| value as u8).collect(),
+            pixels: (0..width * height * 4)
+                .map(|value| value as u8)
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 
-    fn check_upload_chunks(upload: &IrTextureUpload, limit: usize) -> Vec<(u32, u32, u32, u32)> {
+    fn check_upload_chunks(
+        upload: &IrTextureUpload<'_>,
+        limit: usize,
+    ) -> Vec<(u32, u32, u32, u32)> {
         let bpp = upload.storage_format.bytes_per_texel();
         let mut covered = alloc::vec![false; upload.pixels.len() / bpp];
         let mut rectangles = Vec::new();
@@ -7902,13 +7908,14 @@ mod tests {
         rectangles
     }
 
-    fn narrow_upload(format: IrTextureFormat, width: u32, height: u32) -> IrTextureUpload {
+    fn narrow_upload(format: IrTextureFormat, width: u32, height: u32) -> IrTextureUpload<'static> {
         let mut upload = texture_upload(width, height);
         upload.texture.format = format;
         upload.storage_format = format;
         upload.pixels = (0..width as usize * height as usize * format.bytes_per_texel())
             .map(|index| (index * 37 + index / 251) as u8)
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         upload
     }
 
@@ -8041,7 +8048,7 @@ mod tests {
             })
             .is_err()
         );
-        upload.pixels.pop();
+        upload.pixels.to_mut().pop();
         assert!(
             submit_ir_texture_inline_write(17, &upload, 72, |_| {
                 submitted += 1;
