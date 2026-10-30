@@ -266,7 +266,7 @@ pub(crate) struct Resources {
     pub views: HashMap<vk::ImageView, crate::images::ImageView>,
     pub render_passes: HashMap<vk::RenderPass, crate::images::RenderPass>,
     pub framebuffers: HashMap<vk::Framebuffer, crate::images::Framebuffer>,
-    #[cfg(any(target_os = "macos", feature = "scarlet-wsi"))]
+    #[cfg(any(target_os = "scarlet", target_os = "macos", feature = "scarlet-wsi"))]
     pub swapchains: HashMap<vk::SwapchainKHR, crate::wsi::Swapchain>,
 }
 impl Resources {
@@ -459,11 +459,15 @@ impl Resources {
             || !self.pipeline_layouts.is_empty()
             || !self.descriptor_sets.is_empty()
             || {
-                #[cfg(any(target_os = "macos", feature = "scarlet-wsi"))]
+                #[cfg(any(target_os = "scarlet", target_os = "macos", feature = "scarlet-wsi"))]
                 {
                     !self.swapchains.is_empty()
                 }
-                #[cfg(not(any(target_os = "macos", feature = "scarlet-wsi")))]
+                #[cfg(not(any(
+                    target_os = "scarlet",
+                    target_os = "macos",
+                    feature = "scarlet-wsi"
+                )))]
                 {
                     false
                 }

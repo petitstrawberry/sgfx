@@ -34,7 +34,11 @@ mod stage_inputs;
 mod transfer;
 mod uniform_arrays;
 mod upload_batches;
-#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+#[cfg(any(
+    target_os = "scarlet",
+    target_os = "macos",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
 mod wsi;
 
 // Keep the Linux-ABI ICD's short-lived command and draw allocations in a
@@ -60,3 +64,11 @@ pub fn linked_entry() -> ash::Entry {
         })
     }
 }
+
+#[cfg(target_os = "scarlet")]
+pub mod scarlet_surface;
+#[cfg(any(
+    target_os = "scarlet",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
+mod sws_wsi;

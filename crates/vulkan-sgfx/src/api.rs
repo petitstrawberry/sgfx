@@ -507,7 +507,11 @@ pub(crate) fn mark_device_lost(device: vk::Device) {
     }
 }
 
-#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+#[cfg(any(
+    target_os = "scarlet",
+    target_os = "macos",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
 pub(crate) fn with_queue<T: Send + 'static>(
     queue: vk::Queue,
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
@@ -698,25 +702,19 @@ unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
             {
                 return true;
             }
-            #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
-            {
-                name == vk::KHR_SWAPCHAIN_NAME
-            }
-            #[cfg(not(any(
+            #[cfg(any(
+                target_os = "scarlet",
                 target_os = "macos",
                 all(target_os = "linux", feature = "scarlet-wsi")
-            )))]
-            {
-                #[cfg(target_os = "scarlet")]
-                {
-                    name == crate::scarlet_image::DEVICE_EXTENSION_NAME
-                }
-                #[cfg(not(target_os = "scarlet"))]
-                {
-                    let _ = name;
-                    false
-                }
+            ))]
+            if name == vk::KHR_SWAPCHAIN_NAME {
+                return true;
             }
+            #[cfg(target_os = "scarlet")]
+            if name == crate::scarlet_image::DEVICE_EXTENSION_NAME {
+                return true;
+            }
+            false
         }
     })
 }
@@ -3575,6 +3573,7 @@ unsafe extern "system" fn destroy_semaphore(
 }
 
 #[cfg(any(
+    target_os = "scarlet",
     target_os = "macos",
     all(target_os = "linux", feature = "scarlet-wsi"),
     test
@@ -3596,6 +3595,7 @@ fn semaphore_refs(d: &Driver, handles: &[vk::Semaphore]) -> VkResult<Vec<Arc<Ato
 }
 
 #[cfg(any(
+    target_os = "scarlet",
     target_os = "macos",
     all(target_os = "linux", feature = "scarlet-wsi"),
     test
@@ -3619,6 +3619,7 @@ fn wait_and_consume_semaphores(d: &Driver, semaphores: &[Arc<AtomicU8>]) -> VkRe
 }
 
 #[cfg(any(
+    target_os = "scarlet",
     target_os = "macos",
     all(target_os = "linux", feature = "scarlet-wsi"),
     test
@@ -3662,6 +3663,7 @@ pub(crate) fn signal_acquire_sync(
 }
 
 #[cfg(any(
+    target_os = "scarlet",
     target_os = "macos",
     all(target_os = "linux", feature = "scarlet-wsi"),
     test
@@ -4351,16 +4353,46 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkWaitForFences" => entry!(wait_for_fences),
         b"vkCreateSemaphore" => entry!(create_semaphore),
         b"vkDestroySemaphore" => entry!(destroy_semaphore),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkCreateSwapchainKHR" => entry!(crate::wsi::create_swapchain),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkDestroySwapchainKHR" => entry!(crate::wsi::destroy_swapchain),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkGetSwapchainImagesKHR" => entry!(crate::wsi::get_swapchain_images),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkAcquireNextImageKHR" => entry!(crate::wsi::acquire_next_image),
-        #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "scarlet-wsi")))]
+        #[cfg(any(
+            target_os = "scarlet",
+            target_os = "macos",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
         b"vkQueuePresentKHR" => entry!(crate::wsi::queue_present),
+        #[cfg(target_os = "scarlet")]
+        b"vkAcquireNextImage2KHR" => entry!(crate::wsi::acquire_next_image2),
+        #[cfg(target_os = "scarlet")]
+        b"vkGetDeviceGroupPresentCapabilitiesKHR" => {
+            entry!(crate::wsi::device_group_present_capabilities)
+        }
+        #[cfg(target_os = "scarlet")]
+        b"vkGetDeviceGroupSurfacePresentModesKHR" => {
+            entry!(crate::wsi::device_group_surface_present_modes)
+        }
         #[cfg(target_os = "scarlet")]
         b"vkGetImageScarletHandleSGFX" => {
             entry!(crate::scarlet_image::vkGetImageScarletHandleSGFX)
