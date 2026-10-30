@@ -554,7 +554,8 @@ pub(crate) struct IrBufferUpdate {
     pub(crate) intervals: Option<IrBufferIntervals>,
 }
 
-/// One owned change layered over a buffer shadow's accepted base.
+/// One disjoint range borrowed from a stable pending write payload. Sparse
+/// sources supply these overlays in ascending, nonoverlapping range order.
 pub(crate) struct IrBufferOverlay<'a> {
     pub(crate) range: core::ops::Range<usize>,
     pub(crate) bytes: &'a [u8],
@@ -580,13 +581,22 @@ impl IrBufferSource<'_> {
         }
     }
 
-    /// Copy an exact logical range, applying overlays in write order.
+    /// Copy an exact logical range from normalized last-write-wins overlays.
     pub(crate) fn copy_range(
         &self,
         range: core::ops::Range<usize>,
         destination: &mut [u8],
     ) -> HandleResult<()> {
-        if range.len() != destination.len() || range.end > self.len() {
+        self.copy_range_with(range, destination, || {})
+    }
+
+    fn copy_range_with(
+        &self,
+        range: core::ops::Range<usize>,
+        destination: &mut [u8],
+        mut visit: impl FnMut(),
+    ) -> HandleResult<()> {
+        if range.start > range.end || range.len() != destination.len() || range.end > self.len() {
             return Err(HandleError::InvalidParameter);
         }
         destination.fill(0);
@@ -601,7 +611,12 @@ impl IrBufferSource<'_> {
                 if let Some(base) = base {
                     copy_intersection(base, 0, range.clone(), destination);
                 }
-                for overlay in *overlays {
+                for overlay in crate::ir_execute::buffer_ranges::intersecting(
+                    overlays,
+                    range.clone(),
+                    |overlay| overlay.range.clone(),
+                ) {
+                    visit();
                     copy_intersection(
                         overlay.bytes,
                         overlay.range.start,
@@ -638,6 +653,56 @@ fn copy_intersection(
     let count = last - first;
     destination[destination_start..destination_start + count]
         .copy_from_slice(&source[source_offset..source_offset + count]);
+}
+
+#[cfg(test)]
+mod buffer_range_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_upload_queries_visit_only_intersecting_normalized_overlays() {
+        let data = [9; 8];
+        let overlays = (0..8192)
+            .map(|index| IrBufferOverlay {
+                range: index * 16..index * 16 + 8,
+                bytes: &data,
+            })
+            .collect::<Vec<_>>();
+        let source = IrBufferSource::Sparse {
+            base: None,
+            overlays: &overlays,
+            len: 131072,
+        };
+        let mut visits = 0;
+        let mut bytes = [1; 18];
+        source
+            .copy_range_with(65535..65553, &mut bytes, || visits += 1)
+            .unwrap();
+        assert_eq!(visits, 2);
+        assert_eq!(
+            bytes,
+            [0, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 9]
+        );
+        visits = 0;
+        let mut gap = [1; 8];
+        source
+            .copy_range_with(65528..65536, &mut gap, || visits += 1)
+            .unwrap();
+        assert_eq!(visits, 0);
+        assert_eq!(gap, [0; 8]);
+        let mut full = [0; 65536];
+        visits = 0;
+        source
+            .copy_range_with(65536..131072, &mut full, || visits += 1)
+            .unwrap();
+        assert_eq!(visits, 4096);
+        assert_eq!(
+            &full[..16],
+            &[9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let reversed = core::ops::Range { start: 10, end: 9 };
+        assert!(source.copy_range(reversed, &mut []).is_err());
+    }
 }
 
 pub(crate) const MAX_BUFFER_DIRTY_INTERVALS: usize = 128;
