@@ -1003,7 +1003,13 @@ impl Resources {
             };
             entries.push(ir::BindGroupEntry::new(entry.binding(), resource));
         }
-        let desc = ir::BindGroupDesc::new(table, layout.clone(), entries).map_err(failure)?;
+        let desc = ir::BindGroupDesc::new(table, layout.clone(), entries)
+            .inspect_err(|error| {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    self.trace_descriptor_group_failure(table, handle, set, layout, error);
+                }
+            })
+            .map_err(failure)?;
         // Validate live resources above even on a cache hit. A set may be used
         // by pipelines with distinct reflected views of its Vulkan layout.
         if dynamic_offsets.is_empty()
@@ -1031,6 +1037,59 @@ impl Resources {
                 .cached_group = Some(id);
         }
         Ok(id)
+    }
+
+    #[cold]
+    fn trace_descriptor_group_failure(
+        &self,
+        table: &ir::ResourceTable,
+        handle: vk::DescriptorSet,
+        set: &DescriptorSet,
+        layout: &ir::BindGroupLayoutDesc,
+        error: &ir::Error,
+    ) {
+        eprintln!(
+            "[SGFX Vulkan] descriptor validation failed: set={handle:?} error={error:?} declared_layout={:?} reflected_layout={layout:?}",
+            set.layout,
+        );
+        for entry in layout.entries() {
+            let binding = set.ir_to_source(entry.binding());
+            let bound = binding.and_then(|binding| set.bindings.get(&binding));
+            eprintln!(
+                "[SGFX Vulkan] descriptor validation entry: set={handle:?} expected={entry:?} source_binding={binding:?} bound={bound:?}"
+            );
+            let sampler = match bound {
+                Some(DescriptorBinding::Image { view, sampler, .. }) => {
+                    let actual_view = self.views.get(view);
+                    let image = actual_view.and_then(|view| self.images.get(&view.image));
+                    let texture = image
+                        .map(|image| table.texture_ref(image.id).and_then(|id| table.texture(id)));
+                    eprintln!(
+                        "[SGFX Vulkan] descriptor validation image: set={handle:?} binding={} vk_view={view:?} ir_view={:?} components={:?} vk_image={:?} vk_format={:?} vk_extent={:?} vk_mip_levels={:?} vk_array_layers={:?} ir_texture={:?} core_texture={texture:?}",
+                        entry.binding(),
+                        actual_view.map(|view| view.desc),
+                        actual_view.map(|view| view.components),
+                        actual_view.map(|view| view.image),
+                        image.map(|image| image.format),
+                        image.map(|image| image.extent),
+                        image.map(|image| image.mip_levels),
+                        image.map(|image| image.array_layers),
+                        image.map(|image| image.id),
+                    );
+                    Some(*sampler)
+                }
+                Some(DescriptorBinding::Sampler(sampler)) => Some(*sampler),
+                _ => None,
+            };
+            if let Some(sampler) = sampler {
+                let id = self.samplers.get(&sampler);
+                let desc = id.map(|id| table.sampler_ref(*id).and_then(|id| table.sampler(id)));
+                eprintln!(
+                    "[SGFX Vulkan] descriptor validation sampler: set={handle:?} binding={} vk_sampler={sampler:?} ir_sampler={id:?} core_sampler={desc:?}",
+                    entry.binding(),
+                );
+            }
+        }
     }
 }
 fn swizzle_entry(
