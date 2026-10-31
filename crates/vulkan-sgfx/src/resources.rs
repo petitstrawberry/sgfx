@@ -1366,7 +1366,16 @@ unsafe extern "system" fn destroy_buffer(
     buffer: vk::Buffer,
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
-    let _ = crate::api::with_device(device, move |r| {
+    if buffer == vk::Buffer::null() {
+        return;
+    }
+    let frame_operation = concat!(module_path!(), "::destroy_buffer");
+    let _frame = crate::frame_profile::Span::new("call", frame_operation);
+    // Destruction owns only the handle and has no return value. Publish it on
+    // the same device FIFO without stopping the caller behind an unrelated
+    // draw submission; cache_buffer retains the backing until GPU retirement.
+    let _ = crate::api::with_device_owned(device, move |r| {
+        let _frame = crate::frame_profile::Span::new("service", frame_operation);
         if let Some(id) = r.resources.buffers.get(&buffer).map(|buffer| buffer.id) {
             let shared = r
                 .resources
