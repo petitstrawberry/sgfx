@@ -62,10 +62,56 @@ pub(super) fn execute(
         return Ok(());
     }
     profile_work("sync::gpu_wait", || {
-        for submission in retained.drain(..) {
-            wait_submission(rt, &submission)?;
-        }
-        Ok(())
+        // Count control points by CPU observation and receipt presence before
+        // draining. `receipts` does not imply a blocking wait; `empty` can still
+        // have earlier in-flight packets covered by the separate wait below.
+        // Static labels use the existing cached opt-in, with no formatting or
+        // environment lookup per action.
+        let labels = match action {
+            Action::IndirectRead(_) => [
+                "sync::gpu_wait::indirect_read::empty",
+                "sync::gpu_wait::indirect_read::receipts",
+            ],
+            Action::Query(queries::Action::Begin(..)) => [
+                "sync::gpu_wait::query_begin::empty",
+                "sync::gpu_wait::query_begin::receipts",
+            ],
+            Action::Query(queries::Action::End(..)) => [
+                "sync::gpu_wait::query_end::empty",
+                "sync::gpu_wait::query_end::receipts",
+            ],
+            Action::Query(queries::Action::Reset(..)) => [
+                "sync::gpu_wait::query_reset::empty",
+                "sync::gpu_wait::query_reset::receipts",
+            ],
+            Action::Query(queries::Action::Timestamp(..)) => [
+                "sync::gpu_wait::query_timestamp::empty",
+                "sync::gpu_wait::query_timestamp::receipts",
+            ],
+            Action::Query(queries::Action::Copy { .. }) => [
+                "sync::gpu_wait::query_copy::empty",
+                "sync::gpu_wait::query_copy::receipts",
+            ],
+            Action::Set(_) => [
+                "sync::gpu_wait::event_set::empty",
+                "sync::gpu_wait::event_set::receipts",
+            ],
+            Action::Reset(_) => [
+                "sync::gpu_wait::event_reset::empty",
+                "sync::gpu_wait::event_reset::receipts",
+            ],
+            Action::Wait(_) => [
+                "sync::gpu_wait::event_wait::empty",
+                "sync::gpu_wait::event_wait::receipts",
+            ],
+            Action::IndirectDraw(_) | Action::Barrier => unreachable!(),
+        };
+        profile_work(labels[usize::from(!retained.is_empty())], || {
+            for submission in retained.drain(..) {
+                wait_submission(rt, &submission)?;
+            }
+            Ok(())
+        })
     })?;
     // Earlier packets may have no operations in this command buffer. Their
     // completion observer runs independently of the resource worker.
