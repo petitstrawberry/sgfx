@@ -356,9 +356,8 @@ impl Window {
             sws_gpu_register_opaque(buffer, image.width(), image.height(), handle.as_raw())
         };
         #[cfg(target_os = "linux")]
-        let registered = unsafe {
-            sws_gpu_register(buffer, image.width(), image.height(), handle.as_raw())
-        };
+        let registered =
+            unsafe { sws_gpu_register(buffer, image.width(), image.height(), handle.as_raw()) };
         if registered < 0 {
             return Err(LOST);
         }
