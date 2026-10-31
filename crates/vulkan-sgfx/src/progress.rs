@@ -122,6 +122,7 @@ pub(crate) fn submitted(draws: u64) {
 }
 
 pub(crate) fn presented(swapchain: u64) {
+    crate::frame_profile::presented();
     let Some(state) = state() else {
         return;
     };

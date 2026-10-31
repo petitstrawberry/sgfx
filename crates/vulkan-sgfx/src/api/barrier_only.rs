@@ -8,7 +8,7 @@ pub(super) fn is_noop(commands: &[ir::OwnedCommand]) -> bool {
     !commands.is_empty() && commands.iter().all(ordinary_barrier)
 }
 
-fn ordinary_barrier(command: &ir::OwnedCommand) -> bool {
+pub(super) fn ordinary_barrier(command: &ir::OwnedCommand) -> bool {
     match command {
         ir::OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::Buffer {
             before,

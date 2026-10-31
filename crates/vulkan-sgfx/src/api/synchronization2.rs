@@ -1,6 +1,6 @@
 //! Synchronization2 lowers to the existing resource barriers and FIFO queue.
-//! Stage scopes are conservatively widened to GPU retirement. This trades
-//! overlap for correctness without introducing a second submission engine.
+//! GPU dependencies stay in the ordered IR stream. CPU observations flush
+//! and retire the preceding queue prefix before accessing its results.
 use super::*;
 
 #[derive(Clone)]
@@ -37,6 +37,29 @@ pub(super) fn execute(
         );
         return Ok(());
     }
+    // CPU-authoritative arguments need no GPU boundary. Eligibility includes
+    // the recorded prefix's write/alias ranges; earlier recordings finish their
+    // readback before execution reaches this point. Preserve the prefix in ops
+    // so the expanded draw stays in the same ordered submission.
+    if let Action::IndirectRead(read) = action {
+        if rt.device_lost.load(Ordering::Acquire) {
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
+        if indirect::read_host(
+            &rt.resources,
+            read,
+            rt.capabilities.supports_shader_draw_parameters(),
+        )? {
+            return Ok(());
+        }
+    }
+    // Resource dependency commands remain in ops and are validated/replayed
+    // in FIFO order by the backend. Only CPU observations below need a submit
+    // boundary; a GPU-only dependency must not create a separate receipt.
+    if matches!(action, Action::Barrier) && rt.capabilities.supports_global_resource_barriers() {
+        ops.push(ir::OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::Global));
+        return Ok(());
+    }
     // A boundary with no preceding commands has nothing new to dispatch. The
     // retained receipts below already cover the earlier queue prefix; CPU
     // observations still wait for them and for earlier in-flight packets.
@@ -52,30 +75,12 @@ pub(super) fn execute(
             )
         })?
     };
-    // Submissions on this queue execute in order. A GPU-only barrier needs
-    // an ordered stream boundary, while CPU observations below need retirement.
-    // Keep every receipt for the enclosing fence/readback instead of dropping
-    // it when the barrier returns.
+    // CPU observations below need retirement. Keep every receipt until the
+    // observation or enclosing fence/readback has consumed the queue prefix.
     retained.extend(submissions);
     if matches!(action, Action::Barrier) {
         reap_completed(rt, retained)?;
         return Ok(());
-    }
-    if let Action::IndirectRead(read) = action {
-        if rt.device_lost.load(Ordering::Acquire) {
-            return Err(vk::Result::ERROR_DEVICE_LOST);
-        }
-        if indirect::read_host(
-            &rt.resources,
-            read,
-            rt.capabilities.supports_shader_draw_parameters(),
-        )? {
-            // Prefix submission and its receipts are preserved. CPU-authored
-            // arguments need no retirement; keep the usual bounded observer
-            // window for all the already submitted work.
-            reap_completed(rt, retained)?;
-            return Ok(());
-        }
     }
     profile_work("sync::gpu_wait", || {
         // Count control points by CPU observation and receipt presence before
@@ -559,6 +564,7 @@ unsafe extern "system" fn submit(
     infos: *const vk::SubmitInfo2<'_>,
     fence: vk::Fence,
 ) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("submit", "queue_submit2");
     status((|| {
         let d = driver(queue.as_raw(), Kind::Queue)?;
         if !d.synchronization2_enabled {

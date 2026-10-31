@@ -83,6 +83,14 @@ impl Drop for Owner {
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities(u64);
 impl Capabilities {
+    /// Global resource-dependency command support in the command ABI.
+    pub fn supports_global_resource_barriers(self) -> bool {
+        self.0 & abi::GLOBAL_RESOURCE_BARRIERS != 0
+    }
+    /// Accepted buffer writes are already visible through the readback API.
+    pub fn supports_immediate_buffer_readback(self) -> bool {
+        self.0 & abi::IMMEDIATE_BUFFER_READBACK != 0
+    }
     /// Native floating-point RGBA render targets and transfers.
     pub fn supports_float_color(self) -> bool {
         self.0 & abi::FLOAT_COLOR_ATTACHMENTS != 0

@@ -4043,6 +4043,13 @@ pub(crate) fn push_dword(commands: &mut Vec<u8>, value: u32) {
     commands.extend_from_slice(&value.to_le_bytes());
 }
 
+fn push_words(commands: &mut Vec<u8>, values: &[u32]) -> HandleResult<()> {
+    commands.try_reserve(core::mem::size_of_val(values))
+        .map_err(|_| HandleError::OutOfResources)?;
+    commands.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+    Ok(())
+}
+
 fn push_float(commands: &mut Vec<u8>, value: f32) {
     push_dword(commands, value.to_bits());
 }
@@ -4610,10 +4617,7 @@ pub(crate) fn push_constant_words(
     );
     push_dword(commands, shader_type);
     push_dword(commands, 0);
-    for value in values {
-        push_dword(commands, *value);
-    }
-    Ok(())
+    push_words(commands, values)
 }
 
 fn push_ir_setup(commands: &mut Vec<u8>, resources: &IrResources) {
@@ -4880,6 +4884,8 @@ fn push_programmable_vertex_elements(
 /// for every draw. Constant packing buffers retain their capacity.
 #[derive(Default)]
 struct ProgrammableBindings {
+    rasterizer: Option<u32>,
+    dsa: Option<u32>,
     pipeline: Option<(u32, u32, u32, u32)>,
     vertex_buffers: Option<[(u32, u32, u32); 8]>,
     constants: Option<Rc<[IrConstantBuffer]>>,
@@ -5047,8 +5053,15 @@ fn push_programmable_draw(
         bindings.pipeline = Some(pipeline_key);
         bindings.constants = None;
     }
-    push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
-    push_bind_object(commands, VIRGL_OBJECT_DSA, state.dsa_handle.unwrap_or(0));
+    if bindings.rasterizer != Some(state.rasterizer_handle) {
+        push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
+        bindings.rasterizer = Some(state.rasterizer_handle);
+    }
+    let dsa = state.dsa_handle.unwrap_or(0);
+    if bindings.dsa != Some(dsa) {
+        push_bind_object(commands, VIRGL_OBJECT_DSA, dsa);
+        bindings.dsa = Some(dsa);
+    }
     let mut vertex_bindings = [(0, 0, 0); 8];
     for (slot, layout) in programmable.pipeline.vertex_buffers.iter().enumerate() {
         let binding = draw.vertex_buffers[slot].ok_or(HandleError::InvalidParameter)?;
@@ -6050,22 +6063,12 @@ fn push_instanced_draw_parameters(
         crate::ir::PrimitiveTopology::PointList if vertex_count > 0 => 0, // PIPE_PRIM_POINTS
         _ => return Err(HandleError::InvalidParameter),
     };
-    push_dword(commands, command_header(VIRGL_CCMD_DRAW_VBO, 0, 12));
-    push_dword(commands, start_vertex);
-    push_dword(commands, vertex_count);
-    push_dword(commands, primitive);
-    push_dword(commands, u32::from(indexed));
-    push_dword(commands, instance_count);
-    push_dword(commands, base_vertex as u32);
-    // VirGL's host may lack GL_ARB_base_instance. The shader constant above
-    // supplies Vulkan's firstInstance to InstanceIndex instead.
-    push_dword(commands, 0);
-    push_dword(commands, 0);
-    push_dword(commands, 0);
-    push_dword(commands, 0);
-    push_dword(commands, u32::MAX);
-    push_dword(commands, 0);
-    Ok(())
+    // Base instance remains in the shader constant bank on this backend.
+    push_words(commands, &[
+        command_header(VIRGL_CCMD_DRAW_VBO, 0, 12), start_vertex, vertex_count,
+        primitive, u32::from(indexed), instance_count, base_vertex as u32,
+        0, 0, 0, 0, u32::MAX, 0,
+    ])
 }
 
 pub(crate) fn push_shader(commands: &mut Vec<u8>, handle: u32, shader_type: u32, source: &str) {

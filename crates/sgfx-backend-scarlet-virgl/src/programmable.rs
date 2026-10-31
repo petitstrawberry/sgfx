@@ -1327,7 +1327,7 @@ pub(super) fn decode_draw(
                     ir::TextureViewDimension::D2
                 };
                 if binding.dimension != dimension
-                    || binding.depth != (descriptor.format() == TextureFormat::Depth32Float)
+                    || (binding.depth && descriptor.format() != TextureFormat::Depth32Float)
                 {
                     return Err(ir::Error::BindingLayoutMismatch.into());
                 }

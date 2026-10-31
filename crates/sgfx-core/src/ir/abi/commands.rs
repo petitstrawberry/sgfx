@@ -424,6 +424,7 @@ fn encode(c: Command<'_, '_>, w: &mut Vec<u64>) {
         }
         Command::ResourceBarrier(v) => {
             match v {
+                ResourceBarrier::Global => w.push(3),
                 ResourceBarrier::Buffer {
                     buffer,
                     before,
@@ -724,6 +725,7 @@ unsafe fn decode_resource_command<'r, 'data>(
         }
         23 => {
             out.write(Command::ResourceBarrier(match r.word()? {
+                3 => ResourceBarrier::Global,
                 0 => ResourceBarrier::Buffer {
                     buffer: t.buffer_ref(r.value(t)?)?,
                     before: r.value(t)?,

@@ -99,6 +99,10 @@ impl std::ops::DerefMut for AlignedBytes {
 pub(crate) struct Memory {
     pub bytes: AlignedBytes,
     pub mapped: bool,
+    // Only a successful CPU mapping can make the Vulkan memory mirror a
+    // source of host-authored bytes. Binding a never-mapped GPU buffer does
+    // not justify uploading its entire zero-filled CPU allocation.
+    pub host_written: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pipeline {
@@ -1340,11 +1344,7 @@ unsafe extern "system" fn create_buffer(
             if r.resources.buffers.len() >= ir::MAX_BUFFERS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
-            let id = r
-                .table
-                .define_buffer(ir::BufferDesc::new(backing_size, ir_usage).map_err(failure)?)
-                .map_err(failure)?
-                .id();
+            let id = r.allocate_buffer(ir::BufferDesc::new(backing_size, ir_usage).map_err(failure)?)?;
             let handle = vk::Buffer::from_raw(crate::api::next_id());
             r.resources.buffers.insert(
                 handle,
@@ -1373,14 +1373,11 @@ unsafe extern "system" fn destroy_buffer(
                 .buffers
                 .iter()
                 .any(|(handle, other)| *handle != buffer && other.id == id);
-            // The backend cache owns the physical allocation for this slot.
-            // Complete submitted work before dropping it or recycling the ID.
+            // Retain the backing until its submission watermark is complete.
+            // A matching later buffer can reuse it without a global GPU drain,
+            // native detach, or full ABI table update on each destruction.
             if !shared {
-                r.in_flight.wait();
-                r.cache
-                    .release_buffer(id)
-                    .map_err(crate::runtime::backend_failure)?;
-                r.table.release_buffer(id).map_err(failure)?;
+                r.cache_buffer(id)?;
             }
             r.resources.buffers.remove(&buffer);
             r.resources.uploaded_unmapped_buffers.remove(&buffer);
@@ -1524,6 +1521,7 @@ unsafe extern "system" fn allocate_memory(
             r.resources.memories.insert(
                 handle,
                 Memory {
+                    host_written: false,
                     bytes,
                     mapped: false,
                 },
@@ -1601,7 +1599,7 @@ pub(crate) unsafe extern "system" fn bind_buffer_memory(
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
                 let unused_id = current.id;
-                r.table.release_buffer(unused_id).map_err(failure)?;
+                r.cache_buffer(unused_id)?;
                 let current = r.resources.buffers.get_mut(&buffer).unwrap();
                 current.id = alias_id;
                 current.bound = Some((memory, offset));
@@ -1696,6 +1694,7 @@ unsafe extern "system" fn map_memory(
                 .materialize()
                 .map_err(|_| vk::Result::ERROR_MEMORY_MAP_FAILED)?;
             mem.mapped = true;
+            mem.host_written = true;
             let address = mem.bytes.as_mut_ptr().add(offset as usize) as usize;
             r.resources.forget_uploads_for_memory(memory);
             Ok(address)
@@ -2810,6 +2809,7 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
     copy_count: u32,
     copies: *const vk::CopyDescriptorSet<'_>,
 ) {
+    let _frame = crate::frame_profile::RecordingSpan::descriptors();
     let result = ffi(|| {
         let writes = copied(writes, write_count as usize, LIMIT)?;
         let copies = copied(copies, copy_count as usize, LIMIT)?;
@@ -4054,6 +4054,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes,
                 mapped: false,
             },
@@ -4714,6 +4715,7 @@ mod tests {
         resources.memories.insert(
             vk::DeviceMemory::from_raw(1),
             Memory {
+                host_written: true,
                 bytes: AlignedBytes::zeroed(256).unwrap(),
                 mapped: true,
             },
@@ -4886,6 +4888,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes: AlignedBytes::zeroed(128).unwrap(),
                 mapped: false,
             },
@@ -5020,6 +5023,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes: AlignedBytes::zeroed(1024).unwrap(),
                 mapped: false,
             },

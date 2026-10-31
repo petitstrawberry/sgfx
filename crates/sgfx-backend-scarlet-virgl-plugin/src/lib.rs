@@ -124,6 +124,7 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
             .and_then(|c| c.timestamp_ns())
             .is_ok();
         let flags = (if timing { abi::GPU_TIMESTAMPS } else { 0 })
+            | abi::IMMEDIATE_BUFFER_READBACK | abi::GLOBAL_RESOURCE_BARRIERS
             | if c.supports_anisotropy_16() {
                 abi::SAMPLER_ANISOTROPY_16
             } else {

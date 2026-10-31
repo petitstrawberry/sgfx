@@ -25,7 +25,7 @@ use sgfx::{
     ir,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::{CStr, c_char},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -60,6 +60,8 @@ type RecordingCell = Arc<Mutex<Recording>>;
 pub(crate) struct InFlight {
     count: Mutex<usize>,
     changed: Condvar,
+    submitted: AtomicU64,
+    completed: AtomicU64,
 }
 
 impl InFlight {
@@ -80,6 +82,7 @@ impl InFlight {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *count = count.saturating_add(1);
+        self.submitted.fetch_add(1, Ordering::Release);
     }
 
     fn finish(&self) {
@@ -88,7 +91,19 @@ impl InFlight {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *count = count.saturating_sub(1);
+        self.completed.fetch_add(1, Ordering::Release);
         self.changed.notify_all();
+    }
+
+    // GPU submissions and their completion observations each use one FIFO.
+    // These watermarks apply to in_flight, not to the pending request counter,
+    // whose Present and submission requests can finish in a different order.
+    pub(crate) fn submitted_serial(&self) -> u64 {
+        self.submitted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn completed_serial(&self) -> u64 {
+        self.completed.load(Ordering::Acquire)
     }
 
     // State stores happen before acquiring this mutex. Sharing the mutex with
@@ -151,7 +166,7 @@ struct Driver {
     completion_sender: mpsc::Sender<CompletionRequest>,
     completion_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     queue: AtomicU64,
-    queue_sender: mpsc::Sender<queue::Request>,
+    queue_sender: mpsc::SyncSender<queue::Request>,
     queue_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     timeline_enabled: bool,
     synchronization2_enabled: bool,
@@ -381,6 +396,7 @@ fn record_call_profile(
 // Nested worker phases share the existing opt-in profiler. Their durations
 // overlap the enclosing API call and must not be summed as separate GPU time.
 fn profile_work<T>(operation: &'static str, work: impl FnOnce() -> VkResult<T>) -> VkResult<T> {
+    let _frame = crate::frame_profile::Span::new("work", operation);
     let started = call_profile_enabled().then(std::time::Instant::now);
     let result = work();
     if let Some(started) = started {
@@ -445,6 +461,8 @@ fn call<T: Send + 'static>(
     driver: &Driver,
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
 ) -> VkResult<T> {
+    let frame_operation = std::any::type_name_of_val(&op);
+    let _frame = crate::frame_profile::Span::new("call", frame_operation);
     // The disabled path performs no clock reads, type-name formatting, or
     // statistics-map access. The opt-in flag is sampled once per process.
     let profile_start = call_profile_enabled().then(std::time::Instant::now);
@@ -455,6 +473,7 @@ fn call<T: Send + 'static>(
         driver
             .sender
             .send(Request::Run(Box::new(move |runtime| {
+                let _frame = crate::frame_profile::Span::new("service", frame_operation);
                 let service_start = profile_start.map(|_| std::time::Instant::now());
                 let result = run_device_operation(runtime, op, false);
                 let service =
@@ -1165,6 +1184,7 @@ unsafe extern "system" fn get_device_queue(
     }
 }
 unsafe extern "system" fn device_wait_idle(device: vk::Device) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("wait", "device_idle");
     let driver = match driver(device.as_raw(), Kind::Device) {
         Ok(driver) => driver,
         Err(error) => return error,
@@ -1172,6 +1192,7 @@ unsafe extern "system" fn device_wait_idle(device: vk::Device) -> vk::Result {
     status(wait_idle(&driver))
 }
 pub(crate) unsafe extern "system" fn queue_wait_idle(queue: vk::Queue) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("wait", "queue_idle");
     let driver = match driver(queue.as_raw(), Kind::Queue) {
         Ok(driver) => driver,
         Err(error) => return error,
@@ -1262,6 +1283,7 @@ struct Recording {
     // device threads. Re-recording uses copy-on-write instead of changing an
     // outstanding snapshot's commands.
     commands: Arc<Vec<RecordedCommand>>,
+    descriptor_refs: Arc<HashSet<vk::DescriptorSet>>,
 }
 
 #[derive(Default)]
@@ -1509,10 +1531,31 @@ impl Recording {
             render_dynamic: false,
             active_queries: Default::default(),
             commands: Arc::default(),
+            descriptor_refs: Arc::default(),
         }
     }
     fn fail(&mut self, e: vk::Result) {
         self.error.get_or_insert(e);
+    }
+    fn reset(&mut self, release: bool) {
+        if !release && let Some(sets) = Arc::get_mut(&mut self.descriptor_refs) {
+            sets.clear();
+        } else {
+            self.descriptor_refs = Arc::default();
+        }
+        if !release && let Some(commands) = Arc::get_mut(&mut self.commands) {
+            commands.clear();
+        } else {
+            // Outstanding submissions own their immutable snapshots. Never
+            // clone old commands just to discard them while re-recording.
+            self.commands = Arc::default();
+        }
+        self.one_time = false;
+        self.state = RecordingState::Initial;
+        self.error = None;
+        self.render_active = false;
+        self.render_dynamic = false;
+        self.active_queries.clear();
     }
     fn push(&mut self, command: RecordedCommand) -> VkResult<()> {
         if self.state != RecordingState::Recording {
@@ -1645,6 +1688,9 @@ impl Recording {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
             _ => {}
+        }
+        if let RecordedCommand::BindDescriptorSets { sets, .. } = &command {
+            Arc::make_mut(&mut self.descriptor_refs).extend(sets.iter().copied());
         }
         Arc::make_mut(&mut self.commands).push(command);
         Ok(())
@@ -2259,6 +2305,7 @@ impl RecordedCommand {
                 {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
+                let barrier_start = rec.ops.len();
                 for (extended, source, destination) in memory {
                     if *extended {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
@@ -2438,7 +2485,12 @@ impl RecordedCommand {
                 // Global dependencies cover attachment writes as well as buffers.
                 // Retire preceding GPU work at this control point for legacy
                 // memory barriers, just as for synchronization2 dependencies.
-                if *full_scope || !memory.is_empty() {
+                // Ordinary resource barriers are validated/replayed in order
+                // inside the command stream and have no backend operation.
+                // Keep global/storage scopes on the conservative boundary path.
+                let fifo_only = memory.is_empty()
+                    && rec.ops[barrier_start..].iter().all(barrier_only::ordinary_barrier);
+                if (*full_scope || !memory.is_empty()) && !fifo_only {
                     rec.synchronizations.push(synchronization2::Insertion {
                         position: rec.ops.len(),
                         order: rec.order,
@@ -2450,14 +2502,7 @@ impl RecordedCommand {
         Ok(())
     }
 
-    fn references_descriptor_sets(&self, sets: &[vk::DescriptorSet]) -> bool {
-        matches!(
-            self,
-            Self::BindDescriptorSets {
-                sets: recorded, ..
-            } if recorded.iter().any(|set| sets.contains(set))
-        )
-    }
+
 }
 
 fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedRecording> {
@@ -2545,6 +2590,7 @@ fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedR
 }
 
 fn record(command: vk::CommandBuffer, recorded: RecordedCommand) {
+    let _frame = crate::frame_profile::RecordingSpan::new();
     let Ok(driver) = driver(command.as_raw(), Kind::Command) else {
         return;
     };
@@ -2771,9 +2817,10 @@ unsafe extern "system" fn reset_command_pool(
             .collect::<Vec<_>>()
     };
     for recording in recordings {
-        *recording
+        recording
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Recording::new(pool.as_raw());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reset(flags.contains(vk::CommandPoolResetFlags::RELEASE_RESOURCES));
     }
     vk::Result::SUCCESS
 }
@@ -2812,9 +2859,10 @@ unsafe extern "system" fn reset_command_buffer(
     {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
-    *recording
+    recording
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Recording::new(pool);
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .reset(flags.contains(vk::CommandBufferResetFlags::RELEASE_RESOURCES));
     vk::Result::SUCCESS
 }
 unsafe extern "system" fn begin_command_buffer(
@@ -2868,12 +2916,10 @@ unsafe extern "system" fn begin_command_buffer(
     {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let mut recording = Recording::new(pool);
+    let mut recording = existing.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    recording.reset(false);
     recording.state = RecordingState::Recording;
     recording.one_time = one_time;
-    *existing
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = recording;
     vk::Result::SUCCESS
 }
 unsafe extern "system" fn end_command_buffer(command: vk::CommandBuffer) -> vk::Result {
@@ -3950,6 +3996,7 @@ unsafe extern "system" fn wait_for_fences(
     all: vk::Bool32,
     timeout: u64,
 ) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("wait", "fences");
     let handles = match slice(ptr, count) {
         Ok(v) if !v.is_empty() => v,
         _ => return vk::Result::ERROR_INITIALIZATION_FAILED,
@@ -4058,18 +4105,12 @@ fn semaphore_refs(d: &Driver, handles: &[vk::Semaphore]) -> VkResult<Vec<Arc<Ato
 ))]
 fn wait_and_consume_semaphores(d: &Driver, semaphores: &[Arc<AtomicU8>]) -> VkResult<()> {
     for semaphore in semaphores {
-        loop {
+        d.in_flight.wait_until(u64::MAX, || {
             if d.lost.load(Ordering::Acquire) {
                 return Err(vk::Result::ERROR_DEVICE_LOST);
             }
-            if semaphore
-                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(50));
-        }
+            Ok(semaphore.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire).is_ok())
+        })?;
     }
     Ok(())
 }
@@ -4118,16 +4159,33 @@ pub(crate) fn signal_acquire_sync(
     Ok(())
 }
 
-#[cfg(any(
-    target_os = "scarlet",
-    target_os = "macos",
-    all(target_os = "linux", feature = "scarlet-wsi"),
-    test
-))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn wait_queue_semaphores(queue: vk::Queue, handles: &[vk::Semaphore]) -> VkResult<()> {
     let d = driver(queue.as_raw(), Kind::Queue)?;
     let semaphores = semaphore_refs(&d, handles)?;
     wait_and_consume_semaphores(&d, &semaphores)
+}
+
+#[cfg(any(target_os = "scarlet", all(target_os = "linux", feature = "scarlet-wsi")))]
+pub(crate) fn enqueue_presentation(queue: vk::Queue, handles: &[vk::Semaphore], packet: crate::wsi::Presentation) -> VkResult<()> {
+    let driver = driver(queue.as_raw(), Kind::Queue)?;
+    if driver.lost.load(Ordering::Acquire) { return Err(vk::Result::ERROR_DEVICE_LOST); }
+    if handles.len() > 64 { return Err(vk::Result::ERROR_INITIALIZATION_FAILED); }
+    let mut waits = std::array::from_fn(|_| None);
+    {
+        let semaphores = driver.semaphores.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, (slot, handle)) in waits.iter_mut().zip(handles).enumerate() {
+            if handles[..index].contains(handle) { return Err(vk::Result::ERROR_INITIALIZATION_FAILED); }
+            *slot = Some(Arc::clone(semaphores.get(&handle.as_raw()).ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?));
+        }
+    }
+    driver.pending.reserve_pending(1)?;
+    if driver.queue_sender.send(queue::Request::Present(Arc::clone(&driver), waits, packet)).is_err() {
+        driver.pending.finish();
+        driver.mark_lost();
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    Ok(())
 }
 
 unsafe extern "system" fn queue_submit(
@@ -4148,6 +4206,7 @@ fn finish_submissions(
     pending: &InFlight,
     lost: &AtomicBool,
 ) {
+    let _frame = crate::frame_profile::Span::new("wait", "completion_receipts");
     // Drain every receipt even when one fails: failure does not free other GPU work.
     let complete = submissions.iter().enumerate().fold(true, |complete, (index, submission)| {
         let result = submission.wait(None);
@@ -4528,6 +4587,7 @@ fn trace_owned_recording_failure(
 }
 
 fn wait_submission(rt: &mut Runtime, submission: &sgfx::driver::Submission) -> VkResult<()> {
+    let _frame = crate::frame_profile::Span::new("wait", "synchronous_receipt");
     match submission.wait(None) {
         Ok(CompletionStatus::Complete) => Ok(()),
         Ok(status) => {
@@ -4712,7 +4772,10 @@ fn execute(
     retained_submissions.extend(submit_owned(rt, ops)?);
     let submissions = retained_submissions;
     let readback = rec.readback_buffers;
-    if !readback.is_empty() {
+    // Native buffer mirrors commit at queue acceptance, including compute
+    // results. Keep receipts alive for the enclosing fence while copying those
+    // CPU bytes; backends without that guarantee retain the retirement wait.
+    if !readback.is_empty() && !rt.capabilities.supports_immediate_buffer_readback() {
         profile_work("execute::readback_wait", || {
             for submission in submissions.iter() {
                 wait_submission(rt, submission)?;
@@ -4903,21 +4966,18 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
 /// Descriptor indexing is not exposed. Updating a referenced set invalidates
 /// every recording or executable command buffer under Vulkan 1.0 rules.
 fn invalidate_recorded_descriptor_sets(recordings: &Recordings, sets: &[vk::DescriptorSet]) {
+    let _frame = crate::frame_profile::RecordingSpan::invalidation();
     let recordings = recordings
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .commands
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    for recording in recordings {
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Recording maintains its reference index while appending commands.
+    // Updating one set must not allocate a handle snapshot or rescan every
+    // previously recorded command on every draw.
+    for recording in recordings.commands.values() {
         let mut recording = recording
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if recording
-            .commands
-            .iter()
-            .any(|command| command.references_descriptor_sets(sets))
+        if sets.iter().any(|set| recording.descriptor_refs.contains(set))
         {
             recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
             if recording.state == RecordingState::Executable {
@@ -4969,6 +5029,7 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
             recording.state = RecordingState::Invalid;
             recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
             recording.commands = Arc::default();
+            recording.descriptor_refs = Arc::default();
         }
     }
 }
@@ -5153,6 +5214,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes,
                 mapped: false,
             },
@@ -5663,7 +5725,7 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
             synchronization2_enabled: true,
@@ -5744,7 +5806,7 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
             synchronization2_enabled: true,
@@ -5809,7 +5871,7 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
             synchronization2_enabled: true,
@@ -6012,7 +6074,7 @@ mod fence_notification_tests {
             completion_sender: mpsc::channel().0,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
             synchronization2_enabled: true,
@@ -6262,7 +6324,7 @@ mod owned_descriptor_tests {
                 completion_sender: mpsc::channel().0,
                 completion_thread: Mutex::new(None),
                 queue: AtomicU64::new(0),
-                queue_sender: mpsc::channel().0,
+                queue_sender: mpsc::sync_channel(4096).0,
                 queue_thread: Mutex::new(None),
                 timeline_enabled: false,
                 synchronization2_enabled: false,

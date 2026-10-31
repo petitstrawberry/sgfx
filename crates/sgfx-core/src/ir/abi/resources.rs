@@ -54,7 +54,7 @@ impl RowCache {
     }
 
     /// `None` means this slot has no accepted cache for the generation;
-    /// `Some(false)` is an immutable-row mismatch and must be rejected.
+    /// `Some(false)` is a mismatch; an active immutable row must reject it.
     fn compare(&self, index: usize, generation: u64, words: &[u64]) -> Option<bool> {
         let row = self.rows.get(index)?.as_ref()?;
         if row.generation != generation {
@@ -566,11 +566,14 @@ fn sync_slots<T: Slot>(
             if generation < old.generation() {
                 return Err(Error::InvalidDescriptor);
             }
-            if generation == old.generation() && old.active() {
+            // Retired rows are immutable while their encoded words stay the
+            // same, too. Avoid rebuilding their cache on every table sync.
+            // A changed inactive row can still reactivate this generation.
+            if generation == old.generation() {
                 match cache.compare(index, generation, words) {
                     Some(true) => continue,
-                    Some(false) => return Err(Error::InvalidDescriptor),
-                    None => {
+                    Some(false) if old.active() => return Err(Error::InvalidDescriptor),
+                    None if old.active() => {
                         // A cache populated by an older implementation or
                         // lost after mirror mutation is re-established once.
                         #[cfg(test)]
@@ -583,6 +586,7 @@ fn sync_slots<T: Slot>(
                         cache.accept(index, generation, words)?;
                         continue;
                     }
+                    _ => {}
                 }
             }
         }

@@ -608,6 +608,14 @@ impl Resources {
                     Resource::Texture(self.texture(table.texture_ref(id)?)?)
                 }
                 BindingResource::TextureView { texture, view } => {
+                    if view.format() == ir::TextureFormat::Depth32Float
+                        && desc.layout().entries().iter().any(|layout| {
+                            layout.binding() == entry.binding()
+                                && matches!(layout.ty(), BindingType::SampledTextureView { depth: false, .. })
+                        })
+                    {
+                        return Err(Error::Unsupported(UnsupportedFeature::TextureFormat));
+                    }
                     let texture = self.texture(table.texture_ref(texture)?)?;
                     Resource::TextureView(validated(self.context.raw_device(), || {
                         Ok(texture.texture.create_view(&raw::TextureViewDescriptor {

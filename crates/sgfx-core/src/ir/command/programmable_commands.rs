@@ -88,6 +88,12 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         self.ensure_outside_pass()?;
         let mut announced = Vec::new();
         match barrier {
+            ResourceBarrier::Global => {
+                self.push(Command::ResourceBarrier(barrier))?;
+                self.pending_writes.clear();
+                self.announced_accesses.clear();
+                return Ok(());
+            }
             ResourceBarrier::Buffer {
                 buffer,
                 before,
@@ -468,14 +474,7 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
     }
     /// End this compute pass, releasing the encoder for barriers or other passes.
     pub fn end(self) -> Result<()> {
-        if self.encoder.commands.len() >= MAX_COMMANDS {
-            return Err(Error::CommandLimitExceeded);
-        }
-        self.encoder
-            .commands
-            .try_reserve(1)
-            .map_err(|_| Error::OutOfMemory)?;
-        self.encoder.commands.push(Command::EndComputePass);
+        self.encoder.push_pass_end(Command::EndComputePass)?;
         self.encoder.pass_open = false;
         Ok(())
     }

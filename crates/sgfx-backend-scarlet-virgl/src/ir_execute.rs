@@ -1123,6 +1123,36 @@ fn equal_buffer_chunk(old: &[u8], new: &[u8]) -> bool {
             .all(|(old, new)| old == new)
 }
 
+// Word comparisons preserve unaligned byte-buffer support and avoid the
+// byte-at-a-time memcmp used by the native runtime.
+fn common_buffer_prefix(old: &[u8], new: &[u8]) -> usize {
+    let n = old.len().min(new.len());
+    let words = n / 8;
+    for i in 0..words {
+        let at = i * 8;
+        let delta = u64::from_le_bytes(old[at..at + 8].try_into().unwrap())
+            ^ u64::from_le_bytes(new[at..at + 8].try_into().unwrap());
+        if delta != 0 { return at + delta.trailing_zeros() as usize / 8; }
+    }
+    let at = words * 8;
+    at + old[at..n].iter().zip(&new[at..n]).take_while(|(a, b)| a == b).count()
+}
+
+fn common_buffer_suffix(old: &[u8], new: &[u8]) -> usize {
+    let n = old.len().min(new.len());
+    let mut matched = 0;
+    while matched + 8 <= n {
+        let a = old.len() - matched - 8;
+        let b = new.len() - matched - 8;
+        let delta = u64::from_le_bytes(old[a..a + 8].try_into().unwrap())
+            ^ u64::from_le_bytes(new[b..b + 8].try_into().unwrap());
+        if delta != 0 { return matched + delta.leading_zeros() as usize / 8; }
+        matched += 8;
+    }
+    matched + old[..old.len() - matched].iter().rev()
+        .zip(new[..new.len() - matched].iter().rev()).take_while(|(a, b)| a == b).count()
+}
+
 /// Bound changed bytes without walking large unchanged regions byte by byte.
 fn changed_buffer_bytes(
     previous: Option<&[u8]>,
@@ -1138,9 +1168,9 @@ fn changed_buffer_bytes(
     let old = previous.get(start..).unwrap_or(&[]);
     let overlap = old.len().min(data.len());
     let mut prefix = 0;
-    for (old, new) in old[..overlap].chunks(256).zip(data[..overlap].chunks(256)) {
+    for (old, new) in old[..overlap].chunks(4096).zip(data[..overlap].chunks(4096)) {
         if !equal_buffer_chunk(old, new) {
-            prefix += old.iter().zip(new).take_while(|(a, b)| a == b).count();
+            prefix += common_buffer_prefix(old, new);
             break;
         }
         prefix += old.len();
@@ -1148,16 +1178,11 @@ fn changed_buffer_bytes(
     let mut suffix = 0;
     if data.len() <= old.len() {
         for (old, new) in old[prefix..data.len()]
-            .rchunks(256)
-            .zip(data[prefix..].rchunks(256))
+            .rchunks(4096)
+            .zip(data[prefix..].rchunks(4096))
         {
             if !equal_buffer_chunk(old, new) {
-                suffix += old
-                    .iter()
-                    .rev()
-                    .zip(new.iter().rev())
-                    .take_while(|(a, b)| a == b)
-                    .count();
+                suffix += common_buffer_suffix(old, new);
                 break;
             }
             suffix += old.len();

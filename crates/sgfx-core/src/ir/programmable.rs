@@ -109,7 +109,9 @@ pub enum BindingType {
     SampledTextureView {
         /// Coordinate interpretation expected by the shader.
         dimension: TextureViewDimension,
-        /// Whether the shader expects depth rather than color samples.
+        /// Whether the shader expects scalar depth samples. A float color
+        /// binding may also read a depth view without comparison on backends
+        /// that support this interpretation.
         depth: bool,
     },
     /// A filtering sampler.
@@ -415,7 +417,7 @@ impl BindGroupDesc {
                         return Err(Error::InvalidUsage);
                     }
                     if view.dimension() != dimension
-                        || (view.format() == TextureFormat::Depth32Float) != depth
+                        || (depth && view.format() != TextureFormat::Depth32Float)
                     {
                         return Err(Error::BindingLayoutMismatch);
                     }
@@ -724,6 +726,8 @@ impl TextureAccess {
 /// An explicit execution and memory dependency between whole-resource accesses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceBarrier<'r> {
+    /// Synchronize all resources at an outside-pass FIFO dependency.
+    Global,
     /// Synchronize a buffer's accesses.
     Buffer {
         /// Resource.

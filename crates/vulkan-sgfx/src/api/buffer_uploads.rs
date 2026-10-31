@@ -230,6 +230,7 @@ fn snapshot_measured(
     ranges: Ranges,
     mut measured: Option<&mut crate::progress::HostUploads>,
 ) -> VkResult<BufferUploads> {
+    let _frame = crate::frame_profile::Span::new("work", "upload::host_snapshot");
     let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
     let mut ops = Vec::new();
     let mut fresh = Vec::new();
@@ -239,6 +240,7 @@ fn snapshot_measured(
             continue;
         };
         let allocation = resources.memories.get(&memory).ok_or(invalid)?;
+        if !allocation.host_written { continue; }
         merge(&mut ranges);
         let full = ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end == buffer.size;
         if !allocation.mapped {
@@ -316,7 +318,7 @@ mod tests {
                 .id();
             let mut bytes = AlignedBytes::zeroed(size as usize).unwrap();
             bytes.fill(raw as u8);
-            resources.memories.insert(memory, Memory { bytes, mapped });
+            resources.memories.insert(memory, Memory { bytes, mapped, host_written: true });
             resources.buffers.insert(
                 handle,
                 Buffer {
@@ -816,6 +818,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes,
                 mapped: true,
             },

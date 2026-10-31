@@ -74,6 +74,8 @@ impl OwnedRenderPassDesc {
 /// An owned resource transition, validated when its recording is replayed.
 #[derive(Debug, Clone, Copy)]
 pub enum OwnedResourceBarrier {
+    /// Synchronize all earlier accesses before subsequent commands.
+    Global,
     /// Change the declared access for one mip level.
     TextureMip {
         /// Texture identity.
@@ -108,6 +110,7 @@ pub enum OwnedResourceBarrier {
 impl OwnedResourceBarrier {
     fn resolve(self, resources: &ResourceTable) -> Result<ResourceBarrier<'_>> {
         Ok(match self {
+            Self::Global => ResourceBarrier::Global,
             Self::TextureMip {
                 texture,
                 mip_level,
@@ -420,7 +423,7 @@ impl OwnedCommandBuffer {
     ///
     /// No backend work is performed. Errors are the same as [`Self::record`].
     pub fn validate(&self, resources: &ResourceTable) -> Result<()> {
-        self.record(resources).map(|_| ())
+        self.record_with(resources, CommandEncoder::for_validation(resources)).map(|_| ())
     }
 
     /// Resolve resource identities and record a validated borrowed buffer.
@@ -434,7 +437,14 @@ impl OwnedCommandBuffer {
         &'data self,
         resources: &'r ResourceTable,
     ) -> Result<CommandBuffer<'r, 'data>> {
-        let mut encoder = CommandEncoder::new(resources);
+        self.record_with(resources, CommandEncoder::new(resources))
+    }
+
+    fn record_with<'r, 'data>(
+        &'data self,
+        resources: &'r ResourceTable,
+        mut encoder: CommandEncoder<'r, 'data>,
+    ) -> Result<CommandBuffer<'r, 'data>> {
         let mut commands = self.commands.iter();
         while let Some(command) = commands.next() {
             match command {

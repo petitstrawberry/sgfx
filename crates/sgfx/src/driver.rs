@@ -127,10 +127,20 @@ pub struct Capabilities {
     shader_draw_parameters: bool,
     depth_transfers: bool,
     float_color: bool,
+    immediate_buffer_readback: bool,
+    global_resource_barriers: bool,
     limits: Limits,
 }
 
 impl Capabilities {
+    /// Backend support for global dependencies inside one command stream.
+    pub const fn supports_global_resource_barriers(&self) -> bool {
+        self.global_resource_barriers
+    }
+    /// Buffer mirrors can be read after acceptance without waiting for the GPU.
+    pub const fn supports_immediate_buffer_readback(&self) -> bool {
+        self.immediate_buffer_readback
+    }
     /// Whether native floating-point RGBA render targets and transfers are available.
     pub const fn supports_float_color(&self) -> bool {
         self.float_color
@@ -1452,6 +1462,8 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                     shader_draw_parameters: false,
                     depth_transfers: false,
                     float_color: false,
+                    immediate_buffer_readback: false,
+                    global_resource_barriers: true,
                     limits: runtime,
                 },
                 backend: AdapterBackend::Wgpu(WgpuAdapter {
@@ -1698,6 +1710,8 @@ struct DynamicFeatures {
     shader_draw_parameters: bool,
     depth_transfers: bool,
     float_color: bool,
+    immediate_buffer_readback: bool,
+    global_resource_barriers: bool,
 }
 
 #[cfg(sgfx_dynamic)]
@@ -1726,6 +1740,8 @@ impl From<crate::dynamic::Capabilities> for DynamicFeatures {
             shader_draw_parameters: capabilities.supports_shader_draw_parameters(),
             depth_transfers: capabilities.supports_depth_transfers(),
             float_color: capabilities.supports_float_color(),
+            immediate_buffer_readback: capabilities.supports_immediate_buffer_readback(),
+            global_resource_barriers: capabilities.supports_global_resource_barriers(),
         }
     }
 }
@@ -1761,6 +1777,8 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
         shader_draw_parameters: programmable && features.shader_draw_parameters,
         depth_transfers: features.depth && features.depth_transfers,
         float_color: features.float_color,
+        immediate_buffer_readback: features.immediate_buffer_readback,
+        global_resource_barriers: features.global_resource_barriers,
         limits: Limits {
             max_push_constants_size: if programmable && features.push_constants_128 {
                 128

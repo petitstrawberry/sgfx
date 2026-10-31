@@ -1,8 +1,10 @@
 //! Autonomous context-ordered dispatch and owned logical completion signals.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+#[cfg(feature = "std")]
+use std::sync::Condvar;
 use std::sync::{Mutex, MutexGuard};
 
 use gpu_raw::{GpuCompletion, GpuQueue, GpuSubmitError};
@@ -18,7 +20,10 @@ use std::{
 };
 
 use crate::completion::{completion_status, monotonic_time_ns};
-use crate::scheduler::{AdmissionError, DispatchError, Scheduler, Transport};
+use crate::scheduler::{
+    AdmissionError, DispatchError, Job, MAX_PENDING_BYTES, MAX_STREAM_BYTES, MAX_SUBMISSIONS,
+    Scheduler, Transport,
+};
 use crate::virgl::UploadArena;
 use crate::{Handle, HandleError, HandleResult, IrSubmitError};
 use sgfx_core::backend::CompletionStatus;
@@ -131,14 +136,26 @@ impl Event {
 }
 
 pub(crate) struct Signal {
+    bytes: usize,
     result: Mutex<Option<Result<(), Failure>>>,
+    #[cfg(feature = "std")]
+    changed: Condvar,
+    #[cfg(not(feature = "std"))]
     event: Event,
 }
 
 impl Signal {
     pub(crate) fn new() -> HandleResult<Self> {
+        Self::with_bytes(0)
+    }
+
+    fn with_bytes(bytes: usize) -> HandleResult<Self> {
         Ok(Self {
+            bytes,
             result: Mutex::new(None),
+            #[cfg(feature = "std")]
+            changed: Condvar::new(),
+            #[cfg(not(feature = "std"))]
             event: Event::new()?,
         })
     }
@@ -151,6 +168,41 @@ impl Signal {
         }
     }
 
+    #[cfg(feature = "std")]
+    pub(crate) fn wait(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<CompletionStatus, IrSubmitError> {
+        let started = monotonic_time_ns();
+        let mut result = lock(&self.result);
+        loop {
+            match *result {
+                Some(Ok(())) => return Ok(CompletionStatus::Complete),
+                Some(Err(error)) => return Err(error.into()),
+                None => {}
+            }
+            // Check and sleep under the same mutex used by complete. Receipts
+            // need no pollable handle, so each stream avoids creating a pipe.
+            result = if let Some(limit) = timeout {
+                let remaining = limit.saturating_sub(Duration::from_nanos(
+                    monotonic_time_ns().saturating_sub(started),
+                ));
+                if remaining.is_zero() {
+                    return Ok(CompletionStatus::Pending);
+                }
+                self.changed
+                    .wait_timeout(result, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0
+            } else {
+                self.changed
+                    .wait(result)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            };
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
     pub(crate) fn wait(
         &self,
         timeout: Option<Duration>,
@@ -181,6 +233,9 @@ impl Signal {
 
     pub(crate) fn complete(&self, result: Result<(), Failure>) {
         *lock(&self.result) = Some(result);
+        #[cfg(feature = "std")]
+        self.changed.notify_all();
+        #[cfg(not(feature = "std"))]
         self.event.notify();
     }
 }
@@ -190,7 +245,9 @@ pub(crate) struct Chunk {
     pub(crate) arena: Option<Arc<UploadArena>>,
 }
 
-struct Native;
+struct Native {
+    shared: Arc<Shared>,
+}
 
 impl Transport for Native {
     type Chunk = Chunk;
@@ -251,14 +308,43 @@ impl Transport for Native {
         native_status(receipt)
     }
     fn complete(&self, signal: &Arc<Signal>, result: Result<(), Failure>) {
-        signal.complete(result);
+        self.shared.finish_signal(signal, result);
     }
 }
 
+// Only admission accounting is shared with producers. GPU syscalls and receipt
+// polling run on the worker's private Scheduler, outside this short mutex.
+struct Admission {
+    pending: VecDeque<Job<Native>>,
+    count: usize,
+    bytes: usize,
+    last: Option<Arc<Signal>>,
+    failure: Option<Failure>,
+}
+
 struct Shared {
-    scheduler: Mutex<Scheduler<Native>>,
+    admission: Mutex<Admission>,
     wake: Event,
     closing: AtomicBool,
+    failed: AtomicBool,
+}
+
+impl Shared {
+    fn finish_signal(&self, signal: &Arc<Signal>, result: Result<(), Failure>) {
+        {
+            let mut state = lock(&self.admission);
+            state.count -= 1;
+            state.bytes -= signal.bytes;
+            if let Err(error) = result {
+                state.failure = Some(error);
+                self.failed.store(true, Ordering::Release);
+            }
+            if state.count == 0 {
+                state.last = None;
+            }
+        }
+        signal.complete(result);
+    }
 }
 
 pub(crate) struct NativeScheduler {
@@ -267,14 +353,34 @@ pub(crate) struct NativeScheduler {
 
 impl NativeScheduler {
     pub(crate) fn new() -> HandleResult<Self> {
+        let mut pending = VecDeque::new();
+        pending
+            .try_reserve(MAX_SUBMISSIONS)
+            .map_err(|_| HandleError::OutOfResources)?;
+        let mut scheduler = Scheduler::new();
+        scheduler
+            .reserve_admission()
+            .map_err(|_| HandleError::OutOfResources)?;
         let shared = Arc::new(Shared {
-            scheduler: Mutex::new(Scheduler::new()),
+            admission: Mutex::new(Admission {
+                pending,
+                count: 0,
+                bytes: 0,
+                last: None,
+                failure: None,
+            }),
             wake: Event::new()?,
             closing: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
         });
-        let worker = Arc::clone(&shared);
+        let worker = Worker {
+            native: Native {
+                shared: Arc::clone(&shared),
+            },
+            scheduler,
+        };
         std::thread::Builder::new()
-            .spawn(move || run(worker))
+            .spawn(move || worker.run())
             .map_err(|_| HandleError::OutOfResources)?;
         Ok(Self { shared })
     }
@@ -284,22 +390,43 @@ impl NativeScheduler {
         queue: Arc<GpuQueue>,
         chunks: Vec<Chunk>,
     ) -> Result<Arc<Signal>, AdmissionError<Failure>> {
-        let signal = Arc::new(Signal::new().map_err(|error| {
-            trace_failure("logical completion signal allocation", error);
-            AdmissionError::OutOfMemory
-        })?);
-        lock(&self.shared.scheduler).enqueue(chunks, queue, Arc::clone(&signal))?;
+        let bytes = chunks
+            .iter()
+            .try_fold(0usize, |n, chunk| n.checked_add(chunk.commands.len()))
+            .filter(|n| *n <= MAX_STREAM_BYTES)
+            .ok_or(AdmissionError::TooLarge)?;
+        let signal = Arc::new(Signal::with_bytes(bytes).map_err(|_| AdmissionError::OutOfMemory)?);
+        let job = Job::prepare(chunks, queue, Arc::clone(&signal))?;
+        {
+            let mut state = lock(&self.shared.admission);
+            if let Some(error) = state.failure {
+                return Err(AdmissionError::Failed(error));
+            }
+            if state.count == MAX_SUBMISSIONS
+                || (state.count != 0
+                    && (bytes > MAX_PENDING_BYTES
+                        || state.bytes.saturating_add(bytes) > MAX_PENDING_BYTES))
+            {
+                return Err(AdmissionError::Busy);
+            }
+            // Capacity was reserved at construction. Global admission includes
+            // both this inbox and the worker's active streams.
+            state.pending.push_back(job);
+            state.count += 1;
+            state.bytes += bytes;
+            state.last = Some(Arc::clone(&signal));
+        }
         self.shared.wake.notify();
         Ok(signal)
     }
 
     pub(crate) fn wait_idle(&self) -> HandleResult<()> {
         let signal = {
-            let scheduler = lock(&self.shared.scheduler);
-            if scheduler.failure().is_some() {
+            let state = lock(&self.shared.admission);
+            if state.failure.is_some() {
                 return Err(HandleError::SystemError(-1));
             }
-            scheduler.last_signal().cloned()
+            state.last.clone()
         };
         if let Some(signal) = signal
             && signal
@@ -314,15 +441,15 @@ impl NativeScheduler {
 
     #[cfg(feature = "backend-abi")]
     pub(crate) fn is_idle(&self) -> HandleResult<bool> {
-        let scheduler = lock(&self.shared.scheduler);
-        if scheduler.failure().is_some() {
+        let state = lock(&self.shared.admission);
+        if state.failure.is_some() {
             return Err(HandleError::SystemError(-1));
         }
-        Ok(scheduler.is_empty())
+        Ok(state.count == 0)
     }
 
     pub(crate) fn check(&self) -> HandleResult<()> {
-        if lock(&self.shared.scheduler).failure().is_some() {
+        if self.shared.failed.load(Ordering::Acquire) {
             Err(HandleError::SystemError(-1))
         } else {
             Ok(())
@@ -332,73 +459,94 @@ impl NativeScheduler {
 
 impl Drop for NativeScheduler {
     fn drop(&mut self) {
-        // The worker, not a receipt/session, owns the shared dispatch state.
-        // Closing the last frontend owner requests exit only after retirement.
         self.shared.closing.store(true, Ordering::Release);
         self.shared.wake.notify();
     }
 }
 
-struct WorkerGuard(Arc<Shared>);
-impl Drop for WorkerGuard {
-    fn drop(&mut self) {
-        let mut scheduler = lock(&self.0.scheduler);
-        if !scheduler.is_empty() {
-            scheduler.fail(&Native, Failure::Unavailable);
+struct Worker {
+    native: Native,
+    scheduler: Scheduler<Native>,
+}
+
+impl Worker {
+    fn fail(&mut self, error: Failure) {
+        let pending = {
+            let mut state = lock(&self.native.shared.admission);
+            state.failure = Some(error);
+            self.native.shared.failed.store(true, Ordering::Release);
+            core::mem::take(&mut state.pending)
+        };
+        self.scheduler.fail(&self.native, error);
+        for job in pending {
+            self.native.complete(&job.signal, Err(error));
+        }
+    }
+
+    fn run(mut self) {
+        let mut handles = Vec::new();
+        if handles.try_reserve_exact(17).is_err() {
+            self.fail(Failure::Backend(HandleError::OutOfResources));
+            return;
+        }
+        loop {
+            if let Err(error) = self.native.shared.wake.consume() {
+                self.fail(Failure::Backend(error));
+                return;
+            }
+            loop {
+                let job = { lock(&self.native.shared.admission).pending.pop_front() };
+                let Some(job) = job else {
+                    break;
+                };
+                let signal = Arc::clone(&job.signal);
+                // The shared admission already reserved capacity and owns all
+                // allocations. Transfer preserves FIFO without a GPU syscall.
+                if self.scheduler.enqueue_prepared(job).is_err() {
+                    self.native.complete(&signal, Err(Failure::Unavailable));
+                    self.fail(Failure::Unavailable);
+                    return;
+                }
+            }
+            let progressed = self.scheduler.advance(&self.native);
+            if let Some(error) = self.scheduler.failure() {
+                self.fail(error);
+                return;
+            }
+            if self.scheduler.is_empty()
+                && self.native.shared.closing.load(Ordering::Acquire)
+                && lock(&self.native.shared.admission).count == 0
+            {
+                return;
+            }
+            if progressed {
+                continue;
+            }
+            handles.clear();
+            handles.push(self.native.shared.wake.poll_handle());
+            handles.extend(
+                self.scheduler
+                    .receipts()
+                    .map(|receipt| PollHandle::new(receipt.as_handle().as_raw() as u32, POLLIN)),
+            );
+            let timeout = if !self.scheduler.is_empty() && handles.len() == 1 {
+                1_000_000
+            } else {
+                100_000_000
+            };
+            if let Err(error) = poll(&mut handles, timeout) {
+                self.fail(Failure::Backend(HandleError::SystemError(error)));
+                return;
+            }
         }
     }
 }
 
-fn run(shared: Arc<Shared>) {
-    let _guard = WorkerGuard(Arc::clone(&shared));
-    // One wake handle plus at most sixteen native completion handles.
-    let mut handles = Vec::new();
-    if handles.try_reserve_exact(17).is_err() {
-        trace_failure(
-            "worker poll storage allocation",
-            HandleError::OutOfResources,
-        );
-        lock(&shared.scheduler).fail(&Native, Failure::Backend(HandleError::OutOfResources));
-        return;
-    }
-    loop {
-        if let Err(error) = shared.wake.consume() {
-            trace_failure("worker wake read", error);
-            lock(&shared.scheduler).fail(&Native, Failure::Backend(error));
-            return;
-        }
-        handles.clear();
-        handles.push(shared.wake.poll_handle());
-        let (progressed, pending) = {
-            let mut scheduler = lock(&shared.scheduler);
-            let progressed = scheduler.advance(&Native);
-            if scheduler.failure().is_some()
-                || scheduler.is_empty() && shared.closing.load(Ordering::Acquire)
-            {
-                return;
-            }
-            handles.extend(
-                scheduler
-                    .receipts()
-                    .map(|receipt| PollHandle::new(receipt.as_handle().as_raw() as u32, POLLIN)),
-            );
-            (progressed, !scheduler.is_empty())
-        };
-        if progressed {
-            continue;
-        }
-        // With no local fence, Busy may come from another context on the
-        // shared device. Only the worker retries that transport-level pressure.
-        let timeout = if pending && handles.len() == 1 {
-            1_000_000
-        } else {
-            100_000_000
-        };
-        if let Err(error) = poll(&mut handles, timeout) {
-            trace_failure("worker completion poll", error);
-            lock(&shared.scheduler)
-                .fail(&Native, Failure::Backend(HandleError::SystemError(error)));
-            return;
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let pending = { lock(&self.native.shared.admission).count };
+        if !self.scheduler.is_empty() || pending != 0 {
+            self.fail(Failure::Unavailable);
         }
     }
 }

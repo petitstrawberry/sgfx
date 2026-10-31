@@ -52,6 +52,7 @@ pub(super) fn push_owned(
     set: u32,
     writes: Vec<crate::resources::Write>,
 ) -> VkResult<()> {
+    let _frame = crate::frame_profile::RecordingSpan::new();
     let driver = driver(command.as_raw(), Kind::Command)?;
     let recording = driver
         .recordings

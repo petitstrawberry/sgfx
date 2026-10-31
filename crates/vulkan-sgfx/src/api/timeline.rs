@@ -114,7 +114,9 @@ unsafe extern "system" fn signal(
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let d = driver(device.as_raw(), Kind::Device)?;
-        get(&d, i.semaphore)?.signal(i.value)
+        get(&d, i.semaphore)?.signal(i.value)?;
+        d.in_flight.notify();
+        Ok(())
     })())
 }
 unsafe extern "system" fn wait(

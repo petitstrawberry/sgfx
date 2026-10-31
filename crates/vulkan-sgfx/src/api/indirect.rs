@@ -381,6 +381,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes: AlignedBytes::zeroed(256).unwrap(),
                 mapped: true,
             },
@@ -457,6 +458,7 @@ mod tests {
         resources.memories.insert(
             other,
             Memory {
+                host_written: true,
                 bytes: AlignedBytes::zeroed(256).unwrap(),
                 mapped: false,
             },

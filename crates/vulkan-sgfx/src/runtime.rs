@@ -8,6 +8,15 @@ pub(crate) type BackendError = sgfx::Error;
 // requests. Observing/materializing operations drain the batch before running.
 pub(crate) const IMAGE_RETIREMENT_BATCH: usize = 256;
 
+const BUFFER_CACHE_CAPACITY: usize = 256;
+const BUFFER_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+struct CachedBuffer {
+    id: ir::BufferId,
+    desc: ir::BufferDesc,
+    after_submission: u64,
+}
+
 pub(crate) fn backend_failure(error: BackendError) -> ash::vk::Result {
     eprintln!("[SGFX Vulkan] backend failure: {error:?}");
     match error.kind() {
@@ -37,6 +46,8 @@ pub(crate) struct Runtime {
     pub device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub lost: bool,
     pub(crate) retired_images: Vec<crate::images::Image>,
+    cached_buffers: Vec<CachedBuffer>,
+    cached_buffer_bytes: u64,
 }
 
 impl Runtime {
@@ -67,11 +78,83 @@ impl Runtime {
             device_lost,
             lost: false,
             retired_images: Vec::new(),
+            cached_buffers: Vec::with_capacity(BUFFER_CACHE_CAPACITY),
+            cached_buffer_bytes: 0,
         })
     }
 }
 
 impl Runtime {
+    pub(crate) fn allocate_buffer(
+        &mut self,
+        desc: ir::BufferDesc,
+    ) -> Result<ir::BufferId, ash::vk::Result> {
+        let completed = self.in_flight.completed_serial();
+        if let Some(index) = self.cached_buffers.iter().position(|buffer| {
+            buffer.desc == desc && buffer.after_submission <= completed
+        }) {
+            let buffer = self.cached_buffers.swap_remove(index);
+            self.cached_buffer_bytes -= buffer.desc.size();
+            // Keep the native allocation and its table identity. Every Vulkan
+            // handle, binding and upload state is fresh; no old VkBuffer lives
+            // in this cache. Reuse never races an accepted GPU submission.
+            return Ok(buffer.id);
+        }
+        match self.table.define_buffer(desc) {
+            Ok(buffer) => Ok(buffer.id()),
+            Err(ir::Error::ResourceLimitExceeded) if !self.cached_buffers.is_empty() => {
+                self.flush_cached_buffers()?;
+                self.table.define_buffer(desc).map(|b| b.id()).map_err(crate::resources::failure)
+            }
+            Err(error) => Err(crate::resources::failure(error)),
+        }
+    }
+
+    pub(crate) fn cache_buffer(&mut self, id: ir::BufferId) -> Result<(), ash::vk::Result> {
+        let desc = self.table.buffer(self.table.buffer_ref(id).map_err(crate::resources::failure)?)
+            .map_err(crate::resources::failure)?;
+        // Only memory/slot pressure drains the cache. Ordinary per-frame
+        // destruction neither waits for other GPU work nor resynchronizes the
+        // entire ABI resource table. The Vec retains its startup capacity.
+        if self.cached_buffers.len() == BUFFER_CACHE_CAPACITY
+            || self.cached_buffer_bytes.saturating_add(desc.size()) > BUFFER_CACHE_BYTES
+        {
+            self.flush_cached_buffers()?;
+        }
+        self.cached_buffers.push(CachedBuffer {
+            id,
+            desc,
+            after_submission: self.in_flight.submitted_serial(),
+        });
+        self.cached_buffer_bytes += desc.size();
+        if self.cached_buffer_bytes > BUFFER_CACHE_BYTES {
+            self.flush_cached_buffers()?;
+        }
+        Ok(())
+    }
+
+    fn flush_cached_buffers(&mut self) -> Result<(), ash::vk::Result> {
+        if self.cached_buffers.is_empty() { return Ok(()); }
+        let _frame = crate::frame_profile::Span::new("work", "buffer_cache::pressure_drain");
+        self.in_flight.wait();
+        // Preserve one table revision across the whole physical batch. A
+        // failed prefix must not recycle IDs whose release status is unknown.
+        let result = (|| {
+            for buffer in &self.cached_buffers {
+                self.cache.release_buffer(buffer.id).map_err(backend_failure)?;
+            }
+            for buffer in &self.cached_buffers {
+                self.table.release_buffer(buffer.id).map_err(crate::resources::failure)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() { self.lost = true; } else {
+            self.cached_buffers.clear();
+            self.cached_buffer_bytes = 0;
+        }
+        result
+    }
+
     pub(crate) fn retire_image(&mut self, image: ash::vk::Image) -> Result<(), ash::vk::Result> {
         if self
             .resources
@@ -149,6 +232,8 @@ impl Runtime {
         };
         self.cache = cache;
         self.table = table;
+        self.cached_buffers.clear();
+        self.cached_buffer_bytes = 0;
     }
 }
 

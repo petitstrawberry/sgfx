@@ -86,6 +86,25 @@ mod native {
             Some(address as usize)
         }
     }
+    static TIMED_SURFACES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn install_timing(callback: Option<extern "C" fn(u32, u64, u64)>) {
+        if let Some(address) = symbol(c"sws_set_timing_callback") {
+            type Install = extern "C" fn(Option<extern "C" fn(u32, u64, u64)>);
+            let install = unsafe { std::mem::transmute::<usize, Install>(address) };
+            install(callback);
+        }
+    }
+    pub(super) fn enable_frame_timing() {
+        if crate::frame_profile::enabled() && TIMED_SURFACES.fetch_add(1, Ordering::AcqRel) == 0 {
+            install_timing(Some(crate::frame_profile::sws_timing));
+        }
+    }
+    pub(super) fn disable_frame_timing() {
+        if crate::frame_profile::enabled() && TIMED_SURFACES.fetch_sub(1, Ordering::AcqRel) == 1 {
+            install_timing(None);
+        }
+    }
+
     // Retain one handle for the process. GLFW's DT_NEEDED and this lookup resolve
     // to the same resident library and therefore the same SWS connection/queues.
     macro_rules! import {
@@ -188,11 +207,12 @@ impl SurfaceWindow {
             pending: Mutex::new(Vec::new()),
             lost: AtomicBool::new(false),
         });
+        native::enable_frame_timing();
         let _ = surface.size()?;
         Ok(surface)
     }
     pub fn size(&self) -> Result<vk::Extent2D, vk::Result> {
-        self.events(0)?;
+        self.events(0, |_| Ok(()))?;
         let mut width = 0;
         let mut height = 0;
         if unsafe { sws_window_size(self.id, &mut width, &mut height) } < 0
@@ -229,7 +249,11 @@ impl SurfaceWindow {
         }
         false
     }
-    fn events(&self, generation: u32) -> Result<Vec<SwsGpuEvent>, vk::Result> {
+    fn events(
+        &self,
+        generation: u32,
+        mut receive: impl FnMut(SwsGpuEvent) -> Result<(), vk::Result>,
+    ) -> Result<(), vk::Result> {
         // A surface can have two live swapchains during replacement. Preserve
         // release events belonging to the other generation instead of consuming
         // them from the shared SWS queue and leaving its images permanently busy.
@@ -255,20 +279,21 @@ impl SurfaceWindow {
                 pending.push(event);
             }
         }
-        let mut output = Vec::new();
         let mut index = 0;
         while index < pending.len() {
             if pending[index].buffer.generation == generation {
-                output.push(pending.remove(index));
+                receive(pending.remove(index))?;
             } else {
                 index += 1;
             }
         }
-        Ok(output)
+        Ok(())
     }
 }
 impl Drop for SurfaceWindow {
     fn drop(&mut self) {
+        #[cfg(target_os = "scarlet")]
+        native::disable_frame_timing();
         if self.owned {
             unsafe {
                 sws_window_destroy(self.id);
@@ -337,19 +362,26 @@ impl Window {
         if self.lost {
             return Err(LOST);
         }
-        for event in self.surface.events(self.generation)? {
+        self.surface.events(self.generation, |event| {
             let Some(index) = self
                 .buffers
                 .iter()
                 .position(|buffer| *buffer == event.buffer)
             else {
-                continue;
+                return Ok(());
             };
             if self.queued[index] != Some(event.commit_serial) {
-                continue;
+                return Ok(());
             }
             match event.kind {
-                1 => self.queued[index] = None,
+                1 => {
+                    #[cfg(target_os = "scarlet")]
+                    crate::frame_profile::sws_buffer_event(
+                        "sws_release_received",
+                        event.commit_serial,
+                    );
+                    self.queued[index] = None;
+                }
                 2 => {
                     self.lost = true;
                     return Err(LOST);
@@ -359,7 +391,8 @@ impl Window {
                     return Err(LOST);
                 }
             }
-        }
+            Ok(())
+        })?;
         if self.surface.size()? != self.extent {
             return Err(vk::Result::ERROR_OUT_OF_DATE_KHR);
         }
@@ -393,6 +426,8 @@ impl Window {
             return Err(LOST);
         }
         self.queued[index] = Some(serial);
+        #[cfg(target_os = "scarlet")]
+        crate::frame_profile::sws_buffer_event("sws_commit_sent", serial);
         Ok(())
     }
 }

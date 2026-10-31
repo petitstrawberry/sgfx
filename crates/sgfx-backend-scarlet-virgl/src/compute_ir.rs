@@ -480,6 +480,9 @@ impl<'a> Plan<'a> {
                         size,
                     });
                 }
+                // Dispatch events retire and publish their buffer writes before
+                // the following event; no extra host fence is needed here.
+                Command::ResourceBarrier(ir::ResourceBarrier::Global) if !active => {}
                 Command::ResourceBarrier(ir::ResourceBarrier::Buffer { buffer, .. }) if !active => {
                     resources.resources.buffer(*buffer)?;
                 }

@@ -214,6 +214,13 @@ pub const SHADER_DRAW_PARAMETERS: u64 = 4194304;
 pub const DEPTH_TRANSFERS: u64 = 8388608;
 /// RGBA16F and RGBA32F sampled render targets, with native packed transfers.
 pub const FLOAT_COLOR_ATTACHMENTS: u64 = 1 << 24;
+/// Buffer mirrors include every accepted write/copy before submit returns.
+/// Compute-generated values must also be published before acceptance returns.
+/// Reading a buffer therefore needs no extra GPU retirement wait. Receipts
+/// still govern GPU completion, errors, and resource lifetimes.
+pub const IMMEDIATE_BUFFER_READBACK: u64 = 1 << 25;
+/// ResourceBarrier discriminator 3: a global outside-pass memory dependency.
+pub const GLOBAL_RESOURCE_BARRIERS: u64 = 1 << 26;
 /// Optional timing extension; existing v2 table layouts remain unchanged.
 pub const TIMESTAMP_ENTRY: &[u8] = b"sgfx_backend_get_timestamp_api_v2\0";
 #[repr(C)]

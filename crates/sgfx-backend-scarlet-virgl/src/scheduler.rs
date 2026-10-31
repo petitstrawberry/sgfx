@@ -43,13 +43,32 @@ pub(crate) trait Transport {
     fn complete(&self, signal: &Self::Signal, result: Result<(), Self::Error>);
 }
 
-struct Job<T: Transport> {
+pub(crate) struct Job<T: Transport> {
     chunks: Vec<T::Chunk>,
     owner: T::Owner,
-    signal: T::Signal,
+    pub(crate) signal: T::Signal,
     next: usize,
     receipts: VecDeque<T::Receipt>,
-    bytes: usize,
+    pub(crate) bytes: usize,
+}
+
+impl<T: Transport> Job<T> {
+    pub(crate) fn prepare(
+        chunks: Vec<T::Chunk>,
+        owner: T::Owner,
+        signal: T::Signal,
+    ) -> Result<Self, AdmissionError<T::Error>> {
+        let bytes = chunks
+            .iter()
+            .try_fold(0usize, |size, chunk| size.checked_add(T::size(chunk)))
+            .filter(|size| *size <= MAX_STREAM_BYTES)
+            .ok_or(AdmissionError::TooLarge)?;
+        let mut receipts = VecDeque::new();
+        receipts
+            .try_reserve(chunks.len().min(MAX_NATIVE_IN_FLIGHT))
+            .map_err(|_| AdmissionError::OutOfMemory)?;
+        Ok(Self { chunks, owner, signal, next: 0, receipts, bytes })
+    }
 }
 
 pub(crate) struct Scheduler<T: Transport> {
@@ -83,6 +102,10 @@ impl<T: Transport> Scheduler<T> {
         self.jobs.back().map(|job| &job.signal)
     }
 
+    pub(crate) fn reserve_admission(&mut self) -> Result<(), AdmissionError<T::Error>> {
+        self.jobs.try_reserve(MAX_SUBMISSIONS).map_err(|_| AdmissionError::OutOfMemory)
+    }
+
     // All fallible allocation precedes publication. No transport operation is
     // performed here, even when hardware currently has no free descriptors.
     pub(crate) fn enqueue(
@@ -91,14 +114,14 @@ impl<T: Transport> Scheduler<T> {
         owner: T::Owner,
         signal: T::Signal,
     ) -> Result<(), AdmissionError<T::Error>> {
+        self.enqueue_prepared(Job::prepare(chunks, owner, signal)?)
+    }
+
+    pub(crate) fn enqueue_prepared(&mut self, job: Job<T>) -> Result<(), AdmissionError<T::Error>> {
         if let Some(error) = self.failure {
             return Err(AdmissionError::Failed(error));
         }
-        let bytes = chunks
-            .iter()
-            .try_fold(0usize, |size, chunk| size.checked_add(T::size(chunk)))
-            .filter(|size| *size <= MAX_STREAM_BYTES)
-            .ok_or(AdmissionError::TooLarge)?;
+        let bytes = job.bytes;
         if self.jobs.len() == MAX_SUBMISSIONS
             || (!self.jobs.is_empty()
                 && (bytes > MAX_PENDING_BYTES
@@ -106,21 +129,10 @@ impl<T: Transport> Scheduler<T> {
         {
             return Err(AdmissionError::Busy);
         }
-        let mut receipts = VecDeque::new();
-        receipts
-            .try_reserve(chunks.len().min(MAX_NATIVE_IN_FLIGHT))
-            .map_err(|_| AdmissionError::OutOfMemory)?;
         self.jobs
             .try_reserve(1)
             .map_err(|_| AdmissionError::OutOfMemory)?;
-        self.jobs.push_back(Job {
-            chunks,
-            owner,
-            signal,
-            next: 0,
-            receipts,
-            bytes,
-        });
+        self.jobs.push_back(job);
         self.bytes += bytes;
         Ok(())
     }
