@@ -1,6 +1,8 @@
 //! FIFO queue acceptance is independent of the device resource worker.
 use super::*;
 
+// Keep present's bounded wait set inline: boxing it would allocate on every frame.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Request {
     Run(Box<dyn FnOnce() + Send>),
     #[cfg(any(
