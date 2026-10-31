@@ -4516,6 +4516,242 @@ mod tests {
 
     #[cfg(feature = "programmable")]
     #[test]
+    fn varying_index_prefixes_reuse_blocks_without_reading_whole_ranges() {
+        let table = ResourceTable::new();
+        let bytes: Vec<u8> = (0..4096u32).flat_map(u32::to_le_bytes).collect();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(bytes.len() as u64, BufferUsage::INDEX).unwrap())
+            .unwrap();
+        let shadows = [range_test_shadow(bytes)];
+        let resources = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        let pending = PendingBuffers::new();
+        for words in [1025, 1033, 2049, 2057, 1027] {
+            assert_eq!(
+                programmable::cached_index_maximum(
+                    &resources,
+                    &pending,
+                    buffer,
+                    0..words * 4,
+                    IndexFormat::Uint32,
+                    0
+                )
+                .unwrap(),
+                words as u32 - 1
+            );
+        }
+        let stats = pending.index_bounds.borrow().scan_stats();
+        assert_eq!(stats.index_words, 2071); // rescanning every prefix would consume 7191
+        assert_eq!(stats.range_reads, 7);
+        assert_eq!((stats.block_hits, stats.block_misses), (5, 2));
+        assert!(matches!(
+            programmable::cached_index_maximum(
+                &resources,
+                &pending,
+                buffer,
+                0..1027 * 4,
+                IndexFormat::Uint32,
+                -1
+            ),
+            Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds))
+        ));
+        assert_eq!(
+            pending.index_bounds.borrow().scan_stats(),
+            stats,
+            "exact hit and base validation must not read any bytes"
+        );
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn index_block_edges_never_read_outside_the_requested_indices() {
+        let table = ResourceTable::new();
+        let start = 17usize;
+        let end = 3 * 1024 + 9;
+        let mut words = vec![u32::MAX; 4 * 1024];
+        words[start..end].fill(3);
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(bytes.len() as u64, BufferUsage::INDEX).unwrap())
+            .unwrap();
+        let shadows = [range_test_shadow(bytes)];
+        let resources = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        let pending = PendingBuffers::new();
+        for last in [end, end - 4] {
+            // The immediately preceding/following values overflow with base=1.
+            assert_eq!(
+                programmable::cached_index_maximum(
+                    &resources,
+                    &pending,
+                    buffer,
+                    start * 4..last * 4,
+                    IndexFormat::Uint32,
+                    1
+                )
+                .unwrap(),
+                4
+            );
+        }
+        let stats = pending.index_bounds.borrow().scan_stats();
+        assert_eq!(stats.index_words, 4076);
+        assert_eq!((stats.block_hits, stats.block_misses), (2, 2));
+        assert!(matches!(
+            programmable::cached_index_maximum(
+                &resources,
+                &pending,
+                buffer,
+                start * 4..(end + 1) * 4,
+                IndexFormat::Uint32,
+                1
+            ),
+            Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds))
+        ));
+        let before = pending.index_bounds.borrow().scan_stats();
+        assert!(matches!(
+            programmable::cached_index_maximum(
+                &resources,
+                &pending,
+                buffer,
+                0..usize::MAX,
+                IndexFormat::Uint32,
+                0
+            ),
+            Err(IrSubmitError::InvalidVertexData)
+        ));
+        assert_eq!(
+            programmable::cached_index_maximum(
+                &resources,
+                &pending,
+                buffer,
+                1..1,
+                IndexFormat::Uint16,
+                i32::MIN
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            pending.index_bounds.borrow().scan_stats(),
+            before,
+            "empty/invalid ranges must not read blocks"
+        );
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn index_blocks_preserve_format_and_nonzero_byte_phase() {
+        let table = ResourceTable::new();
+        let mut bytes = vec![255; 3 + (2 * 1024 + 11) * 2 + 8];
+        for item in bytes[3..3 + (2 * 1024 + 11) * 2].chunks_exact_mut(2) {
+            item.copy_from_slice(&2u16.to_le_bytes());
+        }
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(8192, BufferUsage::INDEX).unwrap())
+            .unwrap();
+        let shadows = [range_test_shadow(bytes)];
+        let resources = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        let pending = PendingBuffers::new();
+        for count in [2 * 1024 + 7, 2 * 1024 + 11] {
+            assert_eq!(
+                programmable::cached_index_maximum(
+                    &resources,
+                    &pending,
+                    buffer,
+                    3..3 + count * 2,
+                    IndexFormat::Uint16,
+                    -1
+                )
+                .unwrap(),
+                1
+            );
+        }
+        assert_eq!(pending.index_bounds.borrow().scan_stats().block_hits, 1);
+        let bytes: Vec<_> = (0..2048)
+            .flat_map(|_| 0x0001_0002u32.to_le_bytes())
+            .collect();
+        let shadows = [range_test_shadow(bytes)];
+        let resources = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        let pending = PendingBuffers::new();
+        for (format, expected) in [(IndexFormat::Uint32, 65538), (IndexFormat::Uint16, 2)] {
+            for end in [8192, 8188] {
+                assert_eq!(
+                    programmable::cached_index_maximum(
+                        &resources,
+                        &pending,
+                        buffer,
+                        0..end,
+                        format,
+                        0
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn pending_same_revision_writes_and_copies_invalidate_exact_and_block_proofs() {
+        let table = ResourceTable::new();
+        let usage = BufferUsage::INDEX | BufferUsage::COPY_SRC | BufferUsage::COPY_DST;
+        let source = table
+            .define_buffer(ir::BufferDesc::new(8192, usage).unwrap())
+            .unwrap();
+        let target = table
+            .define_buffer(ir::BufferDesc::new(8192, usage).unwrap())
+            .unwrap();
+        let bytes = |value: u32| (0..2048).flat_map(|_| value.to_le_bytes()).collect();
+        let shadows = [range_test_shadow(bytes(5)), range_test_shadow(bytes(1))];
+        let resources = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        let mut pending = PendingBuffers::new();
+        let maximum = |pending: &PendingBuffers<'_>, count: usize| {
+            programmable::cached_index_maximum(
+                &resources,
+                pending,
+                target,
+                0..count * 4,
+                IndexFormat::Uint32,
+                0,
+            )
+            .unwrap()
+        };
+        assert_eq!(maximum(&pending, 1025), 1);
+        assert_eq!(maximum(&pending, 1026), 1);
+        pending
+            .write(&table, &shadows, target, 0, &[9, 0, 0, 0])
+            .unwrap();
+        let revision = pending.revision(&resources, target).unwrap();
+        assert_eq!(maximum(&pending, 1025), 9);
+        pending
+            .write(&table, &shadows, target, 0, &[11, 0, 0, 0])
+            .unwrap();
+        assert_eq!(pending.revision(&resources, target).unwrap(), revision);
+        assert_eq!(maximum(&pending, 1026), 11);
+        pending
+            .copy(&table, &shadows, (source, 0), (target, 0), 4096)
+            .unwrap();
+        assert_eq!(pending.revision(&resources, target).unwrap(), revision);
+        assert_eq!(maximum(&pending, 1025), 5);
+        assert_eq!(pending.index_bounds.borrow().scan_stats().block_misses, 4);
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
     fn index_cache_tracks_pending_writes_and_copies_even_at_the_same_revision() {
         let table = ResourceTable::new();
         let usage = BufferUsage::INDEX | BufferUsage::COPY_SRC | BufferUsage::COPY_DST;
@@ -4626,7 +4862,11 @@ mod tests {
                 Err(IrSubmitError::InvalidVertexData)
             ));
             assert!(matches!(
-                maximum(4..2, IndexFormat::Uint16, 0),
+                maximum(
+                    core::ops::Range { start: 4, end: 2 },
+                    IndexFormat::Uint16,
+                    0
+                ),
                 Err(IrSubmitError::InvalidVertexData)
             ));
         }
