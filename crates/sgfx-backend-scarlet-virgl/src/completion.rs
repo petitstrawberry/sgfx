@@ -212,6 +212,24 @@ impl SubmitMode {
             .map_err(|error| packet_error(error, too_large))
     }
 
+    /// Tracked packets can take the encoding buffer; synchronous submission
+    /// keeps it available for reuse after the native call returns.
+    pub(crate) fn submit_owned(
+        &mut self,
+        queue: &GpuQueue,
+        commands: &mut Vec<u8>,
+    ) -> HandleResult<()> {
+        let Self::Tracked {
+            packets, too_large, ..
+        } = self
+        else {
+            return queue.submit(commands).map(|_| ());
+        };
+        packets
+            .append_owned(commands)
+            .map_err(|error| packet_error(error, too_large))
+    }
+
     pub(crate) fn set_limit(&mut self, max_bytes: usize) {
         if let Self::Tracked { packets, .. } = self {
             *packets = Packets::new(max_bytes.min(gpu_raw::GPU_MAX_OPAQUE_COMMAND_SIZE as usize));

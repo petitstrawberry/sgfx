@@ -78,21 +78,7 @@ impl Packets {
     }
 
     pub(crate) fn append(&mut self, commands: &[u8]) -> Result<(), Error> {
-        #[cfg(feature = "std")]
-        if self.bytes.saturating_add(commands.len()) > MAX_STREAM_BYTES {
-            std::eprintln!(
-                "[SGFX VirGL] stream exceeds admission: staged={} packet={} chunks={} limit={MAX_STREAM_BYTES}",
-                self.bytes,
-                commands.len(),
-                self.chunks.len()
-            );
-        }
-        let bytes = self
-            .bytes
-            .checked_add(commands.len())
-            .filter(|bytes| *bytes <= MAX_STREAM_BYTES)
-            .ok_or(Error::TooLarge)?;
-        self.prepare(commands.len())?;
+        let bytes = self.prepare_append(commands.len())?;
         self.current
             .bytes
             .try_reserve(commands.len())
@@ -100,6 +86,37 @@ impl Packets {
         self.current.bytes.extend_from_slice(commands);
         self.bytes = bytes;
         Ok(())
+    }
+
+    /// Transfer the encoding allocation when this packet starts a chunk.
+    /// Otherwise keep the caller's buffer reusable and batch through `append`.
+    pub(crate) fn append_owned(&mut self, commands: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.prepare_append(commands.len())?;
+        if self.current.bytes.is_empty() {
+            self.current.bytes = core::mem::take(commands);
+            self.bytes = bytes;
+            Ok(())
+        } else {
+            self.append(commands)
+        }
+    }
+
+    fn prepare_append(&mut self, length: usize) -> Result<usize, Error> {
+        #[cfg(feature = "std")]
+        if self.bytes.saturating_add(length) > MAX_STREAM_BYTES {
+            std::eprintln!(
+                "[SGFX VirGL] stream exceeds admission: staged={} packet={length} chunks={} limit={MAX_STREAM_BYTES}",
+                self.bytes,
+                self.chunks.len()
+            );
+        }
+        let bytes = self
+            .bytes
+            .checked_add(length)
+            .filter(|bytes| *bytes <= MAX_STREAM_BYTES)
+            .ok_or(Error::TooLarge)?;
+        self.prepare(length)?;
+        Ok(bytes)
     }
 
     fn finish_chunk(&mut self) -> Result<(), Error> {
@@ -191,6 +208,119 @@ mod tests {
         assert_eq!(stream.append(&[1; 4]), Err(Error::TooLarge));
         assert!(stream.current.bytes.is_empty());
         assert!(stream.chunks.is_empty());
+    }
+
+    #[test]
+    fn owned_packet_adopts_allocation_and_preserves_prepared_upload_range() {
+        let mut stream = Packets::new(128);
+        stream.prepare(64).unwrap();
+        assert_eq!(stream.upload_range(60).unwrap(), (0, 0));
+        let mut commands = alloc::vec![7; 64];
+        let pointer = commands.as_ptr();
+        let capacity = commands.capacity();
+        stream.append_owned(&mut commands).unwrap();
+        assert_eq!(commands.capacity(), 0);
+        assert_eq!(stream.current.bytes.as_ptr(), pointer);
+        assert_eq!(stream.current.bytes.capacity(), capacity);
+        assert_eq!(stream.upload_range(60).unwrap(), (0, 60));
+        let chunks = stream.finish().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].bytes, &[7; 64]);
+        assert_eq!(chunks[0].arena, Some(0));
+    }
+
+    #[test]
+    fn owned_packet_batches_after_existing_data_and_keeps_encoding_buffer() {
+        let mut stream = Packets::new(128);
+        stream.append(&[1; 32]).unwrap();
+        let mut commands = alloc::vec![2; 64];
+        let pointer = commands.as_ptr();
+        stream.append_owned(&mut commands).unwrap();
+        assert_eq!(commands.as_ptr(), pointer);
+        assert_eq!(commands, &[2; 64]);
+        stream.append(&[3; 32]).unwrap();
+        let chunks = stream.finish().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(&chunks[0].bytes[..32], &[1; 32]);
+        assert_eq!(&chunks[0].bytes[32..96], &[2; 64]);
+        assert_eq!(&chunks[0].bytes[96..], &[3; 32]);
+    }
+
+    #[test]
+    fn owned_packet_rotates_and_adopts_without_reordering_or_losing_arenas() {
+        let mut stream = Packets::new(128);
+        stream.prepare(96).unwrap();
+        assert_eq!(stream.upload_range(60).unwrap(), (0, 0));
+        stream.append(&[1; 96]).unwrap();
+        let mut commands = alloc::vec![2; 64];
+        let pointer = commands.as_ptr();
+        stream.append_owned(&mut commands).unwrap();
+        assert_eq!(stream.current.bytes.as_ptr(), pointer);
+        assert_eq!(stream.upload_range(60).unwrap(), (1, 0));
+        stream.append(&[3; 64]).unwrap();
+        let chunks = stream.finish().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].bytes, &[1; 96]);
+        assert_eq!(chunks[0].arena, Some(0));
+        assert_eq!(&chunks[1].bytes[..64], &[2; 64]);
+        assert_eq!(&chunks[1].bytes[64..], &[3; 64]);
+        assert_eq!(chunks[1].arena, Some(1));
+    }
+
+    #[test]
+    fn owned_packet_transport_and_admission_overflow_leave_state_and_input_intact() {
+        let mut stream = Packets::new(128);
+        stream.append(&[1; 96]).unwrap();
+        assert_eq!(stream.upload_range(60).unwrap(), (0, 0));
+        let mut oversized = alloc::vec![2; 129];
+        assert_eq!(stream.append_owned(&mut oversized), Err(Error::TooLarge));
+        assert_eq!(oversized, &[2; 129]);
+        let mut commands = alloc::vec![3; 64];
+        let pointer = commands.as_ptr();
+        for staged in [MAX_STREAM_BYTES - 63, usize::MAX] {
+            stream.bytes = staged;
+            assert_eq!(stream.append_owned(&mut commands), Err(Error::TooLarge));
+            assert_eq!(stream.bytes, staged);
+            assert!(stream.chunks.is_empty());
+            assert_eq!(stream.current.bytes, &[1; 96]);
+            assert_eq!(stream.current.arena, Some(0));
+            assert_eq!(stream.upload_offset, 60);
+            assert_eq!(commands.as_ptr(), pointer);
+            assert_eq!(commands, &[3; 64]);
+        }
+        stream.bytes = MAX_STREAM_BYTES - commands.len();
+        stream.append_owned(&mut commands).unwrap();
+        assert_eq!(stream.bytes, MAX_STREAM_BYTES);
+        assert_eq!(stream.current.bytes.as_ptr(), pointer);
+        let mut extra = alloc::vec![4];
+        assert_eq!(stream.append_owned(&mut extra), Err(Error::TooLarge));
+        assert_eq!(stream.current.bytes, &[3; 64]);
+        assert_eq!(stream.chunks.len(), 1);
+        assert_eq!(extra, &[4]);
+    }
+
+    #[test]
+    fn empty_owned_packets_keep_checkpoint_and_do_not_add_trailing_chunks() {
+        let mut stream = Packets::new(128);
+        let mut empty = Vec::with_capacity(64);
+        let pointer = empty.as_ptr();
+        stream.append_owned(&mut empty).unwrap();
+        let chunks = stream.finish().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].bytes.is_empty());
+        assert_eq!(chunks[0].bytes.as_ptr(), pointer);
+        assert_eq!(chunks[0].arena, None);
+
+        let mut stream = Packets::new(128);
+        let mut commands = alloc::vec![1; 128];
+        stream.append_owned(&mut commands).unwrap();
+        stream.append_owned(&mut Vec::new()).unwrap();
+        // Rotation can leave an empty current chunk before the checkpoint.
+        stream.prepare(1).unwrap();
+        stream.append_owned(&mut Vec::new()).unwrap();
+        let chunks = stream.finish().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].bytes, &[1; 128]);
     }
 
     #[test]

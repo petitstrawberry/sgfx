@@ -2136,9 +2136,6 @@ impl Queue {
             .filter(|bytes| *bytes > 0)
             .ok_or(HandleError::InvalidParameter)?;
         let mut commands = Vec::new();
-        commands
-            .try_reserve_exact(self.max_command_size())
-            .map_err(|_| HandleError::OutOfResources)?;
         let scratch_capacity = if matches!(source, IrBufferSource::Contiguous(_)) {
             0
         } else {
@@ -2172,6 +2169,9 @@ impl Queue {
                 // packet's bytes so small intervals share a native chunk.
                 mode.prepare_packet(fixed_bytes + chunk.len())?;
                 commands.clear();
+                commands
+                    .try_reserve_exact(fixed_bytes + chunk.len())
+                    .map_err(|_| HandleError::OutOfResources)?;
                 push_ir_buffer_upload(
                     &mut commands,
                     resource_id,
@@ -2179,7 +2179,7 @@ impl Queue {
                     chunk,
                     mode,
                 )?;
-                mode.submit(&self.raw, &commands)?;
+                mode.submit_owned(&self.raw, &mut commands)?;
                 offset = end;
             }
         }
