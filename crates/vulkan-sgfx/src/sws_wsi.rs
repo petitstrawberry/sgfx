@@ -123,7 +123,7 @@ mod native {
     import!(sws_get_display(out: *mut SwsDisplay));
     import!(sws_window_destroy(window: u32));
     import!(sws_window_size(window: u32, width: *mut u32, height: *mut u32));
-    import!(sws_gpu_register(buffer: SwsBuffer, width: u32, height: u32, handle: i32));
+    import!(sws_gpu_register_opaque(buffer: SwsBuffer, width: u32, height: u32, handle: i32));
     import!(sws_gpu_commit(buffer: SwsBuffer, serial: u64, width: u32, height: u32));
     import!(sws_gpu_destroy(buffer: SwsBuffer));
     import!(sws_gpu_poll(window: u32, out: *mut SwsGpuEvent));
@@ -351,7 +351,15 @@ impl Window {
             generation: self.generation,
             compositor_epoch: self.surface.epoch,
         };
-        if unsafe { sws_gpu_register(buffer, image.width(), image.height(), handle.as_raw()) } < 0 {
+        #[cfg(target_os = "scarlet")]
+        let registered = unsafe {
+            sws_gpu_register_opaque(buffer, image.width(), image.height(), handle.as_raw())
+        };
+        #[cfg(target_os = "linux")]
+        let registered = unsafe {
+            sws_gpu_register(buffer, image.width(), image.height(), handle.as_raw())
+        };
+        if registered < 0 {
             return Err(LOST);
         }
         self.buffers.push(buffer);
