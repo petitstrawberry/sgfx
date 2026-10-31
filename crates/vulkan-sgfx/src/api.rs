@@ -1464,6 +1464,8 @@ struct ResolvedRecording {
     viewport: Option<vk::Viewport>,
     scissor: Option<vk::Rect2D>,
     used_buffers: Vec<vk::Buffer>,
+    referenced_buffers: Vec<vk::Buffer>,
+    source_upload_ranges: buffer_uploads::Ranges,
     readback_buffers: buffer_readback::Readbacks,
     used_images: Vec<vk::Image>,
     used_pipelines: Vec<vk::Pipeline>,
@@ -1676,6 +1678,8 @@ impl ResolvedRecording {
             viewport: None,
             scissor: None,
             used_buffers: Vec::new(),
+            referenced_buffers: Vec::new(),
+            source_upload_ranges: Default::default(),
             readback_buffers: buffer_readback::Readbacks::default(),
             used_images: Vec::new(),
             used_pipelines: Vec::new(),
@@ -2239,55 +2243,7 @@ impl RecordedCommand {
                 source,
                 destination,
                 regions,
-            } => {
-                if rec.render.is_some() {
-                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                }
-                let source_data = rt
-                    .resources
-                    .buffers
-                    .get(source)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                let destination_data = rt
-                    .resources
-                    .buffers
-                    .get(destination)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                if source_data.bound.is_none()
-                    || destination_data.bound.is_none()
-                    || !source_data
-                        .usage
-                        .contains(vk::BufferUsageFlags::TRANSFER_SRC)
-                    || !destination_data
-                        .usage
-                        .contains(vk::BufferUsageFlags::TRANSFER_DST)
-                {
-                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                }
-                for region in regions {
-                    if region
-                        .dst_offset
-                        .checked_add(region.size)
-                        .is_none_or(|end| end > destination_data.size)
-                        || region
-                            .src_offset
-                            .checked_add(region.size)
-                            .is_none_or(|end| end > source_data.size)
-                    {
-                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                    }
-                    rec.ops.push(ir::OwnedCommand::CopyBufferToBuffer {
-                        source: source_data.id,
-                        source_offset: region.src_offset,
-                        destination: destination_data.id,
-                        destination_offset: region.dst_offset,
-                        size: region.size,
-                    });
-                    rec.readback_buffers
-                        .insert(*destination, region.dst_offset, region.size)?;
-                }
-                rec.used_buffers.extend([*source, *destination]);
-            }
+            } => buffer_uploads::resolve_copy(&rt.resources, rec, *source, *destination, regions)?,
             Self::PipelineBarrier {
                 full_scope,
                 source_stage,
@@ -2361,7 +2317,7 @@ impl RecordedCommand {
                     {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
-                    rec.used_buffers.push(*buffer);
+                    rec.referenced_buffers.push(*buffer);
                     if *full_scope && source.is_empty() && destination.is_empty() {
                         continue;
                     }
@@ -2382,7 +2338,7 @@ impl RecordedCommand {
                             after,
                         },
                     ));
-                    rec.used_buffers.push(*buffer);
+                    rec.referenced_buffers.push(*buffer);
                 }
                 for (
                     extended,
@@ -4253,12 +4209,16 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
             .used_pipelines
             .iter()
             .any(|p| !rt.resources.pipelines.contains_key(p))
-        || rec.used_buffers.iter().any(|b| {
-            rt.resources
-                .buffers
-                .get(b)
-                .is_none_or(|b| b.bound.is_none())
-        })
+        || rec
+            .used_buffers
+            .iter()
+            .chain(&rec.referenced_buffers)
+            .any(|b| {
+                rt.resources
+                    .buffers
+                    .get(b)
+                    .is_none_or(|b| b.bound.is_none())
+            })
         || rec
             .used_images
             .iter()
@@ -4622,7 +4582,12 @@ fn execute(
     retained_submissions: &mut Vec<sgfx::driver::Submission>,
 ) -> VkResult<()> {
     let (mut ops, fresh_uploads) = profile_work("execute::snapshot_buffers", || {
-        buffer_uploads::for_recording(&rt.resources, &rec.used_buffers, &rec.descriptors)
+        buffer_uploads::for_recording(
+            &rt.resources,
+            &rec.used_buffers,
+            &rec.descriptors,
+            &rec.source_upload_ranges,
+        )
     })
     .inspect_err(|error| {
         if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
