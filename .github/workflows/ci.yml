@@ -69,10 +69,13 @@ jobs:
       - name: Test native dispatch policy without GPU syscalls
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
-          rustc --edition=2024 --test crates/sgfx-backend-scarlet-virgl/src/scheduler.rs -o "$CARGO_TARGET_DIR/native-scheduler-tests"
-          "$CARGO_TARGET_DIR/native-scheduler-tests"
-          rustc --edition=2024 --test crates/sgfx-backend-scarlet-virgl/src/packets.rs -o "$CARGO_TARGET_DIR/native-packet-tests"
-          "$CARGO_TARGET_DIR/native-packet-tests"
+          rustc --edition=2024 --test -o "$CARGO_TARGET_DIR/native-dispatch-tests" - <<'RS'
+          #[path = "crates/sgfx-backend-scarlet-virgl/src/scheduler.rs"]
+          mod scheduler;
+          #[path = "crates/sgfx-backend-scarlet-virgl/src/packets.rs"]
+          mod packets;
+          RS
+          "$CARGO_TARGET_DIR/native-dispatch-tests"
       - name: Lint portable crates
         run: |
           cargo-clippy clippy --locked --manifest-path crates/sgfx-core/Cargo.toml --all-targets --no-deps -- -D warnings
