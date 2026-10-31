@@ -22,13 +22,14 @@ pub(super) fn apply_write(
     {
         return Err(INVALID);
     }
+    rec.readback_buffers
+        .insert(buffer, offset, data.len() as u64)?;
     rec.ops.push(ir::OwnedCommand::WriteBuffer {
         buffer: dst.id,
         offset,
         data,
     });
     rec.used_buffers.push(buffer);
-    rec.readback_buffers.push(buffer);
     rec.written_buffers.push(buffer);
     Ok(())
 }

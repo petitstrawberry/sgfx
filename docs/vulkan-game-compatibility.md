@@ -1,7 +1,8 @@
 # Vulkan application compatibility
 
-The current development ICD exposes 104 procedures on macOS, including 17
-command procedures. This remains a bounded, non-conformant Vulkan 1.0 path.
+The development ICD implements a bounded, non-conformant profile. API versions
+and optional features follow each adapter's negotiated capabilities; see
+[vulkan-sgfx.md](vulkan-sgfx.md) for the current native and host profiles.
 
 ## Executable additions
 

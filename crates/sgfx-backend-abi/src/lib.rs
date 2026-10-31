@@ -197,6 +197,60 @@ pub const IMAGE_BLITS: u64 = 32768;
 pub const PUSH_CONSTANTS_128: u64 = 65536;
 /// Up to eight simultaneous programmable color attachments.
 pub const COLOR_ATTACHMENTS_8: u64 = 131072;
+/// Actual GPU timestamps returned in nanoseconds by the optional timing API.
+pub const GPU_TIMESTAMPS: u64 = 262144;
+/// Fixed-size compute workgroups (128 invocations), four writable SSBOs, inline
+/// uniforms and push constants. Compute-only streams retire before returning.
+/// No shared memory, atomics, storage images or mixed graphics/compute stream.
+/// Advertise only after native dispatch and GPU-written readback are verified.
+pub const COMPUTE_BUFFERS: u64 = 524288;
+/// Anisotropic samplers through sixteen, including the sampler-row wire extension.
+pub const SAMPLER_ANISOTROPY_16: u64 = 1048576;
+/// Nonzero per-instance divisors, including the DIVS resource-row tail.
+pub const VERTEX_ATTRIBUTE_DIVISORS: u64 = 2097152;
+/// Shader BaseVertex/BaseInstance/DrawIndex and draw-index command opcode 29.
+pub const SHADER_DRAW_PARAMETERS: u64 = 4194304;
+/// Native D32 uploads, copies, readback and attachment clears.
+pub const DEPTH_TRANSFERS: u64 = 8388608;
+/// RGBA16F and RGBA32F sampled render targets, with native packed transfers.
+pub const FLOAT_COLOR_ATTACHMENTS: u64 = 1 << 24;
+/// Buffer mirrors include every accepted write/copy before submit returns.
+/// Compute-generated values must also be published before acceptance returns.
+/// Reading a buffer therefore needs no extra GPU retirement wait. Receipts
+/// still govern GPU completion, errors, and resource lifetimes.
+pub const IMMEDIATE_BUFFER_READBACK: u64 = 1 << 25;
+/// ResourceBarrier discriminator 3: a global outside-pass memory dependency.
+pub const GLOBAL_RESOURCE_BARRIERS: u64 = 1 << 26;
+/// Optional timing extension; existing v2 table layouts remain unchanged.
+pub const TIMESTAMP_ENTRY: &[u8] = b"sgfx_backend_get_timestamp_api_v2\0";
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimestampApi {
+    pub version: u32,
+    pub size: u32,
+    /// Sample after retiring preceding work in this context. Ticks use one GPU
+    /// clock for the device, normalized to nanoseconds (not host wall time).
+    /// `context` belongs to this DSO; output is caller-owned aligned storage.
+    pub timestamp_ns: unsafe extern "C" fn(Object, *mut u64) -> i32,
+}
+const _: () = assert!(core::mem::size_of::<TimestampApi>() == 16);
+pub type GetTimestampApi = unsafe extern "C" fn(u32, usize, *mut TimestampApi) -> i32;
+
+/// Optional scoped GPU counters. Kind 0 is occlusion, kind 1 pipeline statistics.
+/// Counter masks/results use Vulkan pipeline-statistic bit order (11 counters).
+pub const QUERY_ENTRY: &[u8] = b"sgfx_backend_get_query_api_v2\0";
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QueryApi {
+    pub version: u32,
+    pub size: u32,
+    /// Device object -> support bits: occlusion=1, precise=2, statistics=4.
+    pub support: unsafe extern "C" fn(Object) -> u32,
+    pub begin: unsafe extern "C" fn(Object, u32, u32) -> i32,
+    pub end: unsafe extern "C" fn(Object, u32, *mut u64, usize) -> i32,
+}
+const _: () = assert!(core::mem::size_of::<QueryApi>() == 32);
+pub type GetQueryApi = unsafe extern "C" fn(u32, usize, *mut QueryApi) -> i32;
 
 /// Optional v2 extension for low-level API frontends, including Vulkan. The
 /// original mapped-session table remains binary compatible. Resolve once at

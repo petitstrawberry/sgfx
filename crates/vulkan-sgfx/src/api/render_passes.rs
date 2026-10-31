@@ -10,13 +10,15 @@ pub(super) struct ActiveRenderPass {
     pub subpass: usize,
     clears: Vec<vk::ClearValue>,
     images: Vec<(vk::Image, ir::TextureId)>,
+    discarded_color: Option<ir::TextureId>,
+    mip_targets: Vec<Option<(ir::TextureId, u32)>>,
     used: Vec<bool>,
     accesses: Vec<Option<ir::TextureAccess>>,
     pub(super) area: ir::PixelRect,
 }
 
 pub(super) fn begin(
-    rt: &Runtime,
+    rt: &mut Runtime,
     rec: &mut ResolvedRecording,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
@@ -28,8 +30,14 @@ pub(super) fn begin(
         .resources
         .render_passes
         .get(&render_pass)
+        .cloned()
         .ok_or(INVALID)?;
-    let fb = rt.resources.framebuffers.get(&framebuffer).ok_or(INVALID)?;
+    let fb = rt
+        .resources
+        .framebuffers
+        .get(&framebuffer)
+        .cloned()
+        .ok_or(INVALID)?;
     if !pass.compatible(&fb.render_pass) {
         return Err(INVALID);
     }
@@ -65,7 +73,21 @@ pub(super) fn begin(
         }
         &fb.attachments
     };
-    let images = views
+    rec.used_framebuffers.push(framebuffer);
+    rec.used_render_passes.push(render_pass);
+    begin_owned(rt, rec, &pass, views, (fb.width, fb.height), area, clears)
+}
+
+pub(super) fn begin_owned(
+    rt: &mut Runtime,
+    rec: &mut ResolvedRecording,
+    pass: &crate::render_pass::RenderPass,
+    views: &[vk::ImageView],
+    (width, height): (u32, u32),
+    area: ir::PixelRect,
+    clears: &[vk::ClearValue],
+) -> VkResult<()> {
+    let mut images = views
         .iter()
         .map(|view| {
             let view = rt.resources.views.get(view).ok_or(INVALID)?;
@@ -78,15 +100,86 @@ pub(super) fn begin(
         .collect::<VkResult<Vec<_>>>()?;
     rec.used_images
         .extend(images.iter().map(|(image, _)| *image));
-    rec.used_framebuffers.push(framebuffer);
-    rec.used_render_passes.push(render_pass);
-    rec.render = Some((fb.width, fb.height));
+    // A portable attachment targets mip zero. Lower a mip view to a reusable
+    // GPU attachment and ordered subresource blits. Only the render area is
+    // copied back, preserving pixels outside it and all other mip levels.
+    let mut mip_targets = vec![None; views.len()];
+    for (index, view) in views.iter().enumerate() {
+        let view = rt.resources.views.get(view).ok_or(INVALID)?;
+        let level = view.desc.base_mip_level();
+        if level == 0 {
+            continue;
+        }
+        if !pass.dynamic || pass.subpasses.len() != 1 || !pass.subpasses[0].colors.contains(&index)
+        {
+            return Err(UNSUPPORTED);
+        }
+        let image = rt.resources.images.get(&view.image).ok_or(INVALID)?;
+        let extent = image.mip_extent(level)?;
+        let key = (image.format, extent.width, extent.height, index);
+        let original = image.id;
+        let target = if let Some(&id) = rt.resources.mip_render_targets.get(&key) {
+            id
+        } else {
+            let desc = ir::TextureDesc::new(
+                crate::images::texture_format(image.format).ok_or(UNSUPPORTED)?,
+                ir::Extent2D::new(extent.width, extent.height)
+                    .map_err(crate::resources::failure)?,
+                ir::TextureUsage::RENDER_ATTACHMENT
+                    | ir::TextureUsage::COPY_SRC
+                    | ir::TextureUsage::COPY_DST,
+            )
+            .map_err(crate::resources::failure)?;
+            let id = rt
+                .table
+                .define_texture(desc)
+                .map_err(crate::resources::failure)?
+                .id();
+            rt.resources.mip_render_targets.insert(key, id);
+            id
+        };
+        if pass.attachments[index].load_op == vk::AttachmentLoadOp::LOAD {
+            let initial = attachment_access(pass.attachments[index].initial_layout)?;
+            texture_barrier(rec, original, initial, ir::TextureAccess::CopySource);
+            texture_barrier(
+                rec,
+                target,
+                ir::TextureAccess::CopySource,
+                ir::TextureAccess::CopyDestination,
+            );
+            rec.ops.push(mip_blit(original, level, target, 0, area));
+            texture_barrier(rec, original, ir::TextureAccess::CopySource, initial);
+            texture_barrier(
+                rec,
+                target,
+                ir::TextureAccess::CopyDestination,
+                ir::TextureAccess::RenderAttachment,
+            );
+        } else {
+            texture_barrier(
+                rec,
+                target,
+                ir::TextureAccess::CopySource,
+                ir::TextureAccess::RenderAttachment,
+            );
+        }
+        mip_targets[index] = Some((original, level));
+        images[index].1 = target;
+    }
+    rec.render = Some((width, height));
+    let discarded_color = if pass.subpasses.iter().any(|p| p.colors.is_empty()) {
+        Some(crate::clear::discarded_color(rt, width, height)?)
+    } else {
+        None
+    };
     let mut active = ActiveRenderPass {
         pass: pass.clone(),
         views: views.to_vec(),
         subpass: 0,
         clears: clears.to_vec(),
         images,
+        discarded_color,
+        mip_targets,
         used: vec![false; pass.attachments.len()],
         accesses: vec![None; pass.attachments.len()],
         area,
@@ -133,7 +226,7 @@ pub(super) fn clip_scissor(
     ))
 }
 
-fn retain_current_pass(rec: &mut ResolvedRecording) -> VkResult<()> {
+pub(super) fn retain_current_pass(rec: &mut ResolvedRecording) -> VkResult<()> {
     let original = rec
         .ops
         .iter_mut()
@@ -269,6 +362,33 @@ pub(super) fn end(rec: &mut ResolvedRecording) -> VkResult<()> {
     }
     rec.ops.push(ir::OwnedCommand::EndRenderPass);
     for (index, before) in active.accesses.iter().enumerate() {
+        if let Some((original, level)) = active.mip_targets[index] {
+            let attachment = active.pass.attachments[index];
+            if attachment.store_op == vk::AttachmentStoreOp::STORE {
+                let target = active.images[index].1;
+                texture_barrier(
+                    rec,
+                    target,
+                    ir::TextureAccess::RenderAttachment,
+                    ir::TextureAccess::CopySource,
+                );
+                texture_barrier(
+                    rec,
+                    original,
+                    attachment_access(attachment.initial_layout)?,
+                    ir::TextureAccess::CopyDestination,
+                );
+                rec.ops
+                    .push(mip_blit(target, 0, original, level, active.area));
+                texture_barrier(
+                    rec,
+                    original,
+                    ir::TextureAccess::CopyDestination,
+                    attachment_access(attachment.final_layout)?,
+                );
+            }
+            continue;
+        }
         if let (Some(before), Ok(after)) = (
             before,
             texture_access(active.pass.attachments[index].final_layout),
@@ -287,10 +407,58 @@ pub(super) fn end(rec: &mut ResolvedRecording) -> VkResult<()> {
     Ok(())
 }
 
+// GENERAL permits attachment and transfer use without an API layout change.
+fn attachment_access(layout: vk::ImageLayout) -> VkResult<ir::TextureAccess> {
+    if layout == vk::ImageLayout::GENERAL {
+        Ok(ir::TextureAccess::RenderAttachment)
+    } else {
+        texture_access(layout)
+    }
+}
+
+fn texture_barrier(
+    rec: &mut ResolvedRecording,
+    texture: ir::TextureId,
+    before: ir::TextureAccess,
+    after: ir::TextureAccess,
+) {
+    if before != after {
+        rec.ops.push(ir::OwnedCommand::ResourceBarrier(
+            ir::OwnedResourceBarrier::Texture {
+                texture,
+                before,
+                after,
+            },
+        ));
+    }
+}
+fn mip_blit(
+    source: ir::TextureId,
+    source_mip: u32,
+    destination: ir::TextureId,
+    destination_mip: u32,
+    area: ir::PixelRect,
+) -> ir::OwnedCommand {
+    ir::OwnedCommand::BlitTextureRegion {
+        source,
+        source_mip,
+        destination,
+        destination_mip,
+        source_rect: area,
+        destination_rect: area,
+        filter: ir::FilterMode::Nearest,
+        flips: [false; 2],
+    }
+}
+
 impl ActiveRenderPass {
     fn access(&mut self, index: usize, after: ir::TextureAccess, rec: &mut ResolvedRecording) {
-        let before = self.accesses[index]
-            .or_else(|| texture_access(self.pass.attachments[index].initial_layout).ok());
+        let before = self.accesses[index].or_else(|| {
+            self.mip_targets[index]
+                .is_none()
+                .then(|| texture_access(self.pass.attachments[index].initial_layout).ok())
+                .flatten()
+        });
         if let Some(before) = before
             && before != after
         {
@@ -382,6 +550,13 @@ impl ActiveRenderPass {
             self.access(index, ir::TextureAccess::Sampled, rec);
             self.used[index] = true;
         }
+        if colors.is_empty() {
+            colors.push(ir::OwnedColorAttachment {
+                target: self.discarded_color.ok_or(INVALID)?,
+                load: ir::LoadOp::DontCare,
+                store: ir::StoreOp::DontCare,
+            });
+        }
         let first = colors.remove(0);
         let desc = ir::OwnedRenderPassDesc {
             target: first.target,
@@ -465,6 +640,19 @@ pub(super) fn validate_bindings(
     Ok(())
 }
 
+/// Split a pass without losing attachment contents or implicit binding state.
+pub(super) fn suspend(rec: &mut ResolvedRecording) -> VkResult<ActiveRenderPass> {
+    retain_current_pass(rec)?;
+    let active = rec.active_render_pass.take().ok_or(INVALID)?;
+    rec.ops.push(ir::OwnedCommand::EndRenderPass);
+    Ok(active)
+}
+pub(super) fn resume(rec: &mut ResolvedRecording, mut active: ActiveRenderPass) -> VkResult<()> {
+    active.emit(rec)?;
+    rec.active_render_pass = Some(active);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,7 +683,10 @@ mod tests {
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE);
         let mut active = ActiveRenderPass {
+            discarded_color: None,
+            mip_targets: vec![None],
             pass: crate::render_pass::RenderPass {
+                dynamic: false,
                 attachments: vec![attachment],
                 subpasses: vec![crate::render_pass::Subpass {
                     colors: vec![0],
@@ -699,7 +890,10 @@ mod tests {
             .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         let area = ir::PixelRect::new(7, 9, 25, 23).unwrap();
         let mut active = ActiveRenderPass {
+            discarded_color: None,
+            mip_targets: vec![None; 2],
             pass: crate::render_pass::RenderPass {
+                dynamic: false,
                 attachments: vec![attachment; 2],
                 subpasses: vec![
                     crate::render_pass::Subpass {

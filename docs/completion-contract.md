@@ -32,9 +32,12 @@ only the independent dispatcher may wait before sending another native packet.
 
 VirGL separates **logical acceptance** from **native dispatch**. A context-owned
 worker accepts a fully validated/lowered, owned logical stream into a FIFO
-bounded to 16 streams and 64 MiB of retained command bytes. Insufficient logical
-capacity returns `Busy` before accepting any work; a single stream exceeding
-64 MiB is explicitly `Rejected(SubmissionTooLarge)`. CPU initialization and
+normally bounded to 16 streams and 64 MiB of retained command bytes. A larger
+stream, up to 512 MiB including command overhead, requires an empty queue and
+remains exclusive until all of its chunks retire. This accommodates initialized
+buffers as large as 256 MiB without publishing a partially encoded stream.
+Insufficient capacity returns `Busy` before accepting any work; streams exceeding
+512 MiB are explicitly `Rejected(SubmissionTooLarge)`. CPU initialization and
 buffer revisions are restored on rejection. The advertised 2 MiB native request
 limit is a packetization detail, not a mesh, texture, or UI frame-size limit.
 
@@ -230,8 +233,9 @@ admission: its 60,000-vertex update is 2.4 MB before command overhead. The worke
 repair is covered by deterministic host dispatch/packet tests and a ScarletUI
 test preserving one 60,000-vertex mesh and persistent buffer. The native diagnostic
 now uploads a >2 MiB texture without consumer splitting, uploads a 9.6 MB vertex
-buffer through arena-ring reuse, and rejects >64 MiB before initialization changes
-are accepted. These revised native runtime cases remain user-operated; the earlier
+buffer through arena-ring reuse, and originally rejected >64 MiB before initialization changes were accepted.
+Large buffer streams now use the exclusive admission path described above;
+rejections remain side effect free. These revised native runtime cases remain user-operated; the earlier
 normal-rendering confirmation does not certify this new dispatcher revision.
 
 The coordinated A618 implementation now advertises eight native requests and

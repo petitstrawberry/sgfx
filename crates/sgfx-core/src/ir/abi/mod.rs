@@ -22,6 +22,8 @@ pub(crate) struct State {
     pub legacy_program_ids: Cell<bool>,
     pub revision: Cell<u64>,
     pub snapshot: RefCell<(u64, Vec<u64>)>,
+    pub accepted_rows: RefCell<resources::AcceptedRows>,
+    pub encoded_programs: RefCell<resources::EncodedPrograms>,
 }
 
 impl State {
@@ -31,6 +33,8 @@ impl State {
             legacy_program_ids: Cell::new(false),
             revision: Cell::new(1),
             snapshot: RefCell::new((0, Vec::new())),
+            accepted_rows: RefCell::new(resources::AcceptedRows::new()),
+            encoded_programs: RefCell::new(resources::EncodedPrograms::new()),
         }
     }
 }

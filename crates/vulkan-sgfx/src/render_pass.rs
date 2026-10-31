@@ -6,6 +6,7 @@ const UNSUPPORTED: vk::Result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
 
 #[derive(Clone)]
 pub(crate) struct RenderPass {
+    pub dynamic: bool,
     pub attachments: Vec<vk::AttachmentDescription>,
     pub subpasses: Vec<Subpass>,
 }
@@ -20,11 +21,23 @@ pub(crate) struct Subpass {
 
 impl RenderPass {
     pub fn compatible(&self, other: &Self) -> bool {
-        self.attachments
-            .iter()
-            .map(|a| (a.format, a.samples))
-            .eq(other.attachments.iter().map(|a| (a.format, a.samples)))
-            && self.subpasses == other.subpasses
+        self.dynamic == other.dynamic
+            && self
+                .attachments
+                .iter()
+                .map(|a| (a.format, a.samples))
+                .eq(other.attachments.iter().map(|a| (a.format, a.samples)))
+            && if self.dynamic {
+                self.subpasses
+                    .iter()
+                    .map(|s| (&s.colors, &s.inputs, s.depth))
+                    .eq(other
+                        .subpasses
+                        .iter()
+                        .map(|s| (&s.colors, &s.inputs, s.depth)))
+            } else {
+                self.subpasses == other.subpasses
+            }
     }
 
     pub fn input_depths(&self, subpass: usize) -> Vec<Option<bool>> {
@@ -249,6 +262,7 @@ pub(crate) unsafe fn parse(info: &vk::RenderPassCreateInfo<'_>) -> Result<Render
         }
     }
     Ok(RenderPass {
+        dynamic: false,
         attachments,
         subpasses,
     })

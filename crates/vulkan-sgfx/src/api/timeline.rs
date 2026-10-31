@@ -114,7 +114,9 @@ unsafe extern "system" fn signal(
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let d = driver(device.as_raw(), Kind::Device)?;
-        get(&d, i.semaphore)?.signal(i.value)
+        get(&d, i.semaphore)?.signal(i.value)?;
+        d.in_flight.notify();
+        Ok(())
     })())
 }
 unsafe extern "system" fn wait(
@@ -174,9 +176,11 @@ pub(super) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
         }};
     }
     match name.to_bytes() {
-        b"vkGetSemaphoreCounterValueKHR" => entry!(counter, vk::PFN_vkGetSemaphoreCounterValue),
-        b"vkSignalSemaphoreKHR" => entry!(signal, vk::PFN_vkSignalSemaphore),
-        b"vkWaitSemaphoresKHR" => entry!(wait, vk::PFN_vkWaitSemaphores),
+        b"vkGetSemaphoreCounterValue" | b"vkGetSemaphoreCounterValueKHR" => {
+            entry!(counter, vk::PFN_vkGetSemaphoreCounterValue)
+        }
+        b"vkSignalSemaphore" | b"vkSignalSemaphoreKHR" => entry!(signal, vk::PFN_vkSignalSemaphore),
+        b"vkWaitSemaphores" | b"vkWaitSemaphoresKHR" => entry!(wait, vk::PFN_vkWaitSemaphores),
         _ => None,
     }
 }
@@ -193,9 +197,20 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: false,
+            dynamic_rendering_enabled: false,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),

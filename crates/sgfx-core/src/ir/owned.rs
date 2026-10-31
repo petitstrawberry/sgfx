@@ -74,6 +74,8 @@ impl OwnedRenderPassDesc {
 /// An owned resource transition, validated when its recording is replayed.
 #[derive(Debug, Clone, Copy)]
 pub enum OwnedResourceBarrier {
+    /// Synchronize all earlier accesses before subsequent commands.
+    Global,
     /// Change the declared access for one mip level.
     TextureMip {
         /// Texture identity.
@@ -108,6 +110,7 @@ pub enum OwnedResourceBarrier {
 impl OwnedResourceBarrier {
     fn resolve(self, resources: &ResourceTable) -> Result<ResourceBarrier<'_>> {
         Ok(match self {
+            Self::Global => ResourceBarrier::Global,
             Self::TextureMip {
                 texture,
                 mip_level,
@@ -308,6 +311,8 @@ pub enum OwnedCommand {
     SetSampler(SamplerId),
     /// Set fixed render pipeline uniforms.
     SetUniforms(DrawUniforms),
+    /// Logical index within a multi-draw operation.
+    SetDrawIndex(u32),
     /// Set or reset the render scissor.
     SetScissor(Option<PixelRect>),
     /// Set the viewport for subsequent draws.
@@ -418,7 +423,8 @@ impl OwnedCommandBuffer {
     ///
     /// No backend work is performed. Errors are the same as [`Self::record`].
     pub fn validate(&self, resources: &ResourceTable) -> Result<()> {
-        self.record(resources).map(|_| ())
+        self.record_with(resources, CommandEncoder::for_validation(resources))
+            .map(|_| ())
     }
 
     /// Resolve resource identities and record a validated borrowed buffer.
@@ -432,7 +438,14 @@ impl OwnedCommandBuffer {
         &'data self,
         resources: &'r ResourceTable,
     ) -> Result<CommandBuffer<'r, 'data>> {
-        let mut encoder = CommandEncoder::new(resources);
+        self.record_with(resources, CommandEncoder::new(resources))
+    }
+
+    fn record_with<'r, 'data>(
+        &'data self,
+        resources: &'r ResourceTable,
+        mut encoder: CommandEncoder<'r, 'data>,
+    ) -> Result<CommandBuffer<'r, 'data>> {
         let mut commands = self.commands.iter();
         while let Some(command) = commands.next() {
             match command {
@@ -605,6 +618,7 @@ impl OwnedCommandBuffer {
                             OwnedCommand::SetSampler(sampler) => {
                                 pass.set_sampler(resources.sampler_ref(*sampler)?)?;
                             }
+                            OwnedCommand::SetDrawIndex(index) => pass.set_draw_index(*index)?,
                             OwnedCommand::SetUniforms(uniforms) => pass.set_uniforms(*uniforms)?,
                             OwnedCommand::SetScissor(scissor) => pass.set_scissor(*scissor)?,
                             OwnedCommand::SetViewport(viewport) => pass.set_viewport(*viewport)?,

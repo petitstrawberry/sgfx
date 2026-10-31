@@ -22,7 +22,7 @@ use crate::{HandleError, HandleResult, IrSubmitError};
 /// Completion is not a presentation or SWS buffer-release acknowledgement.
 #[derive(Clone)]
 pub struct Submission {
-    signal: Arc<Signal>,
+    pub(crate) signal: Arc<Signal>,
 }
 
 #[cfg(feature = "backend-abi")]
@@ -209,6 +209,24 @@ impl SubmitMode {
         };
         packets
             .append(commands)
+            .map_err(|error| packet_error(error, too_large))
+    }
+
+    /// Tracked packets can take the encoding buffer; synchronous submission
+    /// keeps it available for reuse after the native call returns.
+    pub(crate) fn submit_owned(
+        &mut self,
+        queue: &GpuQueue,
+        commands: &mut Vec<u8>,
+    ) -> HandleResult<()> {
+        let Self::Tracked {
+            packets, too_large, ..
+        } = self
+        else {
+            return queue.submit(commands).map(|_| ());
+        };
+        packets
+            .append_owned(commands)
             .map_err(|error| packet_error(error, too_large))
     }
 

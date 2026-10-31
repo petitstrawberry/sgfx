@@ -122,10 +122,41 @@ pub struct Capabilities {
     depth32_attachment: bool,
     image_readback: bool,
     image_blits: bool,
+    anisotropy_16: bool,
+    vertex_divisors: bool,
+    shader_draw_parameters: bool,
+    depth_transfers: bool,
+    float_color: bool,
+    immediate_buffer_readback: bool,
+    global_resource_barriers: bool,
     limits: Limits,
 }
 
 impl Capabilities {
+    /// Backend support for global dependencies inside one command stream.
+    pub const fn supports_global_resource_barriers(&self) -> bool {
+        self.global_resource_barriers
+    }
+    /// Buffer mirrors can be read after acceptance without waiting for the GPU.
+    pub const fn supports_immediate_buffer_readback(&self) -> bool {
+        self.immediate_buffer_readback
+    }
+    /// Whether native floating-point RGBA render targets and transfers are available.
+    pub const fn supports_float_color(&self) -> bool {
+        self.float_color
+    }
+    pub const fn supports_depth_transfers(&self) -> bool {
+        self.depth_transfers
+    }
+    pub const fn supports_shader_draw_parameters(&self) -> bool {
+        self.shader_draw_parameters
+    }
+    pub const fn supports_vertex_divisors(&self) -> bool {
+        self.vertex_divisors
+    }
+    pub const fn supports_anisotropy_16(&self) -> bool {
+        self.anisotropy_16
+    }
     pub const fn supports_graphics(&self) -> bool {
         self.graphics
     }
@@ -210,6 +241,8 @@ pub struct Adapter {
     info: AdapterInfo,
     capabilities: Capabilities,
     backend: AdapterBackend,
+    timestamps: bool,
+    query_support: u32,
 }
 
 impl fmt::Debug for Adapter {
@@ -224,6 +257,14 @@ impl fmt::Debug for Adapter {
 }
 
 impl Adapter {
+    /// Whether this adapter supplies actual GPU timestamps in nanoseconds.
+    pub const fn query_support(&self) -> u32 {
+        self.query_support
+    }
+    pub const fn supports_timestamps(&self) -> bool {
+        self.timestamps
+    }
+
     /// Ordinal stable for the lifetime of the discovering [`Instance`].
     pub const fn ordinal(&self) -> u32 {
         self.ordinal
@@ -351,6 +392,74 @@ struct WgpuDevice {
 }
 
 impl Device {
+    /// Sample a hardware GPU clock after previously submitted work has retired.
+    pub fn timestamp_ns(&self) -> Result<u64> {
+        match &self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            DeviceBackend::Wgpu(device) => wgpu_timestamp(&device.context).map_err(Error::Wgpu),
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                sgfx_dynamic_virgl
+            ))]
+            DeviceBackend::ScarletVirgl(context) => context.timestamp_ns().map_err(Error::from),
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            DeviceBackend::Dynamic(context) => context.timestamp_ns().map_err(Error::from),
+        }
+    }
+
+    pub fn begin_query(&self, kind: u32, mask: u32) -> Result<()> {
+        match &self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            DeviceBackend::Wgpu(device) => {
+                device.context.begin_query(kind, mask).map_err(Error::Wgpu)
+            }
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                sgfx_dynamic_virgl
+            ))]
+            DeviceBackend::ScarletVirgl(context) => {
+                context.begin_query(kind, mask).map_err(Error::from)
+            }
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            DeviceBackend::Dynamic(context) => context.begin_query(kind, mask).map_err(Error::from),
+        }
+    }
+
+    pub fn end_query(&self, kind: u32, count: usize) -> Result<Vec<u64>> {
+        match &self.backend {
+            #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+            DeviceBackend::Wgpu(device) => device
+                .context
+                .end_query(kind)
+                .and_then(|values| {
+                    if values.len() == count {
+                        Ok(values)
+                    } else {
+                        Err(sgfx_backend_wgpu::Error::InvalidState)
+                    }
+                })
+                .map_err(Error::Wgpu),
+            #[cfg(all(
+                any(
+                    target_os = "scarlet",
+                    all(target_os = "linux", feature = "scarlet-native-api")
+                ),
+                sgfx_dynamic_virgl
+            ))]
+            DeviceBackend::ScarletVirgl(context) => {
+                context.end_query(kind, count).map_err(Error::from)
+            }
+            #[cfg(all(sgfx_dynamic, not(sgfx_dynamic_virgl)))]
+            DeviceBackend::Dynamic(context) => context.end_query(kind, count).map_err(Error::from),
+        }
+    }
+
     /// Create a backend materialization cache for one logical resource table.
     pub fn create_resources(&self, table: Rc<ir::ResourceTable>) -> Result<Resources> {
         match &self.backend {
@@ -1297,6 +1406,15 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
             let bgra = adapter.get_texture_format_features(wgpu::TextureFormat::Bgra8Unorm);
             let depth = adapter.get_texture_format_features(wgpu::TextureFormat::Depth32Float);
             Adapter {
+                timestamps: adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+                query_support: 1 | if adapter
+                    .features()
+                    .contains(wgpu::Features::PIPELINE_STATISTICS_QUERY)
+                {
+                    4
+                } else {
+                    0
+                },
                 ordinal: 0,
                 info: AdapterInfo {
                     name: raw_info.name,
@@ -1339,6 +1457,13 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                         .contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
                     image_readback: true,
                     image_blits: true,
+                    anisotropy_16: false,
+                    vertex_divisors: false,
+                    shader_draw_parameters: false,
+                    depth_transfers: false,
+                    float_color: false,
+                    immediate_buffer_readback: false,
+                    global_resource_barriers: true,
                     limits: runtime,
                 },
                 backend: AdapterBackend::Wgpu(WgpuAdapter {
@@ -1393,7 +1518,10 @@ fn create_wgpu_device(wgpu_adapter: &WgpuAdapter) -> Result<Device> {
         .max_compute_workgroup_storage_size
         .min(16 * 1024);
     let required_features = adapter.features()
-        & (wgpu::Features::PUSH_CONSTANTS | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
+        & (wgpu::Features::PUSH_CONSTANTS
+            | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+            | wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::PIPELINE_STATISTICS_QUERY);
     required_limits.max_push_constant_size =
         if required_features.contains(wgpu::Features::PUSH_CONSTANTS) {
             adapter_limits
@@ -1509,6 +1637,8 @@ fn discover_dynamic_adapters(preference: BackendPreference) -> Vec<Adapter> {
             backend_kind: backend,
         };
         adapters.push(Adapter {
+            timestamps: device.supports_timestamps(),
+            query_support: device.query_support(),
             ordinal: 0,
             info: AdapterInfo {
                 name: format!("Scarlet {} GPU {index}", device.backend_name()),
@@ -1574,6 +1704,14 @@ struct DynamicFeatures {
     blits: bool,
     push_constants_128: bool,
     color_attachments_8: bool,
+    compute_buffers: bool,
+    anisotropy_16: bool,
+    vertex_divisors: bool,
+    shader_draw_parameters: bool,
+    depth_transfers: bool,
+    float_color: bool,
+    immediate_buffer_readback: bool,
+    global_resource_barriers: bool,
 }
 
 #[cfg(sgfx_dynamic)]
@@ -1596,6 +1734,14 @@ impl From<crate::dynamic::Capabilities> for DynamicFeatures {
             blits: capabilities.supports_image_blits(),
             push_constants_128: capabilities.supports_push_constants_128(),
             color_attachments_8: capabilities.supports_color_attachments_8(),
+            compute_buffers: capabilities.supports_compute_buffers(),
+            anisotropy_16: capabilities.supports_anisotropy_16(),
+            vertex_divisors: capabilities.supports_vertex_divisors(),
+            shader_draw_parameters: capabilities.supports_shader_draw_parameters(),
+            depth_transfers: capabilities.supports_depth_transfers(),
+            float_color: capabilities.supports_float_color(),
+            immediate_buffer_readback: capabilities.supports_immediate_buffer_readback(),
+            global_resource_barriers: capabilities.supports_global_resource_barriers(),
         }
     }
 }
@@ -1606,15 +1752,16 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
     // Optional properties come exclusively from the negotiated ABI flags.
     // A manifest name never grants execution features or resource limits.
     let read_only_storage = programmable && features.read_only_storage;
+    let compute = programmable && features.compute_buffers;
     Capabilities {
         graphics: features.rendering,
-        compute: false,
+        compute,
         transfer: features.upload || features.readback,
         programmable_graphics: programmable,
         vertex_buffers: programmable,
         index_buffers: programmable,
         uniform_buffers: programmable,
-        storage_buffers: read_only_storage,
+        storage_buffers: read_only_storage || compute,
         storage_images: false,
         typed_texture_views: features.typed_views && features.arrays && features.depth_sampling,
         srgb_texture_views: programmable && features.srgb_views,
@@ -1625,6 +1772,13 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
         depth32_attachment: features.depth,
         image_readback: features.readback,
         image_blits: features.blits,
+        anisotropy_16: programmable && features.anisotropy_16,
+        vertex_divisors: programmable && features.vertex_divisors,
+        shader_draw_parameters: programmable && features.shader_draw_parameters,
+        depth_transfers: features.depth && features.depth_transfers,
+        float_color: features.float_color,
+        immediate_buffer_readback: features.immediate_buffer_readback,
+        global_resource_barriers: features.global_resource_barriers,
         limits: Limits {
             max_push_constants_size: if programmable && features.push_constants_128 {
                 128
@@ -1635,10 +1789,14 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
             max_image_mip_levels: if features.mips { 13 } else { 1 },
             max_image_array_layers: if features.arrays { 2048 } else { 1 },
             max_uniform_buffer_range: if programmable { 16 * 1024 } else { 0 },
-            max_storage_buffer_range: if read_only_storage { 256 * 1024 } else { 0 },
+            max_storage_buffer_range: if read_only_storage || compute {
+                256 * 1024
+            } else {
+                0
+            },
             max_bound_descriptor_sets: if programmable { 4 } else { 0 },
             max_uniform_buffers_per_stage: if programmable { 12 } else { 0 },
-            max_storage_buffers_per_stage: if read_only_storage { 4 } else { 0 },
+            max_storage_buffers_per_stage: if read_only_storage || compute { 4 } else { 0 },
             max_storage_images_per_stage: 0,
             max_vertex_attributes: if programmable { 16 } else { 0 },
             max_vertex_buffers: if programmable { 8 } else { 0 },
@@ -1652,14 +1810,117 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
                 0
             },
             max_compute_shared_memory_size: 0,
-            max_compute_work_group_count: [0; 3],
-            max_compute_work_group_invocations: 0,
-            max_compute_work_group_size: [0; 3],
+            max_compute_work_group_count: if compute { [65535; 3] } else { [0; 3] },
+            max_compute_work_group_invocations: if compute { 128 } else { 0 },
+            max_compute_work_group_size: if compute { [128, 128, 64] } else { [0; 3] },
             min_uniform_buffer_offset_alignment: 16,
             min_storage_buffer_offset_alignment: 4,
-            max_buffer_size: u64::from(u32::MAX),
+            max_buffer_size: if compute {
+                1024 * 1024
+            } else {
+                u64::from(u32::MAX)
+            },
         },
     }
+}
+
+#[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
+fn wgpu_timestamp(
+    context: &sgfx_backend_wgpu::Context,
+) -> core::result::Result<u64, sgfx_backend_wgpu::Error> {
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU8;
+    use sgfx_backend_wgpu::Error;
+    let device = context.raw_device();
+    let queue = context.raw_queue();
+    if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        return Err(Error::InvalidState);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // All earlier work is retired before sampling the hardware GPU clock.
+        // Metal's device sample avoids empty-pass counter sampling on drivers
+        // that return zero when resolving isolated query encoders.
+        let _ = device.poll(wgpu::Maintain::Wait);
+        // SAFETY: the HAL device remains borrowed for the callback; no resource
+        // is freed, submitted or mutated through this read-only clock sample.
+        let sampled = unsafe {
+            device.as_hal::<wgpu::hal::api::Metal, _, _>(|hal| {
+                hal.map(|hal| {
+                    let (mut cpu, mut gpu) = (0, 0);
+                    hal.raw_device()
+                        .lock()
+                        .sample_timestamps(&mut cpu, &mut gpu);
+                    gpu
+                })
+            })
+        };
+        if let Some(value) = sampled {
+            return Ok((value as f64 * f64::from(queue.get_timestamp_period())) as u64);
+        }
+    }
+    let query = device.create_query_set(&wgpu::QuerySetDescriptor {
+        label: Some("SGFX GPU timestamp"),
+        ty: wgpu::QueryType::Timestamp,
+        count: 1,
+    });
+    let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 8,
+        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 8,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("GPU clock sample"),
+        source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: &query,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(0),
+            }),
+        });
+        pass.set_pipeline(&pipeline);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    encoder.resolve_query_set(&query, 0..1, &resolve, 0);
+    encoder.copy_buffer_to_buffer(&resolve, 0, &output, 0, 8);
+    queue.submit([encoder.finish()]);
+    // The facade can be no_std even when its host WGPU dependency uses std.
+    // Native poll(Wait) runs mapping callbacks before returning.
+    let mapped = Arc::new(AtomicU8::new(0));
+    let callback = Arc::clone(&mapped);
+    let slice = output.slice(..);
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        callback.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
+    });
+    let _ = device.poll(wgpu::Maintain::Wait);
+    if mapped.load(Ordering::Acquire) != 1 {
+        return Err(Error::DeviceLost);
+    }
+    let bytes = slice.get_mapped_range();
+    let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    drop(bytes);
+    output.unmap();
+    Ok((value as f64 * f64::from(queue.get_timestamp_period())) as u64)
 }
 
 #[cfg(test)]
@@ -1712,6 +1973,35 @@ mod tests {
             panic!("manifest preference must select a dynamic backend");
         };
         assert_eq!(selected.as_str(), name.as_str());
+    }
+
+    #[test]
+    fn dynamic_compute_requires_negotiation_and_has_bounded_limits() {
+        let missing = dynamic_capabilities(DynamicFeatures {
+            rendering: true,
+            programmable: true,
+            ..Default::default()
+        });
+        assert!(!missing.supports_compute());
+        assert_eq!(missing.limits().max_compute_work_group_count, [0; 3]);
+        let incomplete = dynamic_capabilities(DynamicFeatures {
+            compute_buffers: true,
+            ..Default::default()
+        });
+        assert!(!incomplete.supports_compute());
+        let compute = dynamic_capabilities(DynamicFeatures {
+            rendering: true,
+            programmable: true,
+            compute_buffers: true,
+            ..Default::default()
+        });
+        assert!(compute.supports_compute());
+        assert!(compute.supports_storage_buffers());
+        assert!(!compute.supports_storage_images());
+        assert_eq!(compute.limits().max_compute_work_group_invocations, 128);
+        assert_eq!(compute.limits().max_compute_work_group_size, [128, 128, 64]);
+        assert_eq!(compute.limits().max_compute_shared_memory_size, 0);
+        assert_eq!(compute.limits().max_storage_buffer_range, 256 * 1024);
     }
 
     #[test]

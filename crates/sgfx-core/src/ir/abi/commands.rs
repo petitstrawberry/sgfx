@@ -132,7 +132,7 @@ fn scan_compute(words: &[u64], count: usize) -> Result<bool> {
         let header = reader.word()?;
         let length = (header >> 32) as usize;
         let opcode = header as u32;
-        if length == 0 || length > MAX_WORDS || !(1..=28).contains(&opcode) {
+        if length == 0 || length > MAX_WORDS || !(1..=29).contains(&opcode) {
             return Err(Error::InvalidDescriptor);
         }
         reader.take(length - 1)?;
@@ -336,6 +336,10 @@ fn encode(c: Command<'_, '_>, w: &mut Vec<u64>) {
             v.id().put(w);
             10
         }
+        Command::SetDrawIndex(v) => {
+            v.put(w);
+            29
+        }
         Command::SetUniforms(v) => {
             v.put(w);
             11
@@ -420,6 +424,7 @@ fn encode(c: Command<'_, '_>, w: &mut Vec<u64>) {
         }
         Command::ResourceBarrier(v) => {
             match v {
+                ResourceBarrier::Global => w.push(3),
                 ResourceBarrier::Buffer {
                     buffer,
                     before,
@@ -522,6 +527,9 @@ unsafe fn decode_into<'r, 'data>(
     match opcode {
         5 => {
             out.write(Command::EndRenderPass);
+        }
+        29 => {
+            out.write(Command::SetDrawIndex(r.value(t)?));
         }
         11 => {
             out.write(Command::SetUniforms(r.value(t)?));
@@ -717,6 +725,7 @@ unsafe fn decode_resource_command<'r, 'data>(
         }
         23 => {
             out.write(Command::ResourceBarrier(match r.word()? {
+                3 => ResourceBarrier::Global,
                 0 => ResourceBarrier::Buffer {
                     buffer: t.buffer_ref(r.value(t)?)?,
                     before: r.value(t)?,

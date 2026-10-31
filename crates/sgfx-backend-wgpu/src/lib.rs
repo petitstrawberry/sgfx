@@ -21,6 +21,7 @@ use sgfx_core::backend::{CommandSubmitter, SubmitError};
 mod blit;
 mod completion;
 mod programmable;
+mod queries;
 mod readback;
 mod vertex_input;
 pub use completion::Submission;
@@ -100,6 +101,8 @@ impl fmt::Display for Error {
 /// Logical SGFX features that are not yet represented by this backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedFeature {
+    /// Instance divisors larger than one need vertex pulling.
+    VertexDivisor,
     /// Shareable presentation images are unavailable on this WGPU platform.
     PresentationPlatform,
     /// Reserved for compatibility; ordered uploads are now supported.
@@ -120,6 +123,8 @@ pub enum UnsupportedFeature {
     IndexedLineStrip,
     /// WGPU has no native triangle-fan topology; conversion is not implemented.
     TriangleFan,
+    /// WGPU constant depth bias must be an integer within i32 range.
+    DepthBias,
     /// A sampled texture format is incompatible with the selected fragment
     /// program.
     TextureFormat,
@@ -200,6 +205,7 @@ impl Device {
     pub fn create_context(&self) -> Context {
         Context {
             device: self.clone(),
+            queries: Default::default(),
         }
     }
 
@@ -226,6 +232,7 @@ impl Device {
 #[derive(Clone)]
 pub struct Context {
     device: Device,
+    queries: Arc<std::sync::Mutex<queries::State>>,
 }
 
 impl Context {
@@ -993,6 +1000,13 @@ impl Resources {
         if descriptor.min_lod() < 0.0 && descriptor.min_filter() != descriptor.mag_filter() {
             return Err(Error::Unsupported(UnsupportedFeature::SamplerLod));
         }
+        if descriptor.anisotropy() > 1
+            && (descriptor.min_filter() != FilterMode::Linear
+                || descriptor.mag_filter() != FilterMode::Linear
+                || descriptor.mip_filter() != FilterMode::Linear)
+        {
+            return Err(Error::Unsupported(UnsupportedFeature::SamplerLod));
+        }
         let border = descriptor.address_u() == AddressMode::ClampToBorder
             || descriptor.address_v() == AddressMode::ClampToBorder;
         if border
@@ -1019,8 +1033,8 @@ impl Resources {
                 lod_min_clamp: descriptor.min_lod().clamp(0.0, 32.0),
                 lod_max_clamp: descriptor.max_lod().clamp(0.0, 32.0),
                 compare: descriptor.compare().map(compare_function),
+                anisotropy_clamp: u16::from(descriptor.anisotropy()),
                 border_color: border.then_some(raw::SamplerBorderColor::TransparentBlack),
-                ..raw::SamplerDescriptor::default()
             },
         ));
         self.samplers.push((id, Arc::clone(&sampler)));
@@ -1568,12 +1582,13 @@ impl Queue {
                 depth_ops,
                 stencil_ops: None,
             });
+        let query_sets = self.query_sets(false)?;
         let mut render_pass = encoder.begin_render_pass(&raw::RenderPassDescriptor {
             label: Some("sgfx wgpu render pass"),
             color_attachments: &color_attachments,
             depth_stencil_attachment: depth_attachment,
             timestamp_writes: None,
-            occlusion_query_set: None,
+            occlusion_query_set: query_sets.occlusion.as_ref(),
         });
         render_pass.set_scissor_rect(
             desc.area().x(),
@@ -1583,6 +1598,12 @@ impl Queue {
         );
         if let (Some(color), Some(pipeline)) = (partial_clear_color, clear_pipeline.as_ref()) {
             self.encode_color_clear(&mut render_pass, pipeline, color);
+        }
+        if query_sets.occlusion.is_some() {
+            render_pass.begin_occlusion_query(0);
+        }
+        if let Some(set) = &query_sets.statistics {
+            render_pass.begin_pipeline_statistics_query(set, 0);
         }
         let mut state = PassState {
             pipeline: None,
@@ -1678,6 +1699,7 @@ impl Queue {
                 Command::SetSampler(sampler) => {
                     state.sampler = Some(resources.sampler(*sampler)?);
                 }
+                Command::SetDrawIndex(_) => {}
                 Command::SetUniforms(uniforms) => state.uniforms = Some(*uniforms),
                 Command::SetScissor(scissor) => {
                     let rectangle = scissor.unwrap_or(desc.area());
@@ -1708,6 +1730,14 @@ impl Queue {
                     first_vertex,
                 } => {
                     self.encode_draw(&mut render_pass, &state, *vertex_count, *first_vertex, 0..1)?;
+                    self.assembly_query(
+                        *vertex_count,
+                        1,
+                        state
+                            .programmable
+                            .as_ref()
+                            .map_or(ir::PrimitiveTopology::TriangleList, |p| p.topology),
+                    )?;
                 }
                 Command::DrawIndexed {
                     index_count,
@@ -1722,6 +1752,14 @@ impl Queue {
                         *base_vertex,
                         0..1,
                     )?;
+                    self.assembly_query(
+                        *index_count,
+                        1,
+                        state
+                            .programmable
+                            .as_ref()
+                            .map_or(ir::PrimitiveTopology::TriangleList, |p| p.topology),
+                    )?;
                 }
                 Command::DrawInstanced {
                     vertex_count,
@@ -1735,6 +1773,14 @@ impl Queue {
                         *vertex_count,
                         *first_vertex,
                         *first_instance..*first_instance + *instance_count,
+                    )?;
+                    self.assembly_query(
+                        *vertex_count,
+                        *instance_count,
+                        state
+                            .programmable
+                            .as_ref()
+                            .map_or(ir::PrimitiveTopology::TriangleList, |p| p.topology),
                     )?;
                 }
                 Command::DrawIndexedInstanced {
@@ -1752,10 +1798,26 @@ impl Queue {
                         *base_vertex,
                         *first_instance..*first_instance + *instance_count,
                     )?;
+                    self.assembly_query(
+                        *index_count,
+                        *instance_count,
+                        state
+                            .programmable
+                            .as_ref()
+                            .map_or(ir::PrimitiveTopology::TriangleList, |p| p.topology),
+                    )?;
                 }
                 _ => return Err(Error::InvalidState),
             }
         }
+        if query_sets.occlusion.is_some() {
+            render_pass.end_occlusion_query();
+        }
+        if query_sets.statistics.is_some() {
+            render_pass.end_pipeline_statistics_query();
+        }
+        drop(render_pass);
+        self.resolve_queries(encoder, query_sets)?;
         Ok(())
     }
 
@@ -2254,6 +2316,8 @@ fn raw_format(format: TextureFormat) -> Option<raw::TextureFormat> {
         TextureFormat::Rg8Unorm => Some(raw::TextureFormat::Rg8Unorm),
         TextureFormat::Nv12 => None,
         TextureFormat::Depth32Float => Some(raw::TextureFormat::Depth32Float),
+        TextureFormat::Rgba16Float => Some(raw::TextureFormat::Rgba16Float),
+        TextureFormat::Rgba32Float => Some(raw::TextureFormat::Rgba32Float),
     }
 }
 
@@ -2562,12 +2626,32 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 "#;
 
+fn raw_depth_bias(raster: ir::RasterState) -> raw::DepthBiasState {
+    let [constant, slope_scale] = raster.depth_bias();
+    raw::DepthBiasState {
+        constant: constant as i32,
+        slope_scale,
+        clamp: 0.0,
+    }
+}
+fn validate_depth_bias(raster: ir::RasterState) -> Result<()> {
+    let [constant, _] = raster.depth_bias();
+    if constant.fract() != 0.0
+        || f64::from(constant) < f64::from(i32::MIN)
+        || f64::from(constant) > f64::from(i32::MAX)
+    {
+        return Err(Error::Unsupported(UnsupportedFeature::DepthBias));
+    }
+    Ok(())
+}
+
 fn create_pipeline(
     device: &raw::Device,
     descriptor: &RenderPipelineDesc,
     target_format: raw::TextureFormat,
     sample_format: Option<TextureFormat>,
 ) -> Result<GpuPipeline> {
+    validate_depth_bias(descriptor.raster())?;
     if descriptor.target_format() == TextureFormat::Depth32Float
         || descriptor.topology() != ir::PrimitiveTopology::TriangleList
     {
@@ -2622,7 +2706,7 @@ fn create_pipeline(
             depth_write_enabled: depth.write_enabled(),
             depth_compare: compare_function(depth.compare()),
             stencil: raw::StencilState::default(),
-            bias: raw::DepthBiasState::default(),
+            bias: raw_depth_bias(descriptor.raster()),
         });
     let pipeline = device.create_render_pipeline(&raw::RenderPipelineDescriptor {
         label: Some("sgfx wgpu render pipeline"),
@@ -2714,6 +2798,15 @@ fn raw_vertex_attribute(attribute: &VertexAttribute) -> raw::VertexAttribute {
             VertexFormat::Float16x2 => raw::VertexFormat::Float16x2,
             VertexFormat::Float16x4 => raw::VertexFormat::Float16x4,
             VertexFormat::Sint16x4 => raw::VertexFormat::Sint16x4,
+            VertexFormat::Sint16x2 => raw::VertexFormat::Sint16x2,
+            VertexFormat::Snorm8x4 => raw::VertexFormat::Snorm8x4,
+            VertexFormat::Uint32x2 => raw::VertexFormat::Uint32x2,
+            VertexFormat::Uint32x3 => raw::VertexFormat::Uint32x3,
+            VertexFormat::Uint32x4 => raw::VertexFormat::Uint32x4,
+            VertexFormat::Sint32x2 => raw::VertexFormat::Sint32x2,
+            VertexFormat::Sint32x3 => raw::VertexFormat::Sint32x3,
+            VertexFormat::Sint32x4 => raw::VertexFormat::Sint32x4,
+
             VertexFormat::Uint16x2 => raw::VertexFormat::Uint16x2,
         },
         offset: u64::from(attribute.offset()),
@@ -2723,8 +2816,16 @@ fn raw_vertex_attribute(attribute: &VertexAttribute) -> raw::VertexAttribute {
 
 fn blend_component(component: BlendComponent) -> raw::BlendComponent {
     raw::BlendComponent {
-        src_factor: blend_factor(component.source_factor()),
-        dst_factor: blend_factor(component.destination_factor()),
+        src_factor: if matches!(component.operation(), BlendOp::Min | BlendOp::Max) {
+            raw::BlendFactor::One
+        } else {
+            blend_factor(component.source_factor())
+        },
+        dst_factor: if matches!(component.operation(), BlendOp::Min | BlendOp::Max) {
+            raw::BlendFactor::One
+        } else {
+            blend_factor(component.destination_factor())
+        },
         operation: blend_operation(component.operation()),
     }
 }
@@ -2749,6 +2850,8 @@ fn blend_operation(operation: BlendOp) -> raw::BlendOperation {
         BlendOp::Add => raw::BlendOperation::Add,
         BlendOp::Subtract => raw::BlendOperation::Subtract,
         BlendOp::ReverseSubtract => raw::BlendOperation::ReverseSubtract,
+        BlendOp::Min => raw::BlendOperation::Min,
+        BlendOp::Max => raw::BlendOperation::Max,
     }
 }
 
@@ -2880,10 +2983,21 @@ fn wgsl_vertex_type(format: VertexFormat) -> &'static str {
         VertexFormat::Sint32 => "i32",
         VertexFormat::Uint32 | VertexFormat::Snorm10_10_10_2 => "u32",
         VertexFormat::Sint16x4 => "vec4<i32>",
+        VertexFormat::Sint16x2 => "vec2<i32>",
+        VertexFormat::Uint32x2 => "vec2<u32>",
+        VertexFormat::Uint32x3 => "vec3<u32>",
+        VertexFormat::Uint32x4 => "vec4<u32>",
+        VertexFormat::Sint32x2 => "vec2<i32>",
+        VertexFormat::Sint32x3 => "vec3<i32>",
+        VertexFormat::Sint32x4 => "vec4<i32>",
+
         VertexFormat::Uint16x2 => "vec2<u32>",
         VertexFormat::Float16x2 | VertexFormat::Float32x2 => "vec2<f32>",
         VertexFormat::Float32x3 => "vec3<f32>",
-        VertexFormat::Float16x4 | VertexFormat::Float32x4 | VertexFormat::Unorm8x4 => "vec4<f32>",
+        VertexFormat::Float16x4
+        | VertexFormat::Float32x4
+        | VertexFormat::Unorm8x4
+        | VertexFormat::Snorm8x4 => "vec4<f32>",
     }
 }
 

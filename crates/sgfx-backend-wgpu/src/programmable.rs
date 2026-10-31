@@ -345,6 +345,7 @@ impl Resources {
         let desc = self
             .resources
             .programmable_render_pipeline(self.resources.programmable_render_pipeline_ref(id)?)?;
+        validate_depth_bias(desc.raster())?;
         let locations = desc
             .vertex_buffers()
             .iter()
@@ -378,6 +379,13 @@ impl Resources {
             desc.layout(),
             raw::ShaderStages::VERTEX | raw::ShaderStages::FRAGMENT,
         )?;
+        if desc
+            .vertex_buffers()
+            .iter()
+            .any(|layout| layout.instance_divisor() != 1)
+        {
+            return Err(Error::Unsupported(UnsupportedFeature::VertexDivisor));
+        }
         let attributes = desc
             .vertex_buffers()
             .iter()
@@ -452,6 +460,7 @@ impl Resources {
                             }
                             ir::PrimitiveTopology::LineList => raw::PrimitiveTopology::LineList,
                             ir::PrimitiveTopology::LineStrip => raw::PrimitiveTopology::LineStrip,
+                            ir::PrimitiveTopology::PointList => raw::PrimitiveTopology::PointList,
                             ir::PrimitiveTopology::TriangleFan => {
                                 return Err(Error::Unsupported(UnsupportedFeature::TriangleFan));
                             }
@@ -474,7 +483,7 @@ impl Resources {
                             depth_write_enabled: depth.write_enabled(),
                             depth_compare: compare_function(depth.compare()),
                             stencil: Default::default(),
-                            bias: Default::default(),
+                            bias: raw_depth_bias(desc.raster()),
                         })
                         .or_else(|| {
                             has_depth.then_some(raw::DepthStencilState {
@@ -599,6 +608,17 @@ impl Resources {
                     Resource::Texture(self.texture(table.texture_ref(id)?)?)
                 }
                 BindingResource::TextureView { texture, view } => {
+                    if view.format() == ir::TextureFormat::Depth32Float
+                        && desc.layout().entries().iter().any(|layout| {
+                            layout.binding() == entry.binding()
+                                && matches!(
+                                    layout.ty(),
+                                    BindingType::SampledTextureView { depth: false, .. }
+                                )
+                        })
+                    {
+                        return Err(Error::Unsupported(UnsupportedFeature::TextureFormat));
+                    }
                     let texture = self.texture(table.texture_ref(texture)?)?;
                     Resource::TextureView(validated(self.context.raw_device(), || {
                         Ok(texture.texture.create_view(&raw::TextureViewDescriptor {
@@ -664,10 +684,14 @@ impl Queue {
         encoder: &mut raw::CommandEncoder,
         commands: &[Command<'_, '_>],
     ) -> Result<()> {
+        let query_sets = self.query_sets(true)?;
         let mut pass = encoder.begin_compute_pass(&raw::ComputePassDescriptor {
             label: Some("sgfx compute pass"),
             timestamp_writes: None,
         });
+        if let Some(set) = &query_sets.statistics {
+            pass.begin_pipeline_statistics_query(set, 0);
+        }
         let mut current_pipeline: Option<Arc<ComputePipeline>> = None;
         let mut bind_groups: Vec<(u32, Arc<raw::BindGroup>)> = Vec::new();
         for command in commands {
@@ -720,6 +744,11 @@ impl Queue {
                 _ => return Err(Error::InvalidState),
             }
         }
+        if query_sets.statistics.is_some() {
+            pass.end_pipeline_statistics_query();
+        }
+        drop(pass);
+        self.resolve_queries(encoder, query_sets)?;
         Ok(())
     }
 }

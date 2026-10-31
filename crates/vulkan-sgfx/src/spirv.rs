@@ -939,3 +939,50 @@ pub(crate) fn sampled_image_swizzles(
     result[3] = next;
     Ok(result)
 }
+
+/// Naga's SPIR-V writer may copy stale IO member offsets into an internal
+/// return-value struct. Recompute layouts only for value/function structs;
+/// external uniform, storage and push-constant byte layouts remain untouched.
+pub(crate) fn function_struct_layouts(words: Vec<u32>) -> Result<Vec<u32>, vk::Result> {
+    use std::collections::HashSet;
+    let rows = instructions(&words)?;
+    let mut protected = HashSet::new();
+    let mut types = HashMap::new();
+    for row in &rows {
+        let op = row[0] & 65535;
+        if op == 71 && row.len() >= 3 && matches!(row[2], 2 | 3) {
+            protected.insert(row[1]);
+        }
+        if op == 59 && row.len() >= 4 && matches!(row[3], 2 | 9 | 12) {
+            protected.insert(row[1]);
+        }
+        if (19..=39).contains(&op) && row.len() >= 2 {
+            types.insert(row[1], *row);
+        }
+    }
+    let mut visit = protected.iter().copied().collect::<Vec<_>>();
+    while let Some(id) = visit.pop() {
+        let Some(row) = types.get(&id) else {
+            continue;
+        };
+        let children: &[u32] = match row[0] & 65535 {
+            32 if row.len() == 4 => &row[3..4],
+            28 | 29 if row.len() >= 3 => &row[2..3],
+            30 => &row[2..],
+            _ => &[],
+        };
+        for &child in children {
+            if protected.insert(child) {
+                visit.push(child);
+            }
+        }
+    }
+    let mut result = words[..5].to_vec();
+    for row in rows {
+        if row[0] & 65535 == 72 && row.len() == 5 && row[3] == 35 && !protected.contains(&row[1]) {
+            continue;
+        }
+        result.extend_from_slice(row);
+    }
+    Ok(result)
+}

@@ -46,9 +46,16 @@ fn core_batch(batch: abi::Batch) -> ir::abi::Batch {
 
 fn error(e: virgl::IrSubmitError) -> i32 {
     use virgl::IrSubmitError as E;
+    eprintln!("[SGFX VirGL] driver error: {e:?}");
     match e {
-        E::OutOfMemory | E::SubmissionTooLarge => abi::OUT_OF_MEMORY,
-        E::Unsupported(_) | E::ShaderCompile(_) => abi::UNSUPPORTED,
+        cause @ (E::OutOfMemory | E::SubmissionTooLarge) => {
+            eprintln!("[SGFX VirGL] resource exhaustion: {cause:?}");
+            abi::OUT_OF_MEMORY
+        }
+        cause @ (E::Unsupported(_) | E::ShaderCompile(_)) => {
+            eprintln!("[SGFX VirGL] unsupported operation: {cause:?}");
+            abi::UNSUPPORTED
+        }
         E::InvalidIr(_)
         | E::ResourceTableMismatch
         | E::ContextMismatch
@@ -68,8 +75,14 @@ fn handle_error(e: virgl::HandleError) -> i32 {
     use virgl::HandleError as E;
     match e {
         E::InvalidHandle | E::InvalidParameter => abi::INVALID,
-        E::Unsupported => abi::UNSUPPORTED,
-        E::OutOfResources => abi::OUT_OF_MEMORY,
+        E::Unsupported => {
+            eprintln!("[SGFX VirGL] native operation unsupported");
+            abi::UNSUPPORTED
+        }
+        E::OutOfResources => {
+            eprintln!("[SGFX VirGL] native resources exhausted");
+            abi::OUT_OF_MEMORY
+        }
         E::NotFound => abi::INITIALIZATION_FAILED,
         cause => {
             eprintln!("[SGFX VirGL] native operation failed: {cause:?}");
@@ -106,25 +119,58 @@ unsafe extern "C" fn open(path: Span<u8>, out: *mut Object, caps: *mut u64) -> i
         let path = std::str::from_utf8(unsafe { span(path) }?).map_err(|_| abi::INVALID)?;
         let device = virgl::Device::open(path).map_err(handle_error)?;
         let c = device.capabilities();
-        let flags = if c.supports_rendering() {
-            abi::RENDERING
-        } else {
-            0
-        } | if c.supports_presentation() {
-            abi::PRESENTATION
-        } else {
-            0
-        } | if c.supports_image_upload() {
-            abi::IMAGE_UPLOAD
-        } else {
-            0
-        } | if c.supports_image_readback() {
-            abi::IMAGE_READBACK
-        } else {
-            0
-        } | if c.supports_depth() { abi::DEPTH } else { 0 }
+        let timing = device
+            .create_context()
+            .and_then(|c| c.timestamp_ns())
+            .is_ok();
+        let flags = (if timing { abi::GPU_TIMESTAMPS } else { 0 })
+            | abi::IMMEDIATE_BUFFER_READBACK
+            | abi::GLOBAL_RESOURCE_BARRIERS
+            | if c.supports_anisotropy_16() {
+                abi::SAMPLER_ANISOTROPY_16
+            } else {
+                0
+            }
+            | if c.supports_float_color() {
+                abi::FLOAT_COLOR_ATTACHMENTS
+            } else {
+                0
+            }
+            | if c.supports_depth_transfers() {
+                abi::DEPTH_TRANSFERS
+            } else {
+                0
+            }
+            | if device.supports_compute() {
+                abi::COMPUTE_BUFFERS
+            } else {
+                0
+            }
+            | if c.supports_rendering() {
+                abi::RENDERING
+            } else {
+                0
+            }
+            | if c.supports_presentation() {
+                abi::PRESENTATION
+            } else {
+                0
+            }
+            | if c.supports_image_upload() {
+                abi::IMAGE_UPLOAD
+            } else {
+                0
+            }
+            | if c.supports_image_readback() {
+                abi::IMAGE_READBACK
+            } else {
+                0
+            }
+            | if c.supports_depth() { abi::DEPTH } else { 0 }
             | if c.supports_programmable_graphics() {
                 abi::PROGRAMMABLE_GRAPHICS
+                    | abi::VERTEX_ATTRIBUTE_DIVISORS
+                    | abi::SHADER_DRAW_PARAMETERS
             } else {
                 0
             }
@@ -272,15 +318,15 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         if words[2] == s.revision {
             return Ok(());
         }
-        let (textures, buffers) = s
-            .table
-            .abi_retired_resources(words)
-            .map_err(|_| abi::INVALID)?;
+        let (textures, buffers) = s.table.abi_retired_resources(words).map_err(|e| {
+            eprintln!("[SGFX VirGL] resource retirement decode failed: {e:?}");
+            abi::INVALID
+        })?;
         // Never turn resource retirement into a hidden GPU wait in submit.
-        let (shaders, compute, render) = s
-            .table
-            .abi_retired_programs(words)
-            .map_err(|_| abi::INVALID)?;
+        let (shaders, compute, render) = s.table.abi_retired_programs(words).map_err(|e| {
+            eprintln!("[SGFX VirGL] program retirement decode failed: {e:?}");
+            abi::INVALID
+        })?;
         if (!textures.is_empty()
             || !buffers.is_empty()
             || !shaders.is_empty()
@@ -309,7 +355,8 @@ unsafe extern "C" fn sync_resources(p: Object, metadata: Span<u64>) -> i32 {
         }
         match s.table.sync_abi_snapshot(words) {
             Ok((_, revision)) => s.revision = revision,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[SGFX VirGL] resource table synchronization failed: {e:?}");
                 s.poisoned = true;
                 return Err(abi::INVALID);
             }
@@ -422,7 +469,10 @@ unsafe extern "C" fn submit(p: Object, batch: *const abi::Batch, out: *mut abi::
         let batch = unsafe { batch.as_ref() }.ok_or(abi::INVALID)?;
         let commands =
             unsafe { ir::CommandBuffer::from_abi(&s.table, s.source, core_batch(*batch)) }
-                .map_err(|_| abi::INVALID)?;
+                .map_err(|e| {
+                    eprintln!("[SGFX VirGL] command ABI decode failed: {e:?}");
+                    abi::INVALID
+                })?;
         let (disposition, error, receipt) = match s.inner.executor().submit(&commands) {
             Ok(receipt) => (abi::ACCEPTED, abi::OK, receipt),
             Err(SubmitError::Busy) => return Err(abi::BUSY),
@@ -557,5 +607,111 @@ pub unsafe extern "C" fn sgfx_backend_get_api_v2(
             drop_receipt,
         });
     }
+    abi::OK
+}
+
+unsafe extern "C" fn timestamp_ns(context: abi::Object, out: *mut u64) -> i32 {
+    if out.is_null() {
+        return abi::INVALID;
+    }
+    status((|| {
+        let c = unsafe { object::<virgl::Context>(context) }?;
+        let value = c.timestamp_ns().map_err(handle_error)?;
+        unsafe { out.write(value) };
+        Ok(())
+    })())
+}
+/// Negotiate the optional GPU timestamp table; no existing v2 table grows.
+/// # Safety
+/// A non-null output must point to writable aligned storage of the given size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sgfx_backend_get_timestamp_api_v2(
+    version: u32,
+    size: usize,
+    out: *mut abi::TimestampApi,
+) -> i32 {
+    if version != abi::VERSION || size < core::mem::size_of::<abi::TimestampApi>() {
+        return abi::ABI_MISMATCH;
+    }
+    if out.is_null() {
+        return abi::INVALID;
+    }
+    unsafe {
+        out.write(abi::TimestampApi {
+            version: abi::VERSION,
+            size: core::mem::size_of::<abi::TimestampApi>() as u32,
+            timestamp_ns,
+        })
+    };
+    abi::OK
+}
+
+unsafe extern "C" fn query_support(p: abi::Object) -> u32 {
+    let Ok(d) = (unsafe { object::<virgl::Device>(p) }) else {
+        return 0;
+    };
+    let mut support = 0;
+    // Optional protocols are tested on isolated contexts: a host rejecting a
+    // statistics object must never poison the actual rendering context.
+    for kind in 0..2 {
+        if let Ok(c) = d.create_context() {
+            let mask = if kind == 0 { 0 } else { 0x7ff };
+            let count = if kind == 0 { 1 } else { 11 };
+            if c.begin_query(kind, mask)
+                .and_then(|_| c.end_query(kind, count))
+                .is_ok()
+            {
+                support |= if kind == 0 { 1 } else { 4 };
+            }
+        }
+    }
+    support
+}
+unsafe extern "C" fn begin_query(p: abi::Object, kind: u32, mask: u32) -> i32 {
+    status((|| {
+        unsafe { object::<virgl::Context>(p) }?
+            .begin_query(kind, mask)
+            .map_err(handle_error)
+    })())
+}
+unsafe extern "C" fn end_query(p: abi::Object, kind: u32, out: *mut u64, count: usize) -> i32 {
+    if out.is_null() || count == 0 || count > 11 {
+        return abi::INVALID;
+    }
+    status((|| {
+        let values = unsafe { object::<virgl::Context>(p) }?
+            .end_query(kind, count)
+            .map_err(handle_error)?;
+        if values.len() != count {
+            return Err(abi::INVALID);
+        }
+        unsafe { core::ptr::copy_nonoverlapping(values.as_ptr(), out, count) };
+        Ok(())
+    })())
+}
+/// Negotiate scoped query counters without changing existing ABI v2 tables.
+/// # Safety
+/// Output points to writable aligned QueryApi storage of at least `size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sgfx_backend_get_query_api_v2(
+    version: u32,
+    size: usize,
+    out: *mut abi::QueryApi,
+) -> i32 {
+    if version != abi::VERSION || size < core::mem::size_of::<abi::QueryApi>() {
+        return abi::ABI_MISMATCH;
+    }
+    if out.is_null() {
+        return abi::INVALID;
+    }
+    unsafe {
+        out.write(abi::QueryApi {
+            version: abi::VERSION,
+            size: core::mem::size_of::<abi::QueryApi>() as u32,
+            support: query_support,
+            begin: begin_query,
+            end: end_query,
+        })
+    };
     abi::OK
 }

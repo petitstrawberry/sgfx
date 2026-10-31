@@ -4,16 +4,53 @@
 implements a bounded executable subset to exercise Vulkan → SGFX portable IR →
 backend execution, macOS presentation through Metal, and Linux ABI presentation
 through Scarlet SWS with `VK_KHR_display` and `VK_KHR_wayland_surface`. The native
-Scarlet VirGL adapter additionally exposes the Vulkan 1.1 entry-point ABI used
-by Ganesh: memory requirements2/bind memory2, maintenance queries, core
-properties2 aliases, single-device groups and queue2. Other adapters continue
-to report Vulkan 1.0. Neither version is a conformance claim: substantial
-mandatory core functionality is absent. Do not
+Scarlet VirGL adapter exposes core 1.1 aliases and, when native compute,
+draw parameters, divisors, anisotropy and D32 transfers are available, the core
+1.2 entry-point profile. Aggregate 1.1/1.2 feature/property queries agree with
+their extension aliases, including the enforced 256 MiB allocation limit.
+Other adapters continue to report Vulkan 1.0. These API versions are not
+conformance claims: substantial mandatory core functionality is absent. Do not
 select it as a general application driver. Cross-platform WSI, resource
 reclamation with long-lived objects, broader API coverage and conformance work
 remain incomplete.
 
 ## Implemented path
+
+- Push descriptors and push descriptor templates retain immutable command-owned
+  snapshots. Partial updates preserve compatible prior bindings, including
+  replay after caller memory changes. Dynamic buffer descriptors are rejected
+  for push layouts; one push set and up to 16 descriptors are supported.
+- Capable native VirGL adapters support linear sampler anisotropy up to 16,
+  nonzero per-instance attribute divisors, and shader base-instance,
+  base-vertex and draw-index builtins. Indirect draw indices preserve skipped
+  zero-count entries. Native vertex fetch also accepts signed normalized byte
+  vectors, signed 16-bit pairs and 32-bit integer vectors. These features are
+  negotiated separately and stay disabled
+  on backends without the corresponding execution path.
+- Point-list assembly, Min/Max color and alpha blending, explicit sampling
+  gradients, fragment depth output, angle conversions and dynamic local-array
+  stores execute through the normal IR/compiler paths. SPIR-V normalization
+  retains external buffer offsets while repairing internal return-value struct
+  layouts affected by Naga's point-size IO serialization.
+- RGBA16F and RGBA32F sampled color targets, GPU clears, additive blending and
+  raw packed transfers are enabled when the host format masks support both.
+  Fragment output arrays become distinct attachment locations before validation.
+  Depth-only dynamic rendering retains a private discarded color attachment and
+  an empty fragment stage when the application supplies only a vertex stage.
+  Fixed finite constant/slope depth bias reaches the native rasterizer.
+- R8 signed and scalar R32 signed/unsigned/float texel views use the original buffer and range
+  as read-only storage. `texelFetch` preserves component bits and supplies the
+  format's default zero/zero/one channels. R8 views select packed bytes and
+  sign-extend in the GPU shader; format-specialized pipelines keep the original
+  buffer backing and support byte ranges not divisible by four. View metadata
+  is retained across descriptor snapshots, copies and view destruction.
+  Descriptor templates for texel views,
+  other texel formats and texel-buffer size queries are not implemented.
+- Native D32 images support checked staging uploads, image copies, readback and
+  depth clears, with mip zero and one layer. The CGL host needs the depth-aware
+  framebuffer copy path. GPU timestamps use the host's real GPU query result;
+  the Metal bridge retires GL work before sampling a Metal GPU completion marker.
+  A failed clock probe leaves timestamps disabled.
 
 - An actual C ABI `cdylib`, ICD interface negotiation (versions 2–5), scoped
   procedure lookup, instance/physical-device/device/queue/command-buffer
@@ -38,7 +75,11 @@ remain incomplete.
   uploads/barriers/readback, complete matching-format GPU mip blits with
   nearest/linear filtering, and sampler mip filtering/LOD clamps. Native VirGL
   uploads/samples color mip chains and emits full-mip color blits when the kernel
-  reports real mip storage. Multi-mip readback remains unsupported there. Older
+  reports real mip storage. Dynamic color attachments may select a nonzero mip:
+  private GPU render targets and subresource blits preserve LOAD/STORE, partial
+  render areas and other mip levels. The scratch targets are reused by format,
+  size and attachment slot. Native readback selects mip zero; copy other levels
+  to a single-level image before reading them. Older
   kernels and A618 reject unsupported mip storage and blits.
 - Metal supports R8 uploads, layered textures, cube and array sampling, mutable
   UNORM/sRGB views, component swizzles, and sampled D32 depth with comparison
@@ -78,7 +119,7 @@ remain incomplete.
   work. Attachments retain one mip; sampled images can contain a checked chain.
   Native VirGL also supports indexed strips without primitive restart. Indexed
   strips on WGPU, primitive restart, stencil, multisampling,
-  partial/flipped/format-converting blits, indirect drawing,
+  partial/flipped/format-converting blits,
   and other dynamic state are absent.
   Native VirGL retains its existing single-stream, single-instance subset;
   unsupported typed views and new vertex formats are rejected explicitly.
@@ -159,7 +200,129 @@ blocked submitting work. A deterministic test covers an intentionally
 unserviced worker channel. `vkQueueWaitIdle`/`vkDeviceWaitIdle` serialize behind
 prior queue work. Acquire signals a semaphore or fence, queue submission consumes
 wait semaphores and signals completion semaphores, and queue present consumes
-its waits. Timeline semaphores are not implemented.
+its waits. `VK_KHR_timeline_semaphore` supports host signals, counter queries,
+waits and queue values; queue signals become visible only after GPU retirement.
+
+`VkPhysicalDeviceVulkan12Features` queries report the same timeline semaphore,
+host query reset, indirect-count drawing and imageless framebuffer capabilities
+as their individual feature records. Device creation accepts those aggregate
+requests and routes timeline/query enablement to the existing execution paths;
+unsupported aggregate fields are cleared on query and rejected on enablement.
+This query/enablement support does not change the advertised Vulkan 1.1 API.
+
+`VK_KHR_synchronization2` adds explicitly enabled `synchronization2` features,
+64-bit stage/access scopes, `vkCmdPipelineBarrier2KHR`, `vkQueueSubmit2KHR` and
+device event set/wait/reset commands. Split transfer/vertex-input/shader scopes,
+`NONE`, attachment/read-only layout aliases, mixed binary/timeline submissions
+and a single-device mask of zero or one are supported. Resource barriers use
+the existing backend path; synchronization scopes conservatively retire prior
+GPU work. This costs overlap and does not raise the advertised Vulkan API
+version. Barriers and event commands remain outside render passes in this
+bounded profile. Timestamp writes use the same ordered control points, including
+pass splitting that preserves attachment contents.
+
+`VK_KHR_dynamic_rendering` supports explicitly enabled single-layer, single-sample
+rendering with 1–8 non-null color attachments (up to the backend limit) and
+optional D32 depth. Pipelines retain `VkPipelineRenderingCreateInfo` formats
+without application render-pass or framebuffer objects. Attachment loads,
+stores and render areas use the existing render-pass execution path. Resolves,
+stencil, multiview, null attachment slots, suspend/resume flags and depth-only
+rendering remain unsupported. Read-only depth follows backend capability checks.
+
+Indirect and indexed-indirect draws support multiple commands, GPU-written
+argument buffers, signed vertex offsets and nonzero first-instance values.
+`VK_KHR_draw_indirect_count` reads a GPU-written counter and clamps it to
+`maxDrawCount`; the reported command limit is 4096. This portable implementation
+retires preceding GPU work, reads the parameters, preserves/resumes attachments
+and emits direct IR draws. It adds synchronization and readback overhead. Native
+VirGL accepts transfer/update producers and retired compute-buffer producers in
+separate submissions when the native compute capability probe succeeds.
+
+Native VirGL's optional compute-buffer profile lowers WGSL/SPIR-V to TGSI `COMP`,
+binds shader buffers and issues `LAUNCH_GRID` followed by a shader-buffer/update
+memory barrier and fenced GPU readback. It supports fixed workgroups with at
+most 128 invocations (`128,128,64` per-axis limits), `65535` groups per axis,
+invocation/workgroup IDs, four storage bindings of up to 256 KiB, 16 KiB uniforms
+and 128-byte push constants. Buffer allocations are bounded to 1 MiB; a stream
+retains at most 64 MiB of buffer snapshots. Descriptor aliases share one physical
+allocation, and range checks suppress invalid writes and return zero on invalid
+reads. GPU writes update CPU shadows and invalidate cached buffer revisions, so
+subsequent graphics submissions upload the new contents.
+
+Compute-only streams can contain uploads, buffer copies, multiple compute passes
+and buffer barriers. They execute synchronously even through the asynchronous
+submission API; the returned receipt is already retired. Mixed graphics/compute
+streams, shared workgroup memory, atomics, texture bindings and storage images
+remain unsupported and are rejected before execution. If a dispatch may have
+been accepted before a failure, submission reports a partial failure and makes
+the resource cache unusable rather than allowing replay.
+
+The `COMPUTE_BUFFERS` ABI flag and compute queue limits are advertised only after
+an isolated dispatch modifies eight SSBO words and GPU-to-host readback verifies
+every result. Failed probes leave the rendering context untouched. Plain macOS
+CGL/OpenGL 4.1 has no GL compute support, so a renderer without a compute bridge
+keeps this path disabled. The Scarlet virglrenderer fork's optional Metal compute
+backend executes these same VirGL commands on Metal and synchronizes buffer bytes
+with GL. Shared-memory limits remain zero for this SGFX profile.
+
+Local validation of this profile passed five WGSL/SPIR-V compute semantic tests
+(3D invocation IDs, read-modify-write, descriptor offsets, robust bounds and
+arithmetic overflow, distinct UBO/push/storage constants, and explicit profile
+rejection), plus parsing both generated compute shaders with the pinned
+virglrenderer TGSI parser. On Apple M3 Pro, the native OpenJDK 25/HVF fixture now
+passes two real SSBO read-modify-write dispatches, descriptor offset/range and
+eight sentinel-word checks, followed by indirect-count rendering, 128 pixel
+checks, visibility queries and synchronization2. Metal API validation is enabled
+for the packaged host renderer. This validates actual guest-to-host GPU compute;
+the same fixture also verifies disabled compute on a plain CGL renderer.
+
+The host renderer is
+[`petitstrawberry/virglrenderer` at cbe9e52f55a72e625da4b8ad5aba906b681fc46a](https://github.com/petitstrawberry/virglrenderer/commit/cbe9e52f55a72e625da4b8ad5aba906b681fc46a),
+built with `-Dmetal-compute=enabled`. Its direct public-API test additionally
+checks aliased SSBO bindings at slots 3/7, 3D workgroups/global IDs and 64 output
+words, rejection of unbound storage and fence completion. The bridge uses
+synchronous CPU copies between GL and Metal; it does not add images, shared
+memory or mixed-stream execution to SGFX. The validated host library SHA-256 is
+`f422834b493da917587cd5178d94c7371e08cc11ad6f2bdffbe9c113d88328da`.
+
+The native ICD SHA-256 for that check is `d7a0f818219fd79b7a52eb98115e660b269a9c1d6ffb9a72346fcb00071416d4`;
+the VirGL plugin SHA-256 is `52d98a21c98cce1bc26dd6e3bf9b8c18406b31d3edeeaafbcffc7467e70ef7c4`. These hashes identify
+that validation build, independently of the earlier query/rendering builds below.
+
+
+Timestamp query pools provide reset, 32/64-bit results, availability, WAIT,
+strided buffer copies and optional `VK_EXT_host_query_reset`. Only real GPU
+clocks enable `timestampValidBits=64` with a nanosecond period. An optional SGFX
+v2 timing table preserves existing backend ABI layouts. Metal samples its GPU
+clock after retiring prior commands; other WGPU backends use timestamp queries.
+VirGL uses timestamp query objects and CPU-visible query-result buffers, requiring
+Scarlet kernel `b229d6d007fbdf8e3b9a130c3feeaf94ee8019e9` or later. Older kernels,
+missing timing tables and unusable host timers leave timestamp valid bits at zero.
+Host query reset remains available when another query type is implemented.
+
+Occlusion pools support `vkCmdBeginQuery`/`vkCmdEndQuery`, availability, reset,
+32/64-bit reads and strided copies. WGPU and native VirGL currently expose only
+non-precise results: zero means no sample passed, and nonzero means visible.
+`occlusionQueryPrecise` remains false; `PRECISE` is rejected. Query scopes survive
+pass splits used by indirect draws, timestamp writes and attachment preservation.
+Nested queries of the same type, mismatched ends, resetting/copying active slots,
+open queries at command-buffer end and invalid render-pass/subpass boundaries
+are rejected during recording.
+
+Pipeline-statistics pools are enabled only when the backend supplies statistics.
+Results contain requested counters in increasing Vulkan bit order, followed by
+availability when requested. Native VirGL uses one host query per selected
+counter. Its optional protocols are probed on isolated contexts so rejecting a
+statistics object cannot poison the application's render context; such hosts
+can log the rejected probe. WGPU uses hardware VS/clipper/fragment/compute
+counters and exact submitted IA vertex/primitive counts; GS/tessellation counters
+are zero because those shader stages are not exposed. Queries aggregate all
+contributing passes, excluding backend-generated clear draws. The optional
+scoped-query ABI table leaves existing v2 table layouts unchanged. Metal does
+not expose WGPU pipeline-statistics queries, and this macOS OpenGL host rejects
+the native statistics protocol, so `pipelineStatisticsQuery` remains false here.
+`PARTIAL` results and indexed/secondary-command-buffer query variants are outside
+this bounded profile.
 
 Vulkan 1.0 descriptor update rules apply: updating a set already bound in a
 recording or executable command buffer invalidates that buffer. Reset and
@@ -307,21 +470,22 @@ and verify the chosen Mesa driver. The Linux check also used
   WSI currently covers macOS Metal and Scarlet Linux display/Wayland,
   FIFO mode and opaque composition. Windows presentation is through Wine's
   Win32-to-Wayland driver and Box64's native Vulkan wrapper. Direct3D/DXVK,
-  general games, other platform surfaces, timeline semaphores, secondary command buffers, descriptor indexing,
-  pipeline caches, queries, events, sparse resources, external memory, multisampling,
-  indirect operations, partial/flipped/converting blits, or arbitrary
+  general games, other platform surfaces, secondary command buffers, descriptor indexing,
+  compiled pipeline-cache payloads, precise occlusion, legacy device-event commands, sparse resources, external memory, multisampling,
+  indirect dispatch, partial/flipped/converting blits, or arbitrary
   raster state. Custom allocation callbacks are rejected at creation.
 - **Resource lifetime capacity remains bounded.** SGFX tables use persistent
-  append-only IDs. When no live Vulkan objects retain an epoch's IDs, the ICD
+  table-qualified IDs. When no live Vulkan objects retain an epoch's IDs, the ICD
   invalidates stale recordings, drops backend caches, and creates a fresh table.
   A test creates/destroys 1250 buffers on an otherwise idle device, then performs
-  real compute work. With long-lived pipelines/resources, unique transient
-  resources and descriptor configurations still consume that epoch's table
-  budget (including 4096 buffers, 4096 memory allocations and 4096 bind-group configurations). Identical
+  real compute work. Live resources and cached descriptor configurations share
+  bounded budgets (including 8192 texture identities, 4096 buffers, 4096 memory
+  allocations and 32768 bind-group definitions). Identical
   descriptor configurations reuse definitions and physical groups; GPU image
   remapping invalidates physical groups. Exhaustion returns an allocation
-  error. General reclamation requires generational core/backend slots or a safe
-  migration of live resources; this remains a blocker for a general driver.
+  error. Descriptor-cache eviction recycles generational slots as described below.
+  Resource categories without reusable slots still require individual reclamation
+  or safe migration of live resources for a general driver.
 - **Command programs are bounded to 65,536 commands.** Vulkan recording uses
   the canonical IR bound. Lowering may add IR operations, which must also fit
   this bound. Overflow rejects recording/submission without signaling success.
@@ -363,7 +527,13 @@ The Vulkan API version alone does not define an optional arbitrary subset.
 
 The memory2 entry points use the same allocation, ownership, range and alignment
 checks as the original API. Requirements queries preserve output chains and
-write false dedicated-allocation requirements. Sparse queries report zero;
+write false dedicated-allocation requirements. Optional dedicated buffer/image
+allocations are accepted through `VkMemoryDedicatedAllocateInfo`, including
+single-device allocation flags. The allocation must match the resource
+requirements and may bind only its declared target at offset zero; aliases
+remain rejected. A native VMA test verifies a dedicated 64 MiB buffer with ordered
+writes/copies at both boundaries and rejection of a different bind target.
+Float image tests exercise dedicated image allocations. Sparse queries report zero;
 YCbCr creation returns `ERROR_FEATURE_NOT_PRESENT`. Disabled Vulkan 1.1 feature
 records can accompany device creation, but nonzero unsupported features are
 rejected. Layout-support queries share creation's pure validation and do not
@@ -401,22 +571,198 @@ resolution, validation, buffer snapshots, IR recording, backend submission,
 readback and descriptor retirement. Nested durations overlap the enclosing
 API call; summing them double-counts work. The disabled path reads no clocks.
 
-Transient descriptor groups are retired at the end of a queue packet. Backend
-retirements now see one unchanged resource-table revision; logical identities
-are invalidated after that batch. Interleaving those steps previously caused
-the dynamic backend to resynchronize the entire table for every group.
-Failed groups remain available for retry, while successful groups retire and
-keep their generation checks. Native YouTube profiling identified 150-210ms
-per second in the old retirement path. Unit tests cover a failure between two
-successful releases, an unchanged revision throughout the backend batch,
-retry and repeated slot reuse with immutable submitted descriptor snapshots.
+Immutable descriptor groups are reused across queue packets. Once all resolved
+recordings in a packet have been consumed, least-recently-used eviction trims
+the cache to 8,192 nonempty groups. Submitted backend commands already own their
+bindings, so evicting logical groups does not require a GPU completion wait.
+The shared empty group is retained because resolved commands can embed its ID
+directly.
+
+Before execution, capacity preflight counts the descriptor insertions in the
+resolved recordings as an upper bound on new definitions. If that count plus
+the cache size exceeds the 32,768-definition IR limit, the worker flushes cached
+nonempty groups before materializing the packet's descriptors. This flush clears
+per-set cached IDs and preserves the empty group used by resolved commands.
+The packet must still fit within the existing IR limit after the flush.
+
+Both LRU eviction and capacity flush batch backend retirements against one
+unchanged resource-table revision, then retire successful logical identities.
+This avoids synchronizing the entire table for each group. A backend retirement
+failure retains that group's cached descriptor and live logical ID for diagnosis
+or retry; successful retirements still recycle slots and invalidate per-set
+references to the retired IDs. Failed retirements can leave the cache above its
+normal retention bound and propagate an error. Unit tests cover partial failure,
+retry, per-set cache invalidation, LRU recency, and slot reuse while submitted
+descriptor snapshots remain immutable.
+
+The producer also caches serialized shader-module, compute-pipeline and
+programmable-render-pipeline rows by slot generation and active state. Unrelated
+resource-table revisions reuse those encodings instead of serializing unchanged
+programs again. Retirement, reactivation and generation reuse invalidate the
+affected rows. These caches belong to their resource-table epoch and preserve
+the existing snapshot bytes and ABI; no wire-format or ABI version changes are
+required. Tests compare cached snapshots with uncached serialization and check
+both vacancy-to-active reuse and release/replacement between snapshots.
 
 Shader modules have a separate bounded table of 1,024 live entries; compute
-and programmable graphics pipelines each retain their existing 256-entry
-limits. A graphics pipeline can own two distinct shader stages. Several Skia
+pipelines retain their 256-entry limit. Programmable graphics pipelines allow
+512 live entries so resource reloads can overlap the previous and replacement
+pipeline sets. A graphics pipeline can own two distinct shader stages. Several Skia
 contexts share the device table, so a 256-entry shader table could exhaust
 before the graphics-pipeline limit. The R3 metadata importer and retirement
 scanner use the same declared capacities. Released generations remain invalid
 and slots remain reusable. The simultaneous-pipeline contract test retains
 160 graphics pipelines (320 distinct shader modules) while rendering and
 validating their pixels, rather than testing only sequential create/destroy.
+
+
+## Synchronization2 validation
+
+On 2026-10-30, the host suite passed 123 unit tests and 29 opt-in GPU
+contract tests against the built ICD on Metal. The synchronization2 GPU case
+checks a future host timeline signal after queue acceptance, ignored binary
+semaphore values, device events, partial buffer barriers and exact transfer
+readback after fence completion. Run it with:
+
+```sh
+cargo build --locked -p vulkan-sgfx --lib
+cargo test --locked -p vulkan-sgfx --lib
+cargo test --locked -p vulkan-sgfx --test contracts -- --ignored --test-threads=1
+```
+
+The same queue/event/transfer path passed in native OpenJDK 25 on an AArch64
+Scarlet HVF guest with the VirGL plugin. A second native test used only
+`vkCmdPipelineBarrier2KHR` and `vkQueueSubmit2KHR` for 320×240 and 384×256
+SDL/Vulkan swapchain presentation, including resize and keyboard/text input.
+It also checked VMA allocation and reached C2 level 4 in render/swapchain
+methods; these methods may subsequently deoptimize. Neither test establishes
+Vulkan conformance or broader application compatibility.
+
+| Validation artifact | SHA-256 |
+| --- | --- |
+| Native ICD | `2e7fa1542a8340fddf0e2f7c1af2f7d9b57d70ea394991dabf10de980b385777` |
+| Native queue/event log | `544bf49335086c01f6af3908859136b8545c73f6e0128315b38e05e7990f1a0d` |
+| Native presentation log | `f0195f8688119acb540ea3622cf295aa63aeed9df5e6274bf2f47b0b29d5a677` |
+
+
+## Modern rendering validation
+
+On 2026-10-30 all 33 opt-in Metal GPU contract tests passed. New pixel comparisons
+cover dynamic rendering without Vulkan render-pass/framebuffer objects,
+GPU-written indirect arguments/counters, first-instance values and signed
+indexed vertex offsets. Timestamp tests check increasing hardware GPU time,
+availability, 32/64-bit reads, strided copies, untouched padding and host reset.
+
+A native AArch64 HVF/OpenJDK 25 test passed dynamic rendering and both indirect
+count variants with GPU-updated argument/count buffers, baseVertex=-1, 128 exact
+pixel comparisons and teardown. Its synchronization2 transfer/event/timeline
+checks also passed. The guest rejects unsupported timestamp pools and reports
+zero valid bits on this host. Direct CGL tests that bypass QEMU/virglrenderer on
+Apple M3 Pro (OpenGL 4.1 Metal) report `GL_QUERY_COUNTER_BITS=0` and two available
+queries with value zero, reproducing the timer limitation in macOS OpenGL.
+This is separate from the working Metal GPU-clock path; zero values are not
+replaced with CPU time. Reproduction sources, hashes and logs are retained in
+`target/vulkan-next/summary.json` and its fixture directory.
+
+
+| Modern native validation artifact | SHA-256 |
+| --- | --- |
+| AArch64 ICD | `625f58b4a6d01f09e3bcb94085d5cba33cdb67ee7cf1058c571d85e04d31b3db` |
+| HVF guest log | `81c4dc7858b2c5e9ee1cd48aa6046f38e28baeaf9c6bc612935e0d6186335965` |
+| Query-buffer kernel Image | `4c335ca8f0dbee755fcd14abdc490c7ab62195ca597f64dfc82f30fc46fd199c` |
+
+
+## Scoped query validation
+
+On 2026-10-30 all 35 opt-in Metal GPU contract tests passed, including visible
+indirect drawing versus an empty occlusion scope, pass splitting, 32/64-bit
+results, availability and buffer copies. The native AArch64 HVF/OpenJDK test
+also passes visible/empty scopes around normal and indexed indirect-count draws,
+result copies, host reads and host resets, while retaining 128 exact pixel
+comparisons. Unsupported precise/statistics features are rejected explicitly.
+This host cannot exercise positive pipeline-statistics results; their hardware
+path remains unverified here. The conditional graphics contract checks IA, VS
+and fragment counters on backends that expose the feature.
+
+
+| Scoped-query native artifact | SHA-256 |
+| --- | --- |
+| AArch64 ICD | `d59c80831c5fa4606f474aaff39239a2484ce38b34c2e595581c36d0a3d78723` |
+| HVF guest log | `87421c1fe93e98e54a70e909edd40573702d60a0dfd835c62cc3b72fcb42c859` |
+
+Full receipts and logs are retained under `target/vulkan-next/scoped-summary.json`.
+
+
+### Diagnostic GPU frame capture
+
+Build `vulkan-sgfx` with `--features frame-capture` and set
+`SGFX_VULKAN_CAPTURE_DIR` to an output directory. The driver reads back the actual
+GPU presentation image after rendering completes and saves RGBA PNGs before
+handing the image to WSI. It captures the first frame and at most one frame every
+30 seconds, up to twelve per swapchain. Files use create-new semantics. Failures
+are logged without failing presentation. Capture adds synchronous readback and
+PNG encoding overhead; the default build contains no capture path.
+
+`SGFX_VULKAN_CALL_PROFILE=1` enables the existing worker/API phase profiler. Both
+settings use the loader-published process environment on Scarlet, where a loaded
+Rust DSO does not initialize its own std environment.
+
+Large native buffer uploads include inline payload and transport headers in the
+logical stream. VirGL admits streams above the ordinary 64 MiB queue budget
+exclusively, up to 512 MiB, after prior work retires. Native dispatch remains
+bounded to individual transport packets and four upload arenas. The native
+modern regression initializes a 64 MiB vertex backing through its last word,
+then verifies actual rendered color and depth across repeated draws.
+
+`SGFX_VULKAN_PROGRESS=1` emits a progress record after successful presentation,
+at most once per five seconds after the first frame. It reports cumulative
+accepted IR streams, draw commands and presented frames. Scarlet records are
+emitted only after the queue-idle completion check succeeds; they are separate
+from the API timing profiler and do not capture images.
+
+Read-only graphics storage/texel bindings use the native 1 MiB buffer-view
+budget for both the backing and the bound range. They do not inherit the
+compute planner's narrower range check. The native test switches from a
+seven-byte R8 view to an odd 710,159-byte view and verifies a GPU fetch at
+index 700,000, alongside 512 exact color pixels and 512 depth words. Rejected
+backend streams emit payload-free IR/resource metadata and the failing binding
+range, including when a failure occurs after API recording succeeded.
+
+On Scarlet the logical device-memory budget is one quarter of the kernel's
+managed physical RAM, capped at 2 GiB and rounded down to whole MiB. The stable
+budget is shared by memory-property reporting and allocation admission. Native
+memory metadata comes from `scarlet_os::system::memory_info`; unavailable
+metadata and other hosts retain a 512 MiB fallback. The remaining capacity is
+reserved for application memory, CPU mirrors, backend shadows and the kernel.
+The heap reports a capacity bound, not a guarantee of currently free memory.
+
+Transfer readback merges the written byte intervals and preserves gaps, including
+row padding in image-to-buffer copies. Once the backend and host mirror agree,
+unmapped buffers retain their upload cache; overlapping aliases are invalidated
+before reuse. Writable shader buffers retain conservative full-buffer readback.
+The native backend accumulates dirty ranges across update-only submissions
+until a drawing submission's final checkpoint accepts their physical upload.
+Later draws use this cumulative delta only when physical storage has its exact
+base revision. Missing or stale bases and compute replacements use a full-shadow
+repair. Rejected submissions and Busy preserve accepted bytes and pending ranges.
+
+The frontend paces texture uploads at 8 MiB without splitting individual buffer
+writes. Native buffer upload limits are enforced when buffers are materialized
+for drawing; fragmenting CPU-shadow writes would repeatedly copy their entire
+previous contents. The optional native `profile-submissions` feature reports
+submission phases taking at least 50 ms, including shadow-copy bytes and dirty
+bytes. The plugin also reports slow metadata import and command decoding. These
+records contain counts and timings only; normal builds omit the instrumentation.
+
+Buffer-only native submissions validate an ordered overlay of modified ranges
+and reserve any growth before admission. After the checkpoint is accepted they
+apply these ranges to the existing CPU shadows. Copy sources observe preceding
+writes and zero-filled gaps. Rejection or Busy preserves accepted bytes,
+revisions and pending upload ranges; mixed graphics streams retain their
+existing materialization path.
+
+GPU-only synchronization boundaries keep their submission receipts and rely on
+the queue's ordered execution. They do not wait on the CPU at each boundary.
+Queries, indirect argument reads, events and image/host readbacks retain explicit
+retirement waits. Every retained receipt participates in the enclosing fence or
+readback, including a final barrier with no following draw.

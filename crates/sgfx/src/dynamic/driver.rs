@@ -251,7 +251,17 @@ impl Context {
         }
         let reference = resources.table.texture_ref(id).map_err(invalid)?;
         let descriptor = resources.table.texture(reference).map_err(invalid)?;
-        let mut bytes = buffer(descriptor.byte_size().map_err(invalid)?)?;
+        // The v2 readback entrypoint reads mip zero, rather than the complete
+        // allocation's chain. Match the native callback's packed output size.
+        let bytes_per_pixel = descriptor
+            .format()
+            .bytes_per_pixel()
+            .ok_or_else(|| invalid(ir::Error::InvalidDescriptor))?;
+        let length = u64::from(descriptor.extent().width())
+            .checked_mul(u64::from(descriptor.extent().height()))
+            .and_then(|n| n.checked_mul(u64::from(bytes_per_pixel)))
+            .ok_or_else(|| invalid(ir::Error::Overflow))?;
+        let mut bytes = buffer(length)?;
         resources.sync()?;
         status(unsafe {
             (api(&self.owner.library)?.read_texture)(

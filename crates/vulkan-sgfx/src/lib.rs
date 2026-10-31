@@ -15,11 +15,15 @@ mod api;
 mod clear;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod display;
+mod frame_profile;
 mod images;
 mod input_attachments;
 mod instance;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod linux_wsi;
+mod memory_allocation;
+mod memory_budget;
+mod progress;
 mod properties2;
 mod push_constants;
 mod render_pass;
@@ -72,3 +76,8 @@ pub mod scarlet_surface;
     all(target_os = "linux", feature = "scarlet-wsi")
 ))]
 mod sws_wsi;
+
+mod texel_buffers;
+
+#[cfg(feature = "frame-capture")]
+mod frame_capture;

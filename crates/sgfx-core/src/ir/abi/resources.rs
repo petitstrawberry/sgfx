@@ -27,6 +27,189 @@ impl<T: Codec> Codec for Rc<T> {
     }
 }
 
+struct AcceptedRow {
+    generation: u64,
+    words: Vec<u64>,
+}
+
+/// Encoded copies of rows already accepted by this backend-owned mirror.
+/// Every inner vector is bounded by its resource table category's slot count.
+pub(super) struct RowCache {
+    rows: Vec<Option<AcceptedRow>>,
+    #[cfg(test)]
+    hits: core::cell::Cell<u64>,
+    #[cfg(test)]
+    fallback_encodes: core::cell::Cell<u64>,
+}
+
+impl RowCache {
+    const fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            #[cfg(test)]
+            hits: core::cell::Cell::new(0),
+            #[cfg(test)]
+            fallback_encodes: core::cell::Cell::new(0),
+        }
+    }
+
+    /// `None` means this slot has no accepted cache for the generation;
+    /// `Some(false)` is a mismatch; an active immutable row must reject it.
+    fn compare(&self, index: usize, generation: u64, words: &[u64]) -> Option<bool> {
+        let row = self.rows.get(index)?.as_ref()?;
+        if row.generation != generation {
+            return None;
+        }
+        // Native AArch64's generic memcmp walks one byte at a time. These
+        // snapshots are already u64 words; keep the comparison word-sized and
+        // permit vectorization rather than lowering slice equality to memcmp.
+        let equal = row.words.len() == words.len()
+            && row
+                .words
+                .iter()
+                .zip(words)
+                .fold(0, |difference, (old, new)| difference | (old ^ new))
+                == 0;
+        #[cfg(test)]
+        if equal {
+            self.hits.set(self.hits.get() + 1);
+        }
+        Some(equal)
+    }
+
+    fn accept(&mut self, index: usize, generation: u64, words: &[u64]) -> Result<()> {
+        let len = index.checked_add(1).ok_or(Error::Overflow)?;
+        if self.rows.len() < len {
+            self.rows
+                .try_reserve(len - self.rows.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            self.rows.resize_with(len, || None);
+        }
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(words.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        encoded.extend_from_slice(words);
+        self.rows[index] = Some(AcceptedRow {
+            generation,
+            words: encoded,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn note_fallback_encode(&self) {
+        self.fallback_encodes.set(self.fallback_encodes.get() + 1);
+    }
+
+    #[cfg(test)]
+    fn hits(&self) -> u64 {
+        self.hits.get()
+    }
+
+    #[cfg(test)]
+    fn fallback_encodes(&self) -> u64 {
+        self.fallback_encodes.get()
+    }
+}
+
+/// Bounded consumer-side encoded-row caches, one per generated slot category.
+pub(crate) struct AcceptedRows {
+    textures: RowCache,
+    buffers: RowCache,
+    shader_modules: RowCache,
+    bind_groups: RowCache,
+    compute_pipelines: RowCache,
+    programmable_pipelines: RowCache,
+}
+
+impl AcceptedRows {
+    pub(super) const fn new() -> Self {
+        Self {
+            textures: RowCache::new(),
+            buffers: RowCache::new(),
+            shader_modules: RowCache::new(),
+            bind_groups: RowCache::new(),
+            compute_pipelines: RowCache::new(),
+            programmable_pipelines: RowCache::new(),
+        }
+    }
+}
+
+struct EncodedProgram {
+    generation: u64,
+    active: bool,
+    words: Vec<u64>,
+}
+
+struct ProgramRows {
+    rows: Vec<Option<EncodedProgram>>,
+    #[cfg(test)]
+    encodes: usize,
+}
+
+impl ProgramRows {
+    const fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            #[cfg(test)]
+            encodes: 0,
+        }
+    }
+
+    fn put<T: Slot>(&mut self, items: &[T], out: &mut Vec<u64>) -> Result<()> {
+        if self.rows.len() < items.len() {
+            self.rows
+                .try_reserve(items.len() - self.rows.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            self.rows.resize_with(items.len(), || None);
+        }
+        items.len().put(out);
+        for (item, cached) in items.iter().zip(&mut self.rows) {
+            if cached.as_ref().is_none_or(|row| {
+                row.generation != item.generation() || row.active != item.active()
+            }) {
+                let mut words = Vec::new();
+                item.put(&mut words);
+                *cached = Some(EncodedProgram {
+                    generation: item.generation(),
+                    active: item.active(),
+                    words,
+                });
+                #[cfg(test)]
+                {
+                    self.encodes += 1;
+                }
+            }
+            let words = &cached.as_ref().unwrap().words;
+            out.try_reserve(words.len() + 1)
+                .map_err(|_| Error::OutOfMemory)?;
+            words.len().put(out);
+            out.extend_from_slice(words);
+        }
+        Ok(())
+    }
+}
+
+/// Producer-side encodings of immutable programs. A descriptor-only table
+/// change must not convert every shader's SPIR-V words into u64 again.
+/// Slots bound the cache; retirement and reactivation both invalidate rows.
+pub(crate) struct EncodedPrograms {
+    shaders: ProgramRows,
+    compute: ProgramRows,
+    render: ProgramRows,
+}
+
+impl EncodedPrograms {
+    pub const fn new() -> Self {
+        Self {
+            shaders: ProgramRows::new(),
+            compute: ProgramRows::new(),
+            render: ProgramRows::new(),
+        }
+    }
+}
+
 impl ResourceTable {
     /// Active texture and buffer identities replaced by a newer snapshot.
     /// Retire their physical caches before applying the new generations.
@@ -153,6 +336,7 @@ impl ResourceTable {
     pub fn abi_snapshot(&self) -> Result<Ref<'_, [u64]>> {
         if self.abi.snapshot.borrow().0 != self.abi_revision() {
             let mut snapshot = self.abi.snapshot.borrow_mut();
+            let mut programs = self.abi.encoded_programs.borrow_mut();
             let out = &mut snapshot.1;
             out.clear();
             out.try_reserve(64).map_err(|_| Error::OutOfMemory)?;
@@ -161,10 +345,14 @@ impl ResourceTable {
             rows(&self.buffers.borrow(), out);
             rows(&self.samplers.borrow(), out);
             rows(&self.pipelines.borrow(), out);
-            rows(&self.shader_modules.borrow(), out);
+            programs.shaders.put(&self.shader_modules.borrow(), out)?;
             rows(&self.bind_groups.borrow(), out);
-            rows(&self.compute_pipelines.borrow(), out);
-            rows(&self.programmable_pipelines.borrow(), out);
+            programs
+                .compute
+                .put(&self.compute_pipelines.borrow(), out)?;
+            programs
+                .render
+                .put(&self.programmable_pipelines.borrow(), out)?;
             snapshot.0 = self.abi_revision();
         }
         Ok(Ref::map(self.abi.snapshot.borrow(), |v| v.1.as_slice()))
@@ -189,8 +377,21 @@ impl ResourceTable {
         if source == 0 || revision == 0 {
             return Err(Error::InvalidDescriptor);
         }
-        sync_slots(&mut r, &mut self.textures.borrow_mut(), MAX_TEXTURES, self)?;
-        sync_slots(&mut r, &mut self.buffers.borrow_mut(), MAX_BUFFERS, self)?;
+        let mut accepted = self.abi.accepted_rows.borrow_mut();
+        sync_slots(
+            &mut r,
+            &mut self.textures.borrow_mut(),
+            MAX_TEXTURES,
+            self,
+            &mut accepted.textures,
+        )?;
+        sync_slots(
+            &mut r,
+            &mut self.buffers.borrow_mut(),
+            MAX_BUFFERS,
+            self,
+            &mut accepted.buffers,
+        )?;
         let existing = self.samplers.borrow().len();
         self.append_abi_rows::<SamplerDesc>(&mut r, existing, MAX_SAMPLERS, |d| {
             self.define_sampler(d).map(|_| ())
@@ -204,6 +405,7 @@ impl ResourceTable {
             &mut self.shader_modules.borrow_mut(),
             MAX_SHADER_MODULES,
             self,
+            &mut accepted.shader_modules,
         )?;
         // Historical descriptors can reference retired resources. Their IDs
         // are checked when used, without reviving old generations on import.
@@ -212,18 +414,21 @@ impl ResourceTable {
             &mut self.bind_groups.borrow_mut(),
             MAX_BIND_GROUP_DEFINITIONS,
             self,
+            &mut accepted.bind_groups,
         )?;
         sync_program_slots(
             &mut r,
             &mut self.compute_pipelines.borrow_mut(),
             MAX_COMPUTE_PIPELINES,
             self,
+            &mut accepted.compute_pipelines,
         )?;
         sync_program_slots(
             &mut r,
             &mut self.programmable_pipelines.borrow_mut(),
             MAX_PROGRAMMABLE_RENDER_PIPELINES,
             self,
+            &mut accepted.programmable_pipelines,
         )?;
         r.end()?;
         // A cached unchanged pipeline row may not outlive the shader generation
@@ -347,12 +552,12 @@ fn sync_slots<T: Slot>(
     current: &mut Vec<T>,
     maximum: usize,
     table: &ResourceTable,
+    cache: &mut RowCache,
 ) -> Result<()> {
     let count = usize::get(r, table)?;
     if count < current.len() || count > maximum {
         return Err(Error::ResourceLimitExceeded);
     }
-    let mut expected = Vec::new();
     for index in 0..count {
         let len = usize::get(r, table)?;
         let words = r.take(len)?;
@@ -361,16 +566,27 @@ fn sync_slots<T: Slot>(
             if generation < old.generation() {
                 return Err(Error::InvalidDescriptor);
             }
+            // Retired rows are immutable while their encoded words stay the
+            // same, too. Avoid rebuilding their cache on every table sync.
+            // A changed inactive row can still reactivate this generation.
             if generation == old.generation() {
-                // Definitions are immutable within a generation. Comparing
-                // scalar metadata avoids recreating shared bind-group owners.
-                expected.clear();
-                old.put(&mut expected);
-                if expected == words {
-                    continue;
-                }
-                if old.active() {
-                    return Err(Error::InvalidDescriptor);
+                match cache.compare(index, generation, words) {
+                    Some(true) => continue,
+                    Some(false) if old.active() => return Err(Error::InvalidDescriptor),
+                    None if old.active() => {
+                        // A cache populated by an older implementation or
+                        // lost after mirror mutation is re-established once.
+                        #[cfg(test)]
+                        cache.note_fallback_encode();
+                        let mut expected = Vec::new();
+                        old.put(&mut expected);
+                        if expected != words {
+                            return Err(Error::InvalidDescriptor);
+                        }
+                        cache.accept(index, generation, words)?;
+                        continue;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -383,6 +599,7 @@ fn sync_slots<T: Slot>(
             current.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
             current.push(descriptor);
         }
+        cache.accept(index, generation, words)?;
     }
     Ok(())
 }
@@ -426,9 +643,10 @@ fn sync_program_slots<T: Codec + PartialEq>(
     current: &mut Vec<ProgramSlot<T>>,
     maximum: usize,
     table: &ResourceTable,
+    cache: &mut RowCache,
 ) -> Result<()> {
     if !table.abi.legacy_program_ids.get() {
-        return sync_slots(r, current, maximum, table);
+        return sync_slots(r, current, maximum, table, cache);
     }
     let count = usize::get(r, table)?;
     if count < current.len() || count > maximum.min(256) {
@@ -475,6 +693,127 @@ fn rebuild_program_free_list<T>(
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
+    use alloc::vec;
+
+    fn uncached_snapshot(table: &ResourceTable) -> Vec<u64> {
+        let mut out = vec![MAGIC, table.abi_identity(), table.abi_revision()];
+        rows(&table.textures.borrow(), &mut out);
+        rows(&table.buffers.borrow(), &mut out);
+        rows(&table.samplers.borrow(), &mut out);
+        rows(&table.pipelines.borrow(), &mut out);
+        rows(&table.shader_modules.borrow(), &mut out);
+        rows(&table.bind_groups.borrow(), &mut out);
+        rows(&table.compute_pipelines.borrow(), &mut out);
+        rows(&table.programmable_pipelines.borrow(), &mut out);
+        out
+    }
+
+    #[test]
+    fn producer_program_rows_preserve_wire_bytes_and_invalidate_on_slot_reactivation() {
+        fn programs(
+            table: &ResourceTable,
+            source: &str,
+        ) -> (
+            ShaderModuleId,
+            ComputePipelineId,
+            ProgrammableRenderPipelineId,
+        ) {
+            let shader = table
+                .define_shader_module(ShaderModuleDesc::wgsl(source.into()).unwrap())
+                .unwrap();
+            let compute = table
+                .define_compute_pipeline(
+                    ComputePipelineDesc::new(
+                        ShaderEntryPoint::new(shader, ShaderStage::Compute, "cs".into()).unwrap(),
+                        PipelineLayoutDesc::new(vec![]).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id();
+            let render = table
+                .define_programmable_render_pipeline(
+                    ProgrammableRenderPipelineDesc::new(
+                        ShaderEntryPoint::new(shader, ShaderStage::Vertex, "vs".into()).unwrap(),
+                        ShaderEntryPoint::new(shader, ShaderStage::Fragment, "fs".into()).unwrap(),
+                        PipelineLayoutDesc::new(vec![]).unwrap(),
+                        TextureFormat::Rgba8Unorm,
+                        None,
+                        PrimitiveTopology::TriangleList,
+                        BlendState::REPLACE,
+                        RasterState::new(CullMode::None, FrontFace::CounterClockwise),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .id();
+            (shader.id(), compute, render)
+        }
+        let table = ResourceTable::new();
+        let mirror = ResourceTable::new();
+        let (shader, compute, render) = programs(&table, "// initial module");
+        let check = |count| {
+            let snapshot = table.abi_snapshot().unwrap();
+            assert_eq!(&*snapshot, uncached_snapshot(&table));
+            mirror.sync_abi_snapshot(&snapshot).unwrap();
+            let cache = table.abi.encoded_programs.borrow();
+            for rows in [&cache.shaders, &cache.compute, &cache.render] {
+                assert_eq!(rows.rows.len(), 1);
+                assert_eq!(rows.encodes, count);
+            }
+        };
+        check(1);
+        // A buffer-only metadata change cannot re-encode unchanged programs.
+        table
+            .define_buffer(BufferDesc::new(32, BufferUsage::COPY_DST).unwrap())
+            .unwrap();
+        check(1);
+        table.release_programmable_render_pipeline(render).unwrap();
+        table.release_compute_pipeline(compute).unwrap();
+        table.release_shader_module(shader).unwrap();
+        check(2);
+        // Reusing a vacant slot keeps its generation: active state is also
+        // part of the cache key, so the vacancy encoding cannot be reused.
+        let (replacement, compute, render) = programs(&table, "// replacement module");
+        assert_ne!(replacement, shader);
+        check(3);
+        // A release and reuse can also happen between snapshots, so the cache
+        // must notice the new generation even though both rows are active.
+        table.release_programmable_render_pipeline(render).unwrap();
+        table.release_compute_pipeline(compute).unwrap();
+        table.release_shader_module(replacement).unwrap();
+        let (next, _, _) = programs(&table, "// next generation");
+        assert_ne!(next, replacement);
+        check(4);
+    }
+
+    fn cache_counters(table: &ResourceTable) -> (u64, u64) {
+        let caches = table.abi.accepted_rows.borrow();
+        let hits = [
+            &caches.textures,
+            &caches.buffers,
+            &caches.shader_modules,
+            &caches.bind_groups,
+            &caches.compute_pipelines,
+            &caches.programmable_pipelines,
+        ]
+        .into_iter()
+        .map(RowCache::hits)
+        .sum();
+        let fallbacks = [
+            &caches.textures,
+            &caches.buffers,
+            &caches.shader_modules,
+            &caches.bind_groups,
+            &caches.compute_pipelines,
+            &caches.programmable_pipelines,
+        ]
+        .into_iter()
+        .map(RowCache::fallback_encodes)
+        .sum();
+        (hits, fallbacks)
+    }
+
     #[test]
     fn shared_shader_capacity_roundtrips_and_recycles_beyond_256_slots() {
         let producer = ResourceTable::new();
@@ -514,5 +853,68 @@ mod capacity_tests {
         consumer.sync_abi_snapshot(&snapshot).unwrap();
         assert!(consumer.shader_module_ref(old).is_err());
         assert!(consumer.abi_shader_module(300).is_ok());
+    }
+
+    #[test]
+    fn accepted_rows_use_cached_bytes_and_reject_same_generation_tampering() {
+        let producer = ResourceTable::new();
+        producer
+            .define_shader_module(
+                ShaderModuleDesc::wgsl("@compute @workgroup_size(1) fn main() {}".into()).unwrap(),
+            )
+            .unwrap();
+        let snapshot = producer.abi_snapshot().unwrap().to_vec();
+        let consumer = ResourceTable::new();
+
+        consumer.sync_abi_snapshot(&snapshot).unwrap();
+        assert_eq!(cache_counters(&consumer), (0, 0));
+        consumer.sync_abi_snapshot(&snapshot).unwrap();
+        assert_eq!(cache_counters(&consumer), (1, 0));
+
+        let mut tampered = snapshot;
+        // Four empty categories precede the shader count, row length and
+        // generation. This bit is inside the immutable WGSL source payload.
+        tampered[11] ^= 1;
+        assert_eq!(
+            consumer.sync_abi_snapshot(&tampered),
+            Err(Error::InvalidDescriptor)
+        );
+        assert_eq!(cache_counters(&consumer).1, 0);
+    }
+
+    #[test]
+    fn generation_reuse_replaces_cached_row_before_fast_path() {
+        let producer = ResourceTable::new();
+        let original = producer
+            .define_shader_module(
+                ShaderModuleDesc::wgsl("@compute @workgroup_size(1) fn main() {}".into()).unwrap(),
+            )
+            .unwrap()
+            .id();
+        let consumer = ResourceTable::new();
+        consumer
+            .sync_abi_snapshot(&producer.abi_snapshot().unwrap())
+            .unwrap();
+        let old = consumer.abi_shader_module(0).unwrap().id();
+
+        producer.release_shader_module(original).unwrap();
+        consumer
+            .sync_abi_snapshot(&producer.abi_snapshot().unwrap())
+            .unwrap();
+        assert!(consumer.shader_module_ref(old).is_err());
+
+        producer
+            .define_shader_module(
+                ShaderModuleDesc::wgsl("@compute @workgroup_size(2) fn main() {}".into()).unwrap(),
+            )
+            .unwrap();
+        let replacement = producer.abi_snapshot().unwrap().to_vec();
+        consumer.sync_abi_snapshot(&replacement).unwrap();
+        let current = consumer.abi_shader_module(0).unwrap().id();
+        assert_ne!(current, old);
+        assert!(consumer.shader_module_ref(current).is_ok());
+
+        consumer.sync_abi_snapshot(&replacement).unwrap();
+        assert_eq!(cache_counters(&consumer), (1, 0));
     }
 }

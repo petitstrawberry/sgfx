@@ -6,6 +6,10 @@ use alloc::{collections::VecDeque, vec::Vec};
 
 pub(crate) const MAX_SUBMISSIONS: usize = 16;
 pub(crate) const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+// Large initialized buffers include their bytes in the command stream. Admit a
+// bounded oversize stream exclusively, without weakening ordinary backpressure
+// or dispatching a prefix before validation and ownership are complete.
+pub(crate) const MAX_STREAM_BYTES: usize = 512 * 1024 * 1024;
 const MAX_NATIVE_IN_FLIGHT: usize = 16;
 
 pub(crate) enum DispatchError<E> {
@@ -39,13 +43,39 @@ pub(crate) trait Transport {
     fn complete(&self, signal: &Self::Signal, result: Result<(), Self::Error>);
 }
 
-struct Job<T: Transport> {
+pub(crate) struct Job<T: Transport> {
     chunks: Vec<T::Chunk>,
     owner: T::Owner,
-    signal: T::Signal,
+    pub(crate) signal: T::Signal,
     next: usize,
     receipts: VecDeque<T::Receipt>,
-    bytes: usize,
+    pub(crate) bytes: usize,
+}
+
+impl<T: Transport> Job<T> {
+    pub(crate) fn prepare(
+        chunks: Vec<T::Chunk>,
+        owner: T::Owner,
+        signal: T::Signal,
+    ) -> Result<Self, AdmissionError<T::Error>> {
+        let bytes = chunks
+            .iter()
+            .try_fold(0usize, |size, chunk| size.checked_add(T::size(chunk)))
+            .filter(|size| *size <= MAX_STREAM_BYTES)
+            .ok_or(AdmissionError::TooLarge)?;
+        let mut receipts = VecDeque::new();
+        receipts
+            .try_reserve(chunks.len().min(MAX_NATIVE_IN_FLIGHT))
+            .map_err(|_| AdmissionError::OutOfMemory)?;
+        Ok(Self {
+            chunks,
+            owner,
+            signal,
+            next: 0,
+            receipts,
+            bytes,
+        })
+    }
 }
 
 pub(crate) struct Scheduler<T: Transport> {
@@ -79,6 +109,12 @@ impl<T: Transport> Scheduler<T> {
         self.jobs.back().map(|job| &job.signal)
     }
 
+    pub(crate) fn reserve_admission(&mut self) -> Result<(), AdmissionError<T::Error>> {
+        self.jobs
+            .try_reserve(MAX_SUBMISSIONS)
+            .map_err(|_| AdmissionError::OutOfMemory)
+    }
+
     // All fallible allocation precedes publication. No transport operation is
     // performed here, even when hardware currently has no free descriptors.
     pub(crate) fn enqueue(
@@ -87,34 +123,25 @@ impl<T: Transport> Scheduler<T> {
         owner: T::Owner,
         signal: T::Signal,
     ) -> Result<(), AdmissionError<T::Error>> {
+        self.enqueue_prepared(Job::prepare(chunks, owner, signal)?)
+    }
+
+    pub(crate) fn enqueue_prepared(&mut self, job: Job<T>) -> Result<(), AdmissionError<T::Error>> {
         if let Some(error) = self.failure {
             return Err(AdmissionError::Failed(error));
         }
-        let bytes = chunks
-            .iter()
-            .try_fold(0usize, |size, chunk| size.checked_add(T::size(chunk)))
-            .filter(|size| *size <= MAX_PENDING_BYTES)
-            .ok_or(AdmissionError::TooLarge)?;
+        let bytes = job.bytes;
         if self.jobs.len() == MAX_SUBMISSIONS
-            || self.bytes.saturating_add(bytes) > MAX_PENDING_BYTES
+            || (!self.jobs.is_empty()
+                && (bytes > MAX_PENDING_BYTES
+                    || self.bytes.saturating_add(bytes) > MAX_PENDING_BYTES))
         {
             return Err(AdmissionError::Busy);
         }
-        let mut receipts = VecDeque::new();
-        receipts
-            .try_reserve(chunks.len().min(MAX_NATIVE_IN_FLIGHT))
-            .map_err(|_| AdmissionError::OutOfMemory)?;
         self.jobs
             .try_reserve(1)
             .map_err(|_| AdmissionError::OutOfMemory)?;
-        self.jobs.push_back(Job {
-            chunks,
-            owner,
-            signal,
-            next: 0,
-            receipts,
-            bytes,
-        });
+        self.jobs.push_back(job);
         self.bytes += bytes;
         Ok(())
     }
@@ -210,7 +237,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         accepted: RefCell<Vec<u32>>,
-        fences: RefCell<Vec<Rc<Cell<Option<Result<(), u32>>>>>>,
+        fences: RefCell<Vec<Signal>>,
         busy: Cell<bool>,
         ready: Cell<bool>,
         fail_submit: Cell<bool>,
@@ -339,7 +366,7 @@ mod tests {
         let signal = Rc::new(Cell::new(None));
         assert_eq!(
             queue.enqueue(
-                alloc::vec![(1, MAX_PENDING_BYTES + 1)],
+                alloc::vec![(1, MAX_STREAM_BYTES + 1)],
                 Rc::new(()),
                 Rc::clone(&signal)
             ),
@@ -358,6 +385,41 @@ mod tests {
             queue.enqueue(alloc::vec![], Rc::new(()), signal),
             Err(AdmissionError::Busy)
         );
+    }
+
+    #[test]
+    fn large_stream_waits_for_exclusive_admission_and_retires_every_chunk() {
+        let native = ready();
+        let mut queue = Scheduler::new();
+        let prior = add(&mut queue, alloc::vec![(0, 1)]);
+        let signal = Rc::new(Cell::new(None));
+        let chunks = || alloc::vec![(1, MAX_PENDING_BYTES), (2, 65536)];
+        assert_eq!(
+            queue.enqueue(chunks(), Rc::new(()), Rc::clone(&signal)),
+            Err(AdmissionError::Busy)
+        );
+        assert!(native.accepted.borrow().is_empty());
+        queue.advance(&native);
+        native.fences.borrow()[0].set(Some(Ok(())));
+        queue.advance(&native);
+        assert_eq!(prior.get(), Some(Ok(())));
+        queue
+            .enqueue(chunks(), Rc::new(()), Rc::clone(&signal))
+            .unwrap();
+        assert_eq!(
+            queue.enqueue(alloc::vec![], Rc::new(()), Rc::new(Cell::new(None))),
+            Err(AdmissionError::Busy)
+        );
+        queue.advance(&native);
+        assert_eq!(&*native.accepted.borrow(), &[0, 1, 2]);
+        native.fences.borrow()[2].set(Some(Ok(())));
+        queue.advance(&native);
+        assert_eq!(signal.get(), None);
+        native.fences.borrow()[1].set(Some(Ok(())));
+        queue.advance(&native);
+        assert_eq!(signal.get(), Some(Ok(())));
+        assert!(queue.is_empty());
+        add(&mut queue, alloc::vec![(3, MAX_PENDING_BYTES)]);
     }
 
     #[test]

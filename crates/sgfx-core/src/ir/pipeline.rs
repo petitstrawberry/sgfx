@@ -109,6 +109,22 @@ pub enum VertexFormat {
     Uint16x2,
     /// One 32-bit floating-point component.
     Float32,
+    /// Four normalized signed 8-bit components.
+    Snorm8x4,
+    /// Two signed 16-bit integer components.
+    Sint16x2,
+    /// 2 widened 32-bit integer components.
+    Uint32x2,
+    /// 3 widened 32-bit integer components.
+    Uint32x3,
+    /// 4 widened 32-bit integer components.
+    Uint32x4,
+    /// 2 widened 32-bit integer components.
+    Sint32x2,
+    /// 3 widened 32-bit integer components.
+    Sint32x3,
+    /// 4 widened 32-bit integer components.
+    Sint32x4,
 }
 
 impl VertexFormat {
@@ -119,16 +135,18 @@ impl VertexFormat {
     /// The packed format size in bytes.
     pub const fn byte_size(self) -> u32 {
         match self {
-            Self::Float32x2 => 8,
-            Self::Float32x3 => 12,
-            Self::Float32x4 => 16,
+            Self::Float32x2 | Self::Uint32x2 | Self::Sint32x2 => 8,
+            Self::Float32x3 | Self::Uint32x3 | Self::Sint32x3 => 12,
+            Self::Float32x4 | Self::Uint32x4 | Self::Sint32x4 => 16,
             Self::Float32
             | Self::Unorm8x4
             | Self::Sint32
             | Self::Uint32
             | Self::Float16x2
             | Self::Snorm10_10_10_2
-            | Self::Uint16x2 => 4,
+            | Self::Uint16x2
+            | Self::Snorm8x4
+            | Self::Sint16x2 => 4,
             Self::Float16x4 | Self::Sint16x4 => 8,
         }
     }
@@ -198,6 +216,7 @@ pub struct VertexBufferLayout {
     stride: u32,
     attributes: Vec<VertexAttribute>,
     step_mode: VertexStepMode,
+    instance_divisor: u32,
 }
 
 impl VertexBufferLayout {
@@ -232,13 +251,30 @@ impl VertexBufferLayout {
             stride,
             attributes,
             step_mode: VertexStepMode::Vertex,
+            instance_divisor: 1,
         })
     }
 
     /// Select per-vertex or per-instance fetch. Instance stepping uses divisor one.
     pub fn with_step_mode(mut self, step_mode: VertexStepMode) -> Self {
         self.step_mode = step_mode;
+        if step_mode == VertexStepMode::Vertex {
+            self.instance_divisor = 1;
+        }
         self
+    }
+
+    /// Set the number of instances sharing each record. Zero divisors are unsupported.
+    pub fn with_instance_divisor(mut self, divisor: u32) -> Result<Self> {
+        if divisor == 0 || (self.step_mode == VertexStepMode::Vertex && divisor != 1) {
+            return Err(Error::InvalidDescriptor);
+        }
+        self.instance_divisor = divisor;
+        Ok(self)
+    }
+    /// Number of instances sharing each per-instance attribute record.
+    pub const fn instance_divisor(&self) -> u32 {
+        self.instance_divisor
     }
 
     /// Return the index used to advance records in this binding.
@@ -275,6 +311,8 @@ pub enum PrimitiveTopology {
     LineList,
     /// Assemble connected one-pixel lines between consecutive vertices.
     LineStrip,
+    /// Assemble individual points.
+    PointList,
 }
 
 impl PrimitiveTopology {
@@ -284,6 +322,7 @@ impl PrimitiveTopology {
             Self::TriangleStrip | Self::TriangleFan => count >= 3,
             Self::LineList => count != 0 && count.is_multiple_of(2),
             Self::LineStrip => count >= 2,
+            Self::PointList => count != 0,
         }
     }
 }
@@ -407,6 +446,10 @@ pub enum BlendOp {
     Subtract,
     /// Subtract source from destination.
     ReverseSubtract,
+    /// Take the minimum unscaled source and destination.
+    Min,
+    /// Take the maximum unscaled source and destination.
+    Max,
 }
 
 /// Blend factors and operation for color or alpha.
@@ -545,6 +588,7 @@ pub enum FrontFace {
 /// Rasterization state for one render pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RasterState {
+    bias_bits: [u32; 2],
     cull_mode: CullMode,
     front_face: FrontFace,
 }
@@ -563,7 +607,30 @@ impl RasterState {
         Self {
             cull_mode,
             front_face,
+            bias_bits: [0; 2],
         }
+    }
+    /// Set finite constant and slope depth bias, with no clamp.
+    pub fn with_depth_bias(mut self, constant: f32, slope: f32) -> Result<Self> {
+        if !constant.is_finite() || !slope.is_finite() {
+            return Err(Error::InvalidValue);
+        }
+        self.bias_bits = [
+            if constant == 0.0 {
+                0
+            } else {
+                constant.to_bits()
+            },
+            if slope == 0.0 { 0 } else { slope.to_bits() },
+        ];
+        Ok(self)
+    }
+    /// Return constant and slope depth bias.
+    pub const fn depth_bias(self) -> [f32; 2] {
+        [
+            f32::from_bits(self.bias_bits[0]),
+            f32::from_bits(self.bias_bits[1]),
+        ]
     }
     /// Return the face-culling mode.
     ///
@@ -748,6 +815,11 @@ impl RenderPipelineDesc {
     ///
     /// # Returns
     /// The configured raster state.
+    /// Replace the immutable face, winding and depth-bias state.
+    pub fn with_raster_state(mut self, raster: RasterState) -> Self {
+        self.raster = raster;
+        self
+    }
     pub const fn raster(&self) -> RasterState {
         self.raster
     }

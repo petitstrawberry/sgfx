@@ -412,6 +412,8 @@ pub enum Command<'r, 'data> {
     SetSampler(SamplerRef<'r>),
     /// Bind transform and color uniforms for subsequent draws.
     SetUniforms(DrawUniforms),
+    /// Logical index within a multi-draw operation. Defaults to zero.
+    SetDrawIndex(u32),
     /// Set or reset the scissor for subsequent draws.
     SetScissor(Option<PixelRect>),
     /// Set the viewport for subsequent draws.
@@ -471,6 +473,8 @@ pub enum Command<'r, 'data> {
 pub struct CommandEncoder<'r, 'data> {
     resources: &'r ResourceTable,
     commands: CommandStorage<'r, 'data>,
+    command_count: usize,
+    validation_only: bool,
     pass_open: bool,
     pending_writes: Vec<PendingWrite>,
     announced_accesses: Vec<AnnouncedAccess>,
@@ -492,9 +496,20 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             commands: Vec::new(),
             #[cfg(feature = "backend-abi")]
             commands: CommandStorage::new(resources),
+            command_count: 0,
+            validation_only: false,
             pass_open: false,
             pending_writes: Vec::new(),
             announced_accesses: Vec::new(),
+        }
+    }
+
+    // Replay validation uses the same state machine without constructing an
+    // unused command Vec or encoding a second ABI stream before batch splitting.
+    pub(super) fn for_validation(resources: &'r ResourceTable) -> Self {
+        Self {
+            validation_only: true,
+            ..Self::new(resources)
         }
     }
 
@@ -837,12 +852,14 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
     }
     fn push(&mut self, command: Command<'r, 'data>) -> Result<()> {
         let reserved_end_slot = usize::from(self.pass_open);
-        if self.commands.len() >= MAX_COMMANDS - reserved_end_slot {
+        if self.command_count >= MAX_COMMANDS - reserved_end_slot {
             return Err(Error::CommandLimitExceeded);
         }
-        self.commands
-            .try_reserve(1)
-            .map_err(|_| Error::OutOfMemory)?;
+        if !self.validation_only {
+            self.commands
+                .try_reserve(1)
+                .map_err(|_| Error::OutOfMemory)?;
+        }
         match &command {
             Command::WriteBuffer { buffer, .. } => {
                 self.consume_access(PendingWrite::Buffer(buffer.id()))
@@ -876,24 +893,33 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
             }
             _ => {}
         }
-        self.commands.push(command);
+        self.command_count += 1;
+        if !self.validation_only {
+            self.commands.push(command);
+        }
         Ok(())
     }
     fn reserve_pass_begin(&self) -> Result<()> {
-        if self.commands.len() > MAX_COMMANDS - 2 {
+        if self.command_count > MAX_COMMANDS - 2 {
             Err(Error::CommandLimitExceeded)
         } else {
             Ok(())
         }
     }
     fn push_end_render_pass(&mut self) -> Result<()> {
-        if self.commands.len() >= MAX_COMMANDS {
+        self.push_pass_end(Command::EndRenderPass)
+    }
+    fn push_pass_end(&mut self, command: Command<'r, 'data>) -> Result<()> {
+        if self.command_count >= MAX_COMMANDS {
             return Err(Error::CommandLimitExceeded);
         }
-        self.commands
-            .try_reserve(1)
-            .map_err(|_| Error::OutOfMemory)?;
-        self.commands.push(Command::EndRenderPass);
+        if !self.validation_only {
+            self.commands
+                .try_reserve(1)
+                .map_err(|_| Error::OutOfMemory)?;
+            self.commands.push(command);
+        }
+        self.command_count += 1;
         Ok(())
     }
     fn require_texture_usage(usage: TextureUsage, required: TextureUsage) -> Result<()> {
@@ -1153,6 +1179,11 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
     ///
     /// # Returns
     /// Success, or an allocation/capacity error.
+    /// Select the logical multi-draw index for following draws.
+    pub fn set_draw_index(&mut self, index: u32) -> Result<()> {
+        self.encoder.push(Command::SetDrawIndex(index))
+    }
+
     pub fn set_uniforms(&mut self, uniforms: DrawUniforms) -> Result<()> {
         if self.uniforms.is_some_and(|current| {
             current.transform().columns().map(f32::to_bits)

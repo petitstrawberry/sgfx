@@ -281,8 +281,8 @@ non-transactional [backend execution failures](reference.md#execution-and-comple
 
 | Bound | Value | Scope |
 | --- | --- | --- |
-| `MAX_TEXTURES` | 1,024 | Per resource table. |
-| `MAX_BUFFERS` | 1,024 | Per resource table. |
+| `MAX_TEXTURES` | 8,192 | Per resource table. |
+| `MAX_BUFFERS` | 4,096 | Per resource table. |
 | `MAX_SAMPLERS` | 256 | Per resource table. |
 | `MAX_RENDER_PIPELINES` | 256 | Per resource table. |
 | `MAX_BIND_GROUP_DEFINITIONS` | 4,096 | Immutable bind-group definitions per resource table. |
@@ -507,6 +507,13 @@ to the copy operation. WGPU implements accepted dependencies with
 its ordered command stream and automatic resource transitions.
 
 ### Owned recording and the implemented subset
+
+Scarlet VirGL optionally supports compute-buffer streams after a real native
+dispatch/readback capability probe. This bounded profile executes compute-only
+streams synchronously, including buffer uploads/copies and retired SSBO writes.
+Shared memory, atomics, images and mixed rendering/compute streams are outside
+the native profile. See [native compute limits](vulkan-sgfx.md) for its limits
+and host requirements. WGPU retains its broader compute implementation.
 
 `OwnedCommandBuffer::new(Vec<OwnedCommand>)` retains persistent IDs and owns upload
 bytes without borrowing a resource table. Its source commands are inspectable and

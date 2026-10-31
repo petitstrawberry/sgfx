@@ -40,7 +40,8 @@ Rust backend/facade interfaces, feature composition, and unfinished review.
 The IR includes shader modules, programmable render/compute pipelines, resource
 bind groups, buffer copies and explicit same-queue resource dependencies. The
 WGPU executes graphics and compute from this subset. Scarlet VirGL executes the
-bounded programmable graphics subset and rejects compute; Adreno currently
+bounded programmable graphics subset and optionally compute-buffer streams when
+native dispatch and readback pass its host capability probe; Adreno currently
 rejects programmable execution. See the [IR reference](docs/ir-reference.md) and
 [Vulkan frontend scope](docs/vulkan-sgfx.md) for the supported operations.
 

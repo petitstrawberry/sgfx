@@ -88,6 +88,12 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         self.ensure_outside_pass()?;
         let mut announced = Vec::new();
         match barrier {
+            ResourceBarrier::Global => {
+                self.push(Command::ResourceBarrier(barrier))?;
+                self.pending_writes.clear();
+                self.announced_accesses.clear();
+                return Ok(());
+            }
             ResourceBarrier::Buffer {
                 buffer,
                 before,
@@ -468,14 +474,7 @@ impl<'encoder, 'r, 'data> ComputePassEncoder<'encoder, 'r, 'data> {
     }
     /// End this compute pass, releasing the encoder for barriers or other passes.
     pub fn end(self) -> Result<()> {
-        if self.encoder.commands.len() >= MAX_COMMANDS {
-            return Err(Error::CommandLimitExceeded);
-        }
-        self.encoder
-            .commands
-            .try_reserve(1)
-            .map_err(|_| Error::OutOfMemory)?;
-        self.encoder.commands.push(Command::EndComputePass);
+        self.encoder.push_pass_end(Command::EndComputePass)?;
         self.encoder.pass_open = false;
         Ok(())
     }
@@ -637,10 +636,6 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             .checked_add(instances)
             .ok_or(Error::Overflow)?;
         let desc = self.validate_programmable_count(count)?;
-        let last_instance = first_instance
-            .checked_add(instances)
-            .and_then(|end| end.checked_sub(1))
-            .ok_or(Error::Overflow)?;
         let last_vertex = first
             .checked_add(count)
             .and_then(|end| end.checked_sub(1))
@@ -667,7 +662,9 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
                 .unwrap_or(0);
             let last = match layout.step_mode() {
                 crate::ir::VertexStepMode::Vertex => last_vertex,
-                crate::ir::VertexStepMode::Instance => last_instance,
+                crate::ir::VertexStepMode::Instance => first_instance
+                    .checked_add((instances - 1) / layout.instance_divisor())
+                    .ok_or(Error::Overflow)?,
             };
             let bytes = u64::from(last)
                 .checked_mul(u64::from(layout.stride()))
@@ -733,8 +730,7 @@ impl<'encoder, 'r, 'data> RenderPassEncoder<'encoder, 'r, 'data> {
             let last = match layout.step_mode() {
                 crate::ir::VertexStepMode::Vertex => 0, // Opaque indices are validated by the backend.
                 crate::ir::VertexStepMode::Instance => first_instance
-                    .checked_add(instances)
-                    .and_then(|end| end.checked_sub(1))
+                    .checked_add((instances - 1) / layout.instance_divisor())
                     .ok_or(Error::Overflow)?,
             };
             let bytes = u64::from(last)

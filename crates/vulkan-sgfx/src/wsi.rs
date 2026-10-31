@@ -15,7 +15,9 @@ use std::{
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
 
-use crate::api::{next_id, signal_acquire_sync, wait_queue_semaphores, with_device, with_queue};
+#[cfg(target_os = "macos")]
+use crate::api::wait_queue_semaphores;
+use crate::api::{next_id, signal_acquire_sync, with_device, with_queue};
 
 #[cfg(target_os = "scarlet")]
 type PlatformSurface = std::sync::Arc<platform_wsi::SurfaceWindow>;
@@ -320,12 +322,16 @@ pub(crate) unsafe extern "system" fn get_physical_device_surface_present_modes(
 }
 
 pub(crate) struct Swapchain {
+    #[cfg(feature = "frame-capture")]
+    capture: crate::frame_capture::Capture,
     surface: vk::SurfaceKHR,
     format: vk::Format,
     extent: vk::Extent2D,
     images: Vec<vk::Image>,
     physical_images: Vec<sgfx::driver::PresentationImage>,
     acquired: Vec<bool>,
+    pending_present: Vec<bool>,
+    present_error: Option<vk::Result>,
     next_image: usize,
     #[cfg(target_os = "macos")]
     window: sgfx::driver::WindowContext,
@@ -338,6 +344,10 @@ pub(crate) struct Swapchain {
 
 fn swapchain_usage(usage: vk::ImageUsageFlags) -> ir::TextureUsage {
     let mut result = ir::TextureUsage::RENDER_ATTACHMENT | ir::TextureUsage::PRESENT;
+    #[cfg(feature = "frame-capture")]
+    if crate::frame_capture::enabled() {
+        result |= ir::TextureUsage::COPY_SRC;
+    }
     // Presentation images already carry a sampled backend allocation and a
     // mapped sampler view. Preserve this usage in the logical IR descriptor
     // so Kopper can sample or read back a previous swapchain image.
@@ -565,10 +575,14 @@ pub(crate) unsafe extern "system" fn create_swapchain(
         runtime.resources.swapchains.insert(
             swapchain,
             Swapchain {
+                #[cfg(feature = "frame-capture")]
+                capture: Default::default(),
                 surface: surface_handle,
                 format,
                 extent,
                 acquired: vec![false; images.len()],
+                pending_present: vec![false; images.len()],
+                present_error: None,
                 images,
                 physical_images,
                 next_image: 0,
@@ -641,6 +655,7 @@ pub(crate) unsafe extern "system" fn acquire_next_image(
     fence: vk::Fence,
     output: *mut u32,
 ) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("acquire", "acquire_image");
     if output.is_null() {
         return INVALID;
     }
@@ -653,6 +668,9 @@ pub(crate) unsafe extern "system" fn acquire_next_image(
                 .swapchains
                 .get_mut(&swapchain)
                 .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+            if let Some(error) = swapchain.present_error {
+                return Err(error);
+            }
             #[cfg(any(
                 target_os = "scarlet",
                 all(target_os = "linux", feature = "scarlet-wsi")
@@ -721,6 +739,7 @@ pub(crate) unsafe extern "system" fn queue_present(
     queue: vk::Queue,
     info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("present", "queue_present");
     if info.is_null() {
         return INVALID;
     }
@@ -736,92 +755,236 @@ pub(crate) unsafe extern "system" fn queue_present(
     {
         return UNSUPPORTED;
     }
-    let waits = if info.wait_semaphore_count == 0 {
-        Vec::new()
-    } else {
-        unsafe {
-            std::slice::from_raw_parts(info.p_wait_semaphores, info.wait_semaphore_count as usize)
-        }
-        .to_vec()
-    };
-    let swapchains =
-        unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) }
-            .to_vec();
-    let indices =
-        unsafe { std::slice::from_raw_parts(info.p_image_indices, info.swapchain_count as usize) }
-            .to_vec();
-    if let Err(error) = wait_queue_semaphores(queue, &waits) {
-        return error;
-    }
     #[cfg(any(
         target_os = "scarlet",
         all(target_os = "linux", feature = "scarlet-wsi")
     ))]
     {
-        let result = unsafe { crate::api::queue_wait_idle(queue) };
-        if result != vk::Result::SUCCESS {
-            return result;
+        let mut packet = Presentation {
+            queue,
+            count: info.swapchain_count as usize,
+            images: [(vk::SwapchainKHR::null(), 0); MAX_SWAPCHAIN_IMAGES as usize],
+        };
+        for i in 0..packet.count {
+            packet.images[i] = unsafe { (*info.p_swapchains.add(i), *info.p_image_indices.add(i)) };
         }
-    }
-    let mut results = Vec::with_capacity(swapchains.len());
-    for (&handle, &index) in swapchains.iter().zip(&indices) {
-        let result = loop {
-            let result = with_queue(queue, move |runtime| {
-                let swapchain = runtime
-                    .resources
-                    .swapchains
-                    .get_mut(&handle)
-                    .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
-                let index = index as usize;
-                if index >= swapchain.images.len() || !swapchain.acquired[index] {
-                    return Err(INVALID);
-                }
-                debug_assert_eq!(
-                    crate::images::texture_format(swapchain.format),
-                    Some(swapchain.physical_images[index].image_format())
-                );
-                debug_assert_eq!(
-                    swapchain.extent,
-                    vk::Extent2D {
-                        width: swapchain.physical_images[index].width(),
-                        height: swapchain.physical_images[index].height(),
-                    }
-                );
-                #[cfg(target_os = "macos")]
-                let result = swapchain
-                    .window
-                    .present(&swapchain.physical_images[index])
-                    .map_err(present_error);
-                #[cfg(any(
-                    target_os = "scarlet",
-                    all(target_os = "linux", feature = "scarlet-wsi")
-                ))]
-                let result = swapchain.window.present(index);
-                if result.is_ok() {
-                    swapchain.acquired[index] = false;
-                }
-                result
-            });
-            if result == Err(vk::Result::NOT_READY) {
-                // FIFO waits for the Wayland frame callback on the calling
-                // thread. Release the worker between checks so other driver
-                // calls can still finish and query fences while it waits.
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            } else {
-                break result;
+        // Packet validation and semaphore retention do not need the device
+        // resource worker. Keep queue acceptance independent of an earlier
+        // backend submission; image validation runs in FIFO order on the worker.
+        for (position, &(handle, _)) in packet.images[..packet.count].iter().enumerate() {
+            if packet.images[..position]
+                .iter()
+                .any(|(previous, _)| *previous == handle)
+            {
+                return INVALID;
+            }
+        }
+        let waits = if info.wait_semaphore_count == 0 {
+            &[][..]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    info.p_wait_semaphores,
+                    info.wait_semaphore_count as usize,
+                )
             }
         };
-        results.push(result.err().unwrap_or(vk::Result::SUCCESS));
+        let result = crate::api::enqueue_presentation(queue, waits, packet);
+        let result = result.err().unwrap_or(vk::Result::SUCCESS);
+        if !info.p_results.is_null() {
+            for i in 0..packet.count {
+                unsafe { *info.p_results.add(i) = result };
+            }
+        }
+        result
     }
-    if !info.p_results.is_null() {
-        for (index, result) in results.iter().enumerate() {
-            unsafe { *info.p_results.add(index) = *result };
+    #[cfg(not(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    )))]
+    {
+        let waits = if info.wait_semaphore_count == 0 {
+            Vec::new()
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    info.p_wait_semaphores,
+                    info.wait_semaphore_count as usize,
+                )
+            }
+            .to_vec()
+        };
+        let swapchains =
+            unsafe { std::slice::from_raw_parts(info.p_swapchains, info.swapchain_count as usize) }
+                .to_vec();
+        let indices = unsafe {
+            std::slice::from_raw_parts(info.p_image_indices, info.swapchain_count as usize)
+        }
+        .to_vec();
+        let frame_wait = crate::frame_profile::Span::new("wait", "present_semaphores");
+        if let Err(error) = wait_queue_semaphores(queue, &waits) {
+            return error;
+        }
+        drop(frame_wait);
+        #[cfg(any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        ))]
+        if waits.is_empty() {
+            // Wait semaphores already establish completion of the image writes.
+            // Draining the whole queue after consuming them also waits for later,
+            // unrelated uploads. Retain the conservative drain only without waits.
+            let result = unsafe { crate::api::queue_wait_idle(queue) };
+            if result != vk::Result::SUCCESS {
+                return result;
+            }
+        }
+        let mut results = Vec::with_capacity(swapchains.len());
+        for (&handle, &index) in swapchains.iter().zip(&indices) {
+            let result = present_one(queue, handle, index);
+            results.push(result.err().unwrap_or(vk::Result::SUCCESS));
+        }
+        if !info.p_results.is_null() {
+            for (index, result) in results.iter().enumerate() {
+                unsafe { *info.p_results.add(index) = *result };
+            }
+        }
+        results
+            .into_iter()
+            .find(|result| *result != vk::Result::SUCCESS)
+            .unwrap_or(vk::Result::SUCCESS)
+    }
+}
+
+fn present_one(queue: vk::Queue, handle: vk::SwapchainKHR, index: u32) -> Result<(), vk::Result> {
+    loop {
+        let result = with_queue(queue, move |runtime| {
+            let swapchain = runtime
+                .resources
+                .swapchains
+                .get_mut(&handle)
+                .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+            let index = index as usize;
+            if index >= swapchain.images.len() || !swapchain.acquired[index] {
+                return Err(INVALID);
+            }
+            debug_assert_eq!(
+                crate::images::texture_format(swapchain.format),
+                Some(swapchain.physical_images[index].image_format())
+            );
+            debug_assert_eq!(
+                swapchain.extent,
+                vk::Extent2D {
+                    width: swapchain.physical_images[index].width(),
+                    height: swapchain.physical_images[index].height(),
+                }
+            );
+            #[cfg(feature = "frame-capture")]
+            {
+                let image = runtime
+                    .resources
+                    .images
+                    .get(&swapchain.images[index])
+                    .ok_or(INVALID)?
+                    .id;
+                swapchain.capture.presented(
+                    &runtime.queue,
+                    &mut runtime.cache,
+                    image,
+                    swapchain.format,
+                    swapchain.extent,
+                    handle.as_raw(),
+                );
+            }
+            #[cfg(target_os = "macos")]
+            let result = swapchain
+                .window
+                .present(&swapchain.physical_images[index])
+                .map_err(present_error);
+            #[cfg(any(
+                target_os = "scarlet",
+                all(target_os = "linux", feature = "scarlet-wsi")
+            ))]
+            let result = swapchain.window.present(index);
+            if result.is_ok() {
+                swapchain.acquired[index] = false;
+                swapchain.pending_present[index] = false;
+                crate::progress::presented(handle.as_raw());
+            }
+            result
+        });
+        if result == Err(vk::Result::NOT_READY) {
+            // FIFO waits for the Wayland frame callback on the calling
+            // thread. Release the worker between checks so other driver
+            // calls can still finish and query fences while it waits.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        } else {
+            break result;
         }
     }
-    results
-        .into_iter()
-        .find(|result| *result != vk::Result::SUCCESS)
-        .unwrap_or(vk::Result::SUCCESS)
+}
+
+#[cfg(any(
+    target_os = "scarlet",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
+#[derive(Clone, Copy)]
+pub(crate) struct Presentation {
+    queue: vk::Queue,
+    count: usize,
+    images: [(vk::SwapchainKHR, u32); MAX_SWAPCHAIN_IMAGES as usize],
+}
+#[cfg(any(
+    target_os = "scarlet",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
+pub(crate) fn execute_presentation(packet: Presentation) -> Result<(), vk::Result> {
+    with_queue(packet.queue, move |runtime| {
+        for &(handle, index) in &packet.images[..packet.count] {
+            let swapchain = runtime
+                .resources
+                .swapchains
+                .get_mut(&handle)
+                .ok_or(vk::Result::ERROR_OUT_OF_DATE_KHR)?;
+            if let Some(error) = swapchain.present_error {
+                return Err(error);
+            }
+            swapchain.window.dispatch()?;
+            let i = index as usize;
+            if i >= swapchain.images.len() || !swapchain.acquired[i] || swapchain.pending_present[i]
+            {
+                return Err(INVALID);
+            }
+        }
+        for &(handle, index) in &packet.images[..packet.count] {
+            runtime
+                .resources
+                .swapchains
+                .get_mut(&handle)
+                .ok_or(INVALID)?
+                .pending_present[index as usize] = true;
+        }
+        Ok(())
+    })?;
+
+    for &(handle, index) in &packet.images[..packet.count] {
+        present_one(packet.queue, handle, index)?;
+    }
+    Ok(())
+}
+#[cfg(any(
+    target_os = "scarlet",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
+pub(crate) fn fail_presentation(packet: Presentation, error: vk::Result) {
+    let _ = with_queue(packet.queue, move |runtime| {
+        for &(handle, _) in &packet.images[..packet.count] {
+            if let Some(swapchain) = runtime.resources.swapchains.get_mut(&handle) {
+                swapchain.present_error = Some(error);
+            }
+        }
+        Ok(())
+    });
 }
 
 #[cfg(target_os = "macos")]

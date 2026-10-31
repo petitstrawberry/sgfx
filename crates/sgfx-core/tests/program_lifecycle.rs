@@ -122,6 +122,112 @@ fn foreign_and_repeated_release_do_not_change_live_program_slots() {
 }
 
 #[test]
+fn graphics_reload_overlaps_two_240_pipeline_sets_and_reuses_only_retired_slots() {
+    let table = ResourceTable::new();
+    let module_a = shader(&table, 0);
+    let module_b = shader(&table, 1);
+    let allocate = |module| {
+        (0..240)
+            .map(|_| {
+                table
+                    .define_programmable_render_pipeline(graphics(module))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let old = allocate(module_a);
+    let live = allocate(module_b);
+    assert_eq!(live.last().unwrap().slot(), 479);
+    #[cfg(feature = "backend-abi")]
+    let mirror = ResourceTable::new();
+    #[cfg(feature = "backend-abi")]
+    mirror
+        .sync_abi_snapshot(&table.abi_snapshot().unwrap())
+        .unwrap();
+    for pipeline in &old {
+        table
+            .release_programmable_render_pipeline(pipeline.id())
+            .unwrap();
+    }
+    table.release_shader_module(module_a.id()).unwrap();
+    #[cfg(feature = "backend-abi")]
+    {
+        let snapshot = table.abi_snapshot().unwrap();
+        let (_, _, retired) = mirror.abi_retired_programs(&snapshot).unwrap();
+        assert_eq!(retired.len(), old.len());
+        mirror.sync_abi_snapshot(&snapshot).unwrap();
+    }
+    let replacement_module = shader(&table, 2);
+    let replacements = allocate(replacement_module);
+    for pipeline in &replacements {
+        let retired = old[pipeline.slot()];
+        assert_eq!(pipeline.generation(), retired.generation() + 1);
+        assert!(
+            table
+                .programmable_render_pipeline_ref(retired.id())
+                .is_err()
+        );
+        assert!(table.programmable_render_pipeline_shared(retired).is_err());
+        assert_eq!(
+            table
+                .programmable_render_pipeline_shared(*pipeline)
+                .unwrap()
+                .vertex()
+                .module(),
+            replacement_module.id()
+        );
+    }
+    #[cfg(feature = "backend-abi")]
+    mirror
+        .sync_abi_snapshot(&table.abi_snapshot().unwrap())
+        .unwrap();
+    for pipeline in &live {
+        assert_eq!(
+            table
+                .programmable_render_pipeline_ref(pipeline.id())
+                .unwrap(),
+            *pipeline
+        );
+        assert_eq!(pipeline.generation(), 0);
+        assert_eq!(
+            table
+                .programmable_render_pipeline_shared(*pipeline)
+                .unwrap()
+                .vertex()
+                .module(),
+            module_b.id()
+        );
+        #[cfg(feature = "backend-abi")]
+        assert_eq!(
+            mirror
+                .abi_programmable_render_pipeline(pipeline.slot() as u32)
+                .unwrap()
+                .generation(),
+            0
+        );
+    }
+    #[cfg(feature = "backend-abi")]
+    for pipeline in &replacements {
+        assert_eq!(
+            mirror
+                .abi_programmable_render_pipeline(pipeline.slot() as u32)
+                .unwrap()
+                .generation(),
+            pipeline.generation()
+        );
+    }
+    for pipeline in live.iter().chain(&replacements) {
+        table
+            .release_programmable_render_pipeline(pipeline.id())
+            .unwrap();
+    }
+    table.release_shader_module(module_b.id()).unwrap();
+    table
+        .release_shader_module(replacement_module.id())
+        .unwrap();
+}
+
+#[test]
 fn unreleased_program_categories_enforce_their_declared_live_slot_limits() {
     for kind in 0..3 {
         let table = ResourceTable::new();

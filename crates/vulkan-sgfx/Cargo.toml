@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 default = ["backend-wgpu"]
 backend-wgpu = ["sgfx/backend-wgpu"]
 scarlet-wsi = ["sgfx/scarlet-native-api", "dep:dlmalloc"]
+frame-capture = ["dep:png"]
 cube-demo = ["dep:png", "dep:framebuffer", "naga/wgsl-in"]
 
 [[bin]]
@@ -33,7 +34,8 @@ ash = { version = "0.38", default-features = false, features = ["loaded"] }
 dlmalloc = { version = "0.2.14", features = ["global"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", default-features = false, features = ["std"], optional = true }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", default-features = false, features = ["std"] }
+framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", default-features = false, features = ["std"], optional = true }
 sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-dynamic"] }
 
 [dev-dependencies]

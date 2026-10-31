@@ -50,10 +50,14 @@ pub fn matches_backend_id(backend_id: &[u8]) -> bool {
 pub use sgfx_core::ir;
 
 mod completion;
+#[cfg(all(feature = "std", feature = "programmable"))]
+mod compute;
 mod dispatch;
 mod driver;
 mod ir_execute;
 mod packets;
+#[cfg(feature = "std")]
+mod queries;
 mod scheduler;
 mod virgl;
 
@@ -72,6 +76,9 @@ pub struct Capabilities {
     texture_arrays: bool,
     depth_sampling: bool,
     native_narrow_color: bool,
+    anisotropy_16: bool,
+    depth_transfers: bool,
+    float_color: bool,
 }
 
 impl Capabilities {
@@ -87,6 +94,21 @@ impl Capabilities {
             && info.execution_support & GPU_EXECUTION_SUPPORT_QUEUE != 0;
         Self {
             rendering,
+            float_color: rendering
+                && info
+                    .backend_info_bytes()
+                    .get(16..20)
+                    .is_some_and(|b| u32::from_le_bytes(b.try_into().unwrap()) & 2 != 0),
+            depth_transfers: rendering
+                && info
+                    .backend_info_bytes()
+                    .get(16..20)
+                    .is_some_and(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) & 1 != 0),
+            anisotropy_16: rendering
+                && info.backend_info_bytes().get(12..16).is_some_and(|bytes| {
+                    let bits = u32::from_le_bytes(bytes.try_into().unwrap());
+                    (16.0f32.to_bits()..f32::INFINITY.to_bits()).contains(&bits)
+                }),
             presentation: rendering
                 && info.execution_support & GPU_EXECUTION_SUPPORT_PRESENTATION != 0,
             image_upload: rendering
@@ -103,6 +125,19 @@ impl Capabilities {
             native_narrow_color: rendering
                 && info.execution_support & gpu_raw::GPU_EXECUTION_SUPPORT_NATIVE_NARROW_COLOR != 0,
         }
+    }
+
+    /// True only when the host capability reports at least sixteen-way anisotropy.
+    /// Whether both native floating-point RGBA render-target formats are available.
+    pub const fn supports_float_color(&self) -> bool {
+        self.float_color
+    }
+    pub const fn supports_depth_transfers(&self) -> bool {
+        self.depth_transfers
+    }
+
+    pub const fn supports_anisotropy_16(&self) -> bool {
+        self.anisotropy_16
     }
 
     /// Return whether R8/RG8 storage and typed transfers are native.
@@ -185,6 +220,19 @@ pub struct Device {
 }
 
 impl Device {
+    /// True only after an isolated native compute dispatch writes the expected
+    /// bytes and a fenced GPU-to-host transfer reads them back.
+    pub fn supports_compute(&self) -> bool {
+        #[cfg(all(feature = "std", feature = "programmable"))]
+        {
+            let driver::Device::Virgl(device) = self.backend.as_ref();
+            device.supports_compute()
+        }
+        #[cfg(not(all(feature = "std", feature = "programmable")))]
+        {
+            false
+        }
+    }
     /// Return whether already-queried GPU information selects this backend.
     ///
     /// # Arguments
@@ -257,6 +305,20 @@ pub struct Context {
 }
 
 impl Context {
+    /// Return an actual GPU timestamp in nanoseconds after prior context work.
+    #[cfg(feature = "std")]
+    pub fn begin_query(&self, kind: u32, mask: u32) -> HandleResult<()> {
+        self.backend.begin_query(kind, mask)
+    }
+    #[cfg(feature = "std")]
+    pub fn end_query(&self, kind: u32, count: usize) -> HandleResult<Vec<u64>> {
+        self.backend.end_query(kind, count)
+    }
+    #[cfg(feature = "std")]
+    pub fn timestamp_ns(&self) -> HandleResult<u64> {
+        self.backend.timestamp_ns()
+    }
+
     /// Poll all accepted work without waiting, for resource retirement at ABI boundaries.
     #[cfg(feature = "backend-abi")]
     pub fn is_idle(&self) -> HandleResult<bool> {

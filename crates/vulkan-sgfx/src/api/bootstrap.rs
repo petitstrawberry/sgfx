@@ -138,6 +138,16 @@ unsafe extern "system" fn merge_caches(
         Ok(()) // All caches have the same empty compiled payload.
     }))
 }
+pub(super) struct Event {
+    pub state: AtomicBool,
+    pub device_only: bool,
+}
+impl std::ops::Deref for Event {
+    type Target = AtomicBool;
+    fn deref(&self) -> &AtomicBool {
+        &self.state
+    }
+}
 unsafe extern "system" fn create_event(
     device: vk::Device,
     info: *const vk::EventCreateInfo<'_>,
@@ -153,7 +163,7 @@ unsafe extern "system" fn create_event(
     };
     if info.s_type != vk::StructureType::EVENT_CREATE_INFO
         || !info.p_next.is_null()
-        || !info.flags.is_empty()
+        || !vk::EventCreateFlags::DEVICE_ONLY.contains(info.flags)
         || !allocator.is_null()
     {
         return UNSUPPORTED;
@@ -162,12 +172,21 @@ unsafe extern "system" fn create_event(
         Ok(d) => d,
         Err(e) => return e,
     };
+    if !info.flags.is_empty() && !d.synchronization2_enabled {
+        return UNSUPPORTED;
+    }
     let mut events = d.events.lock().unwrap_or_else(|e| e.into_inner());
     if events.len() >= 4096 {
         return vk::Result::ERROR_TOO_MANY_OBJECTS;
     }
     let handle = vk::Event::from_raw(next_id());
-    events.insert(handle.as_raw(), Arc::new(AtomicBool::new(false)));
+    events.insert(
+        handle.as_raw(),
+        Arc::new(Event {
+            state: AtomicBool::new(false),
+            device_only: !info.flags.is_empty(),
+        }),
+    );
     *out = handle;
     vk::Result::SUCCESS
 }
@@ -183,7 +202,7 @@ unsafe extern "system" fn destroy_event(
             .remove(&event.as_raw());
     }
 }
-pub(super) fn event_state(d: &Driver, event: vk::Event) -> VkResult<Arc<AtomicBool>> {
+pub(super) fn event_state(d: &Driver, event: vk::Event) -> VkResult<Arc<Event>> {
     d.events
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -194,6 +213,9 @@ pub(super) fn event_state(d: &Driver, event: vk::Event) -> VkResult<Arc<AtomicBo
 unsafe extern "system" fn get_event_status(device: vk::Device, event: vk::Event) -> vk::Result {
     match driver(device.as_raw(), Kind::Device).and_then(|d| event_state(&d, event)) {
         Ok(state) => {
+            if state.device_only {
+                return UNSUPPORTED;
+            }
             if state.load(Ordering::Acquire) {
                 vk::Result::EVENT_SET
             } else {
@@ -206,6 +228,9 @@ unsafe extern "system" fn get_event_status(device: vk::Device, event: vk::Event)
 unsafe fn set_event_state(device: vk::Device, event: vk::Event, value: bool) -> vk::Result {
     match driver(device.as_raw(), Kind::Device).and_then(|d| event_state(&d, event)) {
         Ok(state) => {
+            if state.device_only {
+                return UNSUPPORTED;
+            }
             state.store(value, Ordering::Release);
             vk::Result::SUCCESS
         }

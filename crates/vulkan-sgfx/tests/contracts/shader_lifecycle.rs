@@ -32,19 +32,25 @@ fn stage_words(stage: naga::ShaderStage, entry: &str, colour: &str) -> Vec<u32> 
 #[test]
 #[ignore = "requires a native GPU and freshly built SGFX ICD"]
 fn shader_modules_and_pipelines_recycle_beyond_256_with_failed_creation_rollback() {
-    graphics_lifecycle(false, 0);
+    graphics_lifecycle(false, 0, 0);
 }
 
 #[test]
 #[ignore = "requires a native GPU and freshly built SGFX ICD"]
 fn live_shader_modules_recycle_1024_unique_specialized_pipelines() {
-    graphics_lifecycle(true, 0);
+    graphics_lifecycle(true, 0, 0);
 }
 
 #[test]
 #[ignore = "requires a native GPU and freshly built SGFX ICD"]
 fn simultaneous_graphics_pipelines_retain_more_than_256_shader_stages() {
-    graphics_lifecycle(false, 160);
+    graphics_lifecycle(false, 160, 0);
+}
+
+#[test]
+#[ignore = "requires a native GPU and freshly built SGFX ICD"]
+fn graphics_resource_reload_overlaps_two_240_pipeline_sets() {
+    graphics_lifecycle(false, 0, 240);
 }
 
 fn specialized_fragment_words() -> Vec<u32> {
@@ -76,7 +82,7 @@ fn specialized_fragment_words() -> Vec<u32> {
     words
 }
 
-fn graphics_lifecycle(long_lived_modules: bool, keep_live: usize) {
+fn graphics_lifecycle(long_lived_modules: bool, keep_live: usize, reload_batch: usize) {
     let context = Context::new();
     let vertices = Storage::with_usage(&context, vk::BufferUsageFlags::VERTEX_BUFFER);
     let output = Storage::with_usage(&context, vk::BufferUsageFlags::TRANSFER_DST);
@@ -286,7 +292,14 @@ fn graphics_lifecycle(long_lived_modules: bool, keep_live: usize) {
         let persistent = long_lived_modules.then(|| modules(0));
         // A new VkDevice per iteration would hide the append-only 256-slot leak.
         let mut retained = std::collections::VecDeque::new();
-        for iteration in 0..if keep_live == 0 { 1024 } else { 350 } {
+        let iterations = if reload_batch != 0 {
+            reload_batch * 3
+        } else if keep_live == 0 {
+            1024
+        } else {
+            350
+        };
+        for iteration in 0..iterations {
             let index = if long_lived_modules { 0 } else { iteration % 2 };
             let red = iteration as f32 / 1023.0;
             let data = red.to_ne_bytes();
@@ -343,7 +356,18 @@ fn graphics_lifecycle(long_lived_modules: bool, keep_live: usize) {
                     .clear_values(&clears),
                 vk::SubpassContents::INLINE,
             );
-            d.cmd_bind_pipeline(context.command, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            // While the third set is built, render the retained second set to
+            // verify that recycling the first set did not change its bindings.
+            let draw_pipeline = if reload_batch != 0 && iteration >= reload_batch * 2 {
+                retained[iteration - reload_batch * 2]
+            } else {
+                pipeline
+            };
+            d.cmd_bind_pipeline(
+                context.command,
+                vk::PipelineBindPoint::GRAPHICS,
+                draw_pipeline,
+            );
             d.cmd_bind_vertex_buffers(context.command, 0, &[vertices.buffer], &[0]);
             d.cmd_draw(context.command, 4, 1, 0, 0);
             d.cmd_end_render_pass(context.command);
@@ -395,7 +419,14 @@ fn graphics_lifecycle(long_lived_modules: bool, keep_live: usize) {
                 );
             }
             retained.push_back(pipeline);
-            if retained.len() > keep_live {
+            if reload_batch != 0 {
+                // Hold all of A and B before retiring A; repeat for B and C.
+                if retained.len() == reload_batch * 2 {
+                    for retired in retained.drain(..reload_batch) {
+                        d.destroy_pipeline(retired, None);
+                    }
+                }
+            } else if retained.len() > keep_live {
                 d.destroy_pipeline(retained.pop_front().unwrap(), None);
             }
         }

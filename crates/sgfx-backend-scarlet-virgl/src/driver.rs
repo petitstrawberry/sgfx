@@ -1,6 +1,6 @@
 //! Private Scarlet/VirGL resource and queue dispatch.
 
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{borrow::Cow, rc::Rc, vec::Vec};
 use gpu_raw::{Gpu, GpuQueryInfo};
 
 use crate::completion::SubmitMode;
@@ -55,6 +55,25 @@ pub(crate) enum Context {
 }
 
 impl Context {
+    #[cfg(feature = "std")]
+    pub(crate) fn begin_query(&self, kind: u32, mask: u32) -> HandleResult<()> {
+        match self {
+            Self::Virgl(c) => c.begin_query(kind, mask),
+        }
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn end_query(&self, kind: u32, count: usize) -> HandleResult<Vec<u64>> {
+        match self {
+            Self::Virgl(c) => c.end_query(kind, count),
+        }
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn timestamp_ns(&self) -> HandleResult<u64> {
+        match self {
+            Self::Virgl(c) => c.timestamp_ns(),
+        }
+    }
+
     #[cfg(feature = "backend-abi")]
     pub(crate) fn is_idle(&self) -> HandleResult<bool> {
         match self {
@@ -309,7 +328,7 @@ impl Queue {
         &self,
         context: &Context,
         resources: &mut IrResources,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
@@ -341,7 +360,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         image: &Image,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources, image) {
@@ -359,7 +378,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         target: IrTextureSpec,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
@@ -374,7 +393,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         texture: IrTextureSpec,
-        upload: &IrTextureUpload,
+        upload: &IrTextureUpload<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
@@ -389,13 +408,13 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         buffer: IrBufferSpec,
-        bytes: &[u8],
+        source: &IrBufferSource<'_>,
         update: Option<&IrBufferUpdate>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         match (self, context, resources) {
             (Self::Virgl(queue), Context::Virgl(context), IrResources::Virgl(resources)) => {
-                queue.prepare_ir_buffer(context, resources, buffer, bytes, update, mode)
+                queue.prepare_ir_buffer(context, resources, buffer, source, update, mode)
             }
         }
     }
@@ -525,10 +544,276 @@ pub(crate) struct IrBufferSpec {
     pub(crate) revision: u64,
 }
 
-/// Byte changes relative to the last accepted CPU shadow revision.
+/// Cumulative byte changes since `previous_revision`, an exact physical base.
+/// `range` is the compatible envelope. Optional intervals omit unwritten gaps;
+/// an empty interval list requires full repair after tracking overflows.
+#[derive(Clone)]
 pub(crate) struct IrBufferUpdate {
     pub(crate) previous_revision: u64,
     pub(crate) range: core::ops::Range<usize>,
+    pub(crate) intervals: Option<IrBufferIntervals>,
+}
+
+/// One disjoint range borrowed from a stable pending write payload. Sparse
+/// sources supply these overlays in ascending, nonoverlapping range order.
+pub(crate) struct IrBufferOverlay<'a> {
+    pub(crate) range: core::ops::Range<usize>,
+    pub(crate) bytes: &'a [u8],
+}
+
+/// Read-only source for a single logical buffer preparation. Sparse sources
+/// keep the accepted shadow untouched and materialize only the requested
+/// upload range into the backend's bounded scratch buffer.
+pub(crate) enum IrBufferSource<'a> {
+    Contiguous(&'a [u8]),
+    Sparse {
+        base: Option<&'a [u8]>,
+        overlays: &'a [IrBufferOverlay<'a>],
+        len: usize,
+    },
+}
+
+impl IrBufferSource<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Contiguous(bytes) => bytes.len(),
+            Self::Sparse { len, .. } => *len,
+        }
+    }
+
+    /// Copy an exact logical range from normalized last-write-wins overlays.
+    pub(crate) fn copy_range(
+        &self,
+        range: core::ops::Range<usize>,
+        destination: &mut [u8],
+    ) -> HandleResult<()> {
+        self.copy_range_with(range, destination, || {})
+    }
+
+    fn copy_range_with(
+        &self,
+        range: core::ops::Range<usize>,
+        destination: &mut [u8],
+        mut visit: impl FnMut(),
+    ) -> HandleResult<()> {
+        if range.start > range.end || range.len() != destination.len() || range.end > self.len() {
+            return Err(HandleError::InvalidParameter);
+        }
+        destination.fill(0);
+        match self {
+            Self::Contiguous(bytes) => {
+                let source = bytes
+                    .get(range.clone())
+                    .ok_or(HandleError::InvalidParameter)?;
+                destination.copy_from_slice(source);
+            }
+            Self::Sparse { base, overlays, .. } => {
+                if let Some(base) = base {
+                    copy_intersection(base, 0, range.clone(), destination);
+                }
+                for overlay in crate::ir_execute::buffer_ranges::intersecting(
+                    overlays,
+                    range.clone(),
+                    |overlay| overlay.range.clone(),
+                ) {
+                    visit();
+                    copy_intersection(
+                        overlay.bytes,
+                        overlay.range.start,
+                        range.clone(),
+                        destination,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn direct_range(&self, range: core::ops::Range<usize>) -> Option<&[u8]> {
+        let Self::Contiguous(bytes) = self else {
+            return None;
+        };
+        bytes.get(range)
+    }
+}
+
+fn copy_intersection(
+    source: &[u8],
+    source_start: usize,
+    requested: core::ops::Range<usize>,
+    destination: &mut [u8],
+) {
+    let first = requested.start.max(source_start);
+    let last = requested.end.min(source_start.saturating_add(source.len()));
+    if first >= last {
+        return;
+    }
+    let destination_start = first - requested.start;
+    let source_offset = first - source_start;
+    let count = last - first;
+    destination[destination_start..destination_start + count]
+        .copy_from_slice(&source[source_offset..source_offset + count]);
+}
+
+#[cfg(test)]
+mod buffer_range_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_upload_queries_visit_only_intersecting_normalized_overlays() {
+        let data = [9; 8];
+        let overlays = (0..8192)
+            .map(|index| IrBufferOverlay {
+                range: index * 16..index * 16 + 8,
+                bytes: &data,
+            })
+            .collect::<Vec<_>>();
+        let source = IrBufferSource::Sparse {
+            base: None,
+            overlays: &overlays,
+            len: 131072,
+        };
+        let mut visits = 0;
+        let mut bytes = [1; 18];
+        source
+            .copy_range_with(65535..65553, &mut bytes, || visits += 1)
+            .unwrap();
+        assert_eq!(visits, 2);
+        assert_eq!(
+            bytes,
+            [0, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 9]
+        );
+        visits = 0;
+        let mut gap = [1; 8];
+        source
+            .copy_range_with(65528..65536, &mut gap, || visits += 1)
+            .unwrap();
+        assert_eq!(visits, 0);
+        assert_eq!(gap, [0; 8]);
+        let mut full = [0; 65536];
+        visits = 0;
+        source
+            .copy_range_with(65536..131072, &mut full, || visits += 1)
+            .unwrap();
+        assert_eq!(visits, 4096);
+        assert_eq!(
+            &full[..16],
+            &[9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let reversed = core::ops::Range { start: 10, end: 9 };
+        assert!(source.copy_range(reversed, &mut []).is_err());
+    }
+}
+
+pub(crate) const MAX_BUFFER_DIRTY_INTERVALS: usize = 128;
+
+/// Nonempty lists always reserve the complete bound before admission. This
+/// permits cumulative merging at accepted publication without allocating.
+pub(crate) struct IrBufferIntervals {
+    ranges: Vec<core::ops::Range<usize>>,
+}
+
+impl Clone for IrBufferIntervals {
+    fn clone(&self) -> Self {
+        let mut ranges = Vec::new();
+        if !self.ranges.is_empty() && ranges.try_reserve_exact(MAX_BUFFER_DIRTY_INTERVALS).is_ok() {
+            ranges.extend_from_slice(&self.ranges);
+        }
+        // Allocation failure conservatively produces the full-repair marker.
+        Self { ranges }
+    }
+}
+
+impl IrBufferIntervals {
+    fn new(range: core::ops::Range<usize>) -> Self {
+        let mut intervals = Self { ranges: Vec::new() };
+        if intervals
+            .ranges
+            .try_reserve_exact(MAX_BUFFER_DIRTY_INTERVALS)
+            .is_ok()
+            && let Some(range) = Self::aligned(range)
+        {
+            intervals.ranges.push(range);
+        }
+        intervals
+    }
+
+    fn aligned(range: core::ops::Range<usize>) -> Option<core::ops::Range<usize>> {
+        (range.start < range.end).then_some(())?;
+        Some((range.start & !3)..(range.end.checked_add(3)? & !3))
+    }
+
+    pub(crate) fn ranges(&self) -> &[core::ops::Range<usize>] {
+        &self.ranges
+    }
+
+    fn include(&mut self, range: core::ops::Range<usize>) {
+        if self.ranges.is_empty() {
+            return; // Full repair remains sticky until accepted preparation.
+        }
+        let Some(mut range) = Self::aligned(range) else {
+            self.ranges.clear();
+            return;
+        };
+        let first = self.ranges.partition_point(|old| old.end < range.start);
+        let last = first + self.ranges[first..].partition_point(|old| old.start <= range.end);
+        if first < last {
+            range.start = range.start.min(self.ranges[first].start);
+            range.end = range.end.max(self.ranges[last - 1].end);
+            self.ranges.drain(first..last);
+        } else if self.ranges.len() == MAX_BUFFER_DIRTY_INTERVALS {
+            self.ranges.clear();
+            return;
+        }
+        debug_assert!(self.ranges.capacity() >= MAX_BUFFER_DIRTY_INTERVALS);
+        self.ranges.insert(first, range);
+    }
+}
+
+impl IrBufferUpdate {
+    pub(crate) fn sparse(previous_revision: u64, range: core::ops::Range<usize>) -> Self {
+        Self {
+            previous_revision,
+            intervals: Some(IrBufferIntervals::new(range.clone())),
+            range,
+        }
+    }
+
+    pub(crate) fn include_range(&mut self, range: core::ops::Range<usize>) {
+        self.range.start = self.range.start.min(range.start);
+        self.range.end = self.range.end.max(range.end);
+        if let Some(intervals) = &mut self.intervals {
+            intervals.include(range);
+        }
+    }
+
+    /// Called only when the earlier delta ends at our immediate predecessor.
+    /// All storage is already reserved, including on the publication path.
+    pub(crate) fn merge_previous(&mut self, previous: &Self) {
+        self.previous_revision = previous.previous_revision;
+        self.range.start = self.range.start.min(previous.range.start);
+        self.range.end = self.range.end.max(previous.range.end);
+        if previous
+            .intervals
+            .as_ref()
+            .is_some_and(|ranges| ranges.ranges.is_empty())
+        {
+            if let Some(intervals) = &mut self.intervals {
+                intervals.ranges.clear();
+            } else {
+                self.intervals = Some(IrBufferIntervals { ranges: Vec::new() });
+            }
+        } else if let Some(intervals) = &mut self.intervals {
+            if let Some(earlier) = &previous.intervals {
+                for range in &earlier.ranges {
+                    intervals.include(range.clone());
+                }
+            } else {
+                intervals.include(previous.range.clone());
+            }
+        }
+        // A general planner's absent interval list keeps the envelope fallback.
+    }
 }
 
 /// One draw's binding into a persistent canonical vertex buffer.
@@ -581,6 +866,8 @@ pub(crate) enum IrBlendOp {
     Add,
     Subtract,
     ReverseSubtract,
+    Min,
+    Max,
 }
 
 /// Independent portable blend component.
@@ -636,6 +923,7 @@ pub(crate) struct IrDepthState {
 /// Persistent pipeline slot and its immutable portable state.
 #[derive(Clone, Copy)]
 pub(crate) struct IrPipelineState {
+    pub(crate) depth_bias: [u32; 2],
     pub(crate) slot: usize,
     pub(crate) fragment: IrFragmentProgram,
     pub(crate) blend: IrBlendState,
@@ -674,6 +962,7 @@ pub(crate) struct IrSamplerState {
     pub(crate) min_lod: f32,
     pub(crate) max_lod: f32,
     pub(crate) compare: Option<crate::ir::CompareFunction>,
+    pub(crate) anisotropy: u8,
 }
 
 /// Draw-uniform constants sent to the GPU without CPU vertex transformation.
@@ -686,6 +975,7 @@ pub(crate) struct IrUniforms {
 /// One private non-indexed draw in an ordered IR submission.
 #[derive(Clone)]
 pub(crate) struct IrDraw {
+    pub(crate) draw_index: u32,
     pub(crate) programmable: Option<Rc<IrProgrammableDraw>>,
     pub(crate) start_vertex: usize,
     pub(crate) instance_count: u32,
@@ -714,6 +1004,7 @@ pub(crate) fn draw_count_valid(draw: &IrDraw) -> bool {
             draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(2)
         }
         Some(crate::ir::PrimitiveTopology::LineStrip) => draw.vertex_count >= 2,
+        Some(crate::ir::PrimitiveTopology::PointList) => draw.vertex_count != 0,
         _ => draw.vertex_count > 0 && draw.vertex_count.is_multiple_of(3),
     }
 }
@@ -816,12 +1107,13 @@ pub(crate) struct IrTextureBinding {
     pub(crate) sampler: Option<IrSamplerState>,
 }
 
-/// Tightly packed physical texture upload retained until stream validation succeeds.
+/// Tightly packed physical texture upload retained until encoding completes.
+/// Unchanged source bytes may be borrowed; asynchronous packets own their copy.
 #[derive(Clone)]
-pub(crate) struct IrTextureUpload {
+pub(crate) struct IrTextureUpload<'data> {
     pub(crate) texture: IrTextureSpec,
     pub(crate) destination: IrRect,
-    pub(crate) pixels: Vec<u8>,
+    pub(crate) pixels: Cow<'data, [u8]>,
     pub(crate) storage_format: IrTextureFormat,
     pub(crate) mip_level: u32,
     pub(crate) array_layer: u32,
@@ -850,13 +1142,15 @@ pub(crate) enum IrTextureFormat {
     R8,
     Rg8,
     Depth32Float,
+    Rgba16Float,
+    Rgba32Float,
 }
 
 impl IrTextureFormat {
     pub(crate) const fn storage_format(self, native_narrow: bool) -> Self {
         match self {
             Self::R8 | Self::Rg8 if native_narrow => self,
-            Self::Depth32Float => self,
+            Self::Depth32Float | Self::Rgba16Float | Self::Rgba32Float => self,
             _ => Self::Bgra8,
         }
     }
@@ -865,6 +1159,8 @@ impl IrTextureFormat {
         match self {
             Self::R8 => 1,
             Self::Rg8 => 2,
+            Self::Rgba16Float => 8,
+            Self::Rgba32Float => 16,
             _ => 4,
         }
     }
@@ -885,7 +1181,7 @@ pub(crate) struct IrTextureCopy {
 }
 
 /// Complete backend-neutral render submission for one mapped presentation target.
-pub(crate) struct IrSubmission {
+pub(crate) struct IrSubmission<'data> {
     pub(crate) clear_color: Option<[f32; 4]>,
     pub(crate) additional_colors: Vec<IrColorAttachment>,
     pub(crate) depth_attachment: Option<IrTextureSpec>,
@@ -894,7 +1190,7 @@ pub(crate) struct IrSubmission {
     pub(crate) render_area: IrRect,
     pub(crate) vertices: Vec<IrVertex>,
     pub(crate) draws: Vec<IrDraw>,
-    pub(crate) texture_uploads: Vec<IrTextureUpload>,
+    pub(crate) texture_uploads: Vec<IrTextureUpload<'data>>,
 }
 
 /// One additional color output in a render pass.
@@ -994,7 +1290,7 @@ mod tests {
         GPU_DEVICE_STATE_READY, GPU_EXECUTION_SUPPORT_QUEUE, GPU_RESULT_SUCCESS, GpuQueryInfo,
     };
 
-    use super::Device;
+    use super::{Device, IrBufferUpdate, MAX_BUFFER_DIRTY_INTERVALS};
     use crate::{BACKEND_ID, matches_backend_id};
 
     #[test]
@@ -1004,6 +1300,75 @@ mod tests {
         assert!(!matches_backend_id(b"apple-agx"));
         assert!(!matches_backend_id(b""));
         assert!(!matches_backend_id(b"software"));
+    }
+
+    #[test]
+    fn dirty_intervals_align_coalesce_and_merge_without_allocating() {
+        let mut update = IrBufferUpdate::sparse(7, 5..6);
+        let pointer = update.intervals.as_ref().unwrap().ranges.as_ptr();
+        update.include_range(8..9);
+        update.include_range(20..21);
+        assert_eq!(
+            update.intervals.as_ref().unwrap().ranges(),
+            &[4..12, 20..24]
+        );
+        update.include_range(13..17);
+        assert_eq!(update.intervals.as_ref().unwrap().ranges().len(), 1);
+        assert_eq!(update.intervals.as_ref().unwrap().ranges()[0], 4..24);
+        assert_eq!(update.range, 5..21);
+        let earlier = IrBufferUpdate::sparse(5, 40..44);
+        update.merge_previous(&earlier);
+        assert_eq!(update.previous_revision, 5);
+        assert_eq!(
+            update.intervals.as_ref().unwrap().ranges(),
+            &[4..24, 40..44]
+        );
+        assert_eq!(update.intervals.as_ref().unwrap().ranges.as_ptr(), pointer);
+        let mut cloned = update.clone();
+        let pointer = cloned.intervals.as_ref().unwrap().ranges.as_ptr();
+        cloned.include_range(100..104);
+        assert_eq!(cloned.intervals.as_ref().unwrap().ranges.as_ptr(), pointer);
+        assert_eq!(cloned.intervals.as_ref().unwrap().ranges().len(), 3);
+        assert_eq!(update.intervals.as_ref().unwrap().ranges().len(), 2);
+    }
+
+    #[test]
+    fn dirty_interval_overflow_is_sticky_and_general_plans_keep_the_envelope() {
+        let mut update = IrBufferUpdate::sparse(7, 0..4);
+        for index in 1..MAX_BUFFER_DIRTY_INTERVALS {
+            update.include_range(index * 8..index * 8 + 4);
+        }
+        assert_eq!(
+            update.intervals.as_ref().unwrap().ranges().len(),
+            MAX_BUFFER_DIRTY_INTERVALS
+        );
+        let pointer = update.intervals.as_ref().unwrap().ranges.as_ptr();
+        // A touching interval at capacity still coalesces without overflow.
+        update.include_range(1020..1024);
+        assert_eq!(
+            update.intervals.as_ref().unwrap().ranges().len(),
+            MAX_BUFFER_DIRTY_INTERVALS
+        );
+        update.include_range(1032..1036);
+        assert!(update.intervals.as_ref().unwrap().ranges().is_empty());
+        update.include_range(0..2048);
+        assert!(update.intervals.as_ref().unwrap().ranges().is_empty());
+        assert_eq!(update.intervals.as_ref().unwrap().ranges.as_ptr(), pointer);
+        let mut next = IrBufferUpdate::sparse(8, 4096..4100);
+        next.merge_previous(&update);
+        assert_eq!(next.previous_revision, 7);
+        assert!(next.intervals.as_ref().unwrap().ranges().is_empty());
+
+        let mut general = IrBufferUpdate {
+            previous_revision: 9,
+            range: 5000..5004,
+            intervals: None,
+        };
+        general.merge_previous(&IrBufferUpdate::sparse(8, 4000..4004));
+        assert!(general.intervals.is_none());
+        assert_eq!(general.range, 4000..5004);
+        general.merge_previous(&update);
+        assert!(general.intervals.as_ref().unwrap().ranges().is_empty());
     }
 
     #[test]

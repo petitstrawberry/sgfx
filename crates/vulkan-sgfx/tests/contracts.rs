@@ -9,6 +9,11 @@
 use ash::{Entry, vk};
 use std::path::PathBuf;
 
+#[path = "contracts/queries.rs"]
+mod queries;
+#[path = "contracts/synchronization2.rs"]
+mod synchronization2;
+
 #[path = "contracts/scalar_vertex.rs"]
 mod scalar_vertex;
 
@@ -46,6 +51,86 @@ mod resource_limits;
 const WORDS: usize = 256;
 const BYTES: u64 = (WORDS * size_of::<u32>()) as u64;
 
+#[test]
+#[ignore = "requires a native GPU"]
+fn pushed_descriptors_snapshot_templates_partial_updates_and_replay() {
+    let c = Context::new();
+    let compute = Compute::configured(&c, true);
+    let first = Storage::new(&c);
+    let second = Storage::new(&c);
+    unsafe {
+        let push = ash::khr::push_descriptor::Device::new(&c.instance, &c.device);
+        let entries = [vk::DescriptorUpdateTemplateEntry::default()
+            .dst_binding(0)
+            .descriptor_count(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .offset(0)
+            .stride(size_of::<vk::DescriptorBufferInfo>())];
+        let template = c
+            .device
+            .create_descriptor_update_template(
+                &vk::DescriptorUpdateTemplateCreateInfo::default()
+                    .descriptor_update_entries(&entries)
+                    .template_type(vk::DescriptorUpdateTemplateType::PUSH_DESCRIPTORS_KHR)
+                    .pipeline_bind_point(vk::PipelineBindPoint::COMPUTE)
+                    .pipeline_layout(compute.layout)
+                    .set(0),
+                None,
+            )
+            .unwrap();
+        c.device
+            .begin_command_buffer(c.command, &Default::default())
+            .unwrap();
+        c.device
+            .cmd_bind_pipeline(c.command, vk::PipelineBindPoint::COMPUTE, compute.pipeline);
+        let mut data = [vk::DescriptorBufferInfo::default()
+            .buffer(first.buffer)
+            .range(BYTES)];
+        push.cmd_push_descriptor_set(
+            c.command,
+            vk::PipelineBindPoint::COMPUTE,
+            compute.layout,
+            0,
+            &[vk::WriteDescriptorSet::default()
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&data)],
+        );
+        data[0].buffer = second.buffer;
+        // Empty pushes retain all defined bindings. Caller data was snapshotted.
+        push.cmd_push_descriptor_set(
+            c.command,
+            vk::PipelineBindPoint::COMPUTE,
+            compute.layout,
+            0,
+            &[],
+        );
+        c.device.cmd_dispatch(c.command, 4, 1, 1);
+        push.cmd_push_descriptor_set_with_template(
+            c.command,
+            template,
+            compute.layout,
+            0,
+            data.as_ptr().cast(),
+        );
+        data[0].buffer = vk::Buffer::null();
+        std::hint::black_box(&data);
+        c.device.cmd_dispatch(c.command, 4, 1, 1);
+        c.device.end_command_buffer(c.command).unwrap();
+        let expected = (0..WORDS as u32).map(|i| i * 3 + 7).collect::<Vec<_>>();
+        for _ in 0..2 {
+            let fence = c.device.create_fence(&Default::default(), None).unwrap();
+            c.submit(fence).unwrap();
+            c.device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            assert_eq!(first.read(), expected);
+            assert_eq!(second.read(), expected);
+            c.device.destroy_fence(fence, None);
+        }
+        c.reset();
+        c.device.destroy_descriptor_update_template(template, None);
+    }
+}
+
 struct Context {
     device: ash::Device,
     queue: vk::Queue,
@@ -59,6 +144,9 @@ struct Context {
 
 impl Context {
     fn new() -> Self {
+        Self::configured(false)
+    }
+    fn configured(synchronization2: bool) -> Self {
         unsafe {
             let path = std::env::var_os("SGFX_ICD_LIBRARY")
                 .map(PathBuf::from)
@@ -84,7 +172,11 @@ impl Context {
             let entry = Entry::from_static_fn(ash::StaticFn {
                 get_instance_proc_addr,
             });
-            let application = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0);
+            let application = vk::ApplicationInfo::default().api_version(if synchronization2 {
+                vk::API_VERSION_1_1
+            } else {
+                vk::API_VERSION_1_0
+            });
             let instance = entry
                 .create_instance(
                     &vk::InstanceCreateInfo::default().application_info(&application),
@@ -101,12 +193,62 @@ impl Context {
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
                 .queue_priorities(&priorities)];
+            let mut sync =
+                vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+            let mut aggregate = vk::PhysicalDeviceVulkan12Features::default();
+            if synchronization2 {
+                let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+                let mut host_queries = vk::PhysicalDeviceHostQueryResetFeatures::default();
+                let mut queried = vk::PhysicalDeviceFeatures2::default()
+                    .push_next(&mut aggregate)
+                    .push_next(&mut timeline)
+                    .push_next(&mut host_queries);
+                let query: vk::PFN_vkGetPhysicalDeviceFeatures2 = std::mem::transmute(
+                    entry
+                        .get_instance_proc_addr(
+                            instance.handle(),
+                            c"vkGetPhysicalDeviceFeatures2KHR".as_ptr(),
+                        )
+                        .unwrap(),
+                );
+                query(physical, &mut queried);
+                assert_eq!(aggregate.timeline_semaphore, timeline.timeline_semaphore);
+                assert_eq!(aggregate.host_query_reset, host_queries.host_query_reset);
+                assert_eq!(aggregate.buffer_device_address, vk::FALSE);
+                assert_eq!(aggregate.runtime_descriptor_array, vk::FALSE);
+                // Enable only the implemented promoted features. The query chain
+                // above also exercises alias agreement; device creation uses only
+                // the aggregate record, without the former extension names.
+                aggregate.p_next = std::ptr::null_mut();
+            }
+            let mut rendering =
+                vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+            let supported = instance.get_physical_device_features(physical);
+            let indirect_features = vk::PhysicalDeviceFeatures::default()
+                .occlusion_query_precise(supported.occlusion_query_precise == vk::TRUE)
+                .pipeline_statistics_query(supported.pipeline_statistics_query == vk::TRUE)
+                .multi_draw_indirect(true)
+                .draw_indirect_first_instance(true);
+            let extensions = [
+                vk::KHR_PUSH_DESCRIPTOR_NAME.as_ptr(),
+                vk::KHR_DYNAMIC_RENDERING_NAME.as_ptr(),
+                vk::KHR_DRAW_INDIRECT_COUNT_NAME.as_ptr(),
+                vk::KHR_SYNCHRONIZATION2_NAME.as_ptr(),
+            ];
+            let base_extensions = [vk::KHR_PUSH_DESCRIPTOR_NAME.as_ptr()];
+            let mut info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queues)
+                .enabled_extension_names(&base_extensions);
+            if synchronization2 {
+                info = info
+                    .enabled_features(&indirect_features)
+                    .enabled_extension_names(&extensions)
+                    .push_next(&mut rendering)
+                    .push_next(&mut sync)
+                    .push_next(&mut aggregate);
+            }
             let device = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                    None,
-                )
+                .create_device(physical, &info, None)
                 .expect("a native GPU adapter is required for this opt-in test");
             let queue = device.get_device_queue(family, 0);
             let pool = device
@@ -300,6 +442,9 @@ struct Compute<'a> {
 
 impl<'a> Compute<'a> {
     fn new(context: &'a Context) -> Self {
+        Self::configured(context, false)
+    }
+    fn configured(context: &'a Context, pushed: bool) -> Self {
         let module = naga::front::wgsl::parse_str(include_str!("assets/fill.wgsl")).unwrap();
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -329,7 +474,13 @@ impl<'a> Compute<'a> {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)];
             let descriptor_layout = device
                 .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .bindings(&bindings)
+                        .flags(if pushed {
+                            vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+                        } else {
+                            vk::DescriptorSetLayoutCreateFlags::empty()
+                        }),
                     None,
                 )
                 .unwrap();
@@ -354,24 +505,29 @@ impl<'a> Compute<'a> {
                     None,
                 )
                 .unwrap()[0];
-            let sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)];
-            let pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&sizes),
-                    None,
-                )
-                .unwrap();
-            let set = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&layouts),
-                )
-                .unwrap()[0];
+            let (pool, set) = if pushed {
+                (vk::DescriptorPool::null(), vk::DescriptorSet::null())
+            } else {
+                let sizes = [vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)];
+                let pool = device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .max_sets(1)
+                            .pool_sizes(&sizes),
+                        None,
+                    )
+                    .unwrap();
+                let set = device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(pool)
+                            .set_layouts(&layouts),
+                    )
+                    .unwrap()[0];
+                (pool, set)
+            };
             Self {
                 context,
                 shader,

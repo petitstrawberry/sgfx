@@ -1,13 +1,21 @@
 pub(crate) mod bootstrap;
 mod buffer_operations;
+mod buffer_readback;
+mod buffer_uploads;
 mod buffer_views;
 mod core11;
+mod core12;
 pub(crate) mod descriptor_template;
+pub(crate) mod dynamic_rendering;
 mod dynamic_states;
+mod indirect;
 mod maintenance1;
+mod push_descriptors;
+mod queries;
 mod queue;
 mod render_pass2;
 mod render_passes;
+mod synchronization2;
 mod timeline;
 mod unsupported;
 use crate::runtime::Runtime;
@@ -17,7 +25,7 @@ use sgfx::{
     ir,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::{CStr, c_char},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -52,6 +60,8 @@ type RecordingCell = Arc<Mutex<Recording>>;
 pub(crate) struct InFlight {
     count: Mutex<usize>,
     changed: Condvar,
+    submitted: AtomicU64,
+    completed: AtomicU64,
 }
 
 impl InFlight {
@@ -72,6 +82,7 @@ impl InFlight {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *count = count.saturating_add(1);
+        self.submitted.fetch_add(1, Ordering::Release);
     }
 
     fn finish(&self) {
@@ -80,7 +91,19 @@ impl InFlight {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *count = count.saturating_sub(1);
+        self.completed.fetch_add(1, Ordering::Release);
         self.changed.notify_all();
+    }
+
+    // GPU submissions and their completion observations each use one FIFO.
+    // These watermarks apply to in_flight, not to the pending request counter,
+    // whose Present and submission requests can finish in a different order.
+    pub(crate) fn submitted_serial(&self) -> u64 {
+        self.submitted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn completed_serial(&self) -> u64 {
+        self.completed.load(Ordering::Acquire)
     }
 
     // State stores happen before acquiring this mutex. Sharing the mutex with
@@ -143,11 +166,22 @@ struct Driver {
     completion_sender: mpsc::Sender<CompletionRequest>,
     completion_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     queue: AtomicU64,
-    queue_sender: mpsc::Sender<queue::Request>,
+    queue_sender: mpsc::SyncSender<queue::Request>,
     queue_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     timeline_enabled: bool,
+    synchronization2_enabled: bool,
+    dynamic_rendering_enabled: bool,
+    host_query_reset_enabled: bool,
+    timestamps: bool,
+    query_support: u32,
+    occlusion_precise_enabled: bool,
+    pipeline_statistics_enabled: bool,
+    multi_draw_indirect_enabled: bool,
+    indirect_first_instance_enabled: bool,
+    indirect_count_enabled: bool,
+    queries: Mutex<HashMap<u64, Arc<queries::Pool>>>,
     timelines: Mutex<HashMap<u64, Arc<timeline::Timeline>>>,
-    events: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    events: Mutex<HashMap<u64, Arc<bootstrap::Event>>>,
     fences: Fences,
     semaphores: Semaphores,
     recordings: Recordings,
@@ -210,42 +244,43 @@ fn driver(id: u64, kind: Kind) -> VkResult<Arc<Driver>> {
         .ok_or(vk::Result::ERROR_DEVICE_LOST)
 }
 
+/// Loaded Scarlet DSOs share the loader's process envp, while their private
+/// Rust std environment is uninitialized. Copy values before returning them.
+pub(crate) fn process_env(name: &str) -> Option<String> {
+    #[cfg(target_os = "scarlet")]
+    unsafe {
+        unsafe extern "C" {
+            #[linkage = "extern_weak"]
+            static environ: *const *const *const c_char;
+        }
+        let address = environ;
+        if address.is_null() {
+            return None;
+        }
+        let mut cursor = *address;
+        if cursor.is_null() {
+            return None;
+        }
+        while !(*cursor).is_null() {
+            let entry = CStr::from_ptr(*cursor).to_bytes();
+            if let Some(value) = entry
+                .strip_prefix(name.as_bytes())
+                .and_then(|s| s.strip_prefix(b"="))
+            {
+                return std::str::from_utf8(value).ok().map(str::to_owned);
+            }
+            cursor = cursor.add(1);
+        }
+        None
+    }
+    #[cfg(not(target_os = "scarlet"))]
+    {
+        std::env::var(name).ok()
+    }
+}
 fn call_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        // Loaded Scarlet Rust DSOs have their own uninitialized std environment.
-        // Read the process envp published by scarlet-ld without requiring a
-        // libc getenv export from the application.
-        #[cfg(target_os = "scarlet")]
-        unsafe {
-            unsafe extern "C" {
-                // extern_weak contains the symbol's ADDRESS. The C data at
-                // that address is itself the char ** environment pointer.
-                #[linkage = "extern_weak"]
-                static environ: *const *const *const c_char;
-            }
-            let address = environ;
-            if address.is_null() {
-                return false;
-            }
-            let mut cursor = *address;
-            if cursor.is_null() {
-                return false;
-            }
-            while !(*cursor).is_null() {
-                let entry = CStr::from_ptr(*cursor).to_bytes();
-                if let Some(value) = entry.strip_prefix(b"SGFX_VULKAN_CALL_PROFILE=") {
-                    return value == b"1";
-                }
-                cursor = cursor.add(1);
-            }
-            false
-        }
-        #[cfg(not(target_os = "scarlet"))]
-        {
-            std::env::var("SGFX_VULKAN_CALL_PROFILE").is_ok_and(|v| v == "1")
-        }
-    })
+    *ENABLED.get_or_init(|| process_env("SGFX_VULKAN_CALL_PROFILE").is_some_and(|v| v == "1"))
 }
 
 #[derive(Clone, Copy)]
@@ -361,6 +396,7 @@ fn record_call_profile(
 // Nested worker phases share the existing opt-in profiler. Their durations
 // overlap the enclosing API call and must not be summed as separate GPU time.
 fn profile_work<T>(operation: &'static str, work: impl FnOnce() -> VkResult<T>) -> VkResult<T> {
+    let _frame = crate::frame_profile::Span::new("work", operation);
     let started = call_profile_enabled().then(std::time::Instant::now);
     let result = work();
     if let Some(started) = started {
@@ -389,15 +425,23 @@ fn run_device_operation<T>(
         runtime.lost = true;
         Err(vk::Result::ERROR_DEVICE_LOST)
     } else {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(runtime))).unwrap_or_else(
-            |_| {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                    eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
-                }
-                runtime.lost = true;
-                Err(vk::Result::ERROR_DEVICE_LOST)
-            },
-        )
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !void {
+                profile_work("worker::retire_images", || runtime.flush_retired_images())?;
+            }
+            let result = op(runtime);
+            if runtime.retired_images.len() >= crate::runtime::IMAGE_RETIREMENT_BATCH {
+                profile_work("worker::retire_images", || runtime.flush_retired_images())?;
+            }
+            result
+        }))
+        .unwrap_or_else(|_| {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                eprintln!("[SGFX Vulkan] device worker panicked; marking device lost");
+            }
+            runtime.lost = true;
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        })
     };
     if void && result.is_err() {
         runtime.lost = true;
@@ -417,6 +461,8 @@ fn call<T: Send + 'static>(
     driver: &Driver,
     op: impl FnOnce(&mut Runtime) -> VkResult<T> + Send + 'static,
 ) -> VkResult<T> {
+    let frame_operation = std::any::type_name_of_val(&op);
+    let _frame = crate::frame_profile::Span::new("call", frame_operation);
     // The disabled path performs no clock reads, type-name formatting, or
     // statistics-map access. The opt-in flag is sampled once per process.
     let profile_start = call_profile_enabled().then(std::time::Instant::now);
@@ -427,6 +473,7 @@ fn call<T: Send + 'static>(
         driver
             .sender
             .send(Request::Run(Box::new(move |runtime| {
+                let _frame = crate::frame_profile::Span::new("service", frame_operation);
                 let service_start = profile_start.map(|_| std::time::Instant::now());
                 let result = run_device_operation(runtime, op, false);
                 let service =
@@ -467,6 +514,14 @@ pub(crate) fn with_device<T: Send + 'static>(
     call(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
 }
 
+/// Queue a fully owned void operation without waiting behind GPU submission.
+pub(crate) fn with_device_owned(
+    device: vk::Device,
+    op: impl FnOnce(&mut Runtime) -> VkResult<()> + Send + 'static,
+) -> VkResult<()> {
+    enqueue_device_owned(driver(device.as_raw(), Kind::Device)?.as_ref(), op)
+}
+
 /// Publish fully owned descriptor metadata on the device FIFO without waiting
 /// for a reply. Invalidation belongs to the API invocation, before a subsequent
 /// command recording can bind the newly updated set. Doing it in the worker
@@ -478,6 +533,13 @@ pub(crate) fn update_descriptors_owned(
 ) -> VkResult<()> {
     let driver = driver(device.as_raw(), Kind::Device)?;
     invalidate_recorded_descriptor_sets(&driver.recordings, sets);
+    enqueue_device_owned(&driver, op)
+}
+
+fn enqueue_device_owned(
+    driver: &Driver,
+    op: impl FnOnce(&mut Runtime) -> VkResult<()> + Send + 'static,
+) -> VkResult<()> {
     // The synchronous call profiler intentionally excludes this one-way job:
     // enqueue-to-completion is not an API round trip or response wake delay.
     driver
@@ -572,6 +634,25 @@ unsafe fn device_chain_supported(
                 let f = &*next.cast::<vk::PhysicalDeviceFeatures2<'_>>();
                 core_device_features_supported(&f.features, supported_features)
             }
+            vk::StructureType::PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT => {
+                let f = &*next.cast::<vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT<'_>>();
+                matches!(
+                    f.vertex_attribute_instance_rate_divisor,
+                    vk::FALSE | vk::TRUE
+                ) && f.vertex_attribute_instance_rate_zero_divisor == vk::FALSE
+            }
+            vk::StructureType::PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceHostQueryResetFeatures<'_>>();
+                matches!(f.host_query_reset, vk::FALSE | vk::TRUE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>();
+                matches!(f.dynamic_rendering, vk::FALSE | vk::TRUE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES => {
+                let f = &*next.cast::<vk::PhysicalDeviceSynchronization2Features<'_>>();
+                matches!(f.synchronization2, vk::FALSE | vk::TRUE)
+            }
             vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
                 let f = &*next.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>();
                 matches!(f.timeline_semaphore, vk::FALSE | vk::TRUE)
@@ -629,10 +710,15 @@ unsafe fn device_chain_supported(
                     f.variable_pointers,
                     f.protected_memory,
                     f.sampler_ycbcr_conversion,
-                    f.shader_draw_parameters,
                 ]
                 .into_iter()
                 .all(|value| value == vk::FALSE)
+                    && matches!(f.shader_draw_parameters, vk::FALSE | vk::TRUE)
+            }
+            vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => {
+                crate::properties2::core12_request_supported(
+                    &*next.cast::<vk::PhysicalDeviceVulkan12Features<'_>>(),
+                )
             }
             vk::StructureType::PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES => {
                 let f = &*next.cast::<vk::PhysicalDevice16BitStorageFeatures<'_>>();
@@ -660,7 +746,7 @@ unsafe fn device_chain_supported(
             }
             vk::StructureType::PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES => {
                 let features = &*next.cast::<vk::PhysicalDeviceShaderDrawParametersFeatures<'_>>();
-                features.shader_draw_parameters == vk::FALSE
+                matches!(features.shader_draw_parameters, vk::FALSE | vk::TRUE)
             }
             _ => false,
         };
@@ -682,7 +768,17 @@ unsafe fn device_extensions_supported(info: &vk::DeviceCreateInfo<'_>) -> bool {
     names.iter().all(|&name| {
         !name.is_null() && {
             let name = unsafe { CStr::from_ptr(name) };
-            if name == vk::KHR_TIMELINE_SEMAPHORE_NAME {
+            if [
+                vk::KHR_TIMELINE_SEMAPHORE_NAME,
+                vk::KHR_SYNCHRONIZATION2_NAME,
+                vk::KHR_DYNAMIC_RENDERING_NAME,
+                vk::KHR_DRAW_INDIRECT_COUNT_NAME,
+                vk::EXT_VERTEX_ATTRIBUTE_DIVISOR_NAME,
+                vk::KHR_PUSH_DESCRIPTOR_NAME,
+                vk::EXT_HOST_QUERY_RESET_NAME,
+            ]
+            .contains(&name)
+            {
                 return true;
             }
             #[cfg(any(
@@ -748,8 +844,76 @@ pub(crate) unsafe extern "system" fn create_device(
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
     let mut timeline_enabled = false;
+    let mut synchronization2_enabled = false;
+    let mut dynamic_rendering_enabled = false;
+    let mut host_query_reset_enabled = false;
+    let mut core12 = false;
+    let timestamps = adapter.supports_timestamps();
+    let query_support = adapter.query_support();
+    let mut enabled_core = info
+        .p_enabled_features
+        .as_ref()
+        .copied()
+        .unwrap_or_default();
     let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
     while let Some(base) = node.as_ref() {
+        let draw_requested = match base.s_type {
+            vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_1_FEATURES => {
+                (*node.cast::<vk::PhysicalDeviceVulkan11Features<'_>>()).shader_draw_parameters
+            }
+            vk::StructureType::PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES => {
+                (*node.cast::<vk::PhysicalDeviceShaderDrawParametersFeatures<'_>>())
+                    .shader_draw_parameters
+            }
+            _ => vk::FALSE,
+        };
+        if draw_requested != vk::FALSE
+            && (draw_requested != vk::TRUE
+                || !adapter.capabilities().supports_shader_draw_parameters())
+        {
+            return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        }
+
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT
+            && (*node.cast::<vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT<'_>>())
+                .vertex_attribute_instance_rate_divisor
+                == vk::TRUE
+            && !adapter.capabilities().supports_vertex_divisors()
+        {
+            return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        }
+
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES {
+            let features = &*node.cast::<vk::PhysicalDeviceVulkan12Features<'_>>();
+            let supported = crate::properties2::core12_features(physical);
+            if (features.host_query_reset != 0 && supported.host_query_reset == 0)
+                || (features.timeline_semaphore != 0 && supported.timeline_semaphore == 0)
+                || (features.draw_indirect_count != 0 && supported.draw_indirect_count == 0)
+            {
+                return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+            }
+            host_query_reset_enabled = features.host_query_reset == vk::TRUE;
+            timeline_enabled = features.timeline_semaphore == vk::TRUE;
+            core12 = true;
+        }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_FEATURES_2 {
+            enabled_core = (*node.cast::<vk::PhysicalDeviceFeatures2<'_>>()).features;
+        }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES {
+            host_query_reset_enabled =
+                (*node.cast::<vk::PhysicalDeviceHostQueryResetFeatures<'_>>()).host_query_reset
+                    == vk::TRUE;
+        }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES {
+            dynamic_rendering_enabled =
+                (*node.cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>()).dynamic_rendering
+                    == vk::TRUE;
+        }
+        if base.s_type == vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES {
+            synchronization2_enabled =
+                (*node.cast::<vk::PhysicalDeviceSynchronization2Features<'_>>()).synchronization2
+                    == vk::TRUE;
+        }
         if base.s_type == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES {
             timeline_enabled = (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
                 .timeline_semaphore
@@ -758,6 +922,7 @@ pub(crate) unsafe extern "system" fn create_device(
         node = base.p_next;
     }
     if timeline_enabled
+        && !core12
         && !slice(
             info.pp_enabled_extension_names,
             info.enabled_extension_count,
@@ -767,6 +932,41 @@ pub(crate) unsafe extern "system" fn create_device(
         .any(|&n| CStr::from_ptr(n) == vk::KHR_TIMELINE_SEMAPHORE_NAME)
     {
         return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    }
+    if synchronization2_enabled
+        && !slice(
+            info.pp_enabled_extension_names,
+            info.enabled_extension_count,
+        )
+        .unwrap()
+        .iter()
+        .any(|&n| CStr::from_ptr(n) == vk::KHR_SYNCHRONIZATION2_NAME)
+    {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    }
+    if dynamic_rendering_enabled
+        && !slice(
+            info.pp_enabled_extension_names,
+            info.enabled_extension_count,
+        )
+        .unwrap()
+        .iter()
+        .any(|&n| CStr::from_ptr(n) == vk::KHR_DYNAMIC_RENDERING_NAME)
+    {
+        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+    }
+    if host_query_reset_enabled
+        && ((!timestamps && query_support == 0)
+            || (!core12
+                && !slice(
+                    info.pp_enabled_extension_names,
+                    info.enabled_extension_count,
+                )
+                .unwrap()
+                .iter()
+                .any(|&n| CStr::from_ptr(n) == vk::EXT_HOST_QUERY_RESET_NAME)))
+    {
+        return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
     let qs = match slice(info.p_queue_create_infos, info.queue_create_info_count) {
         Ok(v) => v,
@@ -887,6 +1087,23 @@ pub(crate) unsafe extern "system" fn create_device(
         queue_sender,
         queue_thread: Mutex::new(Some(queue_thread)),
         timeline_enabled,
+        synchronization2_enabled,
+        dynamic_rendering_enabled,
+        host_query_reset_enabled,
+        timestamps,
+        query_support,
+        occlusion_precise_enabled: enabled_core.occlusion_query_precise == vk::TRUE,
+        pipeline_statistics_enabled: enabled_core.pipeline_statistics_query == vk::TRUE,
+        multi_draw_indirect_enabled: enabled_core.multi_draw_indirect == vk::TRUE,
+        indirect_first_instance_enabled: enabled_core.draw_indirect_first_instance == vk::TRUE,
+        indirect_count_enabled: slice(
+            info.pp_enabled_extension_names,
+            info.enabled_extension_count,
+        )
+        .unwrap()
+        .iter()
+        .any(|&n| CStr::from_ptr(n) == vk::KHR_DRAW_INDIRECT_COUNT_NAME),
+        queries: Default::default(),
         timelines: Default::default(),
         events: Default::default(),
         fences,
@@ -967,6 +1184,7 @@ unsafe extern "system" fn get_device_queue(
     }
 }
 unsafe extern "system" fn device_wait_idle(device: vk::Device) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("wait", "device_idle");
     let driver = match driver(device.as_raw(), Kind::Device) {
         Ok(driver) => driver,
         Err(error) => return error,
@@ -974,6 +1192,7 @@ unsafe extern "system" fn device_wait_idle(device: vk::Device) -> vk::Result {
     status(wait_idle(&driver))
 }
 pub(crate) unsafe extern "system" fn queue_wait_idle(queue: vk::Queue) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("wait", "queue_idle");
     let driver = match driver(queue.as_raw(), Kind::Queue) {
         Ok(driver) => driver,
         Err(error) => return error,
@@ -1020,6 +1239,7 @@ struct DeferredBarrier {
 }
 #[derive(Clone)]
 struct ReadImage {
+    order: usize,
     mip_level: u32,
     position: usize,
     image: vk::Image,
@@ -1057,10 +1277,13 @@ struct Recording {
     state: RecordingState,
     error: Option<vk::Result>,
     render_active: bool,
+    render_dynamic: bool,
+    active_queries: BTreeMap<u32, (Arc<queries::Pool>, u32, bool)>,
     // Submit snapshots share immutable recorded data across the calling and
     // device threads. Re-recording uses copy-on-write instead of changing an
     // outstanding snapshot's commands.
     commands: Arc<Vec<RecordedCommand>>,
+    descriptor_refs: Arc<HashSet<vk::DescriptorSet>>,
 }
 
 #[derive(Default)]
@@ -1095,6 +1318,11 @@ pub(crate) fn set_pipeline_layout_metadata(
 #[derive(Clone)]
 enum RecordedCommand {
     InertDynamicState,
+    Query(queries::Action),
+    BeginRendering(dynamic_rendering::Rendering),
+    EndRendering,
+    DrawIndirect(indirect::Draw),
+    Synchronize(synchronization2::Action),
     CopyImage {
         source: vk::Image,
         source_layout: vk::ImageLayout,
@@ -1120,12 +1348,22 @@ enum RecordedCommand {
         point: vk::PipelineBindPoint,
         pipeline: vk::Pipeline,
     },
+    PushDescriptorWrites {
+        point: vk::PipelineBindPoint,
+        layout: vk::PipelineLayout,
+        set: u32,
+        writes: Vec<crate::resources::Write>,
+        handle: vk::DescriptorSet,
+        owner: std::sync::Weak<()>,
+        history: push_descriptors::History,
+    },
     BindDescriptorSets {
         point: vk::PipelineBindPoint,
         layout: vk::PipelineLayout,
         first: u32,
         sets: Vec<vk::DescriptorSet>,
         dynamic_offsets: Vec<u32>,
+        pushed: Option<Arc<()>>,
     },
     Dispatch {
         x: u32,
@@ -1177,6 +1415,12 @@ enum RecordedCommand {
         attachments: Vec<vk::ClearAttachment>,
         rects: Vec<vk::ClearRect>,
     },
+    ClearDepthImage {
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        depth: f32,
+        ranges: Vec<vk::ImageSubresourceRange>,
+    },
     ClearColorImage {
         image: vk::Image,
         layout: vk::ImageLayout,
@@ -1206,6 +1450,7 @@ enum RecordedCommand {
         regions: Vec<vk::BufferImageCopy>,
     },
     PipelineBarrier {
+        full_scope: bool,
         source_stage: vk::PipelineStageFlags,
         destination_stage: vk::PipelineStageFlags,
         flags: vk::DependencyFlags,
@@ -1224,6 +1469,8 @@ struct ResolvedRecording {
     descriptors: Vec<DescriptorInsertion>,
     copies: Vec<ReadImage>,
     barriers: Vec<DeferredBarrier>,
+    synchronizations: Vec<synchronization2::Insertion>,
+    order: usize,
     written_buffers: Vec<vk::Buffer>,
     compute: Option<vk::Pipeline>,
     graphics: Option<vk::Pipeline>,
@@ -1239,7 +1486,9 @@ struct ResolvedRecording {
     viewport: Option<vk::Viewport>,
     scissor: Option<vk::Rect2D>,
     used_buffers: Vec<vk::Buffer>,
-    readback_buffers: Vec<vk::Buffer>,
+    referenced_buffers: Vec<vk::Buffer>,
+    source_upload_ranges: buffer_uploads::Ranges,
+    readback_buffers: buffer_readback::Readbacks,
     used_images: Vec<vk::Image>,
     used_pipelines: Vec<vk::Pipeline>,
     used_framebuffers: Vec<vk::Framebuffer>,
@@ -1279,11 +1528,34 @@ impl Recording {
             state: RecordingState::Initial,
             error: None,
             render_active: false,
+            render_dynamic: false,
+            active_queries: Default::default(),
             commands: Arc::default(),
+            descriptor_refs: Arc::default(),
         }
     }
     fn fail(&mut self, e: vk::Result) {
         self.error.get_or_insert(e);
+    }
+    fn reset(&mut self, release: bool) {
+        if !release && let Some(sets) = Arc::get_mut(&mut self.descriptor_refs) {
+            sets.clear();
+        } else {
+            self.descriptor_refs = Arc::default();
+        }
+        if !release && let Some(commands) = Arc::get_mut(&mut self.commands) {
+            commands.clear();
+        } else {
+            // Outstanding submissions own their immutable snapshots. Never
+            // clone old commands just to discard them while re-recording.
+            self.commands = Arc::default();
+        }
+        self.one_time = false;
+        self.state = RecordingState::Initial;
+        self.error = None;
+        self.render_active = false;
+        self.render_dynamic = false;
+        self.active_queries.clear();
     }
     fn push(&mut self, command: RecordedCommand) -> VkResult<()> {
         if self.state != RecordingState::Recording {
@@ -1295,11 +1567,82 @@ impl Recording {
             return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
         }
         match command {
+            RecordedCommand::Query(
+                queries::Action::Reset(ref pool, first, count)
+                | queries::Action::Copy {
+                    ref pool,
+                    first,
+                    count,
+                    ..
+                },
+            ) if self.active_queries.values().any(|(p, i, _)| {
+                Arc::ptr_eq(p, pool)
+                    && *i >= first
+                    && u64::from(*i) < u64::from(first) + u64::from(count)
+            }) =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::Query(queries::Action::Begin(ref pool, index)) => {
+                if self.active_queries.contains_key(&pool.kind) {
+                    self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                self.active_queries
+                    .insert(pool.kind, (pool.clone(), index, self.render_active));
+            }
+            RecordedCommand::Query(queries::Action::End(ref pool, index)) => {
+                if !self
+                    .active_queries
+                    .get(&pool.kind)
+                    .is_some_and(|(p, i, inside)| {
+                        Arc::ptr_eq(p, pool) && *i == index && *inside == self.render_active
+                    })
+                {
+                    self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                self.active_queries.remove(&pool.kind);
+            }
+            RecordedCommand::EndRenderPass
+            | RecordedCommand::EndRendering
+            | RecordedCommand::NextSubpass
+                if self.active_queries.values().any(|(_, _, inside)| *inside) =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::BeginRendering(_) if self.render_active => {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::BeginRendering(_) => {
+                self.render_active = true;
+                self.render_dynamic = true;
+            }
+            RecordedCommand::EndRendering if !self.render_active || !self.render_dynamic => {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            RecordedCommand::EndRendering => {
+                self.render_active = false;
+                self.render_dynamic = false;
+            }
+            RecordedCommand::NextSubpass | RecordedCommand::EndRenderPass
+                if self.render_dynamic =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             RecordedCommand::BeginRenderPass { .. } if self.render_active => {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
-            RecordedCommand::BeginRenderPass { .. } => self.render_active = true,
+            RecordedCommand::BeginRenderPass { .. } => {
+                self.render_active = true;
+                self.render_dynamic = false;
+            }
             RecordedCommand::EndRenderPass | RecordedCommand::NextSubpass
                 if !self.render_active =>
             {
@@ -1307,15 +1650,24 @@ impl Recording {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
             RecordedCommand::EndRenderPass => self.render_active = false,
+            RecordedCommand::Query(queries::Action::Reset(..) | queries::Action::Copy { .. })
+                if self.render_active =>
+            {
+                self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             RecordedCommand::Draw { .. }
             | RecordedCommand::DrawIndexed { .. }
+            | RecordedCommand::DrawIndirect(_)
             | RecordedCommand::ClearAttachments { .. }
                 if !self.render_active =>
             {
                 self.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
-            RecordedCommand::Dispatch { .. } | RecordedCommand::PipelineBarrier { .. }
+            RecordedCommand::Dispatch { .. }
+            | RecordedCommand::PipelineBarrier { .. }
+            | RecordedCommand::Synchronize(_)
                 if self.render_active =>
             {
                 self.fail(vk::Result::ERROR_FEATURE_NOT_PRESENT);
@@ -1323,6 +1675,7 @@ impl Recording {
             }
             RecordedCommand::CopyImageToBuffer { .. }
             | RecordedCommand::ClearColorImage { .. }
+            | RecordedCommand::ClearDepthImage { .. }
             | RecordedCommand::BlitImage { .. }
             | RecordedCommand::CopyImage { .. }
             | RecordedCommand::CopyBuffer { .. }
@@ -1335,6 +1688,9 @@ impl Recording {
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
             _ => {}
+        }
+        if let RecordedCommand::BindDescriptorSets { sets, .. } = &command {
+            Arc::make_mut(&mut self.descriptor_refs).extend(sets.iter().copied());
         }
         Arc::make_mut(&mut self.commands).push(command);
         Ok(())
@@ -1351,6 +1707,8 @@ impl ResolvedRecording {
             descriptors: Vec::new(),
             copies: Vec::new(),
             barriers: Vec::new(),
+            synchronizations: Vec::new(),
+            order: 0,
             written_buffers: Vec::new(),
             compute: None,
             graphics: None,
@@ -1366,7 +1724,9 @@ impl ResolvedRecording {
             viewport: None,
             scissor: None,
             used_buffers: Vec::new(),
-            readback_buffers: Vec::new(),
+            referenced_buffers: Vec::new(),
+            source_upload_ranges: Default::default(),
+            readback_buffers: buffer_readback::Readbacks::default(),
             used_images: Vec::new(),
             used_pipelines: Vec::new(),
             used_framebuffers: Vec::new(),
@@ -1377,7 +1737,22 @@ impl ResolvedRecording {
 
 impl RecordedCommand {
     fn apply(&self, rt: &mut Runtime, rec: &mut ResolvedRecording) -> VkResult<()> {
+        rec.order += 1;
         match self {
+            Self::Query(action) => queries::resolve(rt, rec, action)?,
+            Self::BeginRendering(rendering) => dynamic_rendering::begin(rt, rec, rendering)?,
+            Self::EndRendering => render_passes::end(rec)?,
+            Self::DrawIndirect(draw) => indirect::resolve(rt, rec, draw)?,
+            Self::Synchronize(action) => {
+                if rec.render.is_some() {
+                    return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                }
+                rec.synchronizations.push(synchronization2::Insertion {
+                    position: rec.ops.len(),
+                    order: rec.order,
+                    action: action.clone(),
+                });
+            }
             Self::InertDynamicState => (),
             Self::CopyImage {
                 source,
@@ -1445,12 +1820,28 @@ impl RecordedCommand {
                 }
                 rec.used_pipelines.push(*pipeline);
             }
+            Self::PushDescriptorWrites {
+                point,
+                layout,
+                set,
+                writes,
+                handle,
+                owner,
+                history,
+            } => {
+                debug_assert!(matches!(
+                    *point,
+                    vk::PipelineBindPoint::GRAPHICS | vk::PipelineBindPoint::COMPUTE
+                ));
+                push_descriptors::resolve(rt, *layout, *set, writes, *handle, owner, history)?;
+            }
             Self::BindDescriptorSets {
                 point,
                 layout,
                 first,
                 sets,
                 dynamic_offsets,
+                ..
             } => {
                 if first
                     .checked_add(sets.len() as u32)
@@ -1489,7 +1880,7 @@ impl RecordedCommand {
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
                     let group_index = *first as usize + index;
                     if layout.bind_groups().get(group_index) != Some(&descriptor.layout)
-                        || binding_maps.get(group_index) != Some(&descriptor.binding_map())
+                        || binding_maps.get(group_index) != Some(descriptor.binding_map())
                         || binding_stages.get(group_index) != Some(&descriptor.stages)
                     {
                         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -1576,7 +1967,13 @@ impl RecordedCommand {
                             .unwrap_or_default(),
                     });
                 }
-                mark_writable_descriptor_buffers(&rt.resources, rec, &active_sets, desc.layout())?;
+                mark_writable_descriptor_buffers(
+                    &rt.resources,
+                    rec,
+                    &active_sets,
+                    desc.layout(),
+                    vk::PipelineBindPoint::COMPUTE,
+                )?;
                 if *x != 0 && *y != 0 && *z != 0 {
                     rec.ops.push(ir::OwnedCommand::Dispatch {
                         x: *x,
@@ -1610,6 +2007,20 @@ impl RecordedCommand {
             Self::NextSubpass => render_passes::next(rec)?,
             Self::ClearAttachments { attachments, rects } => {
                 render_passes::clear_attachments(rec, attachments, rects)?;
+            }
+            Self::ClearDepthImage {
+                image,
+                layout,
+                depth,
+                ranges,
+            } => {
+                if rec.render.is_some() {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                rec.ops.extend(crate::clear::depth_commands(
+                    rt, *image, *layout, *depth, ranges,
+                )?);
+                rec.used_images.push(*image);
             }
             Self::ClearColorImage {
                 image,
@@ -1680,6 +2091,9 @@ impl RecordedCommand {
                 first,
                 first_instance,
             } => {
+                if rt.capabilities.supports_shader_draw_parameters() {
+                    rec.ops.push(ir::OwnedCommand::SetDrawIndex(0));
+                }
                 if first_instance.checked_add(*instances).is_none() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
@@ -1707,6 +2121,9 @@ impl RecordedCommand {
                 base_vertex,
                 first_instance,
             } => {
+                if rt.capabilities.supports_shader_draw_parameters() {
+                    rec.ops.push(ir::OwnedCommand::SetDrawIndex(0));
+                }
                 if first_instance.checked_add(*instances).is_none() {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
@@ -1779,7 +2196,8 @@ impl RecordedCommand {
                     || !image_data.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                     || !matches!(
                         image_data.format,
-                        vk::Format::R8G8B8A8_UNORM
+                        vk::Format::D32_SFLOAT
+                            | vk::Format::R8G8B8A8_UNORM
                             | vk::Format::B8G8R8A8_UNORM
                             | vk::Format::A8B8G8R8_UNORM_PACK32
                             | vk::Format::R8G8B8A8_SRGB
@@ -1787,6 +2205,8 @@ impl RecordedCommand {
                             | vk::Format::A8B8G8R8_SRGB_PACK32
                             | vk::Format::R8_UNORM
                             | vk::Format::R8G8_UNORM
+                            | vk::Format::R16G16B16A16_SFLOAT
+                            | vk::Format::R32G32B32A32_SFLOAT
                     )
                 {
                     return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
@@ -1796,14 +2216,22 @@ impl RecordedCommand {
                     let bytes_per_pixel = crate::images::texture_format(image_data.format)
                         .and_then(|format| format.bytes_per_pixel())
                         .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
-                    let readback = crate::transfer::ImageReadbackRegion::new(
-                        extent, bytes_per_pixel, buffer_data.size, region,
+                    let readback = crate::transfer::ImageReadbackRegion::with_aspect(
+                        extent, bytes_per_pixel, buffer_data.size, region, crate::images::image_aspect(image_data.format),
                     ).inspect_err(|error| {
                         if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                             eprintln!("[SGFX Vulkan] image readback region rejected: {error:?} format={:?} extent={extent:?} buffer_size={} region={region:?}", image_data.format, buffer_data.size);
                         }
                     })?;
+                    for range in readback.destination_ranges() {
+                        rec.readback_buffers.insert(
+                            *buffer,
+                            range.start,
+                            range.end - range.start,
+                        )?;
+                    }
                     rec.copies.push(ReadImage {
+                        order: rec.order,
                         mip_level: region.image_subresource.mip_level,
                         position: rec.ops.len(),
                         image: *image,
@@ -1813,7 +2241,6 @@ impl RecordedCommand {
                 }
                 rec.used_buffers.push(*buffer);
                 rec.used_images.push(*image);
-                rec.readback_buffers.push(*buffer);
             }
             Self::UpdateBuffer {
                 buffer,
@@ -1862,44 +2289,9 @@ impl RecordedCommand {
                 source,
                 destination,
                 regions,
-            } => {
-                if rec.render.is_some() {
-                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                }
-                let source_data = rt
-                    .resources
-                    .buffers
-                    .get(source)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                let destination_data = rt
-                    .resources
-                    .buffers
-                    .get(destination)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                if source_data.bound.is_none()
-                    || destination_data.bound.is_none()
-                    || !source_data
-                        .usage
-                        .contains(vk::BufferUsageFlags::TRANSFER_SRC)
-                    || !destination_data
-                        .usage
-                        .contains(vk::BufferUsageFlags::TRANSFER_DST)
-                {
-                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-                }
-                for region in regions {
-                    rec.ops.push(ir::OwnedCommand::CopyBufferToBuffer {
-                        source: source_data.id,
-                        source_offset: region.src_offset,
-                        destination: destination_data.id,
-                        destination_offset: region.dst_offset,
-                        size: region.size,
-                    });
-                }
-                rec.used_buffers.extend([*source, *destination]);
-                rec.readback_buffers.push(*destination);
-            }
+            } => buffer_uploads::resolve_copy(&rt.resources, rec, *source, *destination, regions)?,
             Self::PipelineBarrier {
+                full_scope,
                 source_stage,
                 destination_stage,
                 flags,
@@ -1913,8 +2305,12 @@ impl RecordedCommand {
                 {
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
+                let barrier_start = rec.ops.len();
                 for (extended, source, destination) in memory {
                     if *extended {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    if !supported_access(*source) || !supported_access(*destination) {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
                     if source
@@ -1923,15 +2319,12 @@ impl RecordedCommand {
                         rec.barriers.push(DeferredBarrier {
                             position: rec.ops.len(),
                             buffers: std::mem::take(&mut rec.written_buffers),
-                            after: buffer_access(*destination)?,
+                            after: buffer_access(if *full_scope && destination.is_empty() {
+                                vk::AccessFlags::MEMORY_READ
+                            } else {
+                                *destination
+                            })?,
                         });
-                    } else if !(vk::AccessFlags::TRANSFER_WRITE
-                        | vk::AccessFlags::HOST_WRITE
-                        | vk::AccessFlags::MEMORY_WRITE)
-                        .contains(*source)
-                        || !supported_access(*destination)
-                    {
-                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
                 }
                 for (
@@ -1953,17 +2346,46 @@ impl RecordedCommand {
                         .buffers
                         .get(buffer)
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                    if *offset != 0 || (*size != vk::WHOLE_SIZE && *size != buffer_data.size) {
+                    let bytes = if *size == vk::WHOLE_SIZE {
+                        buffer_data.size.checked_sub(*offset)
+                    } else {
+                        Some(*size)
+                    };
+                    if bytes.is_none_or(|bytes| {
+                        bytes == 0
+                            || offset
+                                .checked_add(bytes)
+                                .is_none_or(|end| end > buffer_data.size)
+                    }) {
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                    if !*full_scope
+                        && (*offset != 0 || (*size != vk::WHOLE_SIZE && *size != buffer_data.size))
+                    {
                         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                     }
+                    rec.referenced_buffers.push(*buffer);
+                    if *full_scope && source.is_empty() && destination.is_empty() {
+                        continue;
+                    }
+                    let before = if *full_scope {
+                        synchronization2::buffer_access(*source, *destination, buffer_data.usage)?
+                    } else {
+                        buffer_access(*source)?
+                    };
+                    let after = if *full_scope {
+                        synchronization2::buffer_access(*destination, *source, buffer_data.usage)?
+                    } else {
+                        buffer_access(*destination)?
+                    };
                     rec.ops.push(ir::OwnedCommand::ResourceBarrier(
                         ir::OwnedResourceBarrier::Buffer {
                             buffer: buffer_data.id,
-                            before: buffer_access(*source)?,
-                            after: buffer_access(*destination)?,
+                            before,
+                            after,
                         },
                     ));
-                    rec.used_buffers.push(*buffer);
+                    rec.referenced_buffers.push(*buffer);
                 }
                 for (
                     extended,
@@ -2060,18 +2482,26 @@ impl RecordedCommand {
                     }
                     rec.used_images.push(*image);
                 }
+                // Global dependencies cover attachment writes as well as buffers.
+                // Retire preceding GPU work at this control point for legacy
+                // memory barriers, just as for synchronization2 dependencies.
+                // Ordinary resource barriers are validated/replayed in order
+                // inside the command stream and have no backend operation.
+                // Keep global/storage scopes on the conservative boundary path.
+                let fifo_only = memory.is_empty()
+                    && rec.ops[barrier_start..]
+                        .iter()
+                        .all(barrier_only::ordinary_barrier);
+                if (*full_scope || !memory.is_empty()) && !fifo_only {
+                    rec.synchronizations.push(synchronization2::Insertion {
+                        position: rec.ops.len(),
+                        order: rec.order,
+                        action: synchronization2::Action::Barrier,
+                    });
+                }
             }
         }
         Ok(())
-    }
-
-    fn references_descriptor_sets(&self, sets: &[vk::DescriptorSet]) -> bool {
-        matches!(
-            self,
-            Self::BindDescriptorSets {
-                sets: recorded, ..
-            } if recorded.iter().any(|set| sets.contains(set))
-        )
     }
 }
 
@@ -2160,6 +2590,7 @@ fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedR
 }
 
 fn record(command: vk::CommandBuffer, recorded: RecordedCommand) {
+    let _frame = crate::frame_profile::RecordingSpan::new();
     let Ok(driver) = driver(command.as_raw(), Kind::Command) else {
         return;
     };
@@ -2386,9 +2817,10 @@ unsafe extern "system" fn reset_command_pool(
             .collect::<Vec<_>>()
     };
     for recording in recordings {
-        *recording
+        recording
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Recording::new(pool.as_raw());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reset(flags.contains(vk::CommandPoolResetFlags::RELEASE_RESOURCES));
     }
     vk::Result::SUCCESS
 }
@@ -2427,9 +2859,10 @@ unsafe extern "system" fn reset_command_buffer(
     {
         return vk::Result::ERROR_FEATURE_NOT_PRESENT;
     }
-    *recording
+    recording
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Recording::new(pool);
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .reset(flags.contains(vk::CommandBufferResetFlags::RELEASE_RESOURCES));
     vk::Result::SUCCESS
 }
 unsafe extern "system" fn begin_command_buffer(
@@ -2483,12 +2916,12 @@ unsafe extern "system" fn begin_command_buffer(
     {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let mut recording = Recording::new(pool);
+    let mut recording = existing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    recording.reset(false);
     recording.state = RecordingState::Recording;
     recording.one_time = one_time;
-    *existing
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = recording;
     vk::Result::SUCCESS
 }
 unsafe extern "system" fn end_command_buffer(command: vk::CommandBuffer) -> vk::Result {
@@ -2510,7 +2943,10 @@ unsafe extern "system" fn end_command_buffer(command: vk::CommandBuffer) -> vk::
     let mut recording = recording
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if recording.state != RecordingState::Recording || recording.render_active {
+    if recording.state != RecordingState::Recording
+        || recording.render_active
+        || !recording.active_queries.is_empty()
+    {
         recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED)
     }
     if let Some(error) = recording.error {
@@ -2576,6 +3012,7 @@ unsafe extern "system" fn cmd_bind_descriptor_sets(
             first,
             sets: copied,
             dynamic_offsets,
+            pushed: None,
         },
     )
 }
@@ -2714,6 +3151,32 @@ unsafe extern "system" fn cmd_clear_attachments(
     }
 }
 
+unsafe extern "system" fn cmd_clear_depth_image(
+    command: vk::CommandBuffer,
+    image: vk::Image,
+    layout: vk::ImageLayout,
+    value: *const vk::ClearDepthStencilValue,
+    count: u32,
+    ranges: *const vk::ImageSubresourceRange,
+) {
+    let result = (|| {
+        let depth = value
+            .as_ref()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+            .depth;
+        let ranges = slice(ranges, count)?.to_vec();
+        Ok(RecordedCommand::ClearDepthImage {
+            image,
+            layout,
+            depth,
+            ranges,
+        })
+    })();
+    match result {
+        Ok(command_data) => record(command, command_data),
+        Err(error) => record_error(command, error),
+    }
+}
 unsafe extern "system" fn cmd_clear_color_image(
     command: vk::CommandBuffer,
     image: vk::Image,
@@ -2892,6 +3355,14 @@ fn graphics_bindings(
         )
         .map_err(crate::resources::failure)?;
     render_passes::validate_bindings(resources, rec, pipeline, desc.layout())?;
+    if rec
+        .active_render_pass
+        .as_ref()
+        .is_some_and(|a| a.pass.subpasses[a.subpass].read_only_depth)
+        && desc.depth_state().is_some_and(|d| d.write_enabled())
+    {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
     emit_changed(
         &mut rec.emitted_graphics.viewport,
         viewport,
@@ -2996,7 +3467,13 @@ fn graphics_bindings(
             dynamic_offsets,
         });
     }
-    mark_writable_descriptor_buffers(resources, rec, &active_sets, desc.layout())?;
+    mark_writable_descriptor_buffers(
+        resources,
+        rec,
+        &active_sets,
+        desc.layout(),
+        vk::PipelineBindPoint::GRAPHICS,
+    )?;
     Ok(visible)
 }
 
@@ -3005,6 +3482,7 @@ fn mark_writable_descriptor_buffers(
     rec: &mut ResolvedRecording,
     sets: &[(u32, vk::DescriptorSet)],
     layout: &ir::PipelineLayoutDesc,
+    point: vk::PipelineBindPoint,
 ) -> VkResult<()> {
     for (index, handle) in sets {
         let set = resources
@@ -3023,15 +3501,35 @@ fn mark_writable_descriptor_buffers(
                         )
                 });
             if writable {
-                let crate::resources::DescriptorBinding::Buffer { buffer, .. } = resource else {
+                let crate::resources::DescriptorBinding::Buffer {
+                    buffer,
+                    offset,
+                    range,
+                } = resource
+                else {
                     continue;
                 };
                 if !rec.written_buffers.contains(buffer) {
                     rec.written_buffers.push(*buffer);
                 }
-                if !rec.readback_buffers.contains(buffer) {
-                    rec.readback_buffers.push(*buffer);
-                }
+                let offsets = if point == vk::PipelineBindPoint::COMPUTE {
+                    &rec.compute_offsets
+                } else {
+                    &rec.graphics_offsets
+                };
+                let dynamic = buffer_uploads::dynamic_offset(
+                    set,
+                    binding,
+                    offsets.get(index).map_or(&[], Vec::as_slice),
+                )?;
+                let size = resources
+                    .buffers
+                    .get(buffer)
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+                    .size;
+                let range = buffer_uploads::descriptor_range(size, *offset, *range, dynamic)?;
+                rec.readback_buffers
+                    .insert(*buffer, range.start, range.end - range.start)?;
             }
         }
     }
@@ -3295,6 +3793,7 @@ unsafe extern "system" fn cmd_pipeline_barrier(
     record(
         command,
         RecordedCommand::PipelineBarrier {
+            full_scope: false,
             source_stage,
             destination_stage,
             flags,
@@ -3319,6 +3818,7 @@ fn validate_pipeline_barrier_header(
     let allowed = vk::PipelineStageFlags::TOP_OF_PIPE
         | vk::PipelineStageFlags::BOTTOM_OF_PIPE
         | vk::PipelineStageFlags::HOST
+        | vk::PipelineStageFlags::DRAW_INDIRECT
         | vk::PipelineStageFlags::TRANSFER
         | vk::PipelineStageFlags::COMPUTE_SHADER
         | vk::PipelineStageFlags::VERTEX_SHADER
@@ -3354,7 +3854,9 @@ fn supported_access(access: vk::AccessFlags) -> bool {
         | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
         | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
         | vk::AccessFlags::VERTEX_ATTRIBUTE_READ
-        | vk::AccessFlags::INDEX_READ)
+        | vk::AccessFlags::INDEX_READ
+        | vk::AccessFlags::INPUT_ATTACHMENT_READ
+        | vk::AccessFlags::INDIRECT_COMMAND_READ)
         .contains(access)
 }
 fn buffer_access(access: vk::AccessFlags) -> VkResult<ir::BufferAccess> {
@@ -3369,6 +3871,8 @@ fn buffer_access(access: vk::AccessFlags) -> VkResult<ir::BufferAccess> {
         Ok(ir::BufferAccess::Vertex)
     } else if access.contains(vk::AccessFlags::INDEX_READ) {
         Ok(ir::BufferAccess::Index)
+    } else if access.contains(vk::AccessFlags::INDIRECT_COMMAND_READ) {
+        Ok(ir::BufferAccess::CopySource)
     } else if access.contains(vk::AccessFlags::UNIFORM_READ) {
         Ok(ir::BufferAccess::Uniform)
     } else if access.intersects(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE) {
@@ -3494,6 +3998,7 @@ unsafe extern "system" fn wait_for_fences(
     all: vk::Bool32,
     timeout: u64,
 ) -> vk::Result {
+    let _frame = crate::frame_profile::Span::new("wait", "fences");
     let handles = match slice(ptr, count) {
         Ok(v) if !v.is_empty() => v,
         _ => return vk::Result::ERROR_INITIALIZATION_FAILED,
@@ -3602,18 +4107,14 @@ fn semaphore_refs(d: &Driver, handles: &[vk::Semaphore]) -> VkResult<Vec<Arc<Ato
 ))]
 fn wait_and_consume_semaphores(d: &Driver, semaphores: &[Arc<AtomicU8>]) -> VkResult<()> {
     for semaphore in semaphores {
-        loop {
+        d.in_flight.wait_until(u64::MAX, || {
             if d.lost.load(Ordering::Acquire) {
                 return Err(vk::Result::ERROR_DEVICE_LOST);
             }
-            if semaphore
+            Ok(semaphore
                 .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(50));
-        }
+                .is_ok())
+        })?;
     }
     Ok(())
 }
@@ -3662,16 +4163,54 @@ pub(crate) fn signal_acquire_sync(
     Ok(())
 }
 
-#[cfg(any(
-    target_os = "scarlet",
-    target_os = "macos",
-    all(target_os = "linux", feature = "scarlet-wsi"),
-    test
-))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn wait_queue_semaphores(queue: vk::Queue, handles: &[vk::Semaphore]) -> VkResult<()> {
     let d = driver(queue.as_raw(), Kind::Queue)?;
     let semaphores = semaphore_refs(&d, handles)?;
     wait_and_consume_semaphores(&d, &semaphores)
+}
+
+#[cfg(any(
+    target_os = "scarlet",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
+pub(crate) fn enqueue_presentation(
+    queue: vk::Queue,
+    handles: &[vk::Semaphore],
+    packet: crate::wsi::Presentation,
+) -> VkResult<()> {
+    let driver = driver(queue.as_raw(), Kind::Queue)?;
+    if driver.lost.load(Ordering::Acquire) {
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    if handles.len() > 64 {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+    let mut waits = std::array::from_fn(|_| None);
+    {
+        let semaphores = driver.semaphores.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, (slot, handle)) in waits.iter_mut().zip(handles).enumerate() {
+            if handles[..index].contains(handle) {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            *slot = Some(Arc::clone(
+                semaphores
+                    .get(&handle.as_raw())
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?,
+            ));
+        }
+    }
+    driver.pending.reserve_pending(1)?;
+    if driver
+        .queue_sender
+        .send(queue::Request::Present(Arc::clone(&driver), waits, packet))
+        .is_err()
+    {
+        driver.pending.finish();
+        driver.mark_lost();
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    Ok(())
 }
 
 unsafe extern "system" fn queue_submit(
@@ -3692,6 +4231,7 @@ fn finish_submissions(
     pending: &InFlight,
     lost: &AtomicBool,
 ) {
+    let _frame = crate::frame_profile::Span::new("wait", "completion_receipts");
     // Drain every receipt even when one fails: failure does not free other GPU work.
     let complete = submissions.iter().enumerate().fold(true, |complete, (index, submission)| {
         let result = submission.wait(None);
@@ -3753,12 +4293,16 @@ fn validate_objects(rt: &Runtime, rec: &ResolvedRecording) -> VkResult<()> {
             .used_pipelines
             .iter()
             .any(|p| !rt.resources.pipelines.contains_key(p))
-        || rec.used_buffers.iter().any(|b| {
-            rt.resources
-                .buffers
-                .get(b)
-                .is_none_or(|b| b.bound.is_none())
-        })
+        || rec
+            .used_buffers
+            .iter()
+            .chain(&rec.referenced_buffers)
+            .any(|b| {
+                rt.resources
+                    .buffers
+                    .get(b)
+                    .is_none_or(|b| b.bound.is_none())
+            })
         || rec
             .used_images
             .iter()
@@ -3820,15 +4364,19 @@ fn submit_owned(
     ops: Vec<ir::OwnedCommand>,
 ) -> VkResult<Vec<sgfx::driver::Submission>> {
     let owned = ir::OwnedCommandBuffer::new(ops);
-    let batches = if crate::upload_batches::needs_batches(
-        owned.commands(),
-        crate::upload_batches::UPLOAD_BATCH_BYTES,
-    ) {
-        crate::upload_batches::split(owned, &rt.table, crate::upload_batches::UPLOAD_BATCH_BYTES)
-            .map_err(crate::resources::failure)?
-    } else {
-        vec![owned]
-    };
+    let operation_count = owned.command_count();
+    let batches = profile_work("submit::partition_uploads", || {
+        if crate::upload_batches::needs_batches(
+            owned.commands(),
+            crate::upload_batches::UPLOAD_BATCH_BYTES,
+        ) {
+            crate::upload_batches::split(owned, &rt.table, crate::upload_batches::UPLOAD_BATCH_BYTES)
+                .inspect_err(|e| eprintln!("[SGFX Vulkan] upload batch preflight failed: operations={operation_count} error={e:?}"))
+                .map_err(crate::resources::failure)
+        } else {
+            Ok(vec![owned])
+        }
+    })?;
     let mut submissions = Vec::new();
     for batch in batches {
         match submit_owned_batch(rt, batch) {
@@ -3850,6 +4398,8 @@ fn submit_owned(
     Ok(submissions)
 }
 
+mod barrier_only;
+
 fn submit_owned_batch(
     rt: &mut Runtime,
     owned: ir::OwnedCommandBuffer,
@@ -3859,16 +4409,37 @@ fn submit_owned_batch(
     }
     let commands = profile_work("submit::record_ir", || {
         owned.record(&rt.table).map_err(|error| {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                trace_owned_recording_failure(&rt.table, &owned, error);
-            }
+            trace_owned_recording_failure(&rt.table, &owned, error);
             crate::resources::failure(error)
         })
     })?;
+    if barrier_only::is_noop(owned.commands()) {
+        // These validated transitions need no backend operation on our ordered
+        // queue. Keep outer control points and FIFO completion observations:
+        // an empty receipt list still completes after the earlier queue prefix.
+        return Ok(None);
+    }
     profile_work("submit::backend", || {
         match submit_with_backpressure(|| rt.queue.submit(&mut rt.cache, &commands)) {
-            Ok(receipt) => Ok(Some(receipt)),
+            Ok(receipt) => {
+                let draws = owned
+                    .commands()
+                    .iter()
+                    .filter(|command| {
+                        matches!(
+                            command,
+                            ir::OwnedCommand::Draw { .. }
+                                | ir::OwnedCommand::DrawIndexed { .. }
+                                | ir::OwnedCommand::DrawInstanced { .. }
+                                | ir::OwnedCommand::DrawIndexedInstanced { .. }
+                        )
+                    })
+                    .count() as u64;
+                crate::progress::submitted(draws);
+                Ok(Some(receipt))
+            }
             Err(SubmitError::Rejected(error)) => {
+                trace_owned_recording_failure(&rt.table, &owned, &error);
                 let mut buffer_bytes = 0usize;
                 let mut texture_bytes = 0usize;
                 let mut draws = 0usize;
@@ -3926,10 +4497,10 @@ fn submit_owned_batch(
 fn trace_owned_recording_failure(
     table: &ir::ResourceTable,
     owned: &ir::OwnedCommandBuffer,
-    error: ir::Error,
+    error: impl std::fmt::Debug,
 ) {
     eprintln!(
-        "[SGFX Vulkan] IR recording rejected: {error:?}, {} operations",
+        "[SGFX Vulkan] IR stream rejected: {error:?}, {} operations",
         owned.command_count()
     );
     for (index, command) in owned.commands().iter().enumerate().take(512) {
@@ -4001,8 +4572,11 @@ fn trace_owned_recording_failure(
                     .programmable_render_pipeline_ref(*pipeline)
                     .and_then(|id| table.programmable_render_pipeline_shared(id));
                 eprintln!(
-                    "[SGFX Vulkan] IR[{index}] {command:?} vertex_layout={:?}",
-                    desc.as_ref().map(|desc| desc.vertex_buffers())
+                    "[SGFX Vulkan] IR[{index}] {command:?} vertex_layout={:?} colors={:?} depth={:?}",
+                    desc.as_ref().map(|desc| desc.vertex_buffers()),
+                    desc.as_ref()
+                        .map(|desc| desc.color_targets().collect::<Vec<_>>()),
+                    desc.as_ref().map(|desc| desc.depth_state())
                 );
             }
             ir::OwnedCommand::BeginRenderPass(desc)
@@ -4038,6 +4612,7 @@ fn trace_owned_recording_failure(
 }
 
 fn wait_submission(rt: &mut Runtime, submission: &sgfx::driver::Submission) -> VkResult<()> {
+    let _frame = crate::frame_profile::Span::new("wait", "synchronous_receipt");
     match submission.wait(None) {
         Ok(CompletionStatus::Complete) => Ok(()),
         Ok(status) => {
@@ -4078,74 +4653,39 @@ fn take_positioned<'a, T>(
     current
 }
 
+#[cfg(test)]
 fn snapshot_buffer_uploads(
     resources: &crate::resources::Resources,
     used: &[vk::Buffer],
 ) -> VkResult<BufferUploads> {
-    let mut ops = Vec::new();
-    let mut fresh_uploads = Vec::new();
-    // Every upload is copied into SGFX-owned command storage before submission
-    // returns, so application mappings need not remain borrowed by the backend.
-    for handle in used {
-        let buffer = resources
-            .buffers
-            .get(handle)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        if let Some((memory, offset)) = buffer.bound {
-            let allocation = resources
-                .memories
-                .get(&memory)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-            if !allocation.mapped && resources.uploaded_unmapped_buffers.contains(handle) {
-                continue;
-            }
-            let mut bytes = allocation
-                .bytes
-                .get(offset as usize..(offset + buffer.size) as usize)
-                .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
-                .to_vec();
-            bytes.resize(bytes.len().next_multiple_of(4), 0);
-            ops.push(ir::OwnedCommand::WriteBuffer {
-                buffer: buffer.id,
-                offset: 0,
-                data: bytes,
-            });
-            if !allocation.mapped {
-                fresh_uploads.push((*handle, memory));
-            }
-        }
-    }
-    Ok((ops, fresh_uploads))
+    buffer_uploads::whole(resources, used)
 }
 
-fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::driver::Submission>> {
-    let mut used = rec.used_buffers;
-    for insertion in &rec.descriptors {
-        let set = rt
-            .resources
-            .descriptor_sets
-            .get(&insertion.set)
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        for binding in set.bindings.values() {
-            let crate::resources::DescriptorBinding::Buffer { buffer, .. } = binding else {
-                continue;
-            };
-            used.push(*buffer);
-        }
-    }
-    used.sort_unstable_by_key(|b| b.as_raw());
-    used.dedup();
+fn execute(
+    rt: &mut Runtime,
+    rec: ResolvedRecording,
+    retained_submissions: &mut Vec<sgfx::driver::Submission>,
+) -> VkResult<()> {
     let (mut ops, fresh_uploads) = profile_work("execute::snapshot_buffers", || {
-        snapshot_buffer_uploads(&rt.resources, &used)
+        buffer_uploads::for_recording(
+            &rt.resources,
+            &rec.used_buffers,
+            &rec.descriptors,
+            &rec.source_upload_ranges,
+        )
     })
     .inspect_err(|error| {
         if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-            eprintln!("[SGFX Vulkan] buffer snapshot failed: {error:?} used={used:?}");
+            eprintln!(
+                "[SGFX Vulkan] buffer snapshot failed: {error:?} used={:?}",
+                rec.used_buffers
+            );
         }
     })?;
     let mut descriptors = rec.descriptors.as_slice();
     let mut barriers = rec.barriers.as_slice();
     let mut copies = rec.copies.as_slice();
+    let mut synchronizations = rec.synchronizations.as_slice();
     // Resolution already owns upload payloads. Transfer them to the final
     // stream instead of cloning every texture/buffer byte a second time.
     // Include the final insertion position after the last recorded command.
@@ -4167,7 +4707,7 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
                     .min_storage_buffer_offset_alignment
                     .max(4),
             ).inspect_err(|error| {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                {
                     eprintln!("[SGFX Vulkan] descriptor materialization failed: {error:?} set={:?} offsets={:?} layout={:?}", d.set, d.dynamic_offsets, d.layout);
                     if let Some(set) = rt.resources.descriptor_sets.get(&d.set) {
                         eprintln!("[SGFX Vulkan] descriptor contents: invalid={} layout={:?} types={:?} bindings={:?}", set.invalid, set.layout, set.types, set.bindings);
@@ -4202,8 +4742,21 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
             }
         }
         for copy in take_positioned(&mut copies, position, |c| c.position) {
+            while synchronizations
+                .first()
+                .is_some_and(|s| s.position == position && s.order <= copy.order)
+            {
+                synchronization2::execute(
+                    rt,
+                    &mut ops,
+                    &synchronizations[0].action,
+                    retained_submissions,
+                )?;
+                synchronizations = &synchronizations[1..];
+            }
             profile_work("execute::texture_readback", || {
-                for submission in submit_owned(rt, std::mem::take(&mut ops))? {
+                retained_submissions.extend(submit_owned(rt, std::mem::take(&mut ops))?);
+                for submission in retained_submissions.drain(..) {
                     wait_submission(rt, &submission)?;
                 }
                 let image_id = rt
@@ -4225,58 +4778,76 @@ fn execute(rt: &mut Runtime, rec: ResolvedRecording) -> VkResult<Vec<sgfx::drive
                 Ok(())
             })?;
         }
+        while synchronizations
+            .first()
+            .is_some_and(|s| s.position == position)
+        {
+            synchronization2::execute(
+                rt,
+                &mut ops,
+                &synchronizations[0].action,
+                retained_submissions,
+            )?;
+            synchronizations = &synchronizations[1..];
+        }
         if let Some(op) = commands.next() {
             ops.push(op);
         }
     }
-    let mut submissions = submit_owned(rt, ops)?;
-    let mut readback = rec.readback_buffers;
-    readback.sort_unstable_by_key(|buffer| buffer.as_raw());
-    readback.dedup();
-    if !readback.is_empty() {
+    retained_submissions.extend(submit_owned(rt, ops)?);
+    let submissions = retained_submissions;
+    let readback = rec.readback_buffers;
+    // Native buffer mirrors commit at queue acceptance, including compute
+    // results. Keep receipts alive for the enclosing fence while copying those
+    // CPU bytes; backends without that guarantee retain the retirement wait.
+    if !readback.is_empty() && !rt.capabilities.supports_immediate_buffer_readback() {
         profile_work("execute::readback_wait", || {
-            for submission in &submissions {
+            for submission in submissions.iter() {
                 wait_submission(rt, submission)?;
             }
             Ok(())
         })?;
         submissions.clear();
     }
-    // Stage only GPU-written bytes back into allocations returned by MapMemory.
-    let mut dirty_memories = Vec::new();
-    for handle in &readback {
+    for (handle, _) in fresh_uploads {
+        rt.resources.uploaded_unmapped_buffers.insert(handle);
+    }
+    // The backend and this buffer's mirror agree after readback. Only aliases
+    // overlapping the modified allocation bytes need a later full upload.
+    for (handle, ranges) in readback.into_ranges() {
         profile_work("execute::buffer_readback", || {
             let buffer = rt
                 .resources
                 .buffers
-                .get(handle)
+                .get(&handle)
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+            let id = buffer.id;
             if let Some((memory_handle, offset)) = buffer.bound {
-                let bytes = rt
-                    .cache
-                    .read_buffer(buffer.id, 0, buffer.size)
-                    .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-                let allocation = rt
-                    .resources
-                    .memories
-                    .get_mut(&memory_handle)
-                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-                allocation.bytes[offset as usize..(offset + buffer.size) as usize]
-                    .copy_from_slice(&bytes);
-                dirty_memories.push(memory_handle);
+                for range in ranges {
+                    let bytes = rt
+                        .cache
+                        .read_buffer(id, range.start, range.end - range.start)
+                        .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+                    let allocation = rt
+                        .resources
+                        .memories
+                        .get_mut(&memory_handle)
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    allocation.bytes
+                        [(offset + range.start) as usize..(offset + range.end) as usize]
+                        .copy_from_slice(&bytes);
+                    rt.resources.forget_uploads_for_memory_range(
+                        memory_handle,
+                        offset + range.start..offset + range.end,
+                        handle,
+                    );
+                }
             }
             Ok(())
         })?;
     }
-    for memory in &dirty_memories {
-        rt.resources.forget_uploads_for_memory(*memory);
-    }
-    for (handle, memory) in fresh_uploads {
-        if !dirty_memories.contains(&memory) {
-            rt.resources.uploaded_unmapped_buffers.insert(handle);
-        }
-    }
-    Ok(submissions)
+    synchronization2::reap_completed(rt, submissions)?;
+    Ok(())
 }
 
 pub(crate) unsafe extern "system" fn get_device_proc_addr(
@@ -4339,6 +4910,7 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkCmdNextSubpass" => entry!(cmd_next_subpass),
         b"vkCmdEndRenderPass" => entry!(cmd_end_render_pass),
         b"vkCmdCopyImageToBuffer" => entry!(cmd_copy_image_to_buffer),
+        b"vkCmdClearDepthStencilImage" => entry!(cmd_clear_depth_image),
         b"vkCmdClearColorImage" => entry!(cmd_clear_color_image),
         b"vkCmdClearAttachments" => entry!(cmd_clear_attachments),
         b"vkCmdCopyBuffer" => entry!(cmd_copy_buffer),
@@ -4397,11 +4969,17 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
         b"vkGetImageScarletHandleSGFX" => {
             entry!(crate::scarlet_image::vkGetImageScarletHandleSGFX)
         }
-        _ => descriptor_template::lookup(name)
+        _ => core12::lookup(name)
+            .or_else(|| push_descriptors::lookup(name))
+            .or_else(|| descriptor_template::lookup(name))
             .or_else(|| dynamic_states::lookup(name))
             .or_else(|| buffer_views::lookup(name))
             .or_else(|| render_pass2::lookup(name))
             .or_else(|| timeline::lookup(name))
+            .or_else(|| synchronization2::lookup(name))
+            .or_else(|| dynamic_rendering::lookup(name))
+            .or_else(|| queries::lookup(name))
+            .or_else(|| indirect::lookup(name))
             .or_else(|| bootstrap::lookup(name))
             .or_else(|| buffer_operations::lookup(name))
             .or_else(|| unsupported::lookup(name))
@@ -4413,21 +4991,20 @@ pub(crate) fn lookup_device(name: &CStr) -> vk::PFN_vkVoidFunction {
 /// Descriptor indexing is not exposed. Updating a referenced set invalidates
 /// every recording or executable command buffer under Vulkan 1.0 rules.
 fn invalidate_recorded_descriptor_sets(recordings: &Recordings, sets: &[vk::DescriptorSet]) {
+    let _frame = crate::frame_profile::RecordingSpan::invalidation();
     let recordings = recordings
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .commands
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    for recording in recordings {
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Recording maintains its reference index while appending commands.
+    // Updating one set must not allocate a handle snapshot or rescan every
+    // previously recorded command on every draw.
+    for recording in recordings.commands.values() {
         let mut recording = recording
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if recording
-            .commands
+        if sets
             .iter()
-            .any(|command| command.references_descriptor_sets(sets))
+            .any(|set| recording.descriptor_refs.contains(set))
         {
             recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
             if recording.state == RecordingState::Executable {
@@ -4479,6 +5056,7 @@ pub(crate) fn invalidate_resource_recordings(rt: &mut Runtime) {
             recording.state = RecordingState::Invalid;
             recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
             recording.commands = Arc::default();
+            recording.descriptor_refs = Arc::default();
         }
     }
 }
@@ -4663,6 +5241,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes,
                 mapped: false,
             },
@@ -4702,6 +5281,57 @@ mod tests {
         let (mapped, fresh) = snapshot_buffer_uploads(&resources, &[handle]).unwrap();
         assert_eq!(mapped.len(), 1);
         assert!(fresh.is_empty());
+    }
+
+    #[test]
+    fn gpu_readback_invalidates_only_overlapping_aliases() {
+        use crate::resources::{Buffer, Resources};
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let memory = vk::DeviceMemory::from_raw(1);
+        let other_memory = vk::DeviceMemory::from_raw(2);
+        for (raw, bound, offset) in [
+            (1, memory, 0),
+            (2, memory, 0),
+            (3, memory, 16),
+            (4, memory, 32),
+            (5, other_memory, 0),
+        ] {
+            let handle = vk::Buffer::from_raw(raw);
+            let id = table
+                .define_buffer(ir::BufferDesc::new(16, ir::BufferUsage::COPY_DST).unwrap())
+                .unwrap()
+                .id();
+            resources.buffers.insert(
+                handle,
+                Buffer {
+                    id,
+                    size: 16,
+                    usage: vk::BufferUsageFlags::TRANSFER_DST,
+                    bound: Some((bound, offset)),
+                },
+            );
+            resources.uploaded_unmapped_buffers.insert(handle);
+        }
+        // Updating the first buffer preserves its synchronized backend copy,
+        // invalidates its alias, and leaves adjacent buffers cached.
+        resources.forget_uploads_for_memory_range(memory, 4..16, vk::Buffer::from_raw(1));
+        assert_eq!(
+            (1..=5)
+                .filter(|raw| resources
+                    .uploaded_unmapped_buffers
+                    .contains(&vk::Buffer::from_raw(*raw)))
+                .collect::<Vec<_>>(),
+            [1, 3, 4, 5]
+        );
+        // A subsequent write via the alias invalidates the original buffer;
+        // it must not be re-marked as fresh at the end of the submission.
+        resources.forget_uploads_for_memory_range(memory, 4..8, vk::Buffer::from_raw(2));
+        assert!(
+            !resources
+                .uploaded_unmapped_buffers
+                .contains(&vk::Buffer::from_raw(1))
+        );
     }
 
     #[test]
@@ -4820,12 +5450,13 @@ mod tests {
         for handle in [5, 6] {
             resources.descriptor_sets.insert(
                 vk::DescriptorSet::from_raw(handle),
-                crate::resources::DescriptorSet {
-                    pool: vk::DescriptorPool::from_raw(7),
-                    layout: group_layout.clone(),
-                    types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
-                    stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
-                    bindings: HashMap::from([(
+                crate::resources::DescriptorSet::new(
+                    HashMap::new(),
+                    vk::DescriptorPool::from_raw(7),
+                    group_layout.clone(),
+                    BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
+                    BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                    HashMap::from([(
                         0,
                         crate::resources::DescriptorBinding::Buffer {
                             buffer,
@@ -4833,9 +5464,8 @@ mod tests {
                             range: 16,
                         },
                     )]),
-                    cached_group: None,
-                    invalid: false,
-                },
+                )
+                .unwrap(),
             );
         }
         let mut rec = ResolvedRecording::new();
@@ -5122,9 +5752,20 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: true,
+            dynamic_rendering_enabled: true,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5192,9 +5833,20 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: true,
+            dynamic_rendering_enabled: true,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5246,9 +5898,20 @@ mod tests {
             completion_sender,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: true,
+            dynamic_rendering_enabled: true,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5341,6 +6004,8 @@ mod tests {
         assert!(!supported(&mut indexing, &mut draw));
         indexing.descriptor_binding_partially_bound = vk::FALSE;
         draw.shader_draw_parameters = vk::TRUE;
+        assert!(supported(&mut indexing, &mut draw));
+        draw.shader_draw_parameters = 2;
         assert!(!supported(&mut indexing, &mut draw));
     }
 
@@ -5436,9 +6101,20 @@ mod fence_notification_tests {
             completion_sender: mpsc::channel().0,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: true,
+            synchronization2_enabled: true,
+            dynamic_rendering_enabled: true,
+            host_query_reset_enabled: false,
+            timestamps: false,
+            query_support: 0,
+            occlusion_precise_enabled: false,
+            pipeline_statistics_enabled: false,
+            multi_draw_indirect_enabled: false,
+            indirect_first_instance_enabled: false,
+            indirect_count_enabled: false,
+            queries: Default::default(),
             timelines: Default::default(),
             events: Default::default(),
             fences: Default::default(),
@@ -5675,9 +6351,20 @@ mod owned_descriptor_tests {
                 completion_sender: mpsc::channel().0,
                 completion_thread: Mutex::new(None),
                 queue: AtomicU64::new(0),
-                queue_sender: mpsc::channel().0,
+                queue_sender: mpsc::sync_channel(4096).0,
                 queue_thread: Mutex::new(None),
                 timeline_enabled: false,
+                synchronization2_enabled: false,
+                dynamic_rendering_enabled: false,
+                host_query_reset_enabled: false,
+                timestamps: false,
+                query_support: 0,
+                occlusion_precise_enabled: false,
+                pipeline_statistics_enabled: false,
+                multi_draw_indirect_enabled: false,
+                indirect_first_instance_enabled: false,
+                indirect_count_enabled: false,
+                queries: Default::default(),
                 timelines: Default::default(),
                 events: Default::default(),
                 fences: Default::default(),
@@ -5739,6 +6426,7 @@ mod owned_descriptor_tests {
             first: 0,
             sets,
             dynamic_offsets: Vec::new(),
+            pushed: None,
         }
     }
 
@@ -5843,20 +6531,20 @@ mod owned_descriptor_tests {
         for set in sets {
             runtime.resources.descriptor_sets.insert(
                 set,
-                DescriptorSet {
+                DescriptorSet::new(
+                    HashMap::new(),
                     pool,
-                    layout: ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+                    ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
                         0,
                         ir::ShaderStages::VERTEX,
                         ir::BindingType::UniformBuffer,
                     )])
                     .unwrap(),
-                    types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
-                    stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
-                    bindings: HashMap::new(),
-                    cached_group: None,
-                    invalid: false,
-                },
+                    BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                    BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                    HashMap::new(),
+                )
+                .unwrap(),
             );
         }
         (pool, sets, buffer)

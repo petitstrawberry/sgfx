@@ -12,6 +12,308 @@ pub use sgfx_codegen_virgl::programmable::ShaderCompileError;
 #[derive(Debug)]
 pub enum ShaderCompileError {}
 
+#[cfg(feature = "programmable")]
+const INDEX_BOUNDS_CACHE_SIZE: usize = 32;
+#[cfg(feature = "programmable")]
+const INDEX_BLOCK_WORDS: usize = 1024;
+#[cfg(feature = "programmable")]
+const INDEX_BLOCK_CACHE_SIZE: usize = 512;
+
+#[cfg(feature = "programmable")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct IndexBoundsKey {
+    buffer: ir::BufferId,
+    slot: usize,
+    revision: u64,
+    start: usize,
+    end: usize,
+    format: IndexFormat,
+}
+
+#[cfg(feature = "programmable")]
+#[derive(Clone, Copy)]
+struct IndexBoundsEntry {
+    key: IndexBoundsKey,
+    bounds: Option<(u32, u32)>,
+}
+
+#[cfg(all(test, feature = "programmable"))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(super) struct IndexScanStats {
+    pub(super) range_reads: usize,
+    pub(super) index_words: usize,
+    pub(super) block_hits: usize,
+    pub(super) block_misses: usize,
+}
+
+/// Exact round-robin and direct-mapped block caches owned by one plan only.
+/// Raw bounds are independent of baseVertex; no command bytes are retained.
+#[cfg(feature = "programmable")]
+#[derive(Default)]
+pub(super) struct IndexBoundsCache {
+    entries: [Option<IndexBoundsEntry>; INDEX_BOUNDS_CACHE_SIZE],
+    next: usize,
+    // At most 512 tagged metadata entries, allocated only after a full block
+    // is consumed. No index bytes or cross-plan state are retained.
+    blocks: Vec<Option<IndexBoundsEntry>>,
+    block_allocation_failed: bool,
+    live: usize,
+    #[cfg(test)]
+    stats: IndexScanStats,
+}
+
+#[cfg(feature = "programmable")]
+impl IndexBoundsCache {
+    fn get(&self, key: IndexBoundsKey) -> Option<Option<(u32, u32)>> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.bounds)
+    }
+
+    fn insert(&mut self, key: IndexBoundsKey, bounds: Option<(u32, u32)>) {
+        if self.entries[self.next].is_none() {
+            self.live += 1;
+        }
+        self.entries[self.next] = Some(IndexBoundsEntry { key, bounds });
+        self.next = (self.next + 1) % INDEX_BOUNDS_CACHE_SIZE;
+    }
+
+    pub(super) fn invalidate(&mut self, slot: usize) {
+        // Prefix uploads commonly precede every draw. Do not walk either
+        // cache until there is a proof to invalidate.
+        if self.live == 0 {
+            return;
+        }
+        for entry in self.entries.iter_mut().chain(self.blocks.iter_mut()) {
+            if entry.is_some_and(|entry| entry.key.slot == slot) {
+                *entry = None;
+                self.live -= 1;
+            }
+        }
+    }
+
+    fn block_bucket(key: IndexBoundsKey) -> usize {
+        let block = key.start / (INDEX_BLOCK_WORDS * key.format.byte_size() as usize);
+        let salt = key.slot.wrapping_mul(0x9e37_79b1)
+            ^ key.revision as usize
+            ^ if key.format == IndexFormat::Uint16 {
+                0
+            } else {
+                0x85eb_ca6b
+            };
+        (block ^ salt) & (INDEX_BLOCK_CACHE_SIZE - 1)
+    }
+
+    fn block(&mut self, key: IndexBoundsKey) -> Option<Option<(u32, u32)>> {
+        let found = self
+            .blocks
+            .get(Self::block_bucket(key))
+            .copied()
+            .flatten()
+            .filter(|entry| entry.key == key)
+            .map(|entry| entry.bounds);
+        #[cfg(test)]
+        if found.is_some() {
+            self.stats.block_hits += 1;
+        } else {
+            self.stats.block_misses += 1;
+        }
+        found
+    }
+
+    fn insert_block(&mut self, key: IndexBoundsKey, bounds: Option<(u32, u32)>) {
+        if self.blocks.is_empty() {
+            if self.block_allocation_failed {
+                return;
+            }
+            if self
+                .blocks
+                .try_reserve_exact(INDEX_BLOCK_CACHE_SIZE)
+                .is_err()
+            {
+                self.block_allocation_failed = true;
+                return;
+            }
+            self.blocks.resize(INDEX_BLOCK_CACHE_SIZE, None);
+        }
+        let bucket = Self::block_bucket(key);
+        if self.blocks[bucket].is_none() {
+            self.live += 1;
+        }
+        self.blocks[bucket] = Some(IndexBoundsEntry { key, bounds });
+    }
+
+    #[cfg(test)]
+    pub(super) fn scan_stats(&self) -> IndexScanStats {
+        self.stats
+    }
+}
+
+#[cfg(feature = "programmable")]
+fn raw_index_bounds(
+    bytes: &[u8],
+    format: IndexFormat,
+) -> Result<Option<(u32, u32)>, IrSubmitError> {
+    let mut bounds = None;
+    for index in bytes.chunks_exact(format.byte_size() as usize) {
+        let index = match format {
+            IndexFormat::Uint16 => u32::from(read_u16(index, 0)?),
+            IndexFormat::Uint32 => read_u32(index, 0)?,
+        };
+        bounds = Some(
+            bounds.map_or((index, index), |(minimum, maximum): (u32, u32)| {
+                (minimum.min(index), maximum.max(index))
+            }),
+        );
+    }
+    Ok(bounds)
+}
+
+#[cfg(feature = "programmable")]
+fn maximum_with_base(bounds: Option<(u32, u32)>, base_vertex: i32) -> Result<u32, IrSubmitError> {
+    let Some((minimum, maximum)) = bounds else {
+        return Ok(0);
+    };
+    // Signed addition is monotone: validating both extrema proves every index
+    // fits, including a negative base underflow hidden by a valid maximum.
+    u32::try_from(i64::from(minimum) + i64::from(base_vertex))
+        .map_err(|_| ir::Error::OutOfBounds)?;
+    Ok(u32::try_from(i64::from(maximum) + i64::from(base_vertex))
+        .map_err(|_| ir::Error::OutOfBounds)?)
+}
+
+#[cfg(feature = "programmable")]
+fn merge_index_bounds(a: Option<(u32, u32)>, b: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    match (a, b) {
+        (Some((a_min, a_max)), Some((b_min, b_max))) => Some((a_min.min(b_min), a_max.max(b_max))),
+        (a, None) | (None, a) => a,
+    }
+}
+
+#[cfg(feature = "programmable")]
+fn scan_index_span<R: PlanResourceAccess + ?Sized>(
+    resources: &R,
+    pending: &PendingBuffers<'_>,
+    buffer: BufferRef<'_>,
+    key: IndexBoundsKey,
+) -> Result<Option<(u32, u32)>, IrSubmitError> {
+    let bytes = pending.range(resources, buffer, key.start..key.end)?;
+    #[cfg(test)]
+    {
+        let mut cache = pending.index_bounds.borrow_mut();
+        cache.stats.range_reads += 1;
+        cache.stats.index_words += bytes.len() / key.format.byte_size() as usize;
+    }
+    raw_index_bounds(bytes.as_ref(), key.format)
+}
+
+#[cfg(feature = "programmable")]
+fn blocked_index_bounds<R: PlanResourceAccess + ?Sized>(
+    resources: &R,
+    pending: &PendingBuffers<'_>,
+    buffer: BufferRef<'_>,
+    key: IndexBoundsKey,
+) -> Result<Option<(u32, u32)>, IrSubmitError> {
+    let width = key.format.byte_size() as usize;
+    let block_bytes = INDEX_BLOCK_WORDS * width;
+    let mut cursor = key.start;
+    // Match chunks_exact: trailing bytes are not indices, but the entire
+    // caller-supplied byte range was validated before looking in either cache.
+    let end = key.end - (key.end - key.start) % width;
+    let leading_words =
+        (INDEX_BLOCK_WORDS - (cursor / width) % INDEX_BLOCK_WORDS) % INDEX_BLOCK_WORDS;
+    let head_end = cursor + (end - cursor).min(leading_words * width);
+    let mut bounds = None;
+    if head_end != cursor {
+        bounds = scan_index_span(
+            resources,
+            pending,
+            buffer,
+            IndexBoundsKey {
+                start: cursor,
+                end: head_end,
+                ..key
+            },
+        )?;
+        cursor = head_end;
+    }
+    while end - cursor >= block_bytes {
+        let block = IndexBoundsKey {
+            start: cursor,
+            end: cursor + block_bytes,
+            ..key
+        };
+        let cached = pending.index_bounds.borrow_mut().block(block);
+        let part = if let Some(bounds) = cached {
+            bounds
+        } else {
+            let bounds = scan_index_span(resources, pending, buffer, block)?;
+            pending
+                .index_bounds
+                .borrow_mut()
+                .insert_block(block, bounds);
+            bounds
+        };
+        bounds = merge_index_bounds(bounds, part);
+        cursor += block_bytes;
+    }
+    if cursor != end {
+        bounds = merge_index_bounds(
+            bounds,
+            scan_index_span(
+                resources,
+                pending,
+                buffer,
+                IndexBoundsKey {
+                    start: cursor,
+                    end,
+                    ..key
+                },
+            )?,
+        );
+    }
+    Ok(bounds)
+}
+
+#[cfg(feature = "programmable")]
+pub(super) fn cached_index_maximum<R: PlanResourceAccess + ?Sized>(
+    resources: &R,
+    pending: &PendingBuffers<'_>,
+    buffer: BufferRef<'_>,
+    range: core::ops::Range<usize>,
+    format: IndexFormat,
+    base_vertex: i32,
+) -> Result<u32, IrSubmitError> {
+    // Keep PendingBuffers::range's validation on hits, without allocating a
+    // merged pending range or scanning its bytes again.
+    let length = pending
+        .plan
+        .length(resources.buffer_shadows(), buffer.slot())?;
+    if range.start > range.end || range.end > length {
+        return Err(IrSubmitError::InvalidVertexData);
+    }
+    resources.table().buffer(buffer)?;
+    let key = IndexBoundsKey {
+        buffer: buffer.id(),
+        slot: buffer.slot(),
+        revision: pending.revision(resources, buffer)?,
+        start: range.start,
+        end: range.end,
+        format,
+    };
+    let cached = pending.index_bounds.borrow().get(key);
+    let bounds = if let Some(bounds) = cached {
+        bounds
+    } else {
+        let bounds = blocked_index_bounds(resources, pending, buffer, key)?;
+        pending.index_bounds.borrow_mut().insert(key, bounds);
+        bounds
+    };
+    maximum_with_base(bounds, base_vertex)
+}
+
 impl IrResources {
     /// Parse and semantically validate a shader before admitting its handle.
     #[cfg(feature = "programmable")]
@@ -55,11 +357,19 @@ impl IrResources {
         ))
     }
 
-    /// Compute execution is not implemented by this native backend.
+    /// Validate the native compute profile and actual host execution support.
     pub fn validate_compute_pipeline(
         &self,
         id: ir::ComputePipelineId,
     ) -> Result<(), IrSubmitError> {
+        #[cfg(all(feature = "std", feature = "programmable"))]
+        {
+            super::compute::compile_pipeline(self, id)?;
+            let driver::Context::Virgl(context) = &self.context;
+            if context.compute_supported() {
+                return Ok(());
+            }
+        }
         self.resources
             .compute_pipeline(self.resources.compute_pipeline_ref(id)?)?;
         Err(IrSubmitError::Unsupported(
@@ -67,7 +377,7 @@ impl IrResources {
         ))
     }
 
-    /// Read ordered CPU-visible bytes. Native graphics never writes buffer storage.
+    /// Read ordered CPU-visible bytes, including retired compute SSBO writes.
     /// Callers must observe the submission receipt before reading GPU image results.
     pub fn read_buffer(
         &self,
@@ -172,6 +482,8 @@ fn compile_pipeline(
                 | TextureFormat::Rgba8Unorm
                 | TextureFormat::R8Unorm
                 | TextureFormat::Rg8Unorm
+                | TextureFormat::Rgba16Float
+                | TextureFormat::Rgba32Float
         )
     }) {
         return Err(IrSubmitError::Unsupported(
@@ -185,6 +497,7 @@ fn compile_pipeline(
             | PrimitiveTopology::TriangleFan
             | PrimitiveTopology::LineList
             | PrimitiveTopology::LineStrip
+            | PrimitiveTopology::PointList
     ) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::PrimitiveTopology,
@@ -271,8 +584,17 @@ fn compile_pipeline(
             .find(|attribute| attribute.location() == input.location)
             .ok_or(ir::Error::InvalidDescriptor)?;
         let scalar = match attribute.format() {
-            VertexFormat::Sint32 | VertexFormat::Sint16x4 => IoScalar::Sint,
-            VertexFormat::Uint32 | VertexFormat::Uint16x2 => IoScalar::Uint,
+            VertexFormat::Sint32
+            | VertexFormat::Sint16x4
+            | VertexFormat::Sint16x2
+            | VertexFormat::Sint32x2
+            | VertexFormat::Sint32x3
+            | VertexFormat::Sint32x4 => IoScalar::Sint,
+            VertexFormat::Uint32
+            | VertexFormat::Uint16x2
+            | VertexFormat::Uint32x2
+            | VertexFormat::Uint32x3
+            | VertexFormat::Uint32x4 => IoScalar::Uint,
             VertexFormat::Float32
             | VertexFormat::Float32x2
             | VertexFormat::Float32x3
@@ -280,6 +602,7 @@ fn compile_pipeline(
             | VertexFormat::Float16x2
             | VertexFormat::Float16x4
             | VertexFormat::Unorm8x4
+            | VertexFormat::Snorm8x4
             | VertexFormat::Snorm10_10_10_2 => IoScalar::Float,
         };
         // Vertex fetch supplies a four-component value independently of the
@@ -311,7 +634,7 @@ fn compile_pipeline(
             || !(vertex_spirv && fragment_spirv) && input.interpolation != output.interpolation
         {
             #[cfg(feature = "std")]
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            {
                 std::eprintln!(
                     "[SGFX VirGL] stage interface mismatch: vertex={output:?} fragment={input:?}"
                 );
@@ -513,7 +836,7 @@ impl Context {
         }
         let reference = resources.resources.texture_ref(id)?;
         let descriptor = resources.resources.texture(reference)?;
-        if descriptor.mip_level_count() != 1 || descriptor.array_layer_count() != 1 {
+        if descriptor.array_layer_count() != 1 {
             return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
         }
         if !descriptor.usage().contains(TextureUsage::COPY_SRC) {
@@ -521,17 +844,29 @@ impl Context {
         }
         if !matches!(
             descriptor.format(),
-            TextureFormat::Bgra8Unorm
+            TextureFormat::Depth32Float
+                | TextureFormat::Bgra8Unorm
                 | TextureFormat::Rgba8Unorm
                 | TextureFormat::R8Unorm
                 | TextureFormat::Rg8Unorm
+                | TextureFormat::Rgba16Float
+                | TextureFormat::Rgba32Float
         ) {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::TargetFormat,
             ));
         }
-        let length =
-            usize::try_from(descriptor.byte_size()?).map_err(|_| IrSubmitError::OutOfMemory)?;
+        let length = usize::try_from(
+            u64::from(descriptor.extent().width())
+                * u64::from(descriptor.extent().height())
+                * u64::from(
+                    descriptor
+                        .format()
+                        .bytes_per_pixel()
+                        .ok_or(ir::Error::InvalidDescriptor)?,
+                ),
+        )
+        .map_err(|_| IrSubmitError::OutOfMemory)?;
         let mut output = Vec::new();
         output
             .try_reserve_exact(length)
@@ -556,7 +891,7 @@ impl Context {
         }
         let reference = resources.resources.texture_ref(id)?;
         let descriptor = resources.resources.texture(reference)?;
-        if descriptor.mip_level_count() != 1 || descriptor.array_layer_count() != 1 {
+        if descriptor.array_layer_count() != 1 {
             return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Mipmaps));
         }
         if !descriptor.usage().contains(TextureUsage::COPY_SRC) {
@@ -564,17 +899,29 @@ impl Context {
         }
         if !matches!(
             descriptor.format(),
-            TextureFormat::Bgra8Unorm
+            TextureFormat::Depth32Float
+                | TextureFormat::Bgra8Unorm
                 | TextureFormat::Rgba8Unorm
                 | TextureFormat::R8Unorm
                 | TextureFormat::Rg8Unorm
+                | TextureFormat::Rgba16Float
+                | TextureFormat::Rgba32Float
         ) {
             return Err(IrSubmitError::Unsupported(
                 UnsupportedIrFeature::TargetFormat,
             ));
         }
         let spec = texture_spec(reference, descriptor)?;
-        if descriptor.byte_size()? != bytes.len() as u64 {
+        if u64::from(descriptor.extent().width())
+            * u64::from(descriptor.extent().height())
+            * u64::from(
+                descriptor
+                    .format()
+                    .bytes_per_pixel()
+                    .ok_or(ir::Error::InvalidDescriptor)?,
+            )
+            != bytes.len() as u64
+        {
             return Err(ir::Error::OutOfBounds.into());
         }
         let narrow = matches!(spec.format, IrTextureFormat::R8 | IrTextureFormat::Rg8);
@@ -647,17 +994,9 @@ fn pack_color_readback(bytes: &mut Vec<u8>, format: IrTextureFormat) {
 
 pub(super) fn validate_barrier(barrier: ir::ResourceBarrier<'_>) -> Result<(), IrSubmitError> {
     // Transfer, vertex/index fetch and attachment accesses execute in one ordered
-    // VirGL context. Shader writes are rejected instead of being treated as no-ops.
+    // VirGL context. Compute SSBO writes retire and update CPU shadows before
+    // returning, so buffer dependencies also cover earlier compute submissions.
     match barrier {
-        ir::ResourceBarrier::Buffer { before, after, .. }
-            if [before, after]
-                .iter()
-                .any(|access| matches!(access, ir::BufferAccess::StorageReadWrite)) =>
-        {
-            Err(IrSubmitError::Unsupported(
-                UnsupportedIrFeature::ExplicitBarrier,
-            ))
-        }
         ir::ResourceBarrier::Texture { before, after, .. }
         | ir::ResourceBarrier::TextureMip { before, after, .. }
             if [before, after].contains(&ir::TextureAccess::StorageWrite) =>
@@ -677,11 +1016,10 @@ fn buffer_spec(
     buffer: BufferRef<'_>,
 ) -> Result<IrBufferSpec, IrSubmitError> {
     let descriptor = resources.resources.buffer(buffer)?;
-    let bytes = pending.bytes(resources, buffer)?;
-    if descriptor.size() > u64::from(u32::MAX)
-        || bytes.as_slice().is_empty()
-        || !bytes.as_slice().len().is_multiple_of(4)
-    {
+    let length = pending
+        .plan
+        .length(&resources.buffer_shadows, buffer.slot())?;
+    if descriptor.size() > u64::from(u32::MAX) || length == 0 || !length.is_multiple_of(4) {
         return Err(IrSubmitError::Unsupported(
             UnsupportedIrFeature::VertexBuffer,
         ));
@@ -752,17 +1090,28 @@ fn uniform_words(
     constant_words(bytes, binding.size.next_multiple_of(16) as usize)
 }
 
+pub(super) struct DrawParameters {
+    pub first: u32,
+    pub count: u32,
+    pub base_vertex: Option<i32>,
+    pub instance_count: u32,
+    pub first_instance: u32,
+}
+
 #[cfg(feature = "programmable")]
 pub(super) fn decode_draw(
     resources: &IrResources,
     pending: &PendingBuffers,
     pass: &mut ActivePass<'_>,
-    first: u32,
-    count: u32,
-    base_vertex: Option<i32>,
-    instance_count: u32,
-    first_instance: u32,
+    parameters: DrawParameters,
 ) -> Result<IrDraw, IrSubmitError> {
+    let DrawParameters {
+        first,
+        count,
+        base_vertex,
+        instance_count,
+        first_instance,
+    } = parameters;
     let reference = pass.programmable.ok_or(ir::Error::PipelineNotSet)?;
     let pipeline = resources
         .resources
@@ -772,6 +1121,7 @@ pub(super) fn decode_draw(
         PrimitiveTopology::TriangleStrip | PrimitiveTopology::TriangleFan => count >= 3,
         PrimitiveTopology::LineList => count > 0 && count.is_multiple_of(2),
         PrimitiveTopology::LineStrip => count >= 2,
+        PrimitiveTopology::PointList => count != 0,
     };
     if !valid_count {
         return Err(ir::Error::InvalidValue.into());
@@ -780,15 +1130,32 @@ pub(super) fn decode_draw(
         core::iter::once(pass.attachment).chain(pass.additional_attachments.iter().copied());
     for target in pipeline.color_targets() {
         let Some(attachment) = attached.next() else {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX VirGL] draw descriptor: missing color attachment target={target:?}"
+            );
             return Err(ir::Error::InvalidDescriptor.into());
         };
         if resources.resources.texture(attachment)?.format() != target.format() {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX VirGL] draw descriptor: color format mismatch attachment={:?} target={target:?}",
+                resources.resources.texture(attachment)?
+            );
             return Err(ir::Error::InvalidDescriptor.into());
         }
     }
     if attached.next().is_some()
         || pipeline.depth_state().is_some() && pass.depth_attachment.is_none()
     {
+        #[cfg(feature = "std")]
+        std::eprintln!(
+            "[SGFX VirGL] draw descriptor: attachment count/depth mismatch colors={:?} depth={:?} pass_depth={:?} additional={}",
+            pipeline.color_targets().collect::<Vec<_>>(),
+            pipeline.depth_state(),
+            pass.depth_attachment,
+            pass.additional_attachments.len()
+        );
         return Err(ir::Error::InvalidDescriptor.into());
     }
     let compiled = resources.compiled_pipeline(reference.id())?;
@@ -852,11 +1219,19 @@ pub(super) fn decode_draw(
                 if !desc.usage().contains(ir::BufferUsage::STORAGE)
                     || desc.size() > crate::virgl::MAX_STORAGE_VIEW_BYTES
                     || size == 0
-                    || size > 256 * 1024
+                    || size > crate::virgl::MAX_STORAGE_VIEW_BYTES
                     || !offset.is_multiple_of(4)
                     || !size.is_multiple_of(4)
                     || offset.checked_add(size).is_none_or(|end| end > desc.size())
                 {
+                    #[cfg(feature = "std")]
+                    std::eprintln!(
+                        "[SGFX VirGL] draw descriptor: storage binding stage={:?} group={} binding={} offset={offset} size={size} descriptor={desc:?} view_limit={}",
+                        shader.stage,
+                        binding.group,
+                        binding.binding,
+                        crate::virgl::MAX_STORAGE_VIEW_BYTES
+                    );
                     return Err(ir::Error::InvalidDescriptor.into());
                 }
                 storage_buffers.push(driver::IrStorageBufferBinding {
@@ -952,7 +1327,7 @@ pub(super) fn decode_draw(
                     ir::TextureViewDimension::D2
                 };
                 if binding.dimension != dimension
-                    || binding.depth != (descriptor.format() == TextureFormat::Depth32Float)
+                    || (binding.depth && descriptor.format() != TextureFormat::Depth32Float)
                 {
                     return Err(ir::Error::BindingLayoutMismatch.into());
                 }
@@ -964,6 +1339,11 @@ pub(super) fn decode_draw(
                     };
                     let sampler = resources.resources.sampler_ref(sampler)?;
                     let desc = resources.resources.sampler(sampler)?;
+                    if desc.anisotropy() > 1
+                        && !resources.context.capabilities().supports_anisotropy_16()
+                    {
+                        return Err(IrSubmitError::Unsupported(UnsupportedIrFeature::Sampler));
+                    }
                     if desc.compare().is_some() != binding.comparison {
                         return Err(ir::Error::BindingLayoutMismatch.into());
                     }
@@ -1043,13 +1423,20 @@ pub(super) fn decode_draw(
                     return Err(ir::Error::BindingLayoutMismatch.into());
                 };
                 let buffer = resources.resources.buffer_ref(buffer)?;
-                let bytes = pending.bytes(resources, buffer)?;
-                let words = uniform_words(binding, bytes.as_slice(), offset, size).inspect_err(|_error| {
+                if offset > u64::from(u32::MAX) {
+                    return Err(ir::Error::OutOfBounds.into());
+                }
+                let start = usize::try_from(offset).map_err(|_| ir::Error::Overflow)?;
+                let end = start
+                    .checked_add(binding.required_size as usize)
+                    .ok_or(ir::Error::Overflow)?;
+                let bytes = pending.range(resources, buffer, start..end)?;
+                let words = uniform_words(binding, bytes.as_ref(), 0, size).inspect_err(|_error| {
                     #[cfg(feature = "std")]
                     if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                         eprintln!(
                             "[SGFX VirGL] uniform snapshot failed: {_error:?} stage={:?} group={} binding={} declared_bytes={} required_bytes={} bound_bytes={size} offset={offset} available={}",
-                            shader.stage, binding.group, binding.binding, binding.size, binding.required_size, bytes.as_slice().len(),
+                            shader.stage, binding.group, binding.binding, binding.size, binding.required_size, bytes.len(),
                         );
                     }
                 })?;
@@ -1070,7 +1457,6 @@ pub(super) fn decode_draw(
         .ok_or(ir::Error::Overflow)?;
     let index_buffer = if let Some(base_vertex) = base_vertex {
         let (buffer, offset, format) = pass.index_buffer.ok_or(ir::Error::IndexBufferNotSet)?;
-        let bytes = pending.bytes(resources, buffer)?;
         let size = format.byte_size();
         let start = offset
             .checked_add(u64::from(first) * size)
@@ -1078,23 +1464,15 @@ pub(super) fn decode_draw(
         let end = start
             .checked_add(u64::from(count) * size)
             .ok_or(ir::Error::Overflow)?;
-        let range = bytes
-            .as_slice()
-            .get(
-                usize::try_from(start).map_err(|_| ir::Error::Overflow)?
-                    ..usize::try_from(end).map_err(|_| ir::Error::Overflow)?,
-            )
-            .ok_or(ir::Error::OutOfBounds)?;
-        maximum_vertex = 0;
-        for index in range.chunks_exact(size as usize) {
-            let index = match format {
-                IndexFormat::Uint16 => u32::from(read_u16(index, 0)?),
-                IndexFormat::Uint32 => read_u32(index, 0)?,
-            };
-            let resolved = i64::from(index) + i64::from(base_vertex);
-            maximum_vertex =
-                maximum_vertex.max(u32::try_from(resolved).map_err(|_| ir::Error::OutOfBounds)?);
-        }
+        maximum_vertex = cached_index_maximum(
+            resources,
+            pending,
+            buffer,
+            usize::try_from(start).map_err(|_| ir::Error::Overflow)?
+                ..usize::try_from(end).map_err(|_| ir::Error::Overflow)?,
+            format,
+            base_vertex,
+        )?;
         Some(driver::IrIndexBufferBinding {
             buffer: buffer_spec(resources, pending, buffer)?,
             offset: u32::try_from(offset).map_err(|_| ir::Error::Overflow)?,
@@ -1110,7 +1488,9 @@ pub(super) fn decode_draw(
     let mut vertex_buffers = [None; 8];
     for (slot, layout) in pipeline.vertex_buffers().iter().enumerate() {
         let (buffer, offset) = pass.vertex_buffers[slot].ok_or(ir::Error::VertexBufferNotSet)?;
-        let bytes = pending.bytes(resources, buffer)?;
+        let length = pending
+            .plan
+            .length(&resources.buffer_shadows, buffer.slot())?;
         let attribute_end = layout
             .attributes()
             .iter()
@@ -1125,13 +1505,13 @@ pub(super) fn decode_draw(
             instance_count,
             attribute_end,
         )?;
-        if end > bytes.as_slice().len() as u64 {
+        if end > length as u64 {
             #[cfg(feature = "std")]
             if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
                 eprintln!(
                     "[SGFX VirGL] vertex shadow out of bounds: slot={slot} offset={offset} maximum_vertex={maximum_vertex} first_instance={first_instance} instance_count={instance_count} stride={} attribute_end={attribute_end} end={end} available={}",
                     layout.stride(),
-                    bytes.as_slice().len(),
+                    length,
                 );
             }
             return Err(ir::Error::OutOfBounds.into());
@@ -1167,6 +1547,7 @@ pub(super) fn decode_draw(
         draw: Rc::clone(&programmable),
     });
     Ok(IrDraw {
+        draw_index: pass.draw_index,
         instance_count,
         first_instance,
         vertex_buffers,
@@ -1175,7 +1556,8 @@ pub(super) fn decode_draw(
         vertex_count: count as usize,
         vertex_buffer,
         pipeline: IrPipelineState {
-            slot: reference.slot() + 256,
+            depth_bias: raster.depth_bias().map(f32::to_bits),
+            slot: reference.slot() + crate::virgl::IR_PROGRAMMABLE_PIPELINE_OFFSET,
             fragment: IrFragmentProgram::Solid,
             blend: color_target_blend(pipeline.color_targets().next().unwrap()).0,
             color_write_mask: color_target_blend(pipeline.color_targets().next().unwrap()).1,
@@ -1244,8 +1626,10 @@ fn vertex_fetch_range(
         ir::VertexStepMode::Vertex => (maximum_vertex, 0),
         ir::VertexStepMode::Instance => (
             first_instance
-                .checked_add(instance_count)
-                .and_then(|end| end.checked_sub(1))
+                .checked_add(
+                    instance_count.checked_sub(1).ok_or(ir::Error::Overflow)?
+                        / layout.instance_divisor(),
+                )
                 .ok_or(ir::Error::Overflow)?,
             first_instance,
         ),
@@ -1256,7 +1640,7 @@ fn vertex_fetch_range(
         .ok_or(ir::Error::Overflow)?;
     // Host VirGL draw packets use base_instance=0. The existing TGSI constant
     // supplies Vulkan's firstInstance to the shader builtin; advance only the
-    // per-instance buffer here so its hardware divisor-one fetch matches it.
+    // per-instance buffer here so the hardware fetch starts at the requested first instance.
     let binding_offset = offset
         .checked_add(u64::from(base) * u64::from(layout.stride()))
         .ok_or(ir::Error::Overflow)?;
@@ -1268,11 +1652,7 @@ pub(super) fn decode_draw(
     _resources: &IrResources,
     _pending: &PendingBuffers,
     _pass: &mut ActivePass<'_>,
-    _first: u32,
-    _count: u32,
-    _base_vertex: Option<i32>,
-    _instance_count: u32,
-    _first_instance: u32,
+    _parameters: DrawParameters,
 ) -> Result<IrDraw, IrSubmitError> {
     Err(IrSubmitError::Unsupported(
         UnsupportedIrFeature::ProgrammableExecution,
@@ -1283,6 +1663,195 @@ pub(super) fn decode_draw(
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn block_cache_uses_tagged_single_slots_and_empty_invalidation_allocates_nothing() {
+        let table = ResourceTable::new();
+        let define = || {
+            table
+                .define_buffer(ir::BufferDesc::new(8192, BufferUsage::INDEX).unwrap())
+                .unwrap()
+                .id()
+        };
+        let buffer = define();
+        let key = IndexBoundsKey {
+            buffer,
+            slot: 0,
+            revision: 7,
+            start: 0,
+            end: INDEX_BLOCK_WORDS * 4,
+            format: IndexFormat::Uint32,
+        };
+        let mut cache = IndexBoundsCache::default();
+        for _ in 0..100 {
+            cache.invalidate(0);
+        }
+        assert_eq!(cache.blocks.capacity(), 0);
+        assert_eq!(cache.live, 0);
+        cache.insert(key, Some((2, 3)));
+        cache.insert_block(key, Some((2, 3)));
+        assert_eq!(cache.blocks.len(), INDEX_BLOCK_CACHE_SIZE);
+        assert_eq!(cache.block(key), Some(Some((2, 3))));
+        let collision = IndexBoundsKey {
+            start: INDEX_BLOCK_CACHE_SIZE * INDEX_BLOCK_WORDS * 4,
+            end: (INDEX_BLOCK_CACHE_SIZE + 1) * INDEX_BLOCK_WORDS * 4,
+            ..key
+        };
+        assert_eq!(
+            IndexBoundsCache::block_bucket(key),
+            IndexBoundsCache::block_bucket(collision)
+        );
+        cache.insert_block(collision, Some((7, 9)));
+        assert_eq!(cache.block(key), None);
+        assert_eq!(cache.block(collision), Some(Some((7, 9))));
+        for changed in [
+            IndexBoundsKey {
+                buffer: define(),
+                ..collision
+            },
+            IndexBoundsKey {
+                revision: 8,
+                ..collision
+            },
+            IndexBoundsKey {
+                format: IndexFormat::Uint16,
+                ..collision
+            },
+            IndexBoundsKey {
+                start: collision.start + 1,
+                end: collision.end + 1,
+                ..collision
+            },
+        ] {
+            assert_eq!(cache.block(changed), None);
+        }
+        table.release_buffer(buffer).unwrap();
+        let next_generation = define();
+        assert_ne!(next_generation, buffer);
+        assert_eq!(
+            cache.block(IndexBoundsKey {
+                buffer: next_generation,
+                ..collision
+            }),
+            None
+        );
+        cache.invalidate(0);
+        assert_eq!(cache.live, 0);
+        assert!(
+            cache
+                .entries
+                .iter()
+                .chain(cache.blocks.iter())
+                .all(Option::is_none)
+        );
+        cache.invalidate(0); // also O(1) after entries were discarded
+    }
+
+    #[test]
+    fn raw_index_extrema_preserve_per_index_signed_bounds_checks() {
+        for format in [IndexFormat::Uint16, IndexFormat::Uint32] {
+            for values in [&[][..], &[0, 2, 7][..], &[2, 9, 3][..], &[u32::MAX, 0][..]] {
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .flat_map(|index| match format {
+                        IndexFormat::Uint16 => (*index as u16).to_le_bytes().to_vec(),
+                        IndexFormat::Uint32 => index.to_le_bytes().to_vec(),
+                    })
+                    .collect();
+                for base in [i32::MIN, -10, -2, 0, 2, i32::MAX] {
+                    // Independent version of the previous per-index validation.
+                    let mut expected = Ok(0u32);
+                    for item in bytes.chunks_exact(format.byte_size() as usize) {
+                        let raw = if format == IndexFormat::Uint16 {
+                            u32::from(u16::from_le_bytes(item.try_into().unwrap()))
+                        } else {
+                            u32::from_le_bytes(item.try_into().unwrap())
+                        };
+                        match u32::try_from(i64::from(raw) + i64::from(base)) {
+                            Ok(index) => expected = expected.map(|maximum| maximum.max(index)),
+                            Err(_) => {
+                                expected = Err(());
+                                break;
+                            }
+                        }
+                    }
+                    let actual = maximum_with_base(raw_index_bounds(&bytes, format).unwrap(), base);
+                    match expected {
+                        Ok(value) => assert_eq!(actual.unwrap(), value),
+                        Err(()) => assert!(matches!(
+                            actual,
+                            Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds))
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_cache_is_bounded_and_keys_identity_revision_exact_range_and_format() {
+        let table = ResourceTable::new();
+        let foreign = ResourceTable::new();
+        let define = |table: &ResourceTable| {
+            table
+                .define_buffer(ir::BufferDesc::new(256, BufferUsage::INDEX).unwrap())
+                .unwrap()
+                .id()
+        };
+        let buffer = define(&table);
+        let key = IndexBoundsKey {
+            buffer,
+            slot: 0,
+            revision: 7,
+            start: 0,
+            end: 4,
+            format: IndexFormat::Uint16,
+        };
+        let mut cache = IndexBoundsCache::default();
+        cache.insert(key, Some((1, 9)));
+        assert_eq!(cache.get(key), Some(Some((1, 9))));
+        for different in [
+            IndexBoundsKey {
+                buffer: define(&table),
+                ..key
+            },
+            IndexBoundsKey {
+                buffer: define(&foreign),
+                ..key
+            },
+            IndexBoundsKey { revision: 8, ..key },
+            IndexBoundsKey { start: 2, ..key },
+            IndexBoundsKey { end: 6, ..key },
+            IndexBoundsKey {
+                format: IndexFormat::Uint32,
+                ..key
+            },
+        ] {
+            assert_eq!(cache.get(different), None);
+        }
+        for index in 1..=INDEX_BOUNDS_CACHE_SIZE {
+            cache.insert(
+                IndexBoundsKey {
+                    start: index * 4,
+                    end: index * 4 + 4,
+                    ..key
+                },
+                Some((0, index as u32)),
+            );
+        }
+        assert_eq!(
+            cache.entries.iter().flatten().count(),
+            INDEX_BOUNDS_CACHE_SIZE
+        );
+        assert_eq!(
+            cache.get(key),
+            None,
+            "round-robin eviction must remove the oldest entry"
+        );
+        cache.invalidate(0);
+        assert!(cache.entries.iter().all(Option::is_none));
+    }
+
     const SHADER: &str = "struct Transform { mvp: mat4x4<f32>, }; @group(0) @binding(0) var<uniform> transform: Transform;
         struct Output { @builtin(position) position: vec4<f32>, @location(0) color: vec3<f32>, };
         @vertex fn vs(@location(0) position: vec3<f32>, @location(1) color: vec3<f32>) -> Output {
@@ -1883,6 +2452,11 @@ mod tests {
             vertex_fetch_range(&instance, 0, 1000, 2, 2, 12).unwrap(),
             (48, 24)
         );
+        let divided = instance.clone().with_instance_divisor(2).unwrap();
+        assert_eq!(
+            vertex_fetch_range(&divided, 16, 100, 2, 5, 12).unwrap(),
+            (76, 40)
+        );
         assert!(vertex_fetch_range(&instance, 0, 0, u32::MAX, 2, 12).is_err());
         assert!(vertex_fetch_range(&instance, u64::MAX - 4, 0, 2, 2, 12).is_err());
     }
@@ -2046,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    fn admits_ordered_transfer_barriers_but_rejects_shader_write_barriers() {
+    fn admits_ordered_transfer_and_retired_compute_buffer_barriers() {
         let table = ResourceTable::new();
         let buffer = table
             .define_buffer(
@@ -2063,16 +2637,12 @@ mod tests {
             after: ir::BufferAccess::Vertex,
         })
         .unwrap();
-        assert!(matches!(
-            validate_barrier(ir::ResourceBarrier::Buffer {
-                buffer,
-                before: ir::BufferAccess::StorageReadWrite,
-                after: ir::BufferAccess::Vertex
-            }),
-            Err(IrSubmitError::Unsupported(
-                UnsupportedIrFeature::ExplicitBarrier
-            ))
-        ));
+        validate_barrier(ir::ResourceBarrier::Buffer {
+            buffer,
+            before: ir::BufferAccess::StorageReadWrite,
+            after: ir::BufferAccess::Vertex,
+        })
+        .unwrap();
     }
     #[test]
     fn narrow_color_readback_preserves_rendered_channels_and_omits_transport_padding() {

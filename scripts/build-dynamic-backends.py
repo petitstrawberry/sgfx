@@ -77,7 +77,7 @@ def audit(staging, scarlet, arch):
                 if section and info >> 4 in (1, 2):
                     exports.append(elf.dynstring(symbol))
             required_exports = {"sgfx_backend_get_api_v2", "sgfx_backend_get_driver_api_v2"}
-            allowed_exports = required_exports | {"sgfx_backend_get_ycbcr_api_v2"}
+            allowed_exports = required_exports | {"sgfx_backend_get_ycbcr_api_v2", "sgfx_backend_get_query_api_v2", "sgfx_backend_get_timestamp_api_v2", "sgfx_backend_get_program_release_api_v2"}
             if not required_exports <= set(exports) <= allowed_exports or report["entry"] != 0:
                 raise RuntimeError(f"backend exports executable/Rust internals: {exports}")
             report["exports"] = exports

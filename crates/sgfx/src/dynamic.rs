@@ -83,6 +83,33 @@ impl Drop for Owner {
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities(u64);
 impl Capabilities {
+    /// Global resource-dependency command support in the command ABI.
+    pub fn supports_global_resource_barriers(self) -> bool {
+        self.0 & abi::GLOBAL_RESOURCE_BARRIERS != 0
+    }
+    /// Accepted buffer writes are already visible through the readback API.
+    pub fn supports_immediate_buffer_readback(self) -> bool {
+        self.0 & abi::IMMEDIATE_BUFFER_READBACK != 0
+    }
+    /// Native floating-point RGBA render targets and transfers.
+    pub fn supports_float_color(self) -> bool {
+        self.0 & abi::FLOAT_COLOR_ATTACHMENTS != 0
+    }
+    pub fn supports_depth_transfers(self) -> bool {
+        self.0 & abi::DEPTH_TRANSFERS != 0
+    }
+    pub fn supports_shader_draw_parameters(self) -> bool {
+        self.0 & abi::SHADER_DRAW_PARAMETERS != 0
+    }
+    pub fn supports_vertex_divisors(self) -> bool {
+        self.0 & abi::VERTEX_ATTRIBUTE_DIVISORS != 0
+    }
+    pub fn supports_anisotropy_16(self) -> bool {
+        self.0 & abi::SAMPLER_ANISOTROPY_16 != 0
+    }
+    pub fn supports_compute_buffers(self) -> bool {
+        self.0 & abi::COMPUTE_BUFFERS != 0
+    }
     pub fn supports_read_only_storage_buffers(self) -> bool {
         self.0 & abi::READ_ONLY_STORAGE_BUFFERS != 0
     }
@@ -191,6 +218,16 @@ impl Device {
         self.capabilities
     }
     /// Whether this plugin provides the optional low-level queue/resource API.
+    pub(crate) fn query_support(&self) -> u32 {
+        self.owner
+            .library
+            .query
+            .as_ref()
+            .map_or(0, |api| unsafe { (api.support)(self.owner.raw) })
+    }
+    pub(crate) fn supports_timestamps(&self) -> bool {
+        self.owner.library.timestamp.is_some() && self.capabilities.0 & abi::GPU_TIMESTAMPS != 0
+    }
     pub(crate) fn supports_driver_api(&self) -> bool {
         self.owner.library.driver.is_some()
     }
@@ -217,6 +254,38 @@ pub struct Context {
     owner: Owner,
 }
 impl Context {
+    pub(crate) fn begin_query(&self, kind: u32, mask: u32) -> Result<()> {
+        let api = self
+            .owner
+            .library
+            .query
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        status(unsafe { (api.begin)(self.owner.raw, kind, mask) })
+    }
+    pub(crate) fn end_query(&self, kind: u32, count: usize) -> Result<Vec<u64>> {
+        let api = self
+            .owner
+            .library
+            .query
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        let mut values = alloc::vec![0;count];
+        status(unsafe { (api.end)(self.owner.raw, kind, values.as_mut_ptr(), count) })?;
+        Ok(values)
+    }
+    pub(crate) fn timestamp_ns(&self) -> Result<u64> {
+        let api = self
+            .owner
+            .library
+            .timestamp
+            .as_ref()
+            .ok_or(Error::Dynamic(DynamicError::Status(abi::UNSUPPORTED)))?;
+        let mut value = 0;
+        status(unsafe { (api.timestamp_ns)(self.owner.raw, &mut value) })?;
+        Ok(value)
+    }
+
     pub fn create_mapped_target_session(
         &self,
         resources: Rc<ir::ResourceTable>,

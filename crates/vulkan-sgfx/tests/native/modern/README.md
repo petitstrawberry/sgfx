@@ -1,0 +1,77 @@
+# Native Vulkan rendering smoke test
+
+Compile `ApplicationsSmoke.java` against native LWJGL 3.4.3 module JARs and run
+with `VK_DRIVER_FILES` selecting the freshly built SGFX ICD. Required providers
+are LWJGL core, SDL, Vulkan and Shaderc, a Vulkan loader and the SGFX backend DSO.
+The native providers and VM runner are produced by `scarlet-bundle-lwjgl`.
+
+The test uses no network or application assets. It also loads the actual VMA
+native library, creates a dedicated 64 MiB buffer, verifies first/last-word
+ordered copies and rejects binding that allocation to a different buffer. Float
+image targets exercise image-dedicated allocations. It checks synchronization2,
+events, binary/timeline semaphores, dynamic rendering, indirect-count drawing,
+indexed indirect drawing with a negative vertex offset and exact image readback.
+The combined graphics path checks push descriptors, anisotropy 16, instance
+divisor two, firstInstance two, signed BaseVertex and DrawIndex after a skipped
+zero-count indirect command. It verifies 512 color pixels and 512 depth words
+across triangle/indexed/point and Min/Max blending passes, including explicit
+sampling gradients, packed signed/normalized inputs, angle conversion, dynamic
+local-array stores and R32 signed texel views at byte offset 16, and an R8 signed view at offset 20
+with a seven-byte range. The R8 path checks -128, 127, negative values and
+packed-word boundaries, then returns to the original R32 view.
+Separate checks validate D32 upload/copy/clear, vertex-only depth rendering with
+static depth bias and preserved texels, plus RGBA16F/RGBA32F additive blending.
+The floating-point test compares 128 exact packed components, including negative
+values and values above one. A mip-one attachment test compares 80 exact pixels
+after a partial clear, LOAD and an in-pass clear/resume. Mip zero and pixels
+outside the render area must retain their original values. A capacity case
+holds 1100 real GPU images and completion observers, reads boundary pixels,
+retires every image and repeats to verify slot reuse.
+Occlusion checks compare visible/empty scopes, copied and host results, and host
+reset. Pipeline-statistics-capable devices also check IA, VS and fragment counts;
+other devices must reject statistics pools.
+The aggregate Vulkan 1.2 feature query must agree with individual timeline/query
+records and clear unsupported fields. Device creation enables the implemented
+features through the aggregate record before the GPU operations run.
+The indirect/count buffers are updated in the command stream. Timestamp-capable
+devices additionally check timer results, query buffer copies and host reset.
+Devices reporting zero timestamp bits must reject timestamp pools, and rendering
+continues without timing. These checks do not establish Vulkan conformance.
+
+Expected final markers are `MODERN_GRAPHICS_NATIVE PASS`, `SYNC2_NATIVE PASS`,
+`SCOPED_QUERIES_NATIVE PASS`, `CORE11_PROPERTIES_NATIVE PASS`,
+`CORE12_FEATURES_NATIVE PASS`, `VULKAN_REQUIREMENTS_NATIVE PASS`,
+`DEPTH_TRANSFER_NATIVE PASS`, `DEPTH_ONLY_NATIVE PASS`, `FLOAT_COLOR_NATIVE PASS`,
+`MIP_ATTACHMENT_NATIVE PASS`, `GPU_HANDLES_NATIVE PASS`,
+`VMA_DEDICATED_NATIVE PASS`, and either `QUERY_NATIVE PASS` or
+`QUERY_NATIVE_UNAVAILABLE PASS`.
+
+On macOS, `host-gl-clock.c` checks OpenGL timestamp counter bits and query values
+without QEMU or VirGL. Build it with `clang -framework OpenGL host-gl-clock.c`.
+A zero bit count means that OpenGL exposes no usable timestamp counter, even
+when query objects complete successfully. This diagnostic does not use CPU time
+as a replacement GPU counter.
+
+For Cocoa/HVF runs include virtio keyboard and mouse devices. A Cocoa input
+callback in the QEMU host can dereference absent keyboard state if an event
+arrives in a GPU-only VM; that host failure must not be counted as a passing run.
+
+The graphics case uses a 64 MiB vertex backing initialized through its last word.
+Its first draw exceeds 64 MiB once transport headers are included. Exact color
+and depth checks verify that every upload packet retired before drawing; later
+draws verify resource reuse.
+
+A separate R8 mode binds 710,159 bytes from offset 20 and reads byte 700,000
+on the GPU. This covers descriptors larger than 256 KiB while remaining within
+the native 1 MiB buffer-view budget.
+
+Run the capacity case with at least 4 GiB of guest RAM. It verifies that the
+reported native heap exceeds 512 MiB, reserves the full logical budget without
+materializing CPU/GPU storage, rejects the next allocation, and reuses freed
+budget twice. This tests allocation accounting, separately from the actual GPU
+buffer/image checks above.
+
+The dedicated-buffer case also submits eight separate four-byte updates near
+the end of its 64 MiB backing. Each round verifies the changed word and untouched
+words at both boundaries. Its elapsed time is printed for comparison between
+native builds; byte correctness determines the fixture result.

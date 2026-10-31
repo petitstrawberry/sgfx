@@ -1,18 +1,22 @@
-//! Bound uploads in transfer and mixed recordings without splitting pass state.
+//! Pace texture uploads without splitting passes or large buffer writes.
 
 use sgfx::ir::{self, OwnedCommand, OwnedCommandBuffer};
 
-// A pacing budget for uploads, independent of native packet encoding.
+// A pacing budget for texture uploads, independent of native packet encoding.
 // Leaves room for resource/transfer metadata in bounded backend schedulers.
 pub(crate) const UPLOAD_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn upload_bytes(command: &OwnedCommand) -> Option<usize> {
     match command {
-        OwnedCommand::WriteBuffer { data, .. }
-        | OwnedCommand::WriteTexture { data, .. }
+        OwnedCommand::WriteTexture { data, .. }
         | OwnedCommand::WriteTextureMip { data, .. }
         | OwnedCommand::WriteTextureLayer { data, .. } => Some(data.len()),
-        OwnedCommand::ResourceBarrier(
+        // Buffer writes update the backend's CPU shadow before a draw uploads
+        // it. Splitting one write repeatedly clones an ever-growing shadow and
+        // loses the exact physical predecessor between chunks. Native queue
+        // admission still bounds the eventual GPU upload.
+        OwnedCommand::WriteBuffer { .. }
+        | OwnedCommand::ResourceBarrier(
             ir::OwnedResourceBarrier::Texture { .. } | ir::OwnedResourceBarrier::TextureMip { .. },
         )
         | OwnedCommand::CopyTextureToTexture { .. }
@@ -22,10 +26,67 @@ fn upload_bytes(command: &OwnedCommand) -> Option<usize> {
     }
 }
 
+// Native draw plans capture buffer shadows before rendering. Later buffer
+// updates require a new plan, while texture uploads and GPU barriers may stay
+// with the ordered passes. Render and compute plans are distinct as well.
+#[derive(Default)]
+struct PlanBoundary {
+    rendered: bool,
+    computed: bool,
+}
+impl PlanBoundary {
+    fn requires_split(&self, command: &OwnedCommand) -> bool {
+        match command {
+            OwnedCommand::WriteBuffer { .. }
+            | OwnedCommand::CopyBufferToBuffer { .. }
+            | OwnedCommand::BeginComputePass => self.rendered,
+            OwnedCommand::BeginRenderPass(_)
+            | OwnedCommand::BeginRenderPassWithAttachments { .. } => self.computed,
+            _ => false,
+        }
+    }
+    fn record(&mut self, command: &OwnedCommand) {
+        match command {
+            OwnedCommand::BeginRenderPass(_)
+            | OwnedCommand::BeginRenderPassWithAttachments { .. } => self.rendered = true,
+            OwnedCommand::BeginComputePass => self.computed = true,
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn needs_batches(commands: &[OwnedCommand], budget: usize) -> bool {
-    commands.iter().fold(0usize, |total, command| {
-        total.saturating_add(upload_bytes(command).unwrap_or(0))
-    }) > budget
+    let mut rendered = false;
+    let mut computed = false;
+    let mut bytes = 0usize;
+    for command in commands {
+        match command {
+            OwnedCommand::WriteBuffer { .. } | OwnedCommand::CopyBufferToBuffer { .. }
+                if rendered =>
+            {
+                return true;
+            }
+            OwnedCommand::BeginComputePass => {
+                if rendered {
+                    return true;
+                }
+                computed = true;
+            }
+            OwnedCommand::BeginRenderPass(_)
+            | OwnedCommand::BeginRenderPassWithAttachments { .. } => {
+                if computed {
+                    return true;
+                }
+                rendered = true;
+            }
+            _ => {}
+        }
+        bytes = bytes.saturating_add(upload_bytes(command).unwrap_or(0));
+        if bytes > budget {
+            return true;
+        }
+    }
+    false
 }
 
 /// Validate the entire recording before admitting any prefix. Preserve command
@@ -46,7 +107,13 @@ pub(crate) fn split(
     let mut batch = Vec::new();
     let mut bytes = 0usize;
     let mut in_pass = false;
+    let mut plan = PlanBoundary::default();
     for command in owned.into_commands() {
+        if !in_pass && plan.requires_split(&command) {
+            batches.push(OwnedCommandBuffer::new(std::mem::take(&mut batch)));
+            bytes = 0;
+            plan = PlanBoundary::default();
+        }
         match &command {
             OwnedCommand::BeginRenderPass(_)
             | OwnedCommand::BeginRenderPassWithAttachments { .. }
@@ -54,7 +121,9 @@ pub(crate) fn split(
                 if bytes >= budget && !batch.is_empty() {
                     batches.push(OwnedCommandBuffer::new(std::mem::take(&mut batch)));
                     bytes = 0;
+                    plan = PlanBoundary::default();
                 }
+                plan.record(&command);
                 in_pass = true;
                 batch.push(command);
                 continue;
@@ -72,32 +141,16 @@ pub(crate) fn split(
         }
         let length = upload_bytes(&command).unwrap_or(0);
         if length <= budget {
-            push(&mut batches, &mut batch, &mut bytes, command, budget);
+            push(
+                &mut batches,
+                &mut batch,
+                &mut bytes,
+                &mut plan,
+                command,
+                budget,
+            );
             continue;
         }
-        let command = match command {
-            OwnedCommand::WriteBuffer {
-                buffer,
-                offset,
-                data,
-            } => {
-                for (index, chunk) in data.chunks(budget).enumerate() {
-                    push(
-                        &mut batches,
-                        &mut batch,
-                        &mut bytes,
-                        OwnedCommand::WriteBuffer {
-                            buffer,
-                            offset: offset + (index * budget) as u64,
-                            data: chunk.to_vec(),
-                        },
-                        budget,
-                    );
-                }
-                continue;
-            }
-            command => command,
-        };
         let (texture, mip_level, array_layer, rect, stride, data) = match command {
             OwnedCommand::WriteTexture {
                 texture,
@@ -154,6 +207,7 @@ pub(crate) fn split(
                 &mut batches,
                 &mut batch,
                 &mut bytes,
+                &mut plan,
                 OwnedCommand::WriteTextureLayer {
                     texture,
                     mip_level,
@@ -180,6 +234,7 @@ fn push(
     batches: &mut Vec<OwnedCommandBuffer>,
     batch: &mut Vec<OwnedCommand>,
     bytes: &mut usize,
+    plan: &mut PlanBoundary,
     command: OwnedCommand,
     budget: usize,
 ) {
@@ -187,7 +242,9 @@ fn push(
     if bytes.saturating_add(length) > budget && !batch.is_empty() {
         batches.push(OwnedCommandBuffer::new(std::mem::take(batch)));
         *bytes = 0;
+        *plan = PlanBoundary::default();
     }
+    plan.record(&command);
     *bytes += length;
     batch.push(command);
 }
@@ -195,6 +252,42 @@ fn push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_buffer_writes_keep_one_owned_payload_and_overwrite_order() {
+        let table = ir::ResourceTable::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(80, ir::BufferUsage::COPY_DST).unwrap())
+            .unwrap()
+            .id();
+        let data: Vec<u8> = (0..64).collect();
+        let address = data.as_ptr();
+        let commands = vec![
+            OwnedCommand::WriteBuffer {
+                buffer,
+                offset: 4,
+                data,
+            },
+            OwnedCommand::WriteBuffer {
+                buffer,
+                offset: 8,
+                data: vec![99; 4],
+            },
+        ];
+        assert!(!needs_batches(&commands, 8));
+        let batches = split(OwnedCommandBuffer::new(commands), &table, 8).unwrap();
+        assert_eq!(batches.len(), 1);
+        let commands = batches[0].commands();
+        assert_eq!(commands.len(), 2);
+        assert!(
+            matches!(&commands[0], OwnedCommand::WriteBuffer { offset: 4, data, .. }
+            if data.as_ptr() == address && data.len() == 64)
+        );
+        assert!(
+            matches!(&commands[1], OwnedCommand::WriteBuffer { offset: 8, data, .. }
+            if data == &[99; 4])
+        );
+    }
 
     fn texture(table: &ir::ResourceTable) -> ir::TextureId {
         table

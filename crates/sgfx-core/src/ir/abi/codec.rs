@@ -157,17 +157,17 @@ macro_rules! enumeration {
         }
     };
 }
-enumeration!(TextureFormat {Bgra8Unorm=0,Bgra8UnormSrgb=1,Rgba8Unorm=2,Rgba8UnormSrgb=3,R8Unorm=4,Nv12=5,Depth32Float=6,Rg8Unorm=7});
+enumeration!(TextureFormat {Bgra8Unorm=0,Bgra8UnormSrgb=1,Rgba8Unorm=2,Rgba8UnormSrgb=3,R8Unorm=4,Nv12=5,Depth32Float=6,Rg8Unorm=7,Rgba16Float=8,Rgba32Float=9});
 enumeration!(FilterMode {Nearest=0,Linear=1});
 enumeration!(AddressMode {ClampToEdge=0,Repeat=1,MirrorRepeat=2,ClampToBorder=3});
 enumeration!(CompareFunction {Never=0,Less=1,Equal=2,LessEqual=3,Greater=4,NotEqual=5,GreaterEqual=6,Always=7});
-enumeration!(VertexFormat {Sint32=0,Uint32=1,Float16x2=2,Float16x4=3,Sint16x4=4,Snorm10_10_10_2=5,Float32x2=6,Float32x3=7,Float32x4=8,Unorm8x4=9,Uint16x2=10,Float32=11});
+enumeration!(VertexFormat {Sint32=0,Uint32=1,Float16x2=2,Float16x4=3,Sint16x4=4,Snorm10_10_10_2=5,Float32x2=6,Float32x3=7,Float32x4=8,Unorm8x4=9,Uint16x2=10,Float32=11,Snorm8x4=12,Sint16x2=13,Uint32x2=14,Uint32x3=15,Uint32x4=16,Sint32x2=17,Sint32x3=18,Sint32x4=19});
 enumeration!(VertexStepMode {Vertex=0,Instance=1});
-enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1,TriangleFan=2,LineList=3,LineStrip=4});
+enumeration!(PrimitiveTopology {TriangleList=0,TriangleStrip=1,TriangleFan=2,LineList=3,LineStrip=4,PointList=5});
 enumeration!(IndexFormat {Uint16=0,Uint32=1});
 enumeration!(TextureSampleMode {Rgba=0,RgbIgnoreAlpha=1,AlphaMask=2});
 enumeration!(BlendFactor {Zero=0,One=1,SourceAlpha=2,OneMinusSourceAlpha=3,DestinationAlpha=4,OneMinusDestinationAlpha=5,SourceColor=6,OneMinusSourceColor=7,DestinationColor=8,OneMinusDestinationColor=9});
-enumeration!(BlendOp {Add=0,Subtract=1,ReverseSubtract=2});
+enumeration!(BlendOp {Add=0,Subtract=1,ReverseSubtract=2,Min=3,Max=4});
 enumeration!(CullMode {None=0,Front=1,Back=2});
 enumeration!(FrontFace {Clockwise=0,CounterClockwise=1});
 enumeration!(StorageTextureAccess {WriteOnly=0});
@@ -386,13 +386,21 @@ impl Codec for SamplerDesc {
         self.min_lod().put(w);
         self.max_lod().put(w);
         self.compare().put(w);
+        // Samplers occupy length-delimited rows. Preserve the exact historical
+        // encoding for isotropic samplers; old readers reject an extended row.
+        if self.anisotropy() > 1 {
+            self.anisotropy().put(w);
+        }
     }
     fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
-        Ok(
-            Self::new(r.value(t)?, r.value(t)?, r.value(t)?, r.value(t)?)
-                .with_mip_filter(r.value(t)?, r.value(t)?, r.value(t)?)?
-                .with_compare(r.value(t)?),
-        )
+        let sampler = Self::new(r.value(t)?, r.value(t)?, r.value(t)?, r.value(t)?)
+            .with_mip_filter(r.value(t)?, r.value(t)?, r.value(t)?)?
+            .with_compare(r.value(t)?);
+        if r.words.is_empty() {
+            Ok(sampler)
+        } else {
+            sampler.with_anisotropy(r.value(t)?)
+        }
     }
 }
 impl Codec for VertexBufferLayout {
@@ -413,6 +421,7 @@ impl Codec for RenderPipelineDesc {
         self.blend().put(w);
         self.raster().put(w);
         self.depth_state().put(w);
+        put_bias(self.raster(), w);
     }
     fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
         let d = Self::new(
@@ -423,10 +432,15 @@ impl Codec for RenderPipelineDesc {
             r.value(t)?,
             r.value(t)?,
         )?;
-        match r.value(t)? {
-            Some(depth) => d.with_depth_state(depth),
-            None => Ok(d),
+        let mut d = match r.value(t)? {
+            Some(depth) => d.with_depth_state(depth)?,
+            None => d,
+        };
+        if !r.words.is_empty() {
+            let raster = get_bias(d.raster(), r, t)?;
+            d = d.with_raster_state(raster);
         }
+        Ok(d)
     }
 }
 
@@ -732,6 +746,19 @@ impl Codec for ProgrammableRenderPipelineDesc {
                 .collect::<Vec<_>>()
                 .put(w);
         }
+        if self
+            .vertex_buffers()
+            .iter()
+            .any(|layout| layout.instance_divisor() != 1)
+        {
+            w.push(0x4449_5653);
+            self.vertex_buffers()
+                .iter()
+                .map(|layout| layout.instance_divisor())
+                .collect::<Vec<_>>()
+                .put(w);
+        }
+        put_bias(self.raster(), w);
     }
     fn get(r: &mut Reader<'_>, t: &ResourceTable) -> Result<Self> {
         let mut d = Self::new(
@@ -749,7 +776,7 @@ impl Codec for ProgrammableRenderPipelineDesc {
             d = d.with_depth_state(depth)?;
         }
         d = d.with_color_targets(r.value(t)?)?;
-        if !r.words.is_empty() {
+        if r.words.first() == Some(&0x5354_4550) {
             if r.word()? != 0x5354_4550 {
                 return Err(Error::InvalidDescriptor);
             }
@@ -765,6 +792,27 @@ impl Codec for ProgrammableRenderPipelineDesc {
                 .map(|(layout, mode)| layout.with_step_mode(mode))
                 .collect();
             d = d.with_vertex_buffers(layouts)?;
+        }
+        if r.words.first() == Some(&0x4449_5653) {
+            if r.word()? != 0x4449_5653 {
+                return Err(Error::InvalidDescriptor);
+            }
+            let divisors: Vec<u32> = r.value(t)?;
+            if divisors.len() != d.vertex_buffers().len() {
+                return Err(Error::InvalidDescriptor);
+            }
+            let layouts = d
+                .vertex_buffers()
+                .iter()
+                .cloned()
+                .zip(divisors)
+                .map(|(layout, divisor)| layout.with_instance_divisor(divisor))
+                .collect::<Result<Vec<_>>>()?;
+            d = d.with_vertex_buffers(layouts)?;
+        }
+        if !r.words.is_empty() {
+            let raster = get_bias(d.raster(), r, t)?;
+            d = d.with_raster_state(raster);
         }
         r.end()?;
         Ok(d)
@@ -829,6 +877,17 @@ mod vertex_format_tests {
             decoded.vertex_buffers()[1].step_mode(),
             VertexStepMode::Instance
         );
+        let mut layouts = instance.vertex_buffers().to_vec();
+        layouts[1] = layouts[1].clone().with_instance_divisor(3).unwrap();
+        let divisor = instance.with_vertex_buffers(layouts).unwrap();
+        let mut words = Vec::new();
+        divisor.put(&mut words);
+        assert_eq!(&words[..extended.len()], extended);
+        let decoded =
+            ProgrammableRenderPipelineDesc::get(&mut Reader { words: &words }, &table).unwrap();
+        assert_eq!(decoded.vertex_buffers()[1].instance_divisor(), 3);
+        assert_eq!(decoded.vertex_buffers()[0].instance_divisor(), 1);
+
         let mut truncated = original.clone();
         truncated.extend([0x5354_4550, 1, 1]);
         assert!(matches!(
@@ -859,6 +918,14 @@ mod vertex_format_tests {
             (VertexFormat::Unorm8x4, 9),
             (VertexFormat::Uint16x2, 10),
             (VertexFormat::Float32, 11),
+            (VertexFormat::Snorm8x4, 12),
+            (VertexFormat::Sint16x2, 13),
+            (VertexFormat::Uint32x2, 14),
+            (VertexFormat::Uint32x3, 15),
+            (VertexFormat::Uint32x4, 16),
+            (VertexFormat::Sint32x2, 17),
+            (VertexFormat::Sint32x3, 18),
+            (VertexFormat::Sint32x4, 19),
         ] {
             let mut words = Vec::new();
             format.put(&mut words);
@@ -869,7 +936,7 @@ mod vertex_format_tests {
         }
         assert_eq!(VertexFormat::Float32.byte_size(), 4);
         assert_eq!(
-            VertexFormat::get(&mut Reader { words: &[12] }, &table),
+            VertexFormat::get(&mut Reader { words: &[20] }, &table),
             Err(Error::InvalidValue)
         );
     }
@@ -879,6 +946,30 @@ mod vertex_format_tests {
 mod sampler_border_tests {
     use super::*;
 
+    #[test]
+    fn anisotropic_sampler_rows_extend_only_when_needed_and_reject_bad_limits() {
+        let table = ResourceTable::new();
+        let sampler = SamplerDesc::new(
+            FilterMode::Linear,
+            FilterMode::Linear,
+            AddressMode::Repeat,
+            AddressMode::Repeat,
+        );
+        let mut legacy = Vec::new();
+        sampler.put(&mut legacy);
+        for limit in [1, 2, 16] {
+            let sampler = sampler.with_anisotropy(limit).unwrap();
+            let mut words = Vec::new();
+            sampler.put(&mut words);
+            assert_eq!(&words[..legacy.len()], legacy);
+            assert_eq!(words.len(), legacy.len() + usize::from(limit != 1));
+            let mut reader = Reader { words: &words };
+            assert_eq!(SamplerDesc::get(&mut reader, &table).unwrap(), sampler);
+            reader.end().unwrap();
+        }
+        assert!(sampler.with_anisotropy(0).is_err());
+        assert!(sampler.with_anisotropy(17).is_err());
+    }
     #[test]
     fn transparent_border_appends_without_changing_existing_address_tags() {
         let table = ResourceTable::new();
@@ -988,6 +1079,11 @@ mod line_topology_tests {
                 4,
                 [false, false, true, true, true, true, true],
             ),
+            (
+                PrimitiveTopology::PointList,
+                5,
+                [false, true, true, true, true, true, true],
+            ),
         ] {
             let mut words = Vec::new();
             topology.put(&mut words);
@@ -1004,8 +1100,27 @@ mod line_topology_tests {
             }
         }
         assert_eq!(
-            PrimitiveTopology::get(&mut Reader { words: &[5] }, &table),
+            PrimitiveTopology::get(&mut Reader { words: &[6] }, &table),
             Err(Error::InvalidValue)
         );
     }
+}
+
+fn put_bias(raster: RasterState, words: &mut Vec<u64>) {
+    let bias = raster.depth_bias();
+    if bias != [0.0; 2] {
+        words.push(0x4249_4153);
+        bias[0].put(words);
+        bias[1].put(words);
+    }
+}
+fn get_bias(
+    raster: RasterState,
+    reader: &mut Reader<'_>,
+    table: &ResourceTable,
+) -> Result<RasterState> {
+    if reader.word()? != 0x4249_4153 {
+        return Err(Error::InvalidDescriptor);
+    }
+    raster.with_depth_bias(reader.value(table)?, reader.value(table)?)
 }

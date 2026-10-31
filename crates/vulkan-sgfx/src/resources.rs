@@ -2,8 +2,9 @@
 use ash::vk::{self, Handle};
 use sgfx::ir;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher},
     ffi::{CStr, c_void},
+    hash::{Hash, Hasher},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice,
 };
@@ -13,8 +14,10 @@ const LIMIT: usize = 1024;
 // Keep their count separate from metadata limits and from the byte budget.
 pub(crate) const MAX_MEMORY_ALLOCATIONS: usize = 4_096;
 const MAX_DESCRIPTOR_SETS: usize = 16_384;
-const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
-pub(crate) const MAX_ALLOCATED: usize = 512 * 1024 * 1024;
+// Leave room for a whole packet's transient descriptors in the bounded IR
+// table, while reusing common immutable groups across queue submissions.
+pub(crate) const CACHED_DESCRIPTOR_GROUPS: usize = 8_192;
+pub(crate) const MAX_ALLOCATION: u64 = 256 * 1024 * 1024;
 pub(crate) struct Buffer {
     pub id: ir::BufferId,
     pub size: u64,
@@ -23,6 +26,7 @@ pub(crate) struct Buffer {
 }
 #[derive(Clone, Copy)]
 pub(crate) struct BufferView {
+    pub format: vk::Format,
     pub buffer: vk::Buffer,
     pub offset: u64,
     pub range: u64,
@@ -34,6 +38,11 @@ pub(crate) struct AlignedBytes {
     len: usize,
 }
 impl AlignedBytes {
+    /// Observe an existing mirror without materializing GPU-only allocations.
+    pub(crate) fn materialized_slice(&self) -> Option<&[u8]> {
+        (self.words.len() == self.len.div_ceil(8)).then(|| &**self)
+    }
+
     /// GPU image storage lives in the backend. Reserve its logical byte range
     /// without allocating and clearing a redundant CPU mirror for every image.
     /// Buffers and explicit mappings materialize the mirror before access.
@@ -90,6 +99,10 @@ impl std::ops::DerefMut for AlignedBytes {
 pub(crate) struct Memory {
     pub bytes: AlignedBytes,
     pub mapped: bool,
+    // Only a successful CPU mapping can make the Vulkan memory mirror a
+    // source of host-authored bytes. Binding a never-mapped GPU buffer does
+    // not justify uploading its entire zero-filled CPU allocation.
+    pub host_written: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pipeline {
@@ -98,6 +111,7 @@ pub(crate) enum Pipeline {
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DescriptorBinding {
+    TexelBuffer(vk::BufferView),
     Buffer {
         buffer: vk::Buffer,
         offset: u64,
@@ -116,10 +130,14 @@ pub(crate) struct DescriptorPool {
     pub capacity: HashMap<vk::DescriptorType, u32>,
     pub remaining: HashMap<vk::DescriptorType, u32>,
 }
+#[derive(Clone)]
 pub(crate) struct DescriptorSet {
+    pub texel_formats: HashMap<u32, vk::Format>,
     pub pool: vk::DescriptorPool,
     pub layout: ir::BindGroupLayoutDesc,
     pub types: BTreeMap<u32, vk::DescriptorType>,
+    binding_map: DescriptorBindingMap,
+    reverse_binding_map: DescriptorBindingMap,
     pub stages: BTreeMap<u32, vk::ShaderStageFlags>,
     pub bindings: HashMap<u32, DescriptorBinding>,
     pub cached_group: Option<ir::BindGroupId>,
@@ -151,17 +169,172 @@ fn descriptor_binding_map(
     }
     Ok(map)
 }
+
+fn descriptor_binding_maps(
+    types: &BTreeMap<u32, vk::DescriptorType>,
+) -> Result<(DescriptorBindingMap, DescriptorBindingMap), vk::Result> {
+    let binding_map = descriptor_binding_map(types)?;
+    let mut reverse_binding_map = BTreeMap::new();
+    for (&binding, &slot) in &binding_map {
+        // SGFX reserves an adjacent even/odd pair for every Vulkan binding.
+        // The reverse lookup accepts either half, just as the previous scan did.
+        reverse_binding_map.insert(slot, binding);
+        reverse_binding_map.insert(slot + 1, binding);
+    }
+    Ok((binding_map, reverse_binding_map))
+}
+
+fn texture_format_key(format: ir::TextureFormat) -> u8 {
+    match format {
+        ir::TextureFormat::Bgra8Unorm => 0,
+        ir::TextureFormat::Bgra8UnormSrgb => 1,
+        ir::TextureFormat::Rgba8Unorm => 2,
+        ir::TextureFormat::Rgba8UnormSrgb => 3,
+        ir::TextureFormat::R8Unorm => 4,
+        ir::TextureFormat::Rg8Unorm => 5,
+        ir::TextureFormat::Nv12 => 6,
+        ir::TextureFormat::Depth32Float => 7,
+        ir::TextureFormat::Rgba16Float => 8,
+        ir::TextureFormat::Rgba32Float => 9,
+    }
+}
+
+fn texture_view_dimension_key(dimension: ir::TextureViewDimension) -> u8 {
+    match dimension {
+        ir::TextureViewDimension::D1 => 0,
+        ir::TextureViewDimension::D1Array => 1,
+        ir::TextureViewDimension::D2 => 2,
+        ir::TextureViewDimension::D2Array => 3,
+        ir::TextureViewDimension::Cube => 4,
+    }
+}
+
+fn binding_type_key(ty: &ir::BindingType) -> u8 {
+    match ty {
+        ir::BindingType::UniformBuffer => 0,
+        ir::BindingType::StorageBuffer { .. } => 1,
+        ir::BindingType::SampledTexture => 2,
+        ir::BindingType::SampledTextureView { .. } => 3,
+        ir::BindingType::Sampler => 4,
+        ir::BindingType::ComparisonSampler => 5,
+        ir::BindingType::StorageTexture { .. } => 6,
+    }
+}
+
+/// Hash only immutable descriptor identity fields. Equality remains the final
+/// authority for cache hits, so this hash may omit fields when that is cheaper.
+fn bind_group_cache_hash(desc: &ir::BindGroupDesc) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    desc.layout().entries().len().hash(&mut hasher);
+    for entry in desc.layout().entries() {
+        entry.binding().hash(&mut hasher);
+        entry.visibility().bits().hash(&mut hasher);
+        binding_type_key(&entry.ty()).hash(&mut hasher);
+        match entry.ty() {
+            ir::BindingType::StorageBuffer { read_only } => read_only.hash(&mut hasher),
+            ir::BindingType::SampledTextureView { dimension, depth } => {
+                texture_view_dimension_key(dimension).hash(&mut hasher);
+                depth.hash(&mut hasher);
+            }
+            ir::BindingType::StorageTexture { format, .. } => {
+                texture_format_key(format).hash(&mut hasher);
+            }
+            ir::BindingType::UniformBuffer
+            | ir::BindingType::SampledTexture
+            | ir::BindingType::Sampler
+            | ir::BindingType::ComparisonSampler => {}
+        }
+    }
+    desc.entries().len().hash(&mut hasher);
+    for entry in desc.entries() {
+        entry.binding().hash(&mut hasher);
+        match entry.resource() {
+            ir::BindingResource::Buffer {
+                buffer,
+                offset,
+                size,
+            } => {
+                0u8.hash(&mut hasher);
+                buffer.hash(&mut hasher);
+                offset.hash(&mut hasher);
+                size.hash(&mut hasher);
+            }
+            ir::BindingResource::Texture(texture) => {
+                1u8.hash(&mut hasher);
+                texture.hash(&mut hasher);
+            }
+            ir::BindingResource::TextureView { texture, view } => {
+                2u8.hash(&mut hasher);
+                texture.hash(&mut hasher);
+                texture_format_key(view.format()).hash(&mut hasher);
+                texture_view_dimension_key(view.dimension()).hash(&mut hasher);
+                view.base_mip_level().hash(&mut hasher);
+                view.mip_level_count().hash(&mut hasher);
+                view.base_array_layer().hash(&mut hasher);
+                view.array_layer_count().hash(&mut hasher);
+            }
+            ir::BindingResource::Sampler(sampler) => {
+                3u8.hash(&mut hasher);
+                sampler.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
 impl DescriptorSet {
-    pub(crate) fn binding_map(&self) -> DescriptorBindingMap {
-        descriptor_binding_map(&self.types).expect("validated descriptor layout")
+    #[cfg(test)]
+    pub(crate) fn new(
+        texel_formats: HashMap<u32, vk::Format>,
+        pool: vk::DescriptorPool,
+        layout: ir::BindGroupLayoutDesc,
+        types: BTreeMap<u32, vk::DescriptorType>,
+        stages: BTreeMap<u32, vk::ShaderStageFlags>,
+        bindings: HashMap<u32, DescriptorBinding>,
+    ) -> Result<Self, vk::Result> {
+        let (binding_map, reverse_binding_map) = descriptor_binding_maps(&types)?;
+        Ok(Self::with_binding_maps(
+            texel_formats,
+            pool,
+            layout,
+            types,
+            (binding_map, reverse_binding_map),
+            stages,
+            bindings,
+        ))
+    }
+
+    fn with_binding_maps(
+        texel_formats: HashMap<u32, vk::Format>,
+        pool: vk::DescriptorPool,
+        layout: ir::BindGroupLayoutDesc,
+        types: BTreeMap<u32, vk::DescriptorType>,
+        maps: (DescriptorBindingMap, DescriptorBindingMap),
+        stages: BTreeMap<u32, vk::ShaderStageFlags>,
+        bindings: HashMap<u32, DescriptorBinding>,
+    ) -> Self {
+        let (binding_map, reverse_binding_map) = maps;
+        Self {
+            texel_formats,
+            pool,
+            layout,
+            types,
+            binding_map,
+            reverse_binding_map,
+            stages,
+            bindings,
+            cached_group: None,
+            invalid: false,
+        }
+    }
+
+    pub(crate) fn binding_map(&self) -> &DescriptorBindingMap {
+        &self.binding_map
     }
     pub(crate) fn source_to_ir(&self, binding: u32) -> Option<u32> {
-        self.binding_map().get(&binding).copied()
+        self.binding_map.get(&binding).copied()
     }
     fn ir_to_source(&self, slot: u32) -> Option<u32> {
-        self.binding_map()
-            .into_iter()
-            .find_map(|(binding, base)| (base == slot / 2 * 2).then_some(binding))
+        self.reverse_binding_map.get(&slot).copied()
     }
 }
 pub(crate) type Specialization = Vec<(u32, Vec<u8>)>;
@@ -228,8 +401,22 @@ pub(crate) unsafe fn specialization(
     Ok(result)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct ShaderViews {
+    textures: crate::spirv::TextureSwizzles,
+    narrow_texels: Vec<(u32, u32)>,
+}
+impl ShaderViews {
+    fn is_empty(&self) -> bool {
+        self.textures.is_empty() && self.narrow_texels.is_empty()
+    }
+}
 #[derive(Default)]
 pub(crate) struct Resources {
+    pub dedicated_allocations: HashMap<vk::DeviceMemory, crate::memory_allocation::DedicatedTarget>,
+    pub mip_render_targets: HashMap<(vk::Format, u32, u32, usize), ir::TextureId>,
+    pub depth_only_fragment: Option<ir::ShaderModuleId>,
+    pub depth_clear_colors: HashMap<(u32, u32), ir::TextureId>,
     pub image_view_formats: HashMap<vk::Image, Vec<vk::Format>>,
     pub descriptor_templates:
         HashMap<vk::DescriptorUpdateTemplate, crate::api::descriptor_template::Template>,
@@ -242,6 +429,9 @@ pub(crate) struct Resources {
     // Destroying VkShaderModule must not retire modules still referenced by a
     // live VkPipeline. View-swizzle modules have no VkShaderModule owner.
     orphaned_shader_modules: HashSet<ir::ShaderModuleId>,
+    pub push_set_layouts: HashSet<vk::DescriptorSetLayout>,
+    pub pipeline_push_sets: HashMap<vk::PipelineLayout, (u32, DescriptorSet)>,
+    pub pushed_set_owners: HashMap<vk::DescriptorSet, std::sync::Weak<()>>,
     pub set_layouts: HashMap<vk::DescriptorSetLayout, ir::BindGroupLayoutDesc>,
     pub set_layout_types: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::DescriptorType>>,
     pub set_layout_stages: HashMap<vk::DescriptorSetLayout, BTreeMap<u32, vk::ShaderStageFlags>>,
@@ -253,11 +443,13 @@ pub(crate) struct Resources {
     pub descriptor_pools: HashMap<vk::DescriptorPool, DescriptorPool>,
     pub descriptor_sets: HashMap<vk::DescriptorSet, DescriptorSet>,
     bind_group_cache: Vec<(ir::BindGroupDesc, ir::BindGroupId)>,
+    bind_group_index: HashMap<u64, Vec<usize>>,
+    bind_group_recency: HashMap<ir::BindGroupId, u64>,
+    bind_group_clock: u64,
     pub pipeline_caches: HashMap<vk::PipelineCache, Vec<u8>>,
     pub pipelines: HashMap<vk::Pipeline, Pipeline>,
-    graphics_swizzles:
-        HashMap<(vk::Pipeline, crate::spirv::TextureSwizzles), ir::ProgrammableRenderPipelineId>,
-    compute_swizzles: HashMap<(vk::Pipeline, crate::spirv::TextureSwizzles), ir::ComputePipelineId>,
+    graphics_swizzles: HashMap<(vk::Pipeline, ShaderViews), ir::ProgrammableRenderPipelineId>,
+    compute_swizzles: HashMap<(vk::Pipeline, ShaderViews), ir::ComputePipelineId>,
     pub graphics_extents: HashMap<vk::Pipeline, vk::Extent2D>,
     pub graphics_state: HashMap<vk::Pipeline, crate::images::GraphicsDynamicState>,
     pub graphics_inputs: HashMap<vk::Pipeline, Vec<crate::input_attachments::InputBinding>>,
@@ -280,6 +472,24 @@ impl Resources {
             buffers
                 .get(handle)
                 .is_some_and(|buffer| buffer.bound.is_some_and(|(bound, _)| bound != memory))
+        });
+    }
+    pub(crate) fn forget_uploads_for_memory_range(
+        &mut self,
+        memory: vk::DeviceMemory,
+        range: std::ops::Range<u64>,
+        synchronized: vk::Buffer,
+    ) {
+        let buffers = &self.buffers;
+        self.uploaded_unmapped_buffers.retain(|handle| {
+            *handle == synchronized
+                || buffers.get(handle).is_some_and(|buffer| {
+                    buffer.bound.is_some_and(|(bound, offset)| {
+                        bound != memory
+                            || offset >= range.end
+                            || offset + buffer.size <= range.start
+                    })
+                })
         });
     }
     /// Cache shader variants for the component maps of statically used views.
@@ -419,18 +629,29 @@ impl Resources {
         &self,
         layout: &ir::PipelineLayoutDesc,
         sets: &BTreeMap<u32, vk::DescriptorSet>,
-    ) -> Result<crate::spirv::TextureSwizzles, vk::Result> {
+    ) -> Result<ShaderViews, vk::Result> {
         let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
-        let mut maps = Vec::new();
+        let mut maps = ShaderViews::default();
         for (group, layout) in layout.bind_groups().iter().enumerate() {
             for entry in layout.entries() {
-                if !matches!(entry.ty(), ir::BindingType::SampledTextureView { .. }) {
+                if !matches!(
+                    entry.ty(),
+                    ir::BindingType::SampledTextureView { .. }
+                        | ir::BindingType::StorageBuffer { read_only: true }
+                ) {
                     continue;
                 }
                 let set = sets
                     .get(&(group as u32))
                     .and_then(|set| self.descriptor_sets.get(set))
                     .ok_or(invalid)?;
+                if matches!(entry.ty(), ir::BindingType::StorageBuffer { .. }) {
+                    let binding = set.ir_to_source(entry.binding()).ok_or(invalid)?;
+                    if set.texel_formats.get(&binding) == Some(&vk::Format::R8_SINT) {
+                        maps.narrow_texels.push((group as u32, entry.binding()));
+                    }
+                    continue;
+                }
                 let Some(DescriptorBinding::Image { view, .. }) = set
                     .bindings
                     .get(&set.ir_to_source(entry.binding()).ok_or(invalid)?)
@@ -439,7 +660,8 @@ impl Resources {
                 };
                 let view = self.views.get(view).ok_or(invalid)?;
                 if view.components != [0, 1, 2, 3] {
-                    maps.push((group as u32, entry.binding(), view.components));
+                    maps.textures
+                        .push((group as u32, entry.binding(), view.components));
                 }
             }
         }
@@ -476,8 +698,14 @@ impl Resources {
 
     /// Forget every cached identity before swapping to a fresh IR table.
     pub(crate) fn clear_ir_cache(&mut self) {
+        self.mip_render_targets.clear();
+        self.depth_clear_colors.clear();
+        self.depth_only_fragment = None;
         self.uploaded_unmapped_buffers.clear();
         self.bind_group_cache.clear();
+        self.bind_group_index.clear();
+        self.bind_group_recency.clear();
+        self.bind_group_clock = 0;
         self.graphics_swizzles.clear();
         self.compute_swizzles.clear();
         self.orphaned_shader_modules.clear();
@@ -486,26 +714,61 @@ impl Resources {
         }
     }
 
-    /// Retire descriptor snapshots after every recording in a queue packet has
-    /// been encoded. Vulkan command recordings retain set handles, not these
-    /// transient IR identities; submitted backend commands own their bindings.
-    /// Keep the single shared empty group used to clear inactive layout slots.
+    /// Release cached snapshots before a packet that could need the entire IR
+    /// table. Resolved recordings contain set handles; empty layout groups are
+    /// kept because those are embedded directly in the resolved commands.
     pub(crate) fn release_descriptor_groups(
         &mut self,
         table: &ir::ResourceTable,
-        mut release_backend: impl FnMut(ir::BindGroupId) -> Result<(), vk::Result>,
+        release_backend: impl FnMut(ir::BindGroupId) -> Result<(), vk::Result>,
     ) -> Result<(), vk::Result> {
         for set in self.descriptor_sets.values_mut() {
             set.cached_group = None;
         }
+        self.trim_descriptor_groups(table, 0, release_backend)
+    }
+
+    pub(crate) fn descriptor_groups_need_capacity(&self, definitions: usize) -> bool {
+        self.bind_group_cache.len().saturating_add(definitions) > ir::MAX_BIND_GROUP_DEFINITIONS
+    }
+
+    /// Backend packets own their bindings after lowering. Evict only the least
+    /// recently used logical groups after the packet has been consumed, keeping
+    /// a bounded cache across submissions instead of changing every generation
+    /// and synchronizing all resource metadata for each packet.
+    pub(crate) fn trim_descriptor_groups(
+        &mut self,
+        table: &ir::ResourceTable,
+        keep: usize,
+        mut release_backend: impl FnMut(ir::BindGroupId) -> Result<(), vk::Result>,
+    ) -> Result<(), vk::Result> {
+        let count = self
+            .bind_group_cache
+            .iter()
+            .filter(|(desc, _)| !desc.layout().entries().is_empty())
+            .count();
+        if count <= keep {
+            return Ok(());
+        }
+        let mut oldest = self
+            .bind_group_cache
+            .iter()
+            .filter(|(desc, _)| !desc.layout().entries().is_empty())
+            .map(|(_, id)| (*id, self.bind_group_recency.get(id).copied().unwrap_or(0)))
+            .collect::<Vec<_>>();
+        oldest.sort_unstable_by_key(|(_, age)| *age);
+        let evict = oldest[..count - keep]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<HashSet<_>>();
+        self.bind_group_index.clear();
         let mut result = Ok(());
         let mut retired = Vec::new();
         for (desc, id) in std::mem::take(&mut self.bind_group_cache) {
-            if desc.layout().entries().is_empty() {
+            if !evict.contains(&id) {
                 self.bind_group_cache.push((desc, id));
             } else if let Err(error) = release_backend(id) {
-                // Preserve failed retirements for diagnosis or a retry, while
-                // still releasing the rest of this packet's snapshots.
+                // Preserve failed retirements for diagnosis or a retry.
                 self.bind_group_cache.push((desc, id));
                 result = Err(error);
             } else {
@@ -515,12 +778,22 @@ impl Resources {
         // Keep one table revision for the whole backend retirement batch.
         // Each logical release changes the ABI revision; interleaving it with
         // backend calls would serialize the entire resource table per group.
+        let mut released = HashSet::new();
         for (desc, id) in retired {
             if let Err(error) = table.release_bind_group(id).map_err(failure) {
                 self.bind_group_cache.push((desc, id));
                 result = Err(error);
+            } else {
+                self.bind_group_recency.remove(&id);
+                released.insert(id);
             }
         }
+        for set in self.descriptor_sets.values_mut() {
+            if set.cached_group.is_some_and(|id| released.contains(&id)) {
+                set.cached_group = None;
+            }
+        }
+        self.rebuild_bind_group_index();
         result
     }
 
@@ -538,8 +811,41 @@ impl Resources {
         let layout = ir::BindGroupLayoutDesc::new(Vec::new()).map_err(failure)?;
         let desc = ir::BindGroupDesc::new(table, layout, Vec::new()).map_err(failure)?;
         let id = table.define_bind_group(desc.clone()).map_err(failure)?.id();
-        self.bind_group_cache.push((desc, id));
+        self.push_bind_group_cache(desc, id);
         Ok(id)
+    }
+
+    fn push_bind_group_cache(&mut self, desc: ir::BindGroupDesc, id: ir::BindGroupId) {
+        let index = self.bind_group_cache.len();
+        let key = bind_group_cache_hash(&desc);
+        self.bind_group_cache.push((desc, id));
+        self.bind_group_index.entry(key).or_default().push(index);
+        self.touch_bind_group(id);
+    }
+
+    fn touch_bind_group(&mut self, id: ir::BindGroupId) {
+        self.bind_group_clock = self.bind_group_clock.saturating_add(1);
+        self.bind_group_recency.insert(id, self.bind_group_clock);
+    }
+
+    fn rebuild_bind_group_index(&mut self) {
+        self.bind_group_index.clear();
+        for (index, (desc, _)) in self.bind_group_cache.iter().enumerate() {
+            let key = bind_group_cache_hash(desc);
+            self.bind_group_index.entry(key).or_default().push(index);
+        }
+    }
+
+    fn cached_bind_group(&mut self, desc: &ir::BindGroupDesc) -> Option<ir::BindGroupId> {
+        let key = bind_group_cache_hash(desc);
+        let id = self.bind_group_index.get(&key)?.iter().find_map(|&index| {
+            let (cached, id) = self.bind_group_cache.get(index)?;
+            (cached == desc).then_some(*id)
+        });
+        if let Some(id) = id {
+            self.touch_bind_group(id);
+        }
+        id
     }
 
     #[cfg(test)]
@@ -559,6 +865,28 @@ impl Resources {
     }
 
     pub fn descriptor_group_with_layout(
+        &mut self,
+        table: &ir::ResourceTable,
+        handle: vk::DescriptorSet,
+        dynamic_offsets: &[u32],
+        layout: &ir::BindGroupLayoutDesc,
+        uniform_alignment: u32,
+        storage_alignment: u32,
+    ) -> Result<ir::BindGroupId, vk::Result> {
+        self.descriptor_group_with_layout_inner(
+            table,
+            handle,
+            dynamic_offsets,
+            layout,
+            uniform_alignment,
+            storage_alignment,
+        )
+        .inspect_err(|error| {
+            self.trace_descriptor_group_failure(table, handle, layout, error);
+        })
+    }
+
+    fn descriptor_group_with_layout_inner(
         &mut self,
         table: &ir::ResourceTable,
         handle: vk::DescriptorSet,
@@ -606,6 +934,9 @@ impl Resources {
             let binding = set.ir_to_source(entry.binding()).ok_or(invalid)?;
             let resource = *set.bindings.get(&binding).ok_or(invalid)?;
             let resource = match resource {
+                DescriptorBinding::TexelBuffer(_) => {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
                 DescriptorBinding::Buffer {
                     buffer,
                     offset,
@@ -632,6 +963,11 @@ impl Resources {
                     if offset.checked_add(size).is_none_or(|end| end > buf.size) {
                         return Err(invalid);
                     }
+                    let size = if set.texel_formats.get(&binding) == Some(&vk::Format::R8_SINT) {
+                        size.next_multiple_of(4)
+                    } else {
+                        size
+                    };
                     ir::BindingResource::Buffer {
                         buffer: buf.id,
                         offset,
@@ -705,21 +1041,18 @@ impl Resources {
             && let Some(id) = set.cached_group
         {
             let cached = table
-                .bind_group(table.bind_group_ref(id).map_err(failure)?)
+                .bind_group_shared(table.bind_group_ref(id).map_err(failure)?)
                 .map_err(failure)?;
-            if cached == desc {
+            if *cached == desc {
+                self.touch_bind_group(id);
                 return Ok(id);
             }
         }
-        let id = if let Some((_, id)) = self
-            .bind_group_cache
-            .iter()
-            .find(|(cached, _)| *cached == desc)
-        {
-            *id
+        let id = if let Some(id) = self.cached_bind_group(&desc) {
+            id
         } else {
             let id = table.define_bind_group(desc.clone()).map_err(failure)?.id();
-            self.bind_group_cache.push((desc, id));
+            self.push_bind_group_cache(desc, id);
             id
         };
         if dynamic_offsets.is_empty() {
@@ -730,11 +1063,64 @@ impl Resources {
         }
         Ok(id)
     }
+
+    #[cold]
+    fn trace_descriptor_group_failure(
+        &self,
+        table: &ir::ResourceTable,
+        handle: vk::DescriptorSet,
+        layout: &ir::BindGroupLayoutDesc,
+        error: &vk::Result,
+    ) {
+        let set = self.descriptor_sets.get(&handle);
+        eprintln!(
+            "[SGFX Vulkan] descriptor validation failed: set={handle:?} error={error:?} declared_layout={:?} reflected_layout={layout:?}",
+            set.map(|set| &set.layout),
+        );
+        for entry in layout.entries() {
+            let binding = set.and_then(|set| set.ir_to_source(entry.binding()));
+            let bound = set.and_then(|set| binding.and_then(|binding| set.bindings.get(&binding)));
+            eprintln!(
+                "[SGFX Vulkan] descriptor validation entry: set={handle:?} expected={entry:?} source_binding={binding:?} bound={bound:?}"
+            );
+            let sampler = match bound {
+                Some(DescriptorBinding::Image { view, sampler, .. }) => {
+                    let actual_view = self.views.get(view);
+                    let image = actual_view.and_then(|view| self.images.get(&view.image));
+                    let texture = image
+                        .map(|image| table.texture_ref(image.id).and_then(|id| table.texture(id)));
+                    eprintln!(
+                        "[SGFX Vulkan] descriptor validation image: set={handle:?} binding={} vk_view={view:?} ir_view={:?} components={:?} vk_image={:?} vk_format={:?} vk_extent={:?} vk_mip_levels={:?} vk_array_layers={:?} ir_texture={:?} core_texture={texture:?}",
+                        entry.binding(),
+                        actual_view.map(|view| view.desc),
+                        actual_view.map(|view| view.components),
+                        actual_view.map(|view| view.image),
+                        image.map(|image| image.format),
+                        image.map(|image| image.extent),
+                        image.map(|image| image.mip_levels),
+                        image.map(|image| image.array_layers),
+                        image.map(|image| image.id),
+                    );
+                    Some(*sampler)
+                }
+                Some(DescriptorBinding::Sampler(sampler)) => Some(*sampler),
+                _ => None,
+            };
+            if let Some(sampler) = sampler {
+                let id = self.samplers.get(&sampler);
+                let desc = id.map(|id| table.sampler_ref(*id).and_then(|id| table.sampler(id)));
+                eprintln!(
+                    "[SGFX Vulkan] descriptor validation sampler: set={handle:?} binding={} vk_sampler={sampler:?} ir_sampler={id:?} core_sampler={desc:?}",
+                    entry.binding(),
+                );
+            }
+        }
+    }
 }
 fn swizzle_entry(
     table: &ir::ResourceTable,
     entry: &ir::ShaderEntryPoint,
-    maps: &crate::spirv::TextureSwizzles,
+    maps: &ShaderViews,
     orphaned: &mut HashSet<ir::ShaderModuleId>,
 ) -> Result<ir::ShaderEntryPoint, vk::Result> {
     let original = table
@@ -743,7 +1129,8 @@ fn swizzle_entry(
     let ir::ShaderSource::SpirV(words) = original.source() else {
         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
     };
-    let changed = crate::spirv::sampled_image_swizzles(words, maps)?;
+    let changed = crate::spirv::sampled_image_swizzles(words, &maps.textures)?;
+    let changed = crate::texel_buffers::narrow_signed_bytes(changed, &maps.narrow_texels)?;
     if changed == *words {
         return Ok(entry.clone());
     }
@@ -818,9 +1205,7 @@ pub(crate) fn backend_failure(error: crate::runtime::BackendError) -> vk::Result
     crate::runtime::backend_failure(error)
 }
 pub(crate) fn failure(error: ir::Error) -> vk::Result {
-    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-        eprintln!("[SGFX Vulkan] IR failure: {error:?}");
-    }
+    eprintln!("[SGFX Vulkan] IR failure: {error:?}");
     match error {
         ir::Error::OutOfMemory => vk::Result::ERROR_OUT_OF_HOST_MEMORY,
         ir::Error::ResourceLimitExceeded => vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
@@ -943,6 +1328,10 @@ unsafe extern "system" fn create_buffer(
                 ir::BufferUsage::UNIFORM,
             ),
             (
+                vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER,
+                ir::BufferUsage::STORAGE,
+            ),
+            (
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 ir::BufferUsage::STORAGE,
             ),
@@ -955,11 +1344,8 @@ unsafe extern "system" fn create_buffer(
             if r.resources.buffers.len() >= ir::MAX_BUFFERS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
-            let id = r
-                .table
-                .define_buffer(ir::BufferDesc::new(backing_size, ir_usage).map_err(failure)?)
-                .map_err(failure)?
-                .id();
+            let id =
+                r.allocate_buffer(ir::BufferDesc::new(backing_size, ir_usage).map_err(failure)?)?;
             let handle = vk::Buffer::from_raw(crate::api::next_id());
             r.resources.buffers.insert(
                 handle,
@@ -981,21 +1367,27 @@ unsafe extern "system" fn destroy_buffer(
     buffer: vk::Buffer,
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
-    let _ = crate::api::with_device(device, move |r| {
+    if buffer == vk::Buffer::null() {
+        return;
+    }
+    let frame_operation = concat!(module_path!(), "::destroy_buffer");
+    let _frame = crate::frame_profile::Span::new("call", frame_operation);
+    // Destruction owns only the handle and has no return value. Publish it on
+    // the same device FIFO without stopping the caller behind an unrelated
+    // draw submission; cache_buffer retains the backing until GPU retirement.
+    let _ = crate::api::with_device_owned(device, move |r| {
+        let _frame = crate::frame_profile::Span::new("service", frame_operation);
         if let Some(id) = r.resources.buffers.get(&buffer).map(|buffer| buffer.id) {
             let shared = r
                 .resources
                 .buffers
                 .iter()
                 .any(|(handle, other)| *handle != buffer && other.id == id);
-            // The backend cache owns the physical allocation for this slot.
-            // Complete submitted work before dropping it or recycling the ID.
+            // Retain the backing until its submission watermark is complete.
+            // A matching later buffer can reuse it without a global GPU drain,
+            // native detach, or full ABI table update on each destruction.
             if !shared {
-                r.in_flight.wait();
-                r.cache
-                    .release_buffer(id)
-                    .map_err(crate::runtime::backend_failure)?;
-                r.table.release_buffer(id).map_err(failure)?;
+                r.cache_buffer(id)?;
             }
             r.resources.buffers.remove(&buffer);
             r.resources.uploaded_unmapped_buffers.remove(&buffer);
@@ -1044,24 +1436,35 @@ unsafe extern "system" fn allocate_memory(
         if i.s_type != vk::StructureType::MEMORY_ALLOCATE_INFO {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        if !i.p_next.is_null()
-            || i.memory_type_index != 0
-            || i.allocation_size == 0
-            || i.allocation_size > MAX_ALLOCATION
+        let dedicated = crate::memory_allocation::parse(i.p_next.cast())?;
+        if i.memory_type_index != 0 || i.allocation_size == 0 || i.allocation_size > MAX_ALLOCATION
         {
+            let tag = i
+                .p_next
+                .cast::<vk::BaseInStructure<'_>>()
+                .as_ref()
+                .map(|node| node.s_type);
+            eprintln!(
+                "[SGFX Vulkan] memory allocation rejected: size={} type={} pnext={tag:?} max={MAX_ALLOCATION}",
+                i.allocation_size, i.memory_type_index
+            );
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
         let size =
             usize::try_from(i.allocation_size).map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
         let handle = crate::api::with_device(device, move |r| {
+            if let Some(target) = dedicated
+                && crate::memory_allocation::allocation_size(&r.resources, target)
+                    != Some(size as u64)
+            {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             if r.resources.memories.len() >= MAX_MEMORY_ALLOCATIONS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
+            let budget = crate::memory_budget::heap_size();
             let allocated: usize = r.resources.memories.values().map(|m| m.bytes.len()).sum();
-            if allocated
-                .checked_add(size)
-                .is_none_or(|v| v > MAX_ALLOCATED)
-            {
+            if allocated.checked_add(size).is_none_or(|v| v > budget) {
                 // Allocation failures must identify the exhausted budget even
                 // in ordinary builds. Do not dump mapped application payloads.
                 let mut largest: Vec<_> = r
@@ -1110,7 +1513,7 @@ unsafe extern "system" fn allocate_memory(
                     .map(|memory| memory.bytes.words.len() * 8)
                     .sum::<usize>();
                 eprintln!(
-                    "[SGFX Vulkan] allocation budget exhausted: requested={size} allocated={allocated} limit={MAX_ALLOCATED} allocations={} buffers={} images={} largest_bytes_mapped={largest:?}",
+                    "[SGFX Vulkan] allocation budget exhausted: requested={size} allocated={allocated} limit={budget} allocations={} buffers={} images={} largest_bytes_mapped={largest:?}",
                     r.resources.memories.len(),
                     r.resources.buffers.len(),
                     r.resources.images.len(),
@@ -1122,9 +1525,13 @@ unsafe extern "system" fn allocate_memory(
             }
             let bytes = AlignedBytes::unbacked(size)?;
             let handle = vk::DeviceMemory::from_raw(crate::api::next_id());
+            if let Some(target) = dedicated {
+                r.resources.dedicated_allocations.insert(handle, target);
+            }
             r.resources.memories.insert(
                 handle,
                 Memory {
+                    host_written: false,
                     bytes,
                     mapped: false,
                 },
@@ -1143,6 +1550,7 @@ unsafe extern "system" fn free_memory(
     let _ = crate::api::with_device(device, move |r| {
         r.resources.forget_uploads_for_memory(memory);
         r.resources.memories.remove(&memory);
+        r.resources.dedicated_allocations.remove(&memory);
         for buffer in r.resources.buffers.values_mut() {
             if buffer.bound.is_some_and(|(m, _)| m == memory) {
                 buffer.bound = None;
@@ -1164,6 +1572,14 @@ pub(crate) unsafe extern "system" fn bind_buffer_memory(
 ) -> vk::Result {
     ffi(|| {
         crate::api::with_device(device, move |r| {
+            if !crate::memory_allocation::permits(
+                &r.resources,
+                memory,
+                crate::memory_allocation::DedicatedTarget::Buffer(buffer),
+                offset,
+            ) {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
             let current = r
                 .resources
                 .buffers
@@ -1193,7 +1609,7 @@ pub(crate) unsafe extern "system" fn bind_buffer_memory(
                     return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
                 }
                 let unused_id = current.id;
-                r.table.release_buffer(unused_id).map_err(failure)?;
+                r.cache_buffer(unused_id)?;
                 let current = r.resources.buffers.get_mut(&buffer).unwrap();
                 current.id = alias_id;
                 current.bound = Some((memory, offset));
@@ -1288,6 +1704,7 @@ unsafe extern "system" fn map_memory(
                 .materialize()
                 .map_err(|_| vk::Result::ERROR_MEMORY_MAP_FAILED)?;
             mem.mapped = true;
+            mem.host_written = true;
             let address = mem.bytes.as_mut_ptr().add(offset as usize) as usize;
             r.resources.forget_uploads_for_memory(memory);
             Ok(address)
@@ -1377,28 +1794,51 @@ fn normalize_spirv_specialized(
     inputs: &[Option<bool>],
     bindings: &[DescriptorBindingMap],
 ) -> Result<ir::ShaderModuleDesc, vk::Result> {
-    ir::ShaderModuleDesc::spirv(words.clone()).map_err(failure)?;
-    let words = crate::specialization::freeze(words, values)?;
-    let words = crate::input_attachments::lower(words, inputs)?;
-    let words = crate::spirv::separate_combined_samplers(words)?;
-    let words = crate::uniform_arrays::lower(words)?;
-    let words = crate::stage_inputs::lower(words)?;
+    ir::ShaderModuleDesc::spirv(words.clone())
+        .map_err(failure)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] shader resource header: {e:?}"))?;
+    let words = crate::specialization::freeze(words, values).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader specialization: {error:?}");
+    })?;
+    let words = crate::input_attachments::lower(words, inputs).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader input attachments: {error:?}");
+    })?;
+    let words = crate::texel_buffers::lower(words)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] texel buffer lowering: {e:?}"))?;
+    let words = crate::spirv::separate_combined_samplers(words).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader combined samplers: {error:?}");
+    })?;
+    let words = crate::uniform_arrays::lower(words).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader uniform arrays: {error:?}");
+    })?;
+    let words = crate::stage_inputs::lower(words).inspect_err(|error| {
+        eprintln!("[SGFX Vulkan] shader stage inputs: {error:?}");
+    })?;
     let options = naga::front::spv::Options {
         adjust_coordinate_space: true,
         strict_capabilities: true,
         block_ctx_dump_prefix: None,
     };
+    let draw_parameters = crate::spirv::instructions(&words)?
+        .iter()
+        .any(|i| i[0] & 65535 == 71 && i.len() == 4 && i[2] == 11 && (4424..=4426).contains(&i[3]));
+    let words = ir::spirv_compat::naga24_spirv(&words)
+        .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
     let mut module = naga::front::spv::Frontend::new(words.into_iter(), &options)
         .parse()
         .map_err(|e| {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+            {
                 eprintln!("[SGFX Vulkan] SPIR-V parse: {e:?}");
             }
             vk::Result::ERROR_FEATURE_NOT_PRESENT
         })?;
-    crate::shader_functions::specialize(&mut module)?;
-    crate::shader_functions::resolve_sampler_types(&mut module)?;
-    crate::shader_functions::widen_fragment_outputs(&mut module)?;
+    crate::shader_functions::specialize(&mut module)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] shader function specialization: {e:?}"))?;
+    crate::shader_functions::resolve_sampler_types(&mut module)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] shader sampler types: {e:?}"))?;
+    crate::shader_functions::flatten_fragment_output_arrays(&mut module)?;
+    crate::shader_functions::widen_fragment_outputs(&mut module)
+        .inspect_err(|e| eprintln!("[SGFX Vulkan] shader fragment outputs: {e:?}"))?;
     // SPIR-V combined image samplers become two Naga globals with the same
     // Vulkan binding. SGFX has separate texture/sampler resources. Reserve an
     // adjacent pair per logical binding, including ordinary buffer bindings.
@@ -1438,20 +1878,32 @@ fn normalize_spirv_specialized(
     )
     .validate(&module)
     .map_err(|e| {
-        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+        {
             eprintln!("[SGFX Vulkan] shader validation: {e:?}");
         }
         vk::Result::ERROR_FEATURE_NOT_PRESENT
     })?;
     let mut output = naga::back::spv::Options {
-        lang_version: (1, 0),
+        lang_version: if draw_parameters { (1, 3) } else { (1, 0) },
         ..Default::default()
     };
     output
         .flags
         .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
-    let normalized = naga::back::spv::write_vec(&module, &info, &output, None)
-        .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    let mut normalized =
+        naga::back::spv::write_vec(&module, &info, &output, None).map_err(|error| {
+            {
+                eprintln!("[SGFX Vulkan] normalized SPIR-V: {error:?}");
+            }
+            vk::Result::ERROR_FEATURE_NOT_PRESENT
+        })?;
+    if draw_parameters
+        && !crate::spirv::instructions(&normalized)?
+            .iter()
+            .any(|i| i[0] & 65535 == 17 && i.get(1) == Some(&4427))
+    {
+        normalized.splice(5..5, [(2u32 << 16) | 17, 4427]);
+    }
     // Validate the representation consumed by backends, including the SPIR-V
     // writer/parser round trip. WGPU 24 cannot format SPIR-V validation spans
     // against its empty text source and would otherwise panic on this path.
@@ -1459,15 +1911,31 @@ fn normalize_spirv_specialized(
         adjust_coordinate_space: false,
         ..options
     };
-    let normalized_module = naga::front::spv::Frontend::new(normalized.iter().copied(), &options)
-        .parse()
-        .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    let normalized = crate::spirv::function_struct_layouts(normalized)?;
+    let normalized_module = naga::front::spv::Frontend::new(
+        ir::spirv_compat::naga24_spirv(&normalized)
+            .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?
+            .into_iter(),
+        &options,
+    )
+    .parse()
+    .map_err(|error| {
+        {
+            eprintln!("[SGFX Vulkan] normalized SPIR-V: {error:?}");
+        }
+        vk::Result::ERROR_FEATURE_NOT_PRESENT
+    })?;
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(&normalized_module)
-    .map_err(|_| vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+    .map_err(|error| {
+        {
+            eprintln!("[SGFX Vulkan] normalized SPIR-V: {error:?}");
+        }
+        vk::Result::ERROR_FEATURE_NOT_PRESENT
+    })?;
     ir::ShaderModuleDesc::spirv(normalized).map_err(failure)
 }
 unsafe extern "system" fn create_shader_module(
@@ -1543,7 +2011,7 @@ pub(crate) unsafe fn descriptor_layout(
     if i.s_type != vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO {
         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
     }
-    if !i.flags.is_empty() {
+    if !vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR.contains(i.flags) {
         return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
     }
     if !i.p_next.is_null() {
@@ -1590,6 +2058,16 @@ pub(crate) unsafe fn descriptor_layout(
             }
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
+        if i.flags
+            .contains(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+            && matches!(
+                binding.descriptor_type,
+                vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+            )
+        {
+            return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        }
         original_stages.insert(binding.binding, binding.stage_flags);
     }
     let binding_map = descriptor_binding_map(&types)?;
@@ -1597,6 +2075,9 @@ pub(crate) unsafe fn descriptor_layout(
         let ty = match binding.descriptor_type {
             vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
                 ir::BindingType::UniformBuffer
+            }
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER => {
+                ir::BindingType::StorageBuffer { read_only: true }
             }
             vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
                 ir::BindingType::StorageBuffer { read_only: false }
@@ -1655,12 +2136,21 @@ unsafe extern "system" fn create_descriptor_set_layout(
         if info.is_null() || !allocator.is_null() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let (desc, types, original_stages) = descriptor_layout(&*info)?;
+        let pushed = (*info)
+            .flags
+            .contains(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
+        let (desc, types, original_stages) = descriptor_layout(&*info).inspect_err(|error| {
+            let i = &*info;
+            eprintln!("[SGFX Vulkan] descriptor layout rejected: {error:?} flags={:?} pnext={:?} bindings={:?}", i.flags, i.p_next, copied(i.p_bindings, i.binding_count as usize, ir::MAX_BINDINGS_PER_GROUP));
+        })?;
         let handle = crate::api::with_device(device, move |r| {
             if r.resources.set_layouts.len() >= LIMIT {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
             let handle = vk::DescriptorSetLayout::from_raw(crate::api::next_id());
+            if pushed {
+                r.resources.push_set_layouts.insert(handle);
+            }
             r.resources.set_layouts.insert(handle, desc);
             r.resources.set_layout_types.insert(handle, types);
             r.resources
@@ -1678,6 +2168,7 @@ unsafe extern "system" fn destroy_descriptor_set_layout(
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
     let _ = crate::api::with_device(device, move |r| {
+        r.resources.push_set_layouts.remove(&handle);
         r.resources.set_layouts.remove(&handle);
         r.resources.set_layout_types.remove(&handle);
         r.resources.set_layout_stages.remove(&handle);
@@ -1728,7 +2219,7 @@ unsafe extern "system" fn create_pipeline_layout(
             let binding_maps = handles
                 .iter()
                 .map(|h| {
-                    descriptor_binding_map(
+                    descriptor_binding_maps(
                         r.resources
                             .set_layout_types
                             .get(h)
@@ -1746,6 +2237,27 @@ unsafe extern "system" fn create_pipeline_layout(
                         .ok_or(vk::Result::ERROR_UNKNOWN)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let mut pushed = None;
+            for (index, h) in handles.iter().enumerate() {
+                if r.resources.push_set_layouts.contains(h) {
+                    if pushed.is_some() {
+                        return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+                    }
+                    let (binding_map, reverse_binding_map) = binding_maps[index].clone();
+                    pushed = Some((
+                        index as u32,
+                        DescriptorSet::with_binding_maps(
+                            HashMap::new(),
+                            vk::DescriptorPool::null(),
+                            r.resources.set_layouts[h].clone(),
+                            r.resources.set_layout_types[h].clone(),
+                            (binding_map, reverse_binding_map),
+                            r.resources.set_layout_stages[h].clone(),
+                            HashMap::new(),
+                        ),
+                    ));
+                }
+            }
             let groups = handles
                 .into_iter()
                 .map(|h| {
@@ -1766,10 +2278,17 @@ unsafe extern "system" fn create_pipeline_layout(
                 .with_push_constant_ranges(push_ranges)
                 .map_err(failure)?;
             let handle = vk::PipelineLayout::from_raw(crate::api::next_id());
+            if let Some(pushed) = pushed {
+                r.resources.pipeline_push_sets.insert(handle, pushed);
+            }
             r.resources.pipeline_layouts.insert(handle, desc.clone());
-            r.resources
-                .pipeline_binding_maps
-                .insert(handle, binding_maps);
+            r.resources.pipeline_binding_maps.insert(
+                handle,
+                binding_maps
+                    .into_iter()
+                    .map(|(binding_map, _)| binding_map)
+                    .collect(),
+            );
             r.resources
                 .pipeline_binding_stages
                 .insert(handle, binding_stages);
@@ -1786,6 +2305,7 @@ unsafe extern "system" fn destroy_pipeline_layout(
     _allocator: *const vk::AllocationCallbacks<'_>,
 ) {
     let _ = crate::api::with_device(device, move |r| {
+        r.resources.pipeline_push_sets.remove(&handle);
         r.resources.pipeline_layouts.remove(&handle);
         r.resources.pipeline_binding_maps.remove(&handle);
         r.resources.pipeline_binding_stages.remove(&handle);
@@ -1922,6 +2442,12 @@ unsafe extern "system" fn allocate_descriptor_sets(
             {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
+            if layouts
+                .iter()
+                .any(|h| r.resources.push_set_layouts.contains(h))
+            {
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
             let layouts = layouts
                 .into_iter()
                 .map(|h| {
@@ -1970,18 +2496,19 @@ unsafe extern "system" fn allocate_descriptor_sets(
             pool.remaining = remaining;
             let mut result = Vec::with_capacity(layouts.len());
             for (layout, types, stages) in layouts {
+                let (binding_map, reverse_binding_map) = descriptor_binding_maps(&types)?;
                 let handle = vk::DescriptorSet::from_raw(crate::api::next_id());
                 r.resources.descriptor_sets.insert(
                     handle,
-                    DescriptorSet {
-                        pool: pool_handle,
+                    DescriptorSet::with_binding_maps(
+                        HashMap::new(),
+                        pool_handle,
                         layout,
                         types,
+                        (binding_map, reverse_binding_map),
                         stages,
-                        bindings: HashMap::new(),
-                        cached_group: None,
-                        invalid: false,
-                    },
+                        HashMap::new(),
+                    ),
                 );
                 result.push(handle);
             }
@@ -2039,12 +2566,12 @@ unsafe extern "system" fn free_descriptor_sets(
     })
 }
 #[derive(Clone)]
-struct Write {
-    set: vk::DescriptorSet,
-    binding: u32,
-    element: u32,
-    ty: vk::DescriptorType,
-    value: Option<DescriptorBinding>,
+pub(crate) struct Write {
+    pub(crate) set: vk::DescriptorSet,
+    pub(crate) binding: u32,
+    pub(crate) element: u32,
+    pub(crate) ty: vk::DescriptorType,
+    pub(crate) value: Option<DescriptorBinding>,
 }
 // This frontend's descriptors each have count one. Vulkan updates may still
 // span consecutive compatible bindings, skipping absent (zero-count) slots.
@@ -2074,6 +2601,217 @@ fn descriptor_write_binding(
     }
 }
 
+pub(crate) unsafe fn snapshot_descriptor_writes(
+    writes: &[vk::WriteDescriptorSet<'_>],
+) -> Vec<Write> {
+    let mut owned_writes = Vec::with_capacity(writes.len());
+    for write in writes {
+        let valid = write.s_type == vk::StructureType::WRITE_DESCRIPTOR_SET
+            && write.p_next.is_null()
+            && (1..=16).contains(&write.descriptor_count)
+            && write.dst_array_element == 0;
+        for element in 0..if valid { write.descriptor_count } else { 1 } {
+            let value = if !valid {
+                None
+            } else {
+                match write.descriptor_type {
+                    vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                        if !write.p_texel_buffer_view.is_null() =>
+                    {
+                        Some(DescriptorBinding::TexelBuffer(
+                            *write.p_texel_buffer_view.add(element as usize),
+                        ))
+                    }
+
+                    vk::DescriptorType::UNIFORM_BUFFER
+                    | vk::DescriptorType::STORAGE_BUFFER
+                    | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                        if !write.p_buffer_info.is_null() =>
+                    {
+                        let b = *write.p_buffer_info.add(element as usize);
+                        Some(DescriptorBinding::Buffer {
+                            buffer: b.buffer,
+                            offset: b.offset,
+                            range: b.range,
+                        })
+                    }
+                    vk::DescriptorType::SAMPLED_IMAGE
+                    | vk::DescriptorType::INPUT_ATTACHMENT
+                    | vk::DescriptorType::STORAGE_IMAGE
+                    | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                        if !write.p_image_info.is_null() =>
+                    {
+                        let i = *write.p_image_info.add(element as usize);
+                        Some(DescriptorBinding::Image {
+                            view: i.image_view,
+                            sampler: i.sampler,
+                            layout: i.image_layout,
+                        })
+                    }
+                    vk::DescriptorType::SAMPLER if !write.p_image_info.is_null() => {
+                        Some(DescriptorBinding::Sampler(
+                            (*write.p_image_info.add(element as usize)).sampler,
+                        ))
+                    }
+                    _ => None,
+                }
+            };
+            owned_writes.push(Write {
+                set: write.dst_set,
+                binding: write.dst_binding,
+                element,
+                ty: write.descriptor_type,
+                value,
+            });
+        }
+    }
+    owned_writes
+}
+
+pub(crate) fn apply_descriptor_writes(r: &mut crate::runtime::Runtime, owned_writes: Vec<Write>) {
+    for mut write in owned_writes {
+        let texel_format = if let Some(DescriptorBinding::TexelBuffer(view)) = write.value {
+            r.resources.buffer_views.get(&view).map(|v| v.format)
+        } else {
+            None
+        };
+        if let Some(DescriptorBinding::TexelBuffer(view)) = write.value {
+            write.value = r
+                .resources
+                .buffer_views
+                .get(&view)
+                .filter(|v| {
+                    matches!(
+                        v.format,
+                        vk::Format::R8_SINT
+                            | vk::Format::R32_SINT
+                            | vk::Format::R32_UINT
+                            | vk::Format::R32_SFLOAT
+                    )
+                })
+                .map(|v| DescriptorBinding::Buffer {
+                    buffer: v.buffer,
+                    offset: v.offset,
+                    range: v.range,
+                });
+        }
+        let valid = write.value.is_some_and(|v| match v {
+            DescriptorBinding::TexelBuffer(_) => false,
+            DescriptorBinding::Buffer {
+                buffer,
+                offset,
+                range,
+            } => r.resources.buffers.get(&buffer).is_some_and(|b| {
+                let size = if range == vk::WHOLE_SIZE {
+                    b.size.saturating_sub(offset)
+                } else {
+                    range
+                };
+                size > 0
+                    && size
+                        <= if matches!(
+                            write.ty,
+                            vk::DescriptorType::UNIFORM_BUFFER
+                                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                        ) {
+                            16 * 1024
+                        } else {
+                            128 * 1024 * 1024
+                        }
+                    && (texel_format == Some(vk::Format::R8_SINT) || size.is_multiple_of(4))
+                    && offset.is_multiple_of(u64::from(
+                        if matches!(
+                            write.ty,
+                            vk::DescriptorType::UNIFORM_BUFFER
+                                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                        ) {
+                            r.capabilities
+                                .limits()
+                                .min_uniform_buffer_offset_alignment
+                                .max(16)
+                        } else {
+                            r.capabilities
+                                .limits()
+                                .min_storage_buffer_offset_alignment
+                                .max(4)
+                        },
+                    ))
+                    && offset.checked_add(size).is_some_and(|end| end <= b.size)
+                    && b.usage.contains(
+                        if matches!(
+                            write.ty,
+                            vk::DescriptorType::UNIFORM_BUFFER
+                                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                        ) {
+                            vk::BufferUsageFlags::UNIFORM_BUFFER
+                        } else if write.ty == vk::DescriptorType::UNIFORM_TEXEL_BUFFER {
+                            vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                        } else {
+                            vk::BufferUsageFlags::STORAGE_BUFFER
+                        },
+                    )
+            }),
+            DescriptorBinding::Sampler(sampler) => r.resources.samplers.contains_key(&sampler),
+            DescriptorBinding::Image {
+                view,
+                sampler,
+                layout,
+            } => {
+                matches!(
+                    layout,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        | vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                        | vk::ImageLayout::GENERAL
+                ) && r
+                    .resources
+                    .views
+                    .get(&view)
+                    .and_then(|view| r.resources.images.get(&view.image))
+                    .is_some_and(|image| {
+                        image
+                            .usage
+                            .contains(if write.ty == vk::DescriptorType::STORAGE_IMAGE {
+                                vk::ImageUsageFlags::STORAGE
+                            } else if write.ty == vk::DescriptorType::INPUT_ATTACHMENT {
+                                vk::ImageUsageFlags::INPUT_ATTACHMENT
+                            } else {
+                                vk::ImageUsageFlags::SAMPLED
+                            })
+                    })
+                    && (write.ty != vk::DescriptorType::STORAGE_IMAGE
+                        || (layout == vk::ImageLayout::GENERAL
+                            && r.resources
+                                .views
+                                .get(&view)
+                                .is_some_and(|view| view.components == [0, 1, 2, 3])))
+                    && (write.ty != vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                        || r.resources.samplers.contains_key(&sampler))
+            }
+        });
+        if let Some(set) = r.resources.descriptor_sets.get_mut(&write.set) {
+            let binding = descriptor_write_binding(set, write.binding, write.element, write.ty);
+            set.cached_group = None;
+            if let (true, Some(binding), Some(value)) = (valid, binding, write.value) {
+                set.bindings.insert(binding, value);
+                if let Some(format) = texel_format {
+                    set.texel_formats.insert(binding, format);
+                } else {
+                    set.texel_formats.remove(&binding);
+                }
+            } else {
+                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                    eprintln!(
+                        "[SGFX Vulkan] invalid descriptor write: set={:?} binding={} element={} type={:?} value={:?} valid_resource={valid} resolved_binding={binding:?}",
+                        write.set, write.binding, write.element, write.ty, write.value
+                    );
+                }
+                set.invalid = true;
+            }
+        }
+    }
+}
+
 pub(crate) unsafe extern "system" fn update_descriptor_sets(
     device: vk::Device,
     write_count: u32,
@@ -2081,63 +2819,11 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
     copy_count: u32,
     copies: *const vk::CopyDescriptorSet<'_>,
 ) {
+    let _frame = crate::frame_profile::RecordingSpan::descriptors();
     let result = ffi(|| {
         let writes = copied(writes, write_count as usize, LIMIT)?;
         let copies = copied(copies, copy_count as usize, LIMIT)?;
-        let mut owned_writes = Vec::with_capacity(writes.len());
-        for write in writes {
-            let valid = write.s_type == vk::StructureType::WRITE_DESCRIPTOR_SET
-                && write.p_next.is_null()
-                && (1..=16).contains(&write.descriptor_count)
-                && write.dst_array_element == 0;
-            for element in 0..if valid { write.descriptor_count } else { 1 } {
-                let value = if !valid {
-                    None
-                } else {
-                    match write.descriptor_type {
-                        vk::DescriptorType::UNIFORM_BUFFER
-                        | vk::DescriptorType::STORAGE_BUFFER
-                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                        | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
-                            if !write.p_buffer_info.is_null() =>
-                        {
-                            let b = *write.p_buffer_info.add(element as usize);
-                            Some(DescriptorBinding::Buffer {
-                                buffer: b.buffer,
-                                offset: b.offset,
-                                range: b.range,
-                            })
-                        }
-                        vk::DescriptorType::SAMPLED_IMAGE
-                        | vk::DescriptorType::INPUT_ATTACHMENT
-                        | vk::DescriptorType::STORAGE_IMAGE
-                        | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-                            if !write.p_image_info.is_null() =>
-                        {
-                            let i = *write.p_image_info.add(element as usize);
-                            Some(DescriptorBinding::Image {
-                                view: i.image_view,
-                                sampler: i.sampler,
-                                layout: i.image_layout,
-                            })
-                        }
-                        vk::DescriptorType::SAMPLER if !write.p_image_info.is_null() => {
-                            Some(DescriptorBinding::Sampler(
-                                (*write.p_image_info.add(element as usize)).sampler,
-                            ))
-                        }
-                        _ => None,
-                    }
-                };
-                owned_writes.push(Write {
-                    set: write.dst_set,
-                    binding: write.dst_binding,
-                    element,
-                    ty: write.descriptor_type,
-                    value,
-                });
-            }
-        }
+        let owned_writes = snapshot_descriptor_writes(&writes);
         let owned_copies = copies
             .into_iter()
             .map(|c| {
@@ -2160,116 +2846,7 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
             .chain(owned_copies.iter().map(|c| c.2))
             .collect::<Vec<_>>();
         crate::api::update_descriptors_owned(device, &modified_sets, move |r| {
-            for write in owned_writes {
-                let valid = write.value.is_some_and(|v| match v {
-                    DescriptorBinding::Buffer {
-                        buffer,
-                        offset,
-                        range,
-                    } => r.resources.buffers.get(&buffer).is_some_and(|b| {
-                        let size = if range == vk::WHOLE_SIZE {
-                            b.size.saturating_sub(offset)
-                        } else {
-                            range
-                        };
-                        size > 0
-                            && size
-                                <= if matches!(
-                                    write.ty,
-                                    vk::DescriptorType::UNIFORM_BUFFER
-                                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                                ) {
-                                    16 * 1024
-                                } else {
-                                    128 * 1024 * 1024
-                                }
-                            && size.is_multiple_of(4)
-                            && offset.is_multiple_of(u64::from(
-                                if matches!(
-                                    write.ty,
-                                    vk::DescriptorType::UNIFORM_BUFFER
-                                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                                ) {
-                                    r.capabilities
-                                        .limits()
-                                        .min_uniform_buffer_offset_alignment
-                                        .max(16)
-                                } else {
-                                    r.capabilities
-                                        .limits()
-                                        .min_storage_buffer_offset_alignment
-                                        .max(4)
-                                },
-                            ))
-                            && offset.checked_add(size).is_some_and(|end| end <= b.size)
-                            && b.usage.contains(
-                                if matches!(
-                                    write.ty,
-                                    vk::DescriptorType::UNIFORM_BUFFER
-                                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                                ) {
-                                    vk::BufferUsageFlags::UNIFORM_BUFFER
-                                } else {
-                                    vk::BufferUsageFlags::STORAGE_BUFFER
-                                },
-                            )
-                    }),
-                    DescriptorBinding::Sampler(sampler) => {
-                        r.resources.samplers.contains_key(&sampler)
-                    }
-                    DescriptorBinding::Image {
-                        view,
-                        sampler,
-                        layout,
-                    } => {
-                        matches!(
-                            layout,
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                                | vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                | vk::ImageLayout::GENERAL
-                        ) && r
-                            .resources
-                            .views
-                            .get(&view)
-                            .and_then(|view| r.resources.images.get(&view.image))
-                            .is_some_and(|image| {
-                                image.usage.contains(
-                                    if write.ty == vk::DescriptorType::STORAGE_IMAGE {
-                                        vk::ImageUsageFlags::STORAGE
-                                    } else if write.ty == vk::DescriptorType::INPUT_ATTACHMENT {
-                                        vk::ImageUsageFlags::INPUT_ATTACHMENT
-                                    } else {
-                                        vk::ImageUsageFlags::SAMPLED
-                                    },
-                                )
-                            })
-                            && (write.ty != vk::DescriptorType::STORAGE_IMAGE
-                                || (layout == vk::ImageLayout::GENERAL
-                                    && r.resources
-                                        .views
-                                        .get(&view)
-                                        .is_some_and(|view| view.components == [0, 1, 2, 3])))
-                            && (write.ty != vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-                                || r.resources.samplers.contains_key(&sampler))
-                    }
-                });
-                if let Some(set) = r.resources.descriptor_sets.get_mut(&write.set) {
-                    let binding =
-                        descriptor_write_binding(set, write.binding, write.element, write.ty);
-                    set.cached_group = None;
-                    if let (true, Some(binding), Some(value)) = (valid, binding, write.value) {
-                        set.bindings.insert(binding, value);
-                    } else {
-                        if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                            eprintln!(
-                                "[SGFX Vulkan] invalid descriptor write: set={:?} binding={} element={} type={:?} value={:?} valid_resource={valid} resolved_binding={binding:?}",
-                                write.set, write.binding, write.element, write.ty, write.value
-                            );
-                        }
-                        set.invalid = true;
-                    }
-                }
-            }
+            apply_descriptor_writes(r, owned_writes);
             for (src, src_binding, dst, dst_binding, valid) in owned_copies {
                 let source = r
                     .resources
@@ -2282,6 +2859,12 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
                             .copied()
                             .zip(s.bindings.get(&src_binding).copied())
                     });
+                let texel_format = r
+                    .resources
+                    .descriptor_sets
+                    .get(&src)
+                    .and_then(|s| s.texel_formats.get(&src_binding))
+                    .copied();
                 if let Some(set) = r.resources.descriptor_sets.get_mut(&dst) {
                     set.cached_group = None;
                     if valid
@@ -2289,6 +2872,11 @@ pub(crate) unsafe extern "system" fn update_descriptor_sets(
                     {
                         if let Some((_, value)) = source {
                             set.bindings.insert(dst_binding, value);
+                            if let Some(format) = texel_format {
+                                set.texel_formats.insert(dst_binding, format);
+                            } else {
+                                set.texel_formats.remove(&dst_binding);
+                            }
                         }
                     } else {
                         set.invalid = true;
@@ -2653,7 +3241,9 @@ fn sampler_descriptor(
         || i.s_type != vk::StructureType::SAMPLER_CREATE_INFO
         || !i.p_next.is_null()
         || !i.flags.is_empty()
-        || i.anisotropy_enable != vk::FALSE
+        || !matches!(i.anisotropy_enable, vk::FALSE | vk::TRUE)
+        || (i.anisotropy_enable == vk::TRUE
+            && (!i.max_anisotropy.is_finite() || !(1.0..=16.0).contains(&i.max_anisotropy)))
         || i.unnormalized_coordinates != vk::FALSE
         || !matches!(i.compare_enable, vk::FALSE | vk::TRUE)
         || i.mip_lod_bias != 0.0
@@ -2707,6 +3297,12 @@ fn sampler_descriptor(
         i.max_lod,
     )
     .map_err(failure)?
+    .with_anisotropy(if i.anisotropy_enable == vk::TRUE {
+        i.max_anisotropy.ceil() as u8
+    } else {
+        1
+    })
+    .map_err(failure)?
     .with_compare(if i.compare_enable != vk::FALSE {
         Some(crate::images::compare(i.compare_op)?)
     } else {
@@ -2730,6 +3326,9 @@ unsafe extern "system" fn create_sampler(
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         let desc = sampler_descriptor(i, !allocator.is_null())?;
         let handle = crate::api::with_device(device, move |r| {
+            if desc.anisotropy() > 1 && !r.capabilities.supports_anisotropy_16() {
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
             let id = r.table.define_sampler(desc).map_err(failure)?.id();
             let handle = vk::Sampler::from_raw(crate::api::next_id());
             r.resources.samplers.insert(handle, id);
@@ -2820,6 +3419,52 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_mirror_observation_does_not_materialize_gpu_storage() {
+        let mut bytes = AlignedBytes::unbacked(13).unwrap();
+        assert!(bytes.materialized_slice().is_none());
+        assert!(bytes.words.is_empty());
+        bytes.materialize().unwrap();
+        assert_eq!(bytes.materialized_slice().unwrap(), &[0; 13]);
+    }
+
+    #[test]
+    fn descriptor_diagnostics_cover_errors_before_and_after_descriptor_construction() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let handle = vk::DescriptorSet::from_raw(1);
+        let layout = ir::BindGroupLayoutDesc::new(vec![]).unwrap();
+        assert_eq!(
+            resources.descriptor_group_with_layout(&table, handle, &[], &layout, 256, 256),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        let mut set = DescriptorSet::new(
+            HashMap::new(),
+            vk::DescriptorPool::null(),
+            layout.clone(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        set.invalid = true;
+        resources.descriptor_sets.insert(handle, set);
+        assert_eq!(
+            resources.descriptor_group_with_layout(&table, handle, &[], &layout, 256, 256),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        resources.descriptor_sets.get_mut(&handle).unwrap().invalid = false;
+        let group = resources
+            .descriptor_group_with_layout(&table, handle, &[], &layout, 256, 256)
+            .unwrap();
+        // Fail during cached-ID lookup, after BindGroupDesc::new succeeded.
+        table.release_bind_group(group).unwrap();
+        assert_eq!(
+            resources.descriptor_group_with_layout(&table, handle, &[], &layout, 256, 256),
+            Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+        );
+    }
 
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     fn lifecycle_runtime() -> crate::runtime::Runtime {
@@ -2999,6 +3644,68 @@ mod tests {
     }
 
     #[test]
+    fn r32_texel_fetch_preserves_signed_bits_and_default_channels() {
+        let words = include_bytes!("../tests/assets/texel-buffer.vert.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let module = normalize_spirv(words).unwrap();
+        let shader = sgfx_codegen_virgl::programmable::compile_shader(
+            &module,
+            ir::ShaderStage::Vertex,
+            "main",
+        )
+        .unwrap();
+        assert_eq!(shader.storage_buffers.len(), 1);
+        assert!(shader.tgsi.contains("BUFFER"));
+    }
+    #[test]
+    fn fragment_output_arrays_expand_to_distinct_attachment_locations() {
+        let words = include_bytes!("../tests/assets/output-array.frag.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let module = normalize_spirv(words).unwrap();
+        let shader = sgfx_codegen_virgl::programmable::compile_shader(
+            &module,
+            ir::ShaderStage::Fragment,
+            "main",
+        )
+        .unwrap();
+        assert_eq!(shader.output_locations, [0, 1]);
+    }
+    #[test]
+    fn point_size_and_vec4_varying_roundtrip() {
+        let words = include_bytes!("../tests/assets/point-varying.vert.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        normalize_spirv(words).unwrap();
+    }
+    #[test]
+    fn scalar_color_and_fragment_depth_roundtrip() {
+        let words = include_bytes!("../tests/assets/scalar-depth.frag.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        normalize_spirv(words).unwrap();
+    }
+    #[test]
+    fn shader_draw_parameters_and_flat_instance_varyings_normalize() {
+        let words = include_bytes!("../tests/assets/requirements.vert.spv")
+            .chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        let module = normalize_spirv(words).unwrap();
+        let shader = sgfx_codegen_virgl::programmable::compile_shader(
+            &module,
+            ir::ShaderStage::Vertex,
+            "main",
+        )
+        .unwrap();
+        assert!(shader.first_instance_register.is_some());
+    }
+    #[test]
     fn nonzero_border_and_unimplemented_sampler_controls_are_rejected() {
         for color in [
             vk::BorderColor::FLOAT_OPAQUE_BLACK,
@@ -3012,7 +3719,11 @@ mod tests {
             );
         }
         for info in [
-            decal_sampler().anisotropy_enable(true).max_anisotropy(2.0),
+            decal_sampler()
+                .anisotropy_enable(true)
+                .max_anisotropy(f32::NAN),
+            decal_sampler().anisotropy_enable(true).max_anisotropy(0.0),
+            decal_sampler().anisotropy_enable(true).max_anisotropy(17.0),
             decal_sampler().mip_lod_bias(0.5),
             decal_sampler().unnormalized_coordinates(true),
             decal_sampler().address_mode_w(vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE),
@@ -3081,23 +3792,56 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_set_reuses_bidirectional_binding_maps_across_copies_and_updates() {
+        let types = BTreeMap::from([
+            (0, vk::DescriptorType::UNIFORM_BUFFER),
+            (4, vk::DescriptorType::UNIFORM_BUFFER),
+            (128, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+            (u32::MAX, vk::DescriptorType::STORAGE_BUFFER),
+        ]);
+        let set = DescriptorSet::new(
+            HashMap::new(),
+            vk::DescriptorPool::null(),
+            ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+            types.clone(),
+            BTreeMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(set.binding_map(), &descriptor_binding_map(&types).unwrap());
+        for (&binding, &slot) in set.binding_map() {
+            assert_eq!(set.source_to_ir(binding), Some(slot));
+            assert_eq!(set.ir_to_source(slot), Some(binding));
+            assert_eq!(set.ir_to_source(slot + 1), Some(binding));
+        }
+
+        let mut copied = set.clone();
+        copied.texel_formats.insert(128, vk::Format::R8_SINT);
+        copied.invalid = true;
+        assert_eq!(copied.binding_map, set.binding_map);
+        assert_eq!(copied.source_to_ir(128), Some(2));
+        assert_eq!(copied.ir_to_source(3), Some(128));
+    }
+
+    #[test]
     fn descriptor_writes_preserve_declared_stage_visibility() {
-        let set = DescriptorSet {
-            pool: vk::DescriptorPool::null(),
-            layout: ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
-            types: [1, 3, 128]
+        let set = DescriptorSet::new(
+            HashMap::new(),
+            vk::DescriptorPool::null(),
+            ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+            [1, 3, 128]
                 .into_iter()
                 .map(|b| (b, vk::DescriptorType::UNIFORM_BUFFER))
                 .collect(),
-            stages: BTreeMap::from([
+            BTreeMap::from([
                 (1, vk::ShaderStageFlags::GEOMETRY),
                 (3, vk::ShaderStageFlags::GEOMETRY),
                 (128, vk::ShaderStageFlags::FRAGMENT),
             ]),
-            bindings: HashMap::new(),
-            cached_group: None,
-            invalid: false,
-        };
+            HashMap::new(),
+        )
+        .unwrap();
         // Declared but unused stages still accept updates. Consecutive writes
         // may cross holes only while the ORIGINAL Vulkan visibility matches.
         assert_eq!(
@@ -3228,12 +3972,13 @@ mod tests {
         .unwrap();
         resources.descriptor_sets.insert(
             set,
-            DescriptorSet {
-                pool: vk::DescriptorPool::null(),
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
                 layout,
-                types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
-                stages: BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
-                bindings: HashMap::from([(
+                BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)]),
+                BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                HashMap::from([(
                     0,
                     DescriptorBinding::Buffer {
                         buffer: buffer_handle,
@@ -3241,9 +3986,8 @@ mod tests {
                         range: 64,
                     },
                 )]),
-                cached_group: None,
-                invalid: false,
-            },
+            )
+            .unwrap(),
         );
         let first = resources.descriptor_group(&table, set, &[0]).unwrap();
         let second = resources.descriptor_group(&table, set, &[256]).unwrap();
@@ -3320,6 +4064,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes,
                 mapped: false,
             },
@@ -3403,6 +4148,378 @@ mod tests {
     }
 
     #[test]
+    fn bind_group_hash_index_reuses_only_equal_descriptors() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let vertex_layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let fragment_layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::FRAGMENT,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let descriptor = |layout: &ir::BindGroupLayoutDesc, offset| {
+            ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap()
+        };
+
+        let original = descriptor(&vertex_layout, 0);
+        let id = table.define_bind_group(original.clone()).unwrap().id();
+        resources.push_bind_group_cache(original.clone(), id);
+
+        assert_eq!(resources.cached_bind_group(&original), Some(id));
+        assert_eq!(
+            resources.cached_bind_group(&descriptor(&vertex_layout, 16)),
+            None
+        );
+        assert_eq!(
+            resources.cached_bind_group(&descriptor(&fragment_layout, 0)),
+            None
+        );
+        assert_eq!(resources.bind_group_cache.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_cache_reuses_packets_and_evicts_oldest_without_aliasing_snapshots() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let groups = [0, 16, 32].map(|offset| {
+            let desc = ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap();
+            let id = table.define_bind_group(desc.clone()).unwrap().id();
+            resources.push_bind_group_cache(desc.clone(), id);
+            (desc, id)
+        });
+        let snapshot = table
+            .bind_group_shared(table.bind_group_ref(groups[1].1).unwrap())
+            .unwrap();
+        let revision = table.abi_revision();
+        for _ in 0..8 {
+            assert_eq!(resources.cached_bind_group(&groups[0].0), Some(groups[0].1));
+            resources
+                .trim_descriptor_groups(&table, 3, |_| panic!("cache within budget"))
+                .unwrap();
+            assert_eq!(table.abi_revision(), revision);
+        }
+        // The frequently reused first group survives; the second is oldest.
+        let mut released = Vec::new();
+        resources
+            .trim_descriptor_groups(&table, 2, |id| {
+                assert_eq!(table.abi_revision(), revision);
+                released.push(id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![groups[1].1]);
+        assert!(table.bind_group_ref(groups[1].1).is_err());
+        assert_eq!(resources.cached_bind_group(&groups[0].0), Some(groups[0].1));
+        assert_eq!(resources.cached_bind_group(&groups[1].0), None);
+        assert_eq!(resources.cached_bind_group(&groups[2].0), Some(groups[2].1));
+        assert!(matches!(
+            snapshot.entries()[0].resource(),
+            ir::BindingResource::Buffer {
+                offset: 16,
+                size: 16,
+                ..
+            }
+        ));
+        assert!(!resources.descriptor_groups_need_capacity(
+            ir::MAX_BIND_GROUP_DEFINITIONS - resources.bind_group_cache.len(),
+        ));
+        assert!(resources.descriptor_groups_need_capacity(
+            ir::MAX_BIND_GROUP_DEFINITIONS - resources.bind_group_cache.len() + 1,
+        ));
+        resources.clear_ir_cache();
+        assert!(resources.bind_group_recency.is_empty());
+    }
+
+    #[test]
+    fn descriptor_lru_retirement_clears_only_successful_set_caches_and_retries_failures() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer_handle = vk::Buffer::from_raw(1);
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        resources.buffers.insert(
+            buffer_handle,
+            Buffer {
+                id: buffer,
+                size: 128,
+                usage: vk::BufferUsageFlags::UNIFORM_BUFFER,
+                bound: Some((vk::DeviceMemory::from_raw(1), 0)),
+            },
+        );
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let sets = [2, 3, 4].map(vk::DescriptorSet::from_raw);
+        let groups = std::array::from_fn::<_, 3, _>(|index| {
+            resources.descriptor_sets.insert(
+                sets[index],
+                DescriptorSet::new(
+                    HashMap::new(),
+                    vk::DescriptorPool::null(),
+                    layout.clone(),
+                    BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                    BTreeMap::from([(0, vk::ShaderStageFlags::VERTEX)]),
+                    HashMap::from([(
+                        0,
+                        DescriptorBinding::Buffer {
+                            buffer: buffer_handle,
+                            offset: index as u64 * 16,
+                            range: 16,
+                        },
+                    )]),
+                )
+                .unwrap(),
+            );
+            resources
+                .descriptor_group(&table, sets[index], &[])
+                .unwrap()
+        });
+        let empty = resources.empty_bind_group(&table).unwrap();
+        let snapshot = table
+            .bind_group_shared(table.bind_group_ref(groups[2]).unwrap())
+            .unwrap();
+        let revision = table.abi_revision();
+        // Refresh through the per-set fast path, rather than the hash index.
+        assert_eq!(
+            resources.descriptor_group(&table, sets[0], &[]).unwrap(),
+            groups[0]
+        );
+        let mut attempted = Vec::new();
+        assert_eq!(
+            resources.trim_descriptor_groups(&table, 1, |id| {
+                assert_eq!(table.abi_revision(), revision);
+                attempted.push(id);
+                if id == groups[1] {
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert_eq!(attempted, vec![groups[1], groups[2]]);
+        assert_eq!(
+            resources.descriptor_sets[&sets[0]].cached_group,
+            Some(groups[0])
+        );
+        assert_eq!(
+            resources.descriptor_sets[&sets[1]].cached_group,
+            Some(groups[1])
+        );
+        assert_eq!(resources.descriptor_sets[&sets[2]].cached_group, None);
+        assert!(table.bind_group_ref(groups[1]).is_ok());
+        assert!(table.bind_group_ref(groups[2]).is_err());
+        assert!(resources.bind_group_recency.contains_key(&groups[1]));
+        assert!(!resources.bind_group_recency.contains_key(&groups[2]));
+        resources
+            .trim_descriptor_groups(&table, 1, |id| {
+                assert_eq!(id, groups[1]);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(resources.descriptor_sets[&sets[1]].cached_group, None);
+        assert_eq!(
+            resources.descriptor_group(&table, sets[0], &[]).unwrap(),
+            groups[0]
+        );
+        let replacement = resources.descriptor_group(&table, sets[2], &[]).unwrap();
+        assert_ne!(replacement, groups[2]);
+        assert!(table.bind_group_ref(replacement).is_ok());
+        assert!(matches!(
+            snapshot.entries()[0].resource(),
+            ir::BindingResource::Buffer {
+                offset: 32,
+                size: 16,
+                ..
+            }
+        ));
+        // Capacity preflight must clear all per-set identities while retaining
+        // the empty group already embedded in resolved commands.
+        assert!(resources.descriptor_groups_need_capacity(ir::MAX_BIND_GROUP_DEFINITIONS));
+        resources
+            .release_descriptor_groups(&table, |_| Ok(()))
+            .unwrap();
+        assert!(
+            resources
+                .descriptor_sets
+                .values()
+                .all(|set| set.cached_group.is_none())
+        );
+        assert_eq!(resources.empty_bind_group(&table).unwrap(), empty);
+        assert!(table.bind_group_ref(groups[0]).is_err());
+        assert!(table.bind_group_ref(replacement).is_err());
+        assert!(!resources.descriptor_groups_need_capacity(ir::MAX_BIND_GROUP_DEFINITIONS - 1));
+    }
+
+    #[test]
+    fn bind_group_hash_collision_requires_full_descriptor_equality() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let descriptor = |offset| {
+            ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap()
+        };
+        let wanted = descriptor(0);
+        let wanted_id = table.define_bind_group(wanted.clone()).unwrap().id();
+        let colliding = descriptor(16);
+        let colliding_id = table.define_bind_group(colliding.clone()).unwrap().id();
+        let wanted_key = bind_group_cache_hash(&wanted);
+
+        let colliding_index = resources.bind_group_cache.len();
+        resources.bind_group_cache.push((colliding, colliding_id));
+        resources
+            .bind_group_index
+            .entry(wanted_key)
+            .or_default()
+            .push(colliding_index);
+        resources.push_bind_group_cache(wanted.clone(), wanted_id);
+
+        assert_eq!(resources.cached_bind_group(&wanted), Some(wanted_id));
+    }
+
+    #[test]
+    fn bind_group_index_is_rebuilt_after_release_and_cleared_with_epoch_cache() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(128, ir::BufferUsage::UNIFORM).unwrap())
+            .unwrap()
+            .id();
+        let layout = ir::BindGroupLayoutDesc::new(vec![ir::BindGroupLayoutEntry::new(
+            0,
+            ir::ShaderStages::VERTEX,
+            ir::BindingType::UniformBuffer,
+        )])
+        .unwrap();
+        let descriptor = |offset| {
+            ir::BindGroupDesc::new(
+                &table,
+                layout.clone(),
+                vec![ir::BindGroupEntry::new(
+                    0,
+                    ir::BindingResource::Buffer {
+                        buffer,
+                        offset,
+                        size: 16,
+                    },
+                )],
+            )
+            .unwrap()
+        };
+        let released = descriptor(0);
+        let released_id = table.define_bind_group(released.clone()).unwrap().id();
+        let retained = descriptor(16);
+        let retained_id = table.define_bind_group(retained.clone()).unwrap().id();
+        resources.push_bind_group_cache(released.clone(), released_id);
+        resources.push_bind_group_cache(retained.clone(), retained_id);
+        let empty = resources.empty_bind_group(&table).unwrap();
+
+        let error = resources
+            .release_descriptor_groups(&table, |id| {
+                if id == retained_id {
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error, vk::Result::ERROR_DEVICE_LOST);
+        assert_eq!(resources.cached_bind_group(&released), None);
+        assert_eq!(resources.cached_bind_group(&retained), Some(retained_id));
+        assert_eq!(
+            resources.cached_bind_group(&descriptor(16)),
+            Some(retained_id)
+        );
+        assert!(
+            resources
+                .bind_group_cache
+                .iter()
+                .any(|(_, id)| *id == empty)
+        );
+        assert!(
+            resources
+                .bind_group_index
+                .values()
+                .flatten()
+                .all(|&index| index < resources.bind_group_cache.len())
+        );
+
+        resources.clear_ir_cache();
+        assert!(resources.bind_group_cache.is_empty());
+        assert!(resources.bind_group_index.is_empty());
+    }
+
+    #[test]
     fn descriptor_retirement_error_preserves_failed_groups_and_releases_others() {
         let table = ir::ResourceTable::new();
         let mut resources = Resources::new();
@@ -3431,7 +4548,7 @@ mod tests {
             )
             .unwrap();
             let id = table.define_bind_group(desc.clone()).unwrap().id();
-            resources.bind_group_cache.push((desc, id));
+            resources.push_bind_group_cache(desc, id);
             id
         });
         let empty = resources.empty_bind_group(&table).unwrap();
@@ -3499,21 +4616,21 @@ mod tests {
         .unwrap();
         resources.descriptor_sets.insert(
             set_handle,
-            DescriptorSet {
-                pool: vk::DescriptorPool::null(),
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
                 layout,
-                types: BTreeMap::from([
+                BTreeMap::from([
                     (0, vk::DescriptorType::UNIFORM_BUFFER),
                     (4, vk::DescriptorType::UNIFORM_BUFFER),
                 ]),
-                stages: BTreeMap::from([
+                BTreeMap::from([
                     (0, vk::ShaderStageFlags::VERTEX),
                     (4, vk::ShaderStageFlags::FRAGMENT),
                 ]),
-                bindings: HashMap::new(),
-                cached_group: None,
-                invalid: false,
-            },
+                HashMap::new(),
+            )
+            .unwrap(),
         );
         let empty = resources.empty_bind_group(&table).unwrap();
         let mut previous = None;
@@ -3584,15 +4701,15 @@ mod tests {
         let handle = vk::DescriptorSet::from_raw(1);
         resources.descriptor_sets.insert(
             handle,
-            DescriptorSet {
-                pool: vk::DescriptorPool::null(),
-                types: BTreeMap::new(),
-                stages: BTreeMap::new(),
-                layout: ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
-                bindings: HashMap::new(),
-                cached_group: None,
-                invalid: false,
-            },
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
+                ir::BindGroupLayoutDesc::new(vec![]).unwrap(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                HashMap::new(),
+            )
+            .unwrap(),
         );
         let old_group = resources.descriptor_group(&old_table, handle, &[]).unwrap();
         resources.clear_ir_cache();
@@ -3608,6 +4725,7 @@ mod tests {
         resources.memories.insert(
             vk::DeviceMemory::from_raw(1),
             Memory {
+                host_written: true,
                 bytes: AlignedBytes::zeroed(256).unwrap(),
                 mapped: true,
             },
@@ -3708,7 +4826,7 @@ mod tests {
     }
 
     #[test]
-    fn spirv_round_trip_rejects_the_point_size_interface_layout_regression() {
+    fn spirv_round_trip_repairs_the_point_size_interface_layout_regression() {
         // An authored gl_PerVertex block with Position and PointSize, plus a
         // separate color output. Naga 24 validates the input but its writer/
         // parser round trip produces an undersized private output structure.
@@ -3761,10 +4879,15 @@ mod tests {
         )
         .validate(&input)
         .unwrap();
-        assert_eq!(
-            normalize_spirv(words),
-            Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
-        );
+        let module = normalize_spirv(words).unwrap();
+        let shader = sgfx_codegen_virgl::programmable::compile_shader(
+            &module,
+            ir::ShaderStage::Vertex,
+            "main",
+        )
+        .unwrap();
+        assert!(shader.tgsi.contains("PSIZE"));
+        assert!(shader.tgsi.contains("GENERIC[0]"));
     }
 
     #[test]
@@ -3775,6 +4898,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes: AlignedBytes::zeroed(128).unwrap(),
                 mapped: false,
             },
@@ -3909,6 +5033,7 @@ mod tests {
         resources.memories.insert(
             memory,
             Memory {
+                host_written: true,
                 bytes: AlignedBytes::zeroed(1024).unwrap(),
                 mapped: false,
             },
@@ -3967,12 +5092,13 @@ mod tests {
         .unwrap();
         resources.descriptor_sets.insert(
             set_handle,
-            DescriptorSet {
-                pool: vk::DescriptorPool::null(),
-                types: BTreeMap::from([(0, vk::DescriptorType::STORAGE_BUFFER)]),
-                stages: BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
                 layout,
-                bindings: HashMap::from([(
+                BTreeMap::from([(0, vk::DescriptorType::STORAGE_BUFFER)]),
+                BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
+                HashMap::from([(
                     0,
                     DescriptorBinding::Buffer {
                         buffer: buffer_handle,
@@ -3980,9 +5106,8 @@ mod tests {
                         range: vk::WHOLE_SIZE,
                     },
                 )]),
-                cached_group: None,
-                invalid: false,
-            },
+            )
+            .unwrap(),
         );
         let first = resources.descriptor_group(&table, set_handle, &[]).unwrap();
         for _ in 0..1100 {
@@ -4015,15 +5140,15 @@ mod tests {
         .unwrap();
         resources.descriptor_sets.insert(
             handle,
-            DescriptorSet {
-                pool: vk::DescriptorPool::null(),
-                types: BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
-                stages: BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
+            DescriptorSet::new(
+                HashMap::new(),
+                vk::DescriptorPool::null(),
                 layout,
-                bindings: HashMap::new(),
-                cached_group: None,
-                invalid: false,
-            },
+                BTreeMap::from([(0, vk::DescriptorType::UNIFORM_BUFFER)]),
+                BTreeMap::from([(0, vk::ShaderStageFlags::COMPUTE)]),
+                HashMap::new(),
+            )
+            .unwrap(),
         );
         assert!(resources.descriptor_group(&table, handle, &[]).is_err());
         let buffer_handle = vk::Buffer::from_raw(2);

@@ -7,7 +7,7 @@ use ash::vk::{self, Handle};
 use sgfx::ir;
 use std::ffi::CStr;
 
-use crate::api::{next_id, with_device};
+use crate::api::{next_id, with_device, with_device_owned};
 
 pub(crate) struct Image {
     pub id: ir::TextureId,
@@ -93,6 +93,8 @@ pub(crate) fn image_usage(format: vk::Format) -> vk::ImageUsageFlags {
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::B8G8R8A8_SRGB
         | vk::Format::R8_UNORM
+        | vk::Format::R16G16B16A16_SFLOAT
+        | vk::Format::R32G32B32A32_SFLOAT
         | vk::Format::R8G8_UNORM => {
             (if format == vk::Format::R8G8B8A8_UNORM {
                 vk::ImageUsageFlags::STORAGE
@@ -107,6 +109,8 @@ pub(crate) fn image_usage(format: vk::Format) -> vk::ImageUsageFlags {
         }
         vk::Format::D32_SFLOAT => {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::INPUT_ATTACHMENT
                 | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
@@ -139,6 +143,8 @@ pub(crate) fn texture_format(format: vk::Format) -> Option<ir::TextureFormat> {
         vk::Format::R8_UNORM => Some(ir::TextureFormat::R8Unorm),
         vk::Format::R8G8_UNORM => Some(ir::TextureFormat::Rg8Unorm),
         vk::Format::D32_SFLOAT => Some(ir::TextureFormat::Depth32Float),
+        vk::Format::R16G16B16A16_SFLOAT => Some(ir::TextureFormat::Rgba16Float),
+        vk::Format::R32G32B32A32_SFLOAT => Some(ir::TextureFormat::Rgba32Float),
         _ => None,
     }
 }
@@ -180,7 +186,7 @@ unsafe extern "system" fn create_image(
     allocator: *const vk::AllocationCallbacks<'_>,
     output: *mut vk::Image,
 ) -> vk::Result {
-    if std::env::var_os("SGFX_VULKAN_TRACE").is_some() && !info.is_null() {
+    if !info.is_null() && std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
         let i = &*info;
         eprintln!(
             "[SGFX Vulkan] image create: format={:?} type={:?} extent={:?} mips={} layers={} samples={:?} usage={:?} flags={:?} pnext={:?}",
@@ -245,10 +251,9 @@ unsafe extern "system" fn create_image(
         || info.samples != vk::SampleCountFlags::TYPE_1
         || info.mip_levels == 0
         || (info.mip_levels > 1
-            && info.usage.intersects(
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-            ))
+            && info
+                .usage
+                .contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT))
         || info.array_layers == 0
         || (info.flags.contains(vk::ImageCreateFlags::CUBE_COMPATIBLE)
             && (info.array_layers < 6 || info.extent.width != info.extent.height))
@@ -295,6 +300,10 @@ unsafe extern "system" fn create_image(
     if info.usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
         usage |= ir::TextureUsage::COPY_DST;
     }
+    // Private GPU transfers preserve attachment views into nonzero mip levels.
+    if info.mip_levels > 1 && info.usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        usage |= ir::TextureUsage::COPY_SRC | ir::TextureUsage::COPY_DST;
+    }
     match with_device(device, move |runtime| {
         if dimension_1d && !runtime.native_texture_1d {
             return Err(UNSUPPORTED);
@@ -336,7 +345,8 @@ unsafe extern "system" fn create_image(
             && array_layers == 1
             && matches!(
                 format,
-                vk::Format::R8G8B8A8_UNORM
+                vk::Format::D32_SFLOAT
+                    | vk::Format::R8G8B8A8_UNORM
                     | vk::Format::B8G8R8A8_UNORM
                     | vk::Format::R8_UNORM
                     | vk::Format::R8G8_UNORM
@@ -374,6 +384,20 @@ unsafe extern "system" fn create_image(
         {
             return Err(UNSUPPORTED);
         }
+        if format == vk::Format::D32_SFLOAT
+            && image_usage
+                .intersects(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            && !runtime.capabilities.supports_depth_transfers()
+        {
+            return Err(UNSUPPORTED);
+        }
+        if matches!(
+            format,
+            vk::Format::R16G16B16A16_SFLOAT | vk::Format::R32G32B32A32_SFLOAT
+        ) && !runtime.capabilities.supports_float_color()
+        {
+            return Err(UNSUPPORTED);
+        }
         let desc = ir::TextureDesc::new(ir_format, size, usage)
             .map_err(|_| INVALID)?
             .with_mip_level_count(mip_levels)
@@ -387,6 +411,12 @@ unsafe extern "system" fn create_image(
         let id = runtime
             .table
             .define_texture(desc)
+            .inspect_err(|error| {
+                eprintln!(
+                    "[SGFX Vulkan] image resource definition failed: {error:?} live_images={}",
+                    runtime.resources.images.len()
+                )
+            })
             .map_err(crate::resources::failure)?
             .id();
         let handle = vk::Image::from_raw(next_id());
@@ -432,36 +462,7 @@ unsafe extern "system" fn destroy_image(
     _: *const vk::AllocationCallbacks<'_>,
 ) {
     if image != vk::Image::null() {
-        let _ = with_device(device, move |runtime| {
-            let removable = runtime
-                .resources
-                .images
-                .get(&image)
-                .is_some_and(|image| image.swapchain.is_none());
-            if removable {
-                let data = runtime.resources.images.get(&image).ok_or(INVALID)?;
-                let id = data.id;
-                // Do not wait on driver deferred packets here: this closure runs
-                // on the device worker that consumes them. Only submitted GPU
-                // receipts are drained before physical and logical retirement.
-                runtime.in_flight.wait();
-                #[cfg(target_os = "scarlet")]
-                if data.shared.is_some() {
-                    runtime.cache.unmap_presentation_image(id);
-                }
-                runtime
-                    .cache
-                    .release_texture(id)
-                    .map_err(crate::runtime::backend_failure)?;
-                runtime
-                    .table
-                    .release_texture(id)
-                    .map_err(crate::resources::failure)?;
-                runtime.resources.image_view_formats.remove(&image);
-                runtime.resources.images.remove(&image);
-            }
-            Ok(())
-        });
+        let _ = with_device_owned(device, move |runtime| runtime.retire_image(image));
     }
 }
 
@@ -493,6 +494,14 @@ pub(crate) unsafe extern "system" fn bind_image_memory(
     offset: vk::DeviceSize,
 ) -> vk::Result {
     let result = status(with_device(device, move |runtime| {
+        if !crate::memory_allocation::permits(
+            &runtime.resources,
+            memory,
+            crate::memory_allocation::DedicatedTarget::Image(image),
+            offset,
+        ) {
+            return Err(INVALID);
+        }
         let size = runtime
             .resources
             .images
@@ -687,7 +696,7 @@ unsafe extern "system" fn destroy_image_view(
     _: *const vk::AllocationCallbacks<'_>,
 ) {
     if view != vk::ImageView::null() {
-        let _ = with_device(device, move |runtime| {
+        let _ = with_device_owned(device, move |runtime| {
             runtime.resources.views.remove(&view);
             Ok(())
         });
@@ -938,12 +947,12 @@ unsafe extern "system" fn destroy_framebuffer(
 unsafe fn shader_stages(
     info: &vk::GraphicsPipelineCreateInfo<'_>,
 ) -> Result<[(vk::ShaderModule, String, crate::resources::Specialization); 2], vk::Result> {
-    if info.stage_count != 2 || info.p_stages.is_null() {
+    if !(1..=2).contains(&info.stage_count) || info.p_stages.is_null() {
         return Err(UNSUPPORTED);
     }
     let mut vertex = None;
     let mut fragment = None;
-    for index in 0..2 {
+    for index in 0..info.stage_count as usize {
         let stage = &*info.p_stages.add(index);
         if stage.s_type != vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO
             || !stage.p_next.is_null()
@@ -974,7 +983,18 @@ unsafe fn shader_stages(
             return Err(INVALID);
         }
     }
-    Ok([vertex.ok_or(INVALID)?, fragment.ok_or(INVALID)?])
+    if fragment.is_none()
+        && info
+            .p_color_blend_state
+            .as_ref()
+            .is_none_or(|s| s.attachment_count != 0)
+    {
+        return Err(UNSUPPORTED);
+    }
+    Ok([
+        vertex.ok_or(INVALID)?,
+        fragment.unwrap_or((vk::ShaderModule::null(), "main".into(), Vec::new())),
+    ])
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1024,6 +1044,25 @@ unsafe fn vertex_layout(
     {
         return Err(UNSUPPORTED);
     }
+    let mut divisors = std::collections::BTreeMap::new();
+    if !vertex.p_next.is_null() {
+        let d = &*vertex
+            .p_next
+            .cast::<vk::PipelineVertexInputDivisorStateCreateInfoEXT<'_>>();
+        if d.s_type != vk::StructureType::PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT
+            || !d.p_next.is_null()
+            || d.vertex_binding_divisor_count > ir::MAX_VERTEX_BUFFERS as u32
+            || (d.vertex_binding_divisor_count != 0 && d.p_vertex_binding_divisors.is_null())
+        {
+            return Err(UNSUPPORTED);
+        }
+        for entry in crate::api::slice(d.p_vertex_binding_divisors, d.vertex_binding_divisor_count)?
+        {
+            if entry.divisor == 0 || divisors.insert(entry.binding, entry.divisor).is_some() {
+                return Err(UNSUPPORTED);
+            }
+        }
+    }
     let mut buffers = std::collections::BTreeMap::new();
     for binding in std::slice::from_raw_parts(
         vertex.p_vertex_binding_descriptions,
@@ -1046,6 +1085,13 @@ unsafe fn vertex_layout(
             return Err(UNSUPPORTED);
         }
     }
+    if divisors.keys().any(|binding| {
+        buffers
+            .get(binding)
+            .is_none_or(|(_, rate, _)| *rate != vk::VertexInputRate::INSTANCE)
+    }) {
+        return Err(UNSUPPORTED);
+    }
     for attribute in std::slice::from_raw_parts(
         vertex.p_vertex_attribute_descriptions,
         vertex.vertex_attribute_description_count as usize,
@@ -1064,6 +1110,14 @@ unsafe fn vertex_layout(
             vk::Format::R8G8B8A8_UNORM | vk::Format::A8B8G8R8_UNORM_PACK32 => {
                 ir::VertexFormat::Unorm8x4
             }
+            vk::Format::R8G8B8A8_SNORM => ir::VertexFormat::Snorm8x4,
+            vk::Format::R16G16_SINT => ir::VertexFormat::Sint16x2,
+            vk::Format::R32G32_UINT => ir::VertexFormat::Uint32x2,
+            vk::Format::R32G32B32_UINT => ir::VertexFormat::Uint32x3,
+            vk::Format::R32G32B32A32_UINT => ir::VertexFormat::Uint32x4,
+            vk::Format::R32G32_SINT => ir::VertexFormat::Sint32x2,
+            vk::Format::R32G32B32_SINT => ir::VertexFormat::Sint32x3,
+            vk::Format::R32G32B32A32_SINT => ir::VertexFormat::Sint32x4,
             vk::Format::R32_SINT => ir::VertexFormat::Sint32,
             vk::Format::R32_UINT => ir::VertexFormat::Uint32,
             vk::Format::R16G16_SFLOAT => ir::VertexFormat::Float16x2,
@@ -1090,11 +1144,14 @@ unsafe fn vertex_layout(
             }
             ir::VertexBufferLayout::new(stride, attributes)
                 .map(|layout| {
-                    layout.with_step_mode(match rate {
-                        vk::VertexInputRate::VERTEX => ir::VertexStepMode::Vertex,
-                        vk::VertexInputRate::INSTANCE => ir::VertexStepMode::Instance,
-                        _ => unreachable!("input rates are validated above"),
-                    })
+                    layout
+                        .with_step_mode(match rate {
+                            vk::VertexInputRate::VERTEX => ir::VertexStepMode::Vertex,
+                            vk::VertexInputRate::INSTANCE => ir::VertexStepMode::Instance,
+                            _ => unreachable!("input rates are validated above"),
+                        })
+                        .with_instance_divisor(*divisors.get(&slot).unwrap_or(&1))
+                        .expect("validated nonzero divisor")
                 })
                 .map_err(|_| UNSUPPORTED)
         })
@@ -1126,7 +1183,9 @@ fn blend_factor(value: vk::BlendFactor, alpha: bool) -> Result<ir::BlendFactor, 
 unsafe fn graphics_state(
     info: &vk::GraphicsPipelineCreateInfo<'_>,
 ) -> Result<GraphicsState, vk::Result> {
-    if !info.p_next.is_null()
+    if (!info.p_next.is_null()
+        && (*(info.p_next.cast::<vk::BaseInStructure<'_>>())).s_type
+            != vk::StructureType::PIPELINE_RENDERING_CREATE_INFO)
         || !info.flags.is_empty()
         || info.s_type != vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO
         || !info.p_tessellation_state.is_null()
@@ -1177,7 +1236,6 @@ unsafe fn graphics_state(
         || raster.s_type != vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO
         || samples.s_type != vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
         || blend.s_type != vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
-        || !vertex.p_next.is_null()
         || !vertex.flags.is_empty()
         || !assembly.p_next.is_null()
         || !assembly.flags.is_empty()
@@ -1188,6 +1246,7 @@ unsafe fn graphics_state(
                 | vk::PrimitiveTopology::TRIANGLE_FAN
                 | vk::PrimitiveTopology::LINE_LIST
                 | vk::PrimitiveTopology::LINE_STRIP
+                | vk::PrimitiveTopology::POINT_LIST
         )
         || assembly.primitive_restart_enable != vk::FALSE
         || !viewport.p_next.is_null()
@@ -1205,11 +1264,7 @@ unsafe fn graphics_state(
             raster.cull_mode,
             vk::CullModeFlags::NONE | vk::CullModeFlags::FRONT | vk::CullModeFlags::BACK
         )
-        || (raster.depth_bias_enable != vk::FALSE
-            && !dynamic_depth_bias
-            && (raster.depth_bias_constant_factor != 0.0
-                || raster.depth_bias_clamp != 0.0
-                || raster.depth_bias_slope_factor != 0.0))
+        || raster.depth_bias_clamp != 0.0
         || raster.line_width != 1.0
         || !matches!(
             raster.front_face,
@@ -1225,8 +1280,8 @@ unsafe fn graphics_state(
         || !blend.p_next.is_null()
         || !blend.flags.is_empty()
         || blend.logic_op_enable != vk::FALSE
-        || !(1..=ir::MAX_COLOR_ATTACHMENTS as u32).contains(&blend.attachment_count)
-        || blend.p_attachments.is_null()
+        || blend.attachment_count > ir::MAX_COLOR_ATTACHMENTS as u32
+        || (blend.attachment_count != 0 && blend.p_attachments.is_null())
     {
         return Err(UNSUPPORTED);
     }
@@ -1291,11 +1346,13 @@ unsafe fn graphics_state(
             vk::BlendOp::ADD => ir::BlendOp::Add,
             vk::BlendOp::SUBTRACT => ir::BlendOp::Subtract,
             vk::BlendOp::REVERSE_SUBTRACT => ir::BlendOp::ReverseSubtract,
+            vk::BlendOp::MIN => ir::BlendOp::Min,
+            vk::BlendOp::MAX => ir::BlendOp::Max,
             _ => return Err(UNSUPPORTED),
         })
     };
     let mut colors = Vec::new();
-    for color in std::slice::from_raw_parts(blend.p_attachments, blend.attachment_count as usize) {
+    for color in crate::api::slice(blend.p_attachments, blend.attachment_count)? {
         if !matches!(color.blend_enable, vk::FALSE | vk::TRUE)
             || !vk::ColorComponentFlags::RGBA.contains(color.color_write_mask)
         {
@@ -1342,13 +1399,27 @@ unsafe fn graphics_state(
         colors,
         vertex: vertex_layout(vertex)?,
         depth,
-        raster: ir::RasterState::new(cull, front),
+        raster: ir::RasterState::new(cull, front)
+            .with_depth_bias(
+                if raster.depth_bias_enable == vk::TRUE && !dynamic_depth_bias {
+                    raster.depth_bias_constant_factor
+                } else {
+                    0.0
+                },
+                if raster.depth_bias_enable == vk::TRUE && !dynamic_depth_bias {
+                    raster.depth_bias_slope_factor
+                } else {
+                    0.0
+                },
+            )
+            .map_err(|_| UNSUPPORTED)?,
         topology: match assembly.topology {
             vk::PrimitiveTopology::TRIANGLE_STRIP => ir::PrimitiveTopology::TriangleStrip,
             vk::PrimitiveTopology::TRIANGLE_FAN => ir::PrimitiveTopology::TriangleFan,
             vk::PrimitiveTopology::TRIANGLE_LIST => ir::PrimitiveTopology::TriangleList,
             vk::PrimitiveTopology::LINE_LIST => ir::PrimitiveTopology::LineList,
             vk::PrimitiveTopology::LINE_STRIP => ir::PrimitiveTopology::LineStrip,
+            vk::PrimitiveTopology::POINT_LIST => ir::PrimitiveTopology::PointList,
             _ => return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT),
         },
     })
@@ -1435,6 +1506,17 @@ unsafe extern "system" fn create_graphics_pipelines(
             }
         };
         let layout = info.layout;
+        let dynamic_pass = match crate::api::dynamic_rendering::pipeline(info) {
+            Ok(pass) => pass,
+            Err(e) => {
+                first_error.get_or_insert(e);
+                continue;
+            }
+        };
+        if dynamic_pass.is_some() && !crate::api::dynamic_rendering::enabled(device) {
+            first_error.get_or_insert(UNSUPPORTED);
+            continue;
+        }
         let render_pass = info.render_pass;
         let subpass_index = info.subpass as usize;
         // Shader-module normalization already compensates for Vulkan's positive
@@ -1446,17 +1528,20 @@ unsafe extern "system" fn create_graphics_pipelines(
             );
             let result = (|| {
                 crate::api::bootstrap::validate_cache(&runtime.resources, cache)?;
-                let pass = runtime
-                    .resources
-                    .render_passes
-                    .get(&render_pass)
-                    .ok_or(INVALID)?;
-                let pass = pass.clone();
+                let pass = match &dynamic_pass {
+                    Some(pass) => pass.clone(),
+                    None => runtime
+                        .resources
+                        .render_passes
+                        .get(&render_pass)
+                        .ok_or(INVALID)?
+                        .clone(),
+                };
                 let subpass = pass.subpasses.get(subpass_index).ok_or(INVALID)?;
                 if subpass.colors.len() != state.colors.len() {
                     return Err(INVALID);
                 }
-                let targets = subpass
+                let mut targets = subpass
                     .colors
                     .iter()
                     .zip(&state.colors)
@@ -1469,8 +1554,26 @@ unsafe extern "system" fn create_graphics_pipelines(
                         .map_err(|_| INVALID)
                     })
                     .collect::<Result<Vec<_>, vk::Result>>()?;
+                if targets.is_empty() {
+                    if subpass.depth.is_none() {
+                        return Err(UNSUPPORTED);
+                    }
+                    targets.push(
+                        ir::ColorTargetState::new(
+                            ir::TextureFormat::Bgra8Unorm,
+                            ir::BlendState::REPLACE,
+                            ir::ColorWriteMask::from_bits(0).map_err(|_| INVALID)?,
+                        )
+                        .map_err(|_| INVALID)?,
+                    );
+                }
                 let target_format = targets[0].format();
                 let input_depths = pass.input_depths(subpass_index);
+                if state.vertex.iter().any(|v| v.instance_divisor() != 1)
+                    && !runtime.capabilities.supports_vertex_divisors()
+                {
+                    return Err(UNSUPPORTED);
+                }
                 let binding_maps = runtime
                     .resources
                     .pipeline_binding_maps
@@ -1492,26 +1595,79 @@ unsafe extern "system" fn create_graphics_pipelines(
                     .inspect_err(|error| {
                         eprintln!("[SGFX Vulkan] vertex specialization: {error:?}");
                     })?;
-                let input_bindings = runtime
-                    .resources
-                    .shaders
-                    .get(&fragment_module)
-                    .ok_or(INVALID)?
-                    .input_bindings()?;
-                let fragment_id = runtime
-                    .resources
-                    .shaders
-                    .get_mut(&fragment_module)
-                    .ok_or(INVALID)?
-                    .variant_for_layout(
-                        &runtime.table,
-                        &fragment_values,
-                        &input_depths,
-                        &binding_maps,
-                    )
-                    .inspect_err(|error| {
-                        eprintln!("[SGFX Vulkan] fragment specialization: {error:?}");
-                    })?;
+                let (fragment_id, input_bindings) = if fragment_module == vk::ShaderModule::null() {
+                    let id = if let Some(id) = runtime.resources.depth_only_fragment {
+                        id
+                    } else {
+                        // Legal no-output fragment stage for the portable pass's
+                        // discarded color target; Vulkan omitted this stage.
+                        let desc = ir::ShaderModuleDesc::spirv(vec![
+                            0x07230203,
+                            0x00010000,
+                            0,
+                            5,
+                            0,
+                            (2 << 16) | 17,
+                            1,
+                            (3 << 16) | 14,
+                            0,
+                            1,
+                            (5 << 16) | 15,
+                            4,
+                            3,
+                            0x6e69616d,
+                            0,
+                            (3 << 16) | 16,
+                            3,
+                            7,
+                            (2 << 16) | 19,
+                            1,
+                            (3 << 16) | 33,
+                            2,
+                            1,
+                            (5 << 16) | 54,
+                            1,
+                            3,
+                            0,
+                            2,
+                            (2 << 16) | 248,
+                            4,
+                            (1 << 16) | 253,
+                            (1 << 16) | 56,
+                        ])
+                        .map_err(crate::resources::failure)?;
+                        let id = runtime
+                            .table
+                            .define_shader_module(desc)
+                            .map_err(crate::resources::failure)?
+                            .id();
+                        runtime.resources.depth_only_fragment = Some(id);
+                        id
+                    };
+                    (id, Vec::new())
+                } else {
+                    let input_bindings = runtime
+                        .resources
+                        .shaders
+                        .get(&fragment_module)
+                        .ok_or(INVALID)?
+                        .input_bindings()?;
+                    let fragment_id = runtime
+                        .resources
+                        .shaders
+                        .get_mut(&fragment_module)
+                        .ok_or(INVALID)?
+                        .variant_for_layout(
+                            &runtime.table,
+                            &fragment_values,
+                            &input_depths,
+                            &binding_maps,
+                        )
+                        .inspect_err(|error| {
+                            eprintln!("[SGFX Vulkan] fragment specialization: {error:?}");
+                        })?;
+                    (fragment_id, input_bindings)
+                };
                 let vertex = ir::ShaderEntryPoint::new(
                     runtime
                         .table
@@ -2023,7 +2179,7 @@ mod tests {
                         .depth_stencil_state(&depth),
                 )
             }
-            .is_err()
+            .is_ok()
         );
         assert!(
             unsafe {

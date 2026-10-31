@@ -26,11 +26,11 @@ use std::{
 use crate::completion::SubmitMode;
 use crate::dispatch::NativeScheduler;
 use crate::driver::{
-    IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSpec, IrBufferUpdate,
-    IrCompareFunction, IrConstantBuffer, IrCullMode, IrDraw, IrFilterMode, IrFragmentProgram,
-    IrFrontFace, IrPipelineState, IrProgrammablePipeline, IrSamplerState, IrSubmission,
-    IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload, IrUniforms, IrVertex,
-    MAX_IR_VERTICES,
+    IrAddressMode, IrBlendFactor, IrBlendOp, IrBlendState, IrBufferSource, IrBufferSpec,
+    IrBufferUpdate, IrCompareFunction, IrConstantBuffer, IrCullMode, IrDraw, IrFilterMode,
+    IrFragmentProgram, IrFrontFace, IrPipelineState, IrProgrammablePipeline, IrSamplerState,
+    IrSubmission, IrTextureCopy, IrTextureFormat, IrTextureSpec, IrTextureUpload, IrUniforms,
+    IrVertex, MAX_IR_VERTICES,
 };
 use crate::packets::UPLOAD_ARENA_COUNT;
 use crate::{
@@ -143,17 +143,25 @@ const PIPE_SWIZZLE_Z: u32 = 2;
 const PIPE_SWIZZLE_W: u32 = 3;
 const IR_VERTEX_BUFFER_BYTES: usize = MAX_IR_VERTICES * 10 * core::mem::size_of::<f32>();
 const IR_BUFFER_SLOTS: usize = crate::ir::MAX_BUFFERS;
-const IR_TEXTURE_SLOTS: usize = 1_024;
+const IR_TEXTURE_SLOTS: usize = crate::ir::MAX_TEXTURES;
 const IR_SAMPLER_SLOTS: usize = 256;
-const IR_PIPELINE_SLOTS: usize = 512;
+pub(crate) const IR_PROGRAMMABLE_PIPELINE_OFFSET: usize = crate::ir::MAX_RENDER_PIPELINES;
+const IR_PROGRAMMABLE_PIPELINE_SLOTS: usize = crate::ir::MAX_PROGRAMMABLE_RENDER_PIPELINES;
+const IR_PIPELINE_SLOTS: usize = IR_PROGRAMMABLE_PIPELINE_OFFSET + IR_PROGRAMMABLE_PIPELINE_SLOTS;
 // Internal transfer draws cannot collide with public IR resource slots.
 const IR_BLIT_PIPELINE_SLOT: usize = IR_PIPELINE_SLOTS;
 const IR_BLIT_SAMPLER_SLOT: usize = IR_SAMPLER_SLOTS;
-const IR_PROGRAMMABLE_PIPELINE_SLOTS: usize = 256;
+
+fn programmable_pipeline_alias(slot: usize) -> HandleResult<usize> {
+    if slot >= IR_PROGRAMMABLE_PIPELINE_SLOTS {
+        return Err(HandleError::InvalidParameter);
+    }
+    Ok(IR_PROGRAMMABLE_PIPELINE_OFFSET + slot)
+}
 
 type SharedScheduler = Rc<RefCell<Option<Arc<NativeScheduler>>>>;
 
-fn wait_scheduled(scheduler: &SharedScheduler) -> HandleResult<()> {
+pub(crate) fn wait_scheduled(scheduler: &SharedScheduler) -> HandleResult<()> {
     let scheduler = scheduler.borrow().clone();
     scheduler
         .as_ref()
@@ -351,9 +359,11 @@ DCL TEMP[0]\n\
   4: END\n";
 
 pub(crate) struct Device {
-    raw: RawGpu,
+    pub(crate) raw: RawGpu,
     dialect: RawDialect,
     capabilities: Capabilities,
+    #[cfg(all(feature = "std", feature = "programmable"))]
+    pub(crate) compute_supported: Cell<Option<bool>>,
 }
 
 impl Device {
@@ -396,6 +406,8 @@ impl Device {
             raw,
             dialect,
             capabilities,
+            #[cfg(all(feature = "std", feature = "programmable"))]
+            compute_supported: Cell::new(None),
         })
     }
 
@@ -416,19 +428,103 @@ impl Device {
             cleanup_failed: Rc::new(Cell::new(false)),
             next_object_handle: Cell::new(FIRST_DYNAMIC_OBJECT_HANDLE),
             scheduler: Rc::new(RefCell::new(None)),
+            #[cfg(feature = "std")]
+            queries: Default::default(),
         })
     }
 }
 
 pub(crate) struct Context {
-    device: Rc<Device>,
-    raw: Rc<RawContext>,
+    pub(crate) device: Rc<Device>,
+    pub(crate) raw: Rc<RawContext>,
     cleanup_failed: Rc<Cell<bool>>,
     next_object_handle: Cell<u32>,
-    scheduler: SharedScheduler,
+    pub(crate) scheduler: SharedScheduler,
+    #[cfg(feature = "std")]
+    pub(crate) queries: crate::queries::Scopes,
 }
 
 impl Context {
+    #[cfg(feature = "std")]
+    pub(crate) fn timestamp_ns(&self) -> HandleResult<u64> {
+        use scarlet_os::handle::capability::memory_mapping::{MemoryMappingOps, flags, prot};
+        wait_scheduled(&self.scheduler)?;
+        let handle = self.allocate_object_handle()?;
+        let buffer = self.device.raw.create_buffer(
+            4096,
+            gpu_raw::GPU_BUFFER_FLAG_CPU_VISIBLE | gpu_raw::GPU_BUFFER_FLAG_QUERY_RESULT,
+        )?;
+        let token = self.raw.attach_buffer(&buffer)?;
+        let mapped = (|| {
+            let resource = resource_id_from_token(token)?;
+            let mapping = buffer.as_handle().as_memory_mapping()?;
+            // SAFETY: this fresh mapping is private to the query operation.
+            // GPU-written scalars are accessed with volatile reads below.
+            let address =
+                unsafe { mapping.mmap(0, 4096, prot::READ | prot::WRITE, flags::SHARED, 0) }
+                    .map_err(|_| HandleError::OutOfResources)?;
+            Ok((resource, address))
+        })();
+        let (resource, address) = match mapped {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                let _ = self.raw.detach_buffer(&buffer);
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            let mut commands = Vec::new();
+            // VirGL query object: VIRGL_QUERY_TIMESTAMP=2 (not modern Gallium enum values), 64-bit result at offset 8.
+            push_dword(
+                &mut commands,
+                command_header(VIRGL_CCMD_CREATE_OBJECT, 9, 4),
+            );
+            for value in [handle, 2, 0, resource] {
+                push_dword(&mut commands, value);
+            }
+            push_dword(&mut commands, command_header(20, 0, 1));
+            push_dword(&mut commands, handle);
+            push_dword(&mut commands, command_header(21, 0, 2));
+            push_dword(&mut commands, handle);
+            push_dword(&mut commands, 1);
+            self.raw.create_queue()?.submit(&commands)?;
+            let mut transfer = Vec::new();
+            push_dword(&mut transfer, command_header(43, 0, 13));
+            for value in [resource, 0, 0, 0, 0, 0, 0, 0, 16, 1, 1, 0, 2] {
+                push_dword(&mut transfer, value);
+            }
+            for _ in 0..100 {
+                self.raw.create_queue()?.submit(&transfer)?;
+                // SAFETY: the 16-byte query result lies within the live mapping.
+                if unsafe { core::ptr::read_volatile(address as *const u32) } == 1 {
+                    let value = unsafe { core::ptr::read_volatile((address + 8) as *const u64) };
+                    // Some host GL implementations expose timer queries yet
+                    // return a permanently zero counter. Do not advertise a clock.
+                    return if value == 0 {
+                        Err(HandleError::Unsupported)
+                    } else {
+                        Ok(value)
+                    };
+                }
+                std::thread::sleep(core::time::Duration::from_millis(1));
+            }
+            Err(HandleError::Unsupported)
+        })();
+        let mut destroy = Vec::new();
+        push_destroy_object(&mut destroy, 9, handle);
+        let cleanup = self
+            .raw
+            .create_queue()
+            .and_then(|q| q.submit(&destroy).map(|_| ()));
+        // SAFETY: all query/transfer calls have returned and no references exist.
+        let unmapped = unsafe { MemoryMappingOps::munmap(address, 4096) };
+        let detached = self.raw.detach_buffer(&buffer);
+        cleanup?;
+        unmapped.map_err(|_| HandleError::OutOfResources)?;
+        detached?;
+        result
+    }
+
     #[cfg(feature = "backend-abi")]
     pub(crate) fn is_idle(&self) -> HandleResult<bool> {
         // Poll the existing dispatch state directly. Creating a temporary
@@ -653,11 +749,17 @@ impl Context {
         if matches!(spec.format, IrTextureFormat::Depth32Float) {
             usage &= !GPU_IMAGE_USAGE_RENDER_TARGET;
             usage |= GPU_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT;
-        } else {
-            usage |= GPU_IMAGE_USAGE_TRANSFER_SRC;
         }
+        usage |= GPU_IMAGE_USAGE_TRANSFER_SRC;
         if usage == 0 {
             return Err(HandleError::InvalidParameter);
+        }
+        if matches!(
+            spec.format,
+            IrTextureFormat::Rgba16Float | IrTextureFormat::Rgba32Float
+        ) && !self.capabilities().supports_float_color()
+        {
+            return Err(HandleError::Unsupported);
         }
         let storage_format = spec
             .format
@@ -666,6 +768,8 @@ impl Context {
             IrTextureFormat::R8 => gpu_raw::GPU_IMAGE_FORMAT_R8_UNORM,
             IrTextureFormat::Rg8 => gpu_raw::GPU_IMAGE_FORMAT_RG8_UNORM,
             IrTextureFormat::Depth32Float => GPU_IMAGE_FORMAT_DEPTH32_FLOAT,
+            IrTextureFormat::Rgba16Float => 6, // GPU_IMAGE_FORMAT_RGBA16_FLOAT
+            IrTextureFormat::Rgba32Float => 7, // GPU_IMAGE_FORMAT_RGBA32_FLOAT
             _ => GPU_IMAGE_FORMAT_BGRA8_UNORM,
         };
         let raw = self.device.raw.create_layered_image_with_format_and_usage(
@@ -773,10 +877,13 @@ impl Context {
         if resources.context_handle != self.handle_id()
             || !matches!(
                 spec.format,
-                IrTextureFormat::Bgra8
+                IrTextureFormat::Depth32Float
+                    | IrTextureFormat::Bgra8
                     | IrTextureFormat::Rgba8
                     | IrTextureFormat::R8
                     | IrTextureFormat::Rg8
+                    | IrTextureFormat::Rgba16Float
+                    | IrTextureFormat::Rgba32Float
             )
             || !self.device.capabilities.supports_image_readback()
         {
@@ -810,7 +917,14 @@ impl Context {
         while y < spec.height {
             let height = (spec.height - y).min(rows);
             let rect = GpuImageBgraRect::new(0, y, spec.width, height);
-            if native_narrow {
+            if native_narrow
+                || matches!(
+                    spec.format,
+                    IrTextureFormat::Depth32Float
+                        | IrTextureFormat::Rgba16Float
+                        | IrTextureFormat::Rgba32Float
+                )
+            {
                 self.raw
                     .readback_image(&texture.raw, pixels, stride, rect)?;
             } else {
@@ -1121,7 +1235,7 @@ impl Context {
         self.raw.as_handle().as_raw()
     }
 
-    fn allocate_object_handle(&self) -> HandleResult<u32> {
+    pub(crate) fn allocate_object_handle(&self) -> HandleResult<u32> {
         let handle = self.next_object_handle.get();
         let next_handle = handle.checked_add(1).ok_or(HandleError::OutOfResources)?;
         if handle == 0 {
@@ -1136,7 +1250,7 @@ pub(crate) struct Queue {
     context: Rc<RawContext>,
     cleanup_failed: Rc<Cell<bool>>,
     raw: Arc<RawQueue>,
-    scheduler: SharedScheduler,
+    pub(crate) scheduler: SharedScheduler,
     context_handle: i32,
     composition_vertex_buffer: RawBuffer,
     composition_vertex_resource_id: u32,
@@ -1368,7 +1482,7 @@ impl IrResources {
         if self.context_handle != context.handle_id() || slot >= self.programmable_pipelines.len() {
             return Err(HandleError::InvalidParameter);
         }
-        let fixed_slot = slot + IR_PROGRAMMABLE_PIPELINE_SLOTS;
+        let fixed_slot = programmable_pipeline_alias(slot)?;
         if self.programmable_pipelines[slot].is_none() && self.pipelines[fixed_slot].is_none() {
             return Ok(());
         }
@@ -1880,7 +1994,7 @@ impl Queue {
         &self,
         context: &Context,
         resources: &mut IrResources,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
     ) -> HandleResult<()> {
         for color in &submission.additional_colors {
             ir_texture(context, resources, color.texture)?;
@@ -1932,6 +2046,11 @@ impl Queue {
             || info.max_pending_submissions == 0
             || info.max_opaque_command_size < self.raw.max_opaque_command_size()
         {
+            #[cfg(feature = "std")]
+            std::eprintln!(
+                "[SGFX native] async capability mismatch: info={info:?} required_size={}",
+                self.raw.max_opaque_command_size()
+            );
             return Err(HandleError::Unsupported);
         }
         Ok(info.max_opaque_command_size as usize)
@@ -1975,7 +2094,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         spec: IrBufferSpec,
-        bytes: &[u8],
+        source: &IrBufferSource<'_>,
         update: Option<&IrBufferUpdate>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
@@ -1983,9 +2102,9 @@ impl Queue {
             || resources.context_handle != context.handle_id()
             || spec.size == 0
             || spec.size > u64::from(u32::MAX)
-            || bytes.is_empty()
-            || !bytes.len().is_multiple_of(core::mem::size_of::<u32>())
-            || u64::try_from(bytes.len()).map_or(true, |length| length > spec.size)
+            || source.len() == 0
+            || !source.len().is_multiple_of(core::mem::size_of::<u32>())
+            || u64::try_from(source.len()).map_or(true, |length| length > spec.size)
         {
             return Err(HandleError::InvalidParameter);
         }
@@ -1996,52 +2115,105 @@ impl Queue {
         if uploaded_revision == Some(spec.revision) {
             return Ok(());
         }
-        let range = ir_buffer_upload_range(uploaded_revision, spec.revision, bytes.len(), update)?;
+        let ranges =
+            ir_buffer_upload_ranges(uploaded_revision, spec.revision, source.len(), update)?;
+        #[cfg(feature = "profile-submissions")]
+        let prepare_started = std::time::Instant::now();
         self.prepare_ir_upload_arena(context, resources, mode)?;
 
         const INLINE_WRITE_FIXED_BYTES: usize = 12 * core::mem::size_of::<u32>();
         const BUFFER_COPY_BYTES: usize = 14 * core::mem::size_of::<u32>();
+        let fixed_bytes = INLINE_WRITE_FIXED_BYTES
+            + if mode.is_tracked() {
+                BUFFER_COPY_BYTES
+            } else {
+                0
+            };
         let max_payload = self
             .max_command_size()
-            .checked_sub(
-                INLINE_WRITE_FIXED_BYTES
-                    + if mode.is_tracked() {
-                        BUFFER_COPY_BYTES
-                    } else {
-                        0
-                    },
-            )
+            .checked_sub(fixed_bytes)
             .map(|bytes| bytes & !(core::mem::size_of::<u32>() - 1))
             .filter(|bytes| *bytes > 0)
             .ok_or(HandleError::InvalidParameter)?;
         let mut commands = Vec::new();
-        commands
-            .try_reserve_exact(self.max_command_size())
+        let scratch_capacity = if matches!(source, IrBufferSource::Contiguous(_)) {
+            0
+        } else {
+            ranges
+                .as_slice()
+                .iter()
+                .map(|range| range.len().min(max_payload))
+                .max()
+                .unwrap_or(0)
+        };
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(scratch_capacity)
             .map_err(|_| HandleError::OutOfResources)?;
         // A failed synchronous prefix may have changed physical bytes. Until
         // every packet succeeds, a later submission must repair the full
         // initialized shadow. Tracked rejection restores its cache snapshot.
         ir_buffer(context, resources, spec)?.uploaded_revision = None;
-        let mut offset = range.start;
-        while offset < range.end {
-            mode.prepare_packet(self.max_command_size())?;
-            let end = offset.saturating_add(max_payload).min(range.end);
-            let chunk = bytes
-                .get(offset..end)
-                .ok_or(HandleError::InvalidParameter)?;
-            commands.clear();
-            push_ir_buffer_upload(
-                &mut commands,
-                resource_id,
-                u32::try_from(offset).map_err(|_| HandleError::InvalidParameter)?,
-                chunk,
-                mode,
-            )?;
-            mode.submit(&self.raw, &commands)?;
-            offset = end;
+        for range in ranges.as_slice() {
+            let mut offset = range.start;
+            while offset < range.end {
+                let end = offset.saturating_add(max_payload).min(range.end);
+                let chunk = if let Some(bytes) = source.direct_range(offset..end) {
+                    bytes
+                } else {
+                    scratch.resize(end - offset, 0);
+                    source.copy_range(offset..end, &mut scratch)?;
+                    &scratch
+                };
+                // Rotate before choosing arena offsets, but reserve only this
+                // packet's bytes so small intervals share a native chunk.
+                mode.prepare_packet(fixed_bytes + chunk.len())?;
+                commands.clear();
+                commands
+                    .try_reserve_exact(fixed_bytes + chunk.len())
+                    .map_err(|_| HandleError::OutOfResources)?;
+                push_ir_buffer_upload(
+                    &mut commands,
+                    resource_id,
+                    u32::try_from(offset).map_err(|_| HandleError::InvalidParameter)?,
+                    chunk,
+                    mode,
+                )?;
+                mode.submit_owned(&self.raw, &mut commands)?;
+                offset = end;
+            }
         }
         let buffer = ir_buffer(context, resources, spec)?;
         buffer.uploaded_revision = Some(spec.revision);
+        #[cfg(feature = "profile-submissions")]
+        {
+            let prepare_us = prepare_started.elapsed().as_micros();
+            // Include tiny deltas into large native buffers, without logging
+            // every small uniform upload or unchanged draw binding. Tracked
+            // bytes are staged here; final checkpoint acceptance is separate.
+            if source.len() >= 1024 * 1024 || prepare_us >= 50_000 {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "SGFX_VIRGL_BUFFER_UPLOAD stage=prepared tracked={} slot={} physical_revision={:?} target_revision={} delta_base={:?} upload_start={} upload_bytes={} shadow_bytes={} prepare_us={} intervals={} upload_span_bytes={}",
+                    mode.is_tracked(),
+                    spec.slot,
+                    uploaded_revision,
+                    spec.revision,
+                    update.map(|update| update.previous_revision),
+                    ranges.as_slice()[0].start,
+                    ranges
+                        .as_slice()
+                        .iter()
+                        .map(|range| range.len())
+                        .sum::<usize>(),
+                    source.len(),
+                    prepare_us,
+                    ranges.as_slice().len(),
+                    ranges.as_slice().last().unwrap().end - ranges.as_slice()[0].start,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2050,7 +2222,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         spec: IrTextureSpec,
-        upload: &IrTextureUpload,
+        upload: &IrTextureUpload<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
@@ -2190,7 +2362,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         target: IrTextureSpec,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if !target.render_attachment
@@ -2236,7 +2408,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         image: &Image,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         self.submit_ir_target(
@@ -2263,7 +2435,7 @@ impl Queue {
         context: &Context,
         resources: &mut IrResources,
         target: IrPassTarget,
-        submission: &IrSubmission,
+        submission: &IrSubmission<'_>,
         mode: &mut SubmitMode,
     ) -> HandleResult<()> {
         if self.context_handle != context.handle_id()
@@ -2299,6 +2471,8 @@ impl Queue {
                         | IrTextureFormat::Rgba8
                         | IrTextureFormat::R8
                         | IrTextureFormat::Rg8
+                        | IrTextureFormat::Rgba16Float
+                        | IrTextureFormat::Rgba32Float
                 )
                 || spec.width != target.width
                 || spec.height != target.height
@@ -2399,14 +2573,13 @@ impl Queue {
                     let mut setup = Vec::new();
                     push_programmable_pipeline(&mut setup, native)?;
                     for range in command_packet_ranges(&setup, self.max_command_size())? {
-                        mode.prepare_packet(self.max_command_size())?;
+                        mode.prepare_packet(range.len())?;
                         mode.submit(&self.raw, &setup[range])?;
                     }
                     native.initialized.set(true);
                 }
             }
         }
-        mode.prepare_packet(self.max_command_size())?;
         if !submission.vertices.is_empty() {
             self.prepare_ir_upload_arena(context, resources, mode)?;
         }
@@ -2622,14 +2795,16 @@ impl Queue {
                 )?;
             }
         }
-        if !submission.vertices.is_empty() {
+        let vertex_upload = if !submission.vertices.is_empty() {
             push_ir_inline_write(
                 &mut commands,
                 resources.vertex_resource_id,
                 &submission.vertices,
-                mode,
-            )?;
-        }
+                mode.is_tracked(),
+            )?
+        } else {
+            None
+        };
 
         // Re-emitting the complete state for every draw used to make a pass
         // exceed the queue's 64 KiB opaque-command limit even when the vertex
@@ -2785,6 +2960,17 @@ impl Queue {
 
         for upload in &submission.texture_uploads {
             self.upload_ir_texture(context, resources, upload.texture, upload, mode)?;
+        }
+        // Choose the staging range only after uploads and exact packet sizing.
+        // Reserving the transport maximum here used to force one native fence
+        // per pass, even for a few hundred bytes of drawing commands. Choosing
+        // the arena earlier also let intervening texture packets rotate it.
+        mode.prepare_packet(commands.len())?;
+        if let Some(upload) = vertex_upload {
+            let (resource, offset) = mode
+                .upload_range(upload.byte_len)?
+                .ok_or(HandleError::InvalidParameter)?;
+            upload.bind(&mut commands, resource, offset);
         }
         mode.submit(&self.raw, &commands)?;
         if !resources.initialized.get() {
@@ -3233,7 +3419,7 @@ fn ir_texture<'resources>(
     Ok(texture)
 }
 
-fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmission> {
+fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmission<'static>> {
     let filter = copy.filter.ok_or(HandleError::InvalidParameter)?;
     if copy.destination_mip != 0
         || copy.source_mip >= 32
@@ -3291,6 +3477,7 @@ fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmissio
         .try_reserve_exact(1)
         .map_err(|_| HandleError::OutOfResources)?;
     draws.push(IrDraw {
+        draw_index: 0,
         programmable: None,
         start_vertex: 0,
         instance_count: 1,
@@ -3299,6 +3486,7 @@ fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmissio
         vertex_count: 6,
         vertex_buffer: None,
         pipeline: IrPipelineState {
+            depth_bias: [0; 2],
             slot: IR_BLIT_PIPELINE_SLOT,
             fragment: IrFragmentProgram::TextureRgba,
             blend: IrBlendState {
@@ -3324,6 +3512,7 @@ fn narrow_color_blit_submission(copy: IrTextureCopy) -> HandleResult<IrSubmissio
             min_lod: copy.source_mip as f32,
             max_lod: copy.source_mip as f32,
             compare: None,
+            anisotropy: 1,
         }),
         uniforms: IrUniforms {
             transform: [
@@ -3404,6 +3593,7 @@ fn ir_pipeline<'resources>(
 fn ir_sampler_states_equal(left: IrSamplerState, right: IrSamplerState) -> bool {
     left.slot == right.slot
         && left.compare == right.compare
+        && left.anisotropy == right.anisotropy
         && ir_filter_modes_equal(left.min_filter, right.min_filter)
         && ir_filter_modes_equal(left.mag_filter, right.mag_filter)
         && ir_filter_modes_equal(left.mip_filter, right.mip_filter)
@@ -3455,7 +3645,7 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
         .as_ref()
         .ok_or(HandleError::InvalidParameter)?;
     if programmable.pipeline.slot >= resources.programmable_pipelines.len()
-        || draw.pipeline.slot != programmable.pipeline.slot + IR_PROGRAMMABLE_PIPELINE_SLOTS
+        || draw.pipeline.slot != programmable_pipeline_alias(programmable.pipeline.slot)?
         || draw.texture.is_some()
         || draw.sampler.is_some()
     {
@@ -3468,7 +3658,14 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
     for (slot, layout) in programmable.pipeline.vertex_buffers.iter().enumerate() {
         let binding = draw.vertex_buffers[slot].ok_or(HandleError::InvalidParameter)?;
         uploaded_ir_buffer(resources, binding.buffer)?;
-        let elements = if programmable.index_buffer.is_some() {
+        let elements = if layout.step_mode() == crate::ir::VertexStepMode::Instance {
+            u64::from(
+                draw.instance_count
+                    .checked_sub(1)
+                    .ok_or(HandleError::InvalidParameter)?
+                    / layout.instance_divisor(),
+            ) + 1
+        } else if programmable.index_buffer.is_some() {
             1
         } else {
             end as u64
@@ -3545,6 +3742,7 @@ fn validate_programmable_draw(resources: &IrResources, draw: &IrDraw) -> HandleR
 
 fn ir_pipeline_states_equal(left: IrPipelineState, right: IrPipelineState) -> bool {
     left.slot == right.slot
+        && left.depth_bias == right.depth_bias
         && ir_fragment_programs_equal(left.fragment, right.fragment)
         && ir_blend_states_equal(left.blend, right.blend)
         && left.color_write_mask == right.color_write_mask
@@ -3645,14 +3843,13 @@ fn validate_ir_draw(
     draw: &IrDraw,
     vertices_len: usize,
 ) -> HandleResult<()> {
-    if let Some([x, y, width, height, min_depth, max_depth]) = draw.viewport {
-        if crate::ir::Viewport::new(x, y, width, height, min_depth, max_depth).is_err()
+    if let Some([x, y, width, height, min_depth, max_depth]) = draw.viewport
+        && (crate::ir::Viewport::new(x, y, width, height, min_depth, max_depth).is_err()
             || x + width > target_width as f32
             || y.min(y + height) < 0.0
-            || y.max(y + height) > target_height as f32
-        {
-            return Err(HandleError::InvalidParameter);
-        }
+            || y.max(y + height) > target_height as f32)
+    {
+        return Err(HandleError::InvalidParameter);
     }
     if draw.programmable.is_some() {
         if !super::driver::draw_count_valid(draw)
@@ -3728,7 +3925,7 @@ fn validate_ir_draw(
     Ok(())
 }
 
-fn resource_id_from_token(token: u64) -> HandleResult<u32> {
+pub(crate) fn resource_id_from_token(token: u64) -> HandleResult<u32> {
     u32::try_from(token)
         .ok()
         .filter(|&resource_id| resource_id != 0)
@@ -3838,12 +4035,20 @@ fn append_composition_quad(
     Ok(())
 }
 
-fn command_header(command: u32, object: u32, payload_dwords: u32) -> u32 {
+pub(crate) fn command_header(command: u32, object: u32, payload_dwords: u32) -> u32 {
     command | (object << 8) | (payload_dwords << 16)
 }
 
-fn push_dword(commands: &mut Vec<u8>, value: u32) {
+pub(crate) fn push_dword(commands: &mut Vec<u8>, value: u32) {
     commands.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_words(commands: &mut Vec<u8>, values: &[u32]) -> HandleResult<()> {
+    commands
+        .try_reserve(core::mem::size_of_val(values))
+        .map_err(|_| HandleError::OutOfResources)?;
+    commands.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+    Ok(())
 }
 
 fn push_float(commands: &mut Vec<u8>, value: f32) {
@@ -3859,7 +4064,7 @@ fn push_fragment_shader(commands: &mut Vec<u8>, handle: u32) {
     push_bind_shader(commands, PIPE_SHADER_FRAGMENT, handle);
 }
 
-fn push_bind_shader(commands: &mut Vec<u8>, stage: u32, handle: u32) {
+pub(crate) fn push_bind_shader(commands: &mut Vec<u8>, stage: u32, handle: u32) {
     push_dword(commands, command_header(VIRGL_CCMD_BIND_SHADER, 0, 2));
     push_dword(commands, handle);
     push_dword(commands, stage);
@@ -3870,6 +4075,8 @@ fn ir_storage_pipe_format(format: IrTextureFormat, native_narrow: bool) -> u32 {
         IrTextureFormat::R8 => VIRGL_FORMAT_R8_UNORM,
         IrTextureFormat::Rg8 => VIRGL_FORMAT_R8G8_UNORM,
         IrTextureFormat::Depth32Float => VIRGL_FORMAT_Z32_FLOAT,
+        IrTextureFormat::Rgba16Float => 94,
+        IrTextureFormat::Rgba32Float => 31,
         _ => VIRGL_FORMAT_B8G8R8A8_UNORM,
     }
 }
@@ -4186,7 +4393,7 @@ fn push_ir_sampler_view_swizzled(
     push_dword(commands, swizzle);
 }
 
-fn push_destroy_object(commands: &mut Vec<u8>, object: u32, handle: u32) {
+pub(crate) fn push_destroy_object(commands: &mut Vec<u8>, object: u32, handle: u32) {
     push_dword(
         commands,
         command_header(VIRGL_CCMD_DESTROY_OBJECT, object, 1),
@@ -4396,7 +4603,7 @@ fn push_constant_buffer(
     Ok(())
 }
 
-fn push_constant_words(
+pub(crate) fn push_constant_words(
     commands: &mut Vec<u8>,
     shader_type: u32,
     values: &[u32],
@@ -4411,10 +4618,7 @@ fn push_constant_words(
     );
     push_dword(commands, shader_type);
     push_dword(commands, 0);
-    for value in values {
-        push_dword(commands, *value);
-    }
-    Ok(())
+    push_words(commands, values)
 }
 
 fn push_ir_setup(commands: &mut Vec<u8>, resources: &IrResources) {
@@ -4519,12 +4723,13 @@ fn push_programmable_pipeline(
             commands,
             pipeline.vertex_elements_handle,
             &description.vertex_buffers,
+            &description.vertex.input_locations,
         )
     }
 }
 
 #[cfg(feature = "programmable")]
-fn push_programmable_shader(
+pub(crate) fn push_programmable_shader(
     commands: &mut Vec<u8>,
     handle: u32,
     stage: u32,
@@ -4599,22 +4804,9 @@ fn push_programmable_vertex_elements(
     commands: &mut Vec<u8>,
     handle: u32,
     layouts: &[crate::ir::VertexBufferLayout],
+    input_locations: &[u32],
 ) -> HandleResult<()> {
-    let attributes: Vec<_> = layouts
-        .iter()
-        .enumerate()
-        .flat_map(|(slot, layout)| {
-            layout
-                .attributes()
-                .iter()
-                .map(move |attribute| (slot, layout, attribute))
-        })
-        .collect();
-    let count = attributes
-        .iter()
-        .map(|(_, _, attribute)| attribute.location() + 1)
-        .max()
-        .unwrap_or(0);
+    let count = input_locations.len() as u32;
     if count > 16 {
         return Err(HandleError::InvalidParameter);
     }
@@ -4627,20 +4819,30 @@ fn push_programmable_vertex_elements(
         ),
     );
     push_dword(commands, handle);
-    for location in 0..count {
-        // Shader IN numbers correspond to locations, independently of the
-        // application's attribute order. Fill unused holes with a valid fetch.
-        let (slot, layout, attribute) = attributes
+    for &location in input_locations {
+        // Match the compiler's dense IN slots, preserving each logical
+        // attribute's buffer, format, offset and instance divisor.
+        let (slot, layout, attribute) = layouts
             .iter()
-            .find(|(_, _, attribute)| attribute.location() == location)
-            .or_else(|| attributes.first())
+            .enumerate()
+            .find_map(|(slot, layout)| {
+                layout
+                    .attributes()
+                    .iter()
+                    .find(|attribute| attribute.location() == location)
+                    .map(|attribute| (slot, layout, attribute))
+            })
             .ok_or(HandleError::InvalidParameter)?;
         push_dword(commands, attribute.offset());
         push_dword(
             commands,
-            u32::from(layout.step_mode() == crate::ir::VertexStepMode::Instance),
+            if layout.step_mode() == crate::ir::VertexStepMode::Instance {
+                layout.instance_divisor()
+            } else {
+                0
+            },
         );
-        push_dword(commands, *slot as u32);
+        push_dword(commands, slot as u32);
         push_dword(
             commands,
             match attribute.format() {
@@ -4654,6 +4856,15 @@ fn push_programmable_vertex_elements(
                 // VIRGL_FORMAT_R16G16_UINT from the shared VirGL protocol.
                 crate::ir::VertexFormat::Uint16x2 => 186,
                 crate::ir::VertexFormat::Sint16x4 => 192,
+                crate::ir::VertexFormat::Sint16x2 => 190,
+                crate::ir::VertexFormat::Snorm8x4 => 77,
+                crate::ir::VertexFormat::Uint32x2 => 194,
+                crate::ir::VertexFormat::Uint32x3 => 195,
+                crate::ir::VertexFormat::Uint32x4 => 196,
+                crate::ir::VertexFormat::Sint32x2 => 198,
+                crate::ir::VertexFormat::Sint32x3 => 199,
+                crate::ir::VertexFormat::Sint32x4 => 200,
+
                 crate::ir::VertexFormat::Float16x2 => 92,
                 crate::ir::VertexFormat::Float16x4 => 94,
                 crate::ir::VertexFormat::Snorm10_10_10_2 => 173,
@@ -4668,10 +4879,12 @@ fn push_programmable_vertex_elements(
 /// for every draw. Constant packing buffers retain their capacity.
 #[derive(Default)]
 struct ProgrammableBindings {
+    rasterizer: Option<u32>,
+    dsa: Option<u32>,
     pipeline: Option<(u32, u32, u32, u32)>,
     vertex_buffers: Option<[(u32, u32, u32); 8]>,
     constants: Option<Rc<[IrConstantBuffer]>>,
-    first_instance: Option<u32>,
+    first_instance: Option<[u32; 3]>,
     vertex_constants: Vec<u32>,
     fragment_constants: Vec<u32>,
     textures: Vec<((u32, u32), (u32, u32))>,
@@ -4683,14 +4896,14 @@ fn push_programmable_constants(
     commands: &mut Vec<u8>,
     constants: &Rc<[IrConstantBuffer]>,
     first_instance_register: Option<u32>,
-    first_instance: u32,
+    draw_parameters: [u32; 3],
     bindings: &mut ProgrammableBindings,
 ) -> HandleResult<()> {
     let constants_unchanged = bindings.constants.as_ref().is_some_and(|previous| {
         Rc::ptr_eq(previous, constants) || previous.as_ref() == constants.as_ref()
     });
     let instance_unchanged =
-        first_instance_register.is_none_or(|_| bindings.first_instance == Some(first_instance));
+        first_instance_register.is_none_or(|_| bindings.first_instance == Some(draw_parameters));
     if constants_unchanged && instance_unchanged {
         return Ok(());
     }
@@ -4732,7 +4945,12 @@ fn push_programmable_constants(
                 .map_err(|_| HandleError::OutOfResources)?;
             bindings.vertex_constants.resize(end, 0);
         }
-        bindings.vertex_constants[start..end].copy_from_slice(&[first_instance, 0, 0, 0]);
+        bindings.vertex_constants[start..end].copy_from_slice(&[
+            draw_parameters[0],
+            draw_parameters[1],
+            draw_parameters[2],
+            0,
+        ]);
     }
     if (!constants_unchanged || !instance_unchanged) && !bindings.vertex_constants.is_empty() {
         push_constant_words(commands, PIPE_SHADER_VERTEX, &bindings.vertex_constants)?;
@@ -4741,7 +4959,7 @@ fn push_programmable_constants(
         push_constant_words(commands, PIPE_SHADER_FRAGMENT, &bindings.fragment_constants)?;
     }
     bindings.constants = Some(Rc::clone(constants));
-    bindings.first_instance = first_instance_register.map(|_| first_instance);
+    bindings.first_instance = first_instance_register.map(|_| draw_parameters);
     Ok(())
 }
 
@@ -4830,8 +5048,15 @@ fn push_programmable_draw(
         bindings.pipeline = Some(pipeline_key);
         bindings.constants = None;
     }
-    push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
-    push_bind_object(commands, VIRGL_OBJECT_DSA, state.dsa_handle.unwrap_or(0));
+    if bindings.rasterizer != Some(state.rasterizer_handle) {
+        push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
+        bindings.rasterizer = Some(state.rasterizer_handle);
+    }
+    let dsa = state.dsa_handle.unwrap_or(0);
+    if bindings.dsa != Some(dsa) {
+        push_bind_object(commands, VIRGL_OBJECT_DSA, dsa);
+        bindings.dsa = Some(dsa);
+    }
     let mut vertex_bindings = [(0, 0, 0); 8];
     for (slot, layout) in programmable.pipeline.vertex_buffers.iter().enumerate() {
         let binding = draw.vertex_buffers[slot].ok_or(HandleError::InvalidParameter)?;
@@ -4859,7 +5084,13 @@ fn push_programmable_draw(
         commands,
         &programmable.constants,
         first_instance_register,
-        draw.first_instance,
+        [
+            draw.first_instance,
+            programmable
+                .index_buffer
+                .map_or(draw.start_vertex as u32, |b| b.base_vertex as u32),
+            draw.draw_index,
+        ],
         bindings,
     )?;
     for binding in programmable.storage_buffers.iter() {
@@ -4990,7 +5221,7 @@ fn push_buffer_sampler_view(
         193, /* R32_UINT */
         0,
         (size / 4 - 1) as u32,
-        0 | (1 << 3) | (2 << 6) | (3 << 9),
+        (1 << 3) | (2 << 6) | (3 << 9),
     ] {
         push_dword(commands, word);
     }
@@ -5038,14 +5269,19 @@ fn push_ir_pipeline(commands: &mut Vec<u8>, pipeline: &IrPipeline) {
     push_dword(commands, pipeline.rasterizer_handle);
     push_dword(
         commands,
-        ir_rasterizer_flags(pipeline.state.cull_mode, pipeline.state.front_face),
+        ir_rasterizer_flags(pipeline.state.cull_mode, pipeline.state.front_face)
+            | if pipeline.state.depth_bias.map(f32::from_bits) != [0.0; 2] {
+                1 << 20
+            } else {
+                0
+            },
     );
     push_float(commands, 1.0);
     push_dword(commands, 0);
     push_dword(commands, 0);
     push_float(commands, 1.0);
-    push_float(commands, 0.0);
-    push_float(commands, 0.0);
+    push_dword(commands, pipeline.state.depth_bias[0]);
+    push_dword(commands, pipeline.state.depth_bias[1]);
     push_float(commands, 0.0);
     if let (Some(handle), Some(depth)) = (pipeline.dsa_handle, pipeline.state.depth) {
         push_ir_dsa(commands, handle, depth);
@@ -5092,6 +5328,7 @@ fn push_ir_sampler(commands: &mut Vec<u8>, sampler: &IrSampler) {
             | (ir_filter_mode(state.min_filter) << 9)
             | (ir_filter_mode(state.mip_filter) << 11)
             | (ir_filter_mode(state.mag_filter) << 13)
+            | (u32::from(state.anisotropy) << 20)
             | (u32::from(state.compare.is_some()) << 15)
             | (state.compare.map_or(0, |compare| match compare {
                 crate::ir::CompareFunction::Never => 0,
@@ -5233,12 +5470,33 @@ fn push_ir_clear_surface(
     Ok(())
 }
 
+struct PendingVertexUpload {
+    inline_start: usize,
+    copy_start: usize,
+    byte_len: u32,
+}
+
+impl PendingVertexUpload {
+    fn bind(self, commands: &mut [u8], resource: u32, offset: u32) {
+        // Both command records were emitted together below. Patch only their
+        // staging source; the vertex payload and final destination stay put.
+        for (word, value) in [
+            (self.inline_start + 4, resource),
+            (self.inline_start + 24, offset),
+            (self.copy_start + 24, resource),
+            (self.copy_start + 32, offset),
+        ] {
+            commands[word..word + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    }
+}
+
 fn push_ir_inline_write(
     commands: &mut Vec<u8>,
     resource_id: u32,
     vertices: &[IrVertex],
-    mode: &mut SubmitMode,
-) -> HandleResult<()> {
+    staged: bool,
+) -> HandleResult<Option<PendingVertexUpload>> {
     let components = vertices
         .len()
         .checked_mul(10)
@@ -5249,17 +5507,16 @@ fn push_ir_inline_write(
         .checked_mul(40)
         .and_then(|length| u32::try_from(length).ok())
         .ok_or(HandleError::InvalidParameter)?;
+    let inline_start = commands.len();
     push_dword(
         commands,
         command_header(VIRGL_CCMD_RESOURCE_INLINE_WRITE, 0, 11 + components),
     );
-    let upload = mode.upload_range(byte_len)?;
-    let (upload_resource, upload_offset) = upload.unwrap_or((resource_id, 0));
-    push_dword(commands, upload_resource);
+    push_dword(commands, resource_id);
     for _ in 0..4 {
         push_dword(commands, 0);
     }
-    push_dword(commands, upload_offset);
+    push_dword(commands, 0);
     for _ in 0..2 {
         push_dword(commands, 0);
     }
@@ -5277,17 +5534,16 @@ fn push_ir_inline_write(
             push_float(commands, component);
         }
     }
-    if upload.is_some() {
-        push_ir_buffer_copy(
-            commands,
-            resource_id,
-            0,
-            upload_resource,
-            upload_offset,
+    if staged {
+        let copy_start = commands.len();
+        push_ir_buffer_copy(commands, resource_id, 0, resource_id, 0, byte_len);
+        return Ok(Some(PendingVertexUpload {
+            inline_start,
+            copy_start,
             byte_len,
-        );
+        }));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn push_ir_buffer_upload(
@@ -5380,7 +5636,7 @@ fn push_ir_buffer_inline_write(
 // VirGL's payload is 11 header words followed by tightly packed pixel bytes.
 fn submit_ir_texture_inline_write(
     resource_id: u32,
-    upload: &IrTextureUpload,
+    upload: &IrTextureUpload<'_>,
     max_command_size: usize,
     mut submit: impl FnMut(&[u8]) -> HandleResult<()>,
 ) -> HandleResult<()> {
@@ -5411,11 +5667,17 @@ fn submit_ir_texture_inline_write(
             (upload.texture.width >> upload.mip_level).max(1),
             (upload.texture.height >> upload.mip_level).max(1),
         )
-        || upload.texture.format == IrTextureFormat::Depth32Float
         || !matches!(
             upload.storage_format,
-            IrTextureFormat::Bgra8 | IrTextureFormat::R8 | IrTextureFormat::Rg8
+            IrTextureFormat::Bgra8
+                | IrTextureFormat::R8
+                | IrTextureFormat::Rg8
+                | IrTextureFormat::Depth32Float
+                | IrTextureFormat::Rgba16Float
+                | IrTextureFormat::Rgba32Float
         )
+        || upload.texture.format == IrTextureFormat::Depth32Float
+            && upload.storage_format != IrTextureFormat::Depth32Float
         || upload.storage_format != IrTextureFormat::Bgra8
             && upload.storage_format != upload.texture.format
         || upload.pixels.len() != byte_len
@@ -5520,6 +5782,8 @@ fn ir_blend_op(operation: IrBlendOp) -> u32 {
         IrBlendOp::Add => PIPE_BLEND_ADD,
         IrBlendOp::Subtract => PIPE_BLEND_SUBTRACT,
         IrBlendOp::ReverseSubtract => PIPE_BLEND_REVERSE_SUBTRACT,
+        IrBlendOp::Min => 3, // PIPE_BLEND_MIN
+        IrBlendOp::Max => 4, // PIPE_BLEND_MAX
     }
 }
 
@@ -5552,7 +5816,57 @@ fn ir_address_mode(address: IrAddressMode) -> u32 {
     }
 }
 
-/// A partial upload is safe only on the exact physical predecessor revision.
+enum BufferUploadRanges<'a> {
+    Single(core::ops::Range<usize>),
+    Sparse(&'a [core::ops::Range<usize>]),
+}
+
+impl BufferUploadRanges<'_> {
+    fn as_slice(&self) -> &[core::ops::Range<usize>] {
+        match self {
+            Self::Single(range) => core::slice::from_ref(range),
+            Self::Sparse(ranges) => ranges,
+        }
+    }
+}
+
+fn ir_buffer_upload_ranges(
+    uploaded_revision: Option<u64>,
+    revision: u64,
+    length: usize,
+    update: Option<&IrBufferUpdate>,
+) -> HandleResult<BufferUploadRanges<'_>> {
+    let envelope = ir_buffer_upload_range(uploaded_revision, revision, length, update)?;
+    let Some(update) = update else {
+        return Ok(BufferUploadRanges::Single(envelope));
+    };
+    if uploaded_revision != Some(update.previous_revision) || update.previous_revision >= revision {
+        return Ok(BufferUploadRanges::Single(envelope));
+    }
+    let Some(intervals) = &update.intervals else {
+        return Ok(BufferUploadRanges::Single(envelope));
+    };
+    let ranges = intervals.ranges();
+    if ranges.is_empty() {
+        return Ok(BufferUploadRanges::Single(0..length));
+    }
+    if ranges.len() > crate::driver::MAX_BUFFER_DIRTY_INTERVALS
+        || ranges.first().unwrap().start != envelope.start
+        || ranges.last().unwrap().end != envelope.end
+        || ranges.iter().any(|range| {
+            range.start >= range.end
+                || range.end > length
+                || !range.start.is_multiple_of(4)
+                || !range.end.is_multiple_of(4)
+        })
+        || ranges.windows(2).any(|pair| pair[0].end >= pair[1].start)
+    {
+        return Err(HandleError::InvalidParameter);
+    }
+    Ok(BufferUploadRanges::Sparse(ranges))
+}
+
+/// A cumulative delta is safe only on its exact physical base revision.
 fn ir_buffer_upload_range(
     uploaded_revision: Option<u64>,
     revision: u64,
@@ -5565,9 +5879,7 @@ fn ir_buffer_upload_range(
     if update.range.start >= update.range.end || update.range.end > length {
         return Err(HandleError::InvalidParameter);
     }
-    if uploaded_revision != Some(update.previous_revision)
-        || update.previous_revision.checked_add(1) != Some(revision)
-    {
+    if uploaded_revision != Some(update.previous_revision) || update.previous_revision >= revision {
         return Ok(0..length);
     }
     let start = update.range.start & !3;
@@ -5743,27 +6055,31 @@ fn push_instanced_draw_parameters(
             PIPE_PRIM_LINES
         }
         crate::ir::PrimitiveTopology::LineStrip if vertex_count >= 2 => PIPE_PRIM_LINE_STRIP,
+        crate::ir::PrimitiveTopology::PointList if vertex_count > 0 => 0, // PIPE_PRIM_POINTS
         _ => return Err(HandleError::InvalidParameter),
     };
-    push_dword(commands, command_header(VIRGL_CCMD_DRAW_VBO, 0, 12));
-    push_dword(commands, start_vertex);
-    push_dword(commands, vertex_count);
-    push_dword(commands, primitive);
-    push_dword(commands, u32::from(indexed));
-    push_dword(commands, instance_count);
-    push_dword(commands, base_vertex as u32);
-    // VirGL's host may lack GL_ARB_base_instance. The shader constant above
-    // supplies Vulkan's firstInstance to InstanceIndex instead.
-    push_dword(commands, 0);
-    push_dword(commands, 0);
-    push_dword(commands, 0);
-    push_dword(commands, 0);
-    push_dword(commands, u32::MAX);
-    push_dword(commands, 0);
-    Ok(())
+    // Base instance remains in the shader constant bank on this backend.
+    push_words(
+        commands,
+        &[
+            command_header(VIRGL_CCMD_DRAW_VBO, 0, 12),
+            start_vertex,
+            vertex_count,
+            primitive,
+            u32::from(indexed),
+            instance_count,
+            base_vertex as u32,
+            0,
+            0,
+            0,
+            0,
+            u32::MAX,
+            0,
+        ],
+    )
 }
 
-fn push_shader(commands: &mut Vec<u8>, handle: u32, shader_type: u32, source: &str) {
+pub(crate) fn push_shader(commands: &mut Vec<u8>, handle: u32, shader_type: u32, source: &str) {
     push_shader_with_token_count(
         commands,
         handle,
@@ -5898,6 +6214,31 @@ fn push_clear_and_draw(commands: &mut Vec<u8>, clear_color: Color, vertex_count:
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_pipeline_capacity_keeps_alias_offset_distinct_from_programmable_capacity() {
+        let fixed: Vec<Option<()>> = empty_slots(IR_PIPELINE_SLOTS + 1).unwrap();
+        let programmable: Vec<Option<()>> = empty_slots(IR_PROGRAMMABLE_PIPELINE_SLOTS).unwrap();
+        assert_eq!(IR_PROGRAMMABLE_PIPELINE_OFFSET, 256);
+        assert_eq!(programmable.len(), 512);
+        assert_eq!(fixed.len(), 769);
+        for (slot, alias) in [(0, 256), (255, 511), (256, 512), (333, 589), (511, 767)] {
+            assert_eq!(programmable_pipeline_alias(slot), Ok(alias));
+            assert!(programmable.get(slot).is_some());
+            assert!(fixed.get(alias).is_some());
+            assert!(alias >= crate::ir::MAX_RENDER_PIPELINES);
+            assert!(alias < IR_BLIT_PIPELINE_SLOT);
+        }
+        for slot in [512, usize::MAX] {
+            assert_eq!(
+                programmable_pipeline_alias(slot),
+                Err(HandleError::InvalidParameter)
+            );
+            assert!(programmable.get(slot).is_none());
+        }
+        assert_eq!(IR_BLIT_PIPELINE_SLOT, 768);
+        assert!(fixed.get(IR_BLIT_PIPELINE_SLOT).is_some());
+    }
+
     #[cfg(feature = "backend-abi")]
     #[test]
     fn idle_poll_without_dispatch_state_rejects_uncertain_cleanup() {
@@ -5951,7 +6292,8 @@ mod tests {
             dsa_handle: Some(23),
             initialized: Cell::new(false),
             state: IrPipelineState {
-                slot: 17 + IR_PROGRAMMABLE_PIPELINE_SLOTS,
+                depth_bias: [0; 2],
+                slot: 17 + IR_PROGRAMMABLE_PIPELINE_OFFSET,
                 fragment: IrFragmentProgram::Solid,
                 blend: IrBlendState {
                     color: replace,
@@ -6152,6 +6494,7 @@ mod tests {
         let update = IrBufferUpdate {
             previous_revision: 8,
             range: 5..11,
+            intervals: None,
         };
         assert_eq!(
             ir_buffer_upload_range(Some(8), 9, 4096, Some(&update)).unwrap(),
@@ -6165,12 +6508,118 @@ mod tests {
         }
         assert_eq!(
             ir_buffer_upload_range(Some(8), 10, 4096, Some(&update)).unwrap(),
-            0..4096
+            4..12
         );
         assert_eq!(
             ir_buffer_upload_range(Some(8), 9, 4096, None).unwrap(),
             0..4096
         );
+    }
+
+    #[test]
+    fn cumulative_buffer_upload_encodes_union_only_on_the_exact_base() {
+        let update = IrBufferUpdate {
+            previous_revision: 8,
+            range: 5..37,
+            intervals: None,
+        };
+        let bytes: Vec<u8> = (0..64).collect();
+        let range = ir_buffer_upload_range(Some(8), 11, bytes.len(), Some(&update)).unwrap();
+        assert_eq!(range, 4..40);
+        let mut commands = Vec::new();
+        push_ir_buffer_inline_write(&mut commands, 17, range.start as u32, &bytes[range.clone()])
+            .unwrap();
+        let words = dwords(&commands);
+        assert_eq!(words[6], 4);
+        assert_eq!(words[9], 36);
+        assert_eq!(&commands[48..], &bytes[4..40]);
+        // A missing, older, intervening, or newer physical base cannot certify
+        // this retained chain. Equality of the base, not proximity, is required.
+        for physical in [None, Some(7), Some(9), Some(10), Some(12)] {
+            assert_eq!(
+                ir_buffer_upload_range(physical, 11, bytes.len(), Some(&update)).unwrap(),
+                0..64
+            );
+        }
+        for current in [7, 8] {
+            assert_eq!(
+                ir_buffer_upload_range(Some(8), current, bytes.len(), Some(&update)).unwrap(),
+                0..64
+            );
+        }
+        assert_eq!(
+            ir_buffer_upload_range(Some(8), 11, bytes.len(), None).unwrap(),
+            0..64
+        );
+        for range in [5..5, 5..65] {
+            let invalid = IrBufferUpdate {
+                previous_revision: 8,
+                range,
+                intervals: None,
+            };
+            assert!(ir_buffer_upload_range(Some(8), 11, bytes.len(), Some(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn distant_dirty_words_upload_eight_bytes_and_preserve_the_gap() {
+        let mut update = IrBufferUpdate::sparse(7, 4..8);
+        let next = IrBufferUpdate::sparse(8, 4092..4096);
+        let mut latest = next;
+        latest.merge_previous(&update);
+        update = latest;
+        let ranges = ir_buffer_upload_ranges(Some(7), 9, 8192, Some(&update)).unwrap();
+        assert_eq!(ranges.as_slice(), &[4..8, 4092..4096]);
+        let mut physical = vec![3_u8; 8192];
+        let mut target = physical.clone();
+        target[4..8].fill(9);
+        target[4092..4096].fill(7);
+        let mut payload_bytes = 0;
+        for range in ranges.as_slice() {
+            let mut packet = Vec::new();
+            push_ir_buffer_inline_write(
+                &mut packet,
+                17,
+                range.start as u32,
+                &target[range.clone()],
+            )
+            .unwrap();
+            let words = dwords(&packet);
+            let start = words[6] as usize;
+            let length = words[9] as usize;
+            payload_bytes += length;
+            physical[start..start + length].copy_from_slice(&packet[48..]);
+        }
+        assert_eq!(payload_bytes, 8);
+        assert_eq!(physical, target);
+        assert!(physical[8..4092].iter().all(|byte| *byte == 3));
+        for base in [None, Some(6), Some(8), Some(10)] {
+            let repair = ir_buffer_upload_ranges(base, 9, 8192, Some(&update)).unwrap();
+            assert_eq!(repair.as_slice().len(), 1);
+            assert_eq!(repair.as_slice()[0], 0..8192);
+        }
+        let legacy = IrBufferUpdate {
+            previous_revision: 7,
+            range: 4..4096,
+            intervals: None,
+        };
+        let ranges = ir_buffer_upload_ranges(Some(7), 9, 8192, Some(&legacy)).unwrap();
+        assert_eq!(ranges.as_slice().len(), 1);
+        assert_eq!(ranges.as_slice()[0], 4..4096);
+        update.range = 0..8192; // An inconsistent envelope must not hide lost intervals.
+        assert!(ir_buffer_upload_ranges(Some(7), 9, 8192, Some(&update)).is_err());
+    }
+
+    #[test]
+    fn interval_overflow_forces_complete_physical_repair() {
+        let mut update = IrBufferUpdate::sparse(7, 0..4);
+        for index in 1..=crate::driver::MAX_BUFFER_DIRTY_INTERVALS {
+            update.include_range(index * 8..index * 8 + 4);
+        }
+        assert!(update.intervals.as_ref().unwrap().ranges().is_empty());
+        let ranges = ir_buffer_upload_ranges(Some(7), 9, 8192, Some(&update)).unwrap();
+        assert_eq!(ranges.as_slice().len(), 1);
+        assert_eq!(ranges.as_slice()[0], 0..8192);
     }
 
     #[test]
@@ -6188,6 +6637,7 @@ mod tests {
                 min_lod: 0.0,
                 max_lod: 1000.0,
                 compare: None,
+                anisotropy: 1,
             },
         };
         let mut bytes = Vec::new();
@@ -6404,6 +6854,7 @@ mod tests {
         for (topology, token, valid, invalid) in [
             (crate::ir::PrimitiveTopology::LineList, 1, 4, 3),
             (crate::ir::PrimitiveTopology::LineStrip, 3, 3, 1),
+            (crate::ir::PrimitiveTopology::PointList, 0, 1, 0),
         ] {
             for indexed in [false, true] {
                 let mut commands = Vec::new();
@@ -6591,21 +7042,24 @@ mod tests {
         )
         .unwrap();
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 67, core::slice::from_ref(&layout))
-            .unwrap();
+        push_programmable_vertex_elements(
+            &mut commands,
+            67,
+            core::slice::from_ref(&layout),
+            &[2, 0],
+        )
+        .unwrap();
         let words = dwords(&commands);
         assert_eq!(
             words[0],
-            command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 13)
+            command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 9)
         );
         assert_eq!(words[1], 67);
-        assert_eq!(&words[2..6], &[0, 0, 0, VIRGL_FORMAT_R32G32B32_FLOAT]);
-        // The undeclared location has a safe fetch, while location 2 retains
-        // its true byte offset and normalized format despite the input order.
-        assert_eq!(&words[6..10], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
-        assert_eq!(&words[10..14], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
+        // Logical location 2 is dense slot 0, and location 0 is dense slot 1.
+        assert_eq!(&words[2..6], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
+        assert_eq!(&words[6..10], &[0, 0, 0, VIRGL_FORMAT_R32G32B32_FLOAT]);
         commands.clear();
-        push_programmable_vertex_elements(&mut commands, 68, &[]).unwrap();
+        push_programmable_vertex_elements(&mut commands, 68, &[], &[]).unwrap();
         assert_eq!(
             dwords(&commands),
             alloc::vec![
@@ -6667,23 +7121,25 @@ mod tests {
         let mut bindings = ProgrammableBindings::default();
         let mut commands = Vec::new();
         let first = constants(7);
-        push_programmable_constants(&mut commands, &first, None, 0, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &first, None, [0; 3], &mut bindings).unwrap();
         let encoded = commands.clone();
         let storage = bindings.vertex_constants.as_ptr();
-        push_programmable_constants(&mut commands, &first, None, 0, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &first, None, [0; 3], &mut bindings).unwrap();
         let separate_owner = constants(7);
         assert!(!Rc::ptr_eq(&first, &separate_owner));
-        push_programmable_constants(&mut commands, &separate_owner, None, 0, &mut bindings)
+        push_programmable_constants(&mut commands, &separate_owner, None, [0; 3], &mut bindings)
             .unwrap();
         assert_eq!(commands, encoded);
         commands.clear();
-        push_programmable_constants(&mut commands, &constants(9), None, 0, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants(9), None, [0; 3], &mut bindings)
+            .unwrap();
         assert_eq!(bindings.vertex_constants.as_ptr(), storage);
         assert_eq!(&bindings.vertex_constants, &[0, 0, 0, 0, 9, 9, 9, 9]);
         assert_eq!(first[0].words.as_slice(), &[7; 4]);
         let mut fresh_packet = ProgrammableBindings::default();
         commands.clear();
-        push_programmable_constants(&mut commands, &first, None, 0, &mut fresh_packet).unwrap();
+        push_programmable_constants(&mut commands, &first, None, [0; 3], &mut fresh_packet)
+            .unwrap();
         assert_eq!(commands, encoded);
     }
 
@@ -6697,10 +7153,12 @@ mod tests {
         .into();
         let mut bindings = ProgrammableBindings::default();
         let mut commands = Vec::new();
-        push_programmable_constants(&mut commands, &constants, Some(2), 3, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants, Some(2), [3, 0, 0], &mut bindings)
+            .unwrap();
         assert_eq!(&bindings.vertex_constants[8..12], &[3, 0, 0, 0]);
         commands.clear();
-        push_programmable_constants(&mut commands, &constants, Some(2), 5, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants, Some(2), [5, 0, 0], &mut bindings)
+            .unwrap();
         let words = dwords(&commands);
         assert_eq!(
             words[0],
@@ -6709,7 +7167,8 @@ mod tests {
         assert_eq!(&words[1..3], &[PIPE_SHADER_VERTEX, 0]);
         assert_eq!(&words[11..15], &[5, 0, 0, 0]);
         commands.clear();
-        push_programmable_constants(&mut commands, &constants, Some(2), 5, &mut bindings).unwrap();
+        push_programmable_constants(&mut commands, &constants, Some(2), [5, 0, 0], &mut bindings)
+            .unwrap();
         assert!(commands.is_empty());
     }
 
@@ -6938,6 +7397,69 @@ mod tests {
     }
 
     #[test]
+    fn staged_vertex_packets_share_chunks_without_aliasing_and_rotate_after_texture_uploads() {
+        let mut packets = crate::packets::Packets::new(512);
+        // A preceding texture packet has already consumed half this chunk.
+        packets.append(&[0x7b; 256]).unwrap();
+        let vertex = IrVertex {
+            position: [1.0, 2.0, 3.0, 4.0],
+            secondary: [5.0, 6.0, 7.0, 8.0],
+            tertiary: [9.0, 10.0],
+        };
+        let mut encoded = Vec::new();
+        for _ in 0..3 {
+            let mut commands = Vec::new();
+            let upload = push_ir_inline_write(&mut commands, 17, &[vertex], true)
+                .unwrap()
+                .unwrap();
+            packets.prepare(commands.len()).unwrap();
+            let (arena, offset) = packets.upload_range(upload.byte_len).unwrap();
+            upload.bind(&mut commands, 100 + arena as u32, offset);
+            let words = dwords(&commands);
+            // Inline writes and GPU copies must use the same disjoint source.
+            assert_eq!(words[1], 100 + arena as u32);
+            assert_eq!(words[6], offset);
+            assert_eq!(words[23], 17);
+            assert_eq!(words[28], 100 + arena as u32);
+            assert_eq!(words[30], offset);
+            assert_eq!(words[33], 40);
+            assert_eq!(
+                &commands[48..88],
+                &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,]
+                    .map(f32::to_ne_bytes)
+                    .concat()
+            );
+            encoded.push((arena, offset));
+            packets.append(&commands).unwrap();
+        }
+        assert_eq!(encoded, [(0, 0), (1, 0), (1, 40)]);
+        let chunks = packets.finish().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].arena, Some(0));
+        assert_eq!(chunks[1].arena, Some(1));
+        assert_eq!(chunks[0].bytes.len(), 400);
+        assert_eq!(chunks[1].bytes.len(), 288);
+    }
+
+    #[test]
+    fn synchronous_vertex_packet_writes_final_buffer_without_staging_copy() {
+        let vertex = IrVertex {
+            position: [0.0; 4],
+            secondary: [0.0; 4],
+            tertiary: [0.0; 2],
+        };
+        let mut commands = Vec::new();
+        assert!(
+            push_ir_inline_write(&mut commands, 17, &[vertex], false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(commands.len(), 88);
+        assert_eq!(dwords(&commands)[1], 17);
+        assert_eq!(dwords(&commands)[6], 0);
+    }
+
+    #[test]
     fn vertex_buffer_copies_preserve_distinct_source_ranges_and_destination_offsets() {
         let mut commands = Vec::new();
         push_ir_buffer_copy(&mut commands, 17, 4096, 23, 120, 240);
@@ -7075,6 +7597,7 @@ mod tests {
             rasterizer_handle: 32,
             dsa_handle: None,
             state: IrPipelineState {
+                depth_bias: [0; 2],
                 slot: 0,
                 fragment: IrFragmentProgram::Solid,
                 blend,
@@ -7277,7 +7800,7 @@ mod tests {
             .with_step_mode(VertexStepMode::Instance),
         ];
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
+        push_programmable_vertex_elements(&mut commands, 9, &layouts, &[0, 1, 2]).unwrap();
         assert_eq!(
             &dwords(&commands)[2..],
             &[0, 0, 0, 29, 0, 1, 1, 29, 8, 1, 1, 28]
@@ -7296,7 +7819,7 @@ mod tests {
         )
         .unwrap();
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 9, &[layout]).unwrap();
+        push_programmable_vertex_elements(&mut commands, 9, &[layout], &[0, 1]).unwrap();
         assert_eq!(&dwords(&commands)[2..], &[0, 0, 0, 29, 8, 0, 0, 28]);
     }
 
@@ -7320,7 +7843,7 @@ mod tests {
             .unwrap(),
         ];
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
+        push_programmable_vertex_elements(&mut commands, 9, &layouts, &[0, 1, 2, 3]).unwrap();
         assert_eq!(
             &dwords(&commands)[2..],
             &[0, 0, 0, 193, 0, 0, 1, 192, 8, 0, 1, 92, 12, 0, 1, 186]
@@ -7360,7 +7883,7 @@ mod tests {
         assert!(commands.is_empty());
     }
 
-    fn texture_upload(width: u32, height: u32) -> IrTextureUpload {
+    fn texture_upload(width: u32, height: u32) -> IrTextureUpload<'static> {
         IrTextureUpload {
             texture: IrTextureSpec {
                 slot: 0,
@@ -7384,11 +7907,17 @@ mod tests {
                 width,
                 height,
             },
-            pixels: (0..width * height * 4).map(|value| value as u8).collect(),
+            pixels: (0..width * height * 4)
+                .map(|value| value as u8)
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 
-    fn check_upload_chunks(upload: &IrTextureUpload, limit: usize) -> Vec<(u32, u32, u32, u32)> {
+    fn check_upload_chunks(
+        upload: &IrTextureUpload<'_>,
+        limit: usize,
+    ) -> Vec<(u32, u32, u32, u32)> {
         let bpp = upload.storage_format.bytes_per_texel();
         let mut covered = alloc::vec![false; upload.pixels.len() / bpp];
         let mut rectangles = Vec::new();
@@ -7426,13 +7955,14 @@ mod tests {
         rectangles
     }
 
-    fn narrow_upload(format: IrTextureFormat, width: u32, height: u32) -> IrTextureUpload {
+    fn narrow_upload(format: IrTextureFormat, width: u32, height: u32) -> IrTextureUpload<'static> {
         let mut upload = texture_upload(width, height);
         upload.texture.format = format;
         upload.storage_format = format;
         upload.pixels = (0..width as usize * height as usize * format.bytes_per_texel())
             .map(|index| (index * 37 + index / 251) as u8)
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         upload
     }
 
@@ -7565,7 +8095,7 @@ mod tests {
             })
             .is_err()
         );
-        upload.pixels.pop();
+        upload.pixels.to_mut().pop();
         assert!(
             submit_ir_texture_inline_write(17, &upload, 72, |_| {
                 submitted += 1;

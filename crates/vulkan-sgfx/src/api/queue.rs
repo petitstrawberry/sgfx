@@ -1,17 +1,67 @@
 //! FIFO queue acceptance is independent of the device resource worker.
 use super::*;
 
+// Keep present's bounded wait set inline: boxing it would allocate on every frame.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Request {
     Run(Box<dyn FnOnce() + Send>),
+    #[cfg(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    ))]
+    Present(
+        Arc<Driver>,
+        [Option<Arc<AtomicU8>>; 64],
+        crate::wsi::Presentation,
+    ),
     Stop,
 }
-pub(super) fn start() -> VkResult<(mpsc::Sender<Request>, std::thread::JoinHandle<()>)> {
-    let (tx, rx) = mpsc::channel();
+pub(super) fn start() -> VkResult<(mpsc::SyncSender<Request>, std::thread::JoinHandle<()>)> {
+    // Matches logical admission. Storage is reserved once at device creation;
+    // the presentation hot path sends a typed packet without a boxed job.
+    let (tx, rx) = mpsc::sync_channel(4096);
     let thread = std::thread::Builder::new()
         .name("sgfx-vk-queue".into())
         .spawn(move || {
-            while let Ok(Request::Run(job)) = rx.recv() {
-                job();
+            while let Ok(request) = rx.recv() {
+                match request {
+                    Request::Run(job) => job(),
+                    Request::Stop => break,
+                    #[cfg(any(
+                        target_os = "scarlet",
+                        all(target_os = "linux", feature = "scarlet-wsi")
+                    ))]
+                    Request::Present(driver, waits, presentation) => {
+                        let result = (|| {
+                            let wait = crate::frame_profile::Span::new(
+                                "wait",
+                                "queued_present_semaphores",
+                            );
+                            if waits.iter().all(Option::is_none) {
+                                driver.in_flight.wait();
+                            } else {
+                                for semaphore in waits.iter().flatten() {
+                                    wait_and_consume_semaphores(
+                                        &driver,
+                                        std::slice::from_ref(semaphore),
+                                    )?;
+                                }
+                            }
+                            drop(wait);
+                            if driver.lost.load(Ordering::Acquire) {
+                                return Err(vk::Result::ERROR_DEVICE_LOST);
+                            }
+                            crate::wsi::execute_presentation(presentation)
+                        })();
+                        if let Err(error) = result {
+                            crate::wsi::fail_presentation(presentation, error);
+                            if error == vk::Result::ERROR_DEVICE_LOST {
+                                driver.mark_lost();
+                            }
+                        }
+                        driver.pending.finish();
+                    }
+                }
             }
         })
         .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
@@ -39,32 +89,28 @@ impl Semaphore {
         ))
     }
     fn wait(&self, d: &Driver) -> VkResult<()> {
-        loop {
+        d.in_flight.wait_until(u64::MAX, || {
             if d.lost.load(Ordering::Acquire) {
                 return Err(vk::Result::ERROR_DEVICE_LOST);
             }
-            let ready = match self {
+            Ok(match self {
                 Self::Binary(s) => s
                     .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok(),
                 Self::Timeline(s, v) => s.value.load(Ordering::Acquire) >= *v,
-            };
-            if ready {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_micros(50));
-        }
+            })
+        })
     }
 }
 #[derive(Default)]
-struct Packet {
+pub(super) struct Packet {
     waits: Vec<Semaphore>,
     binary_signals: Vec<Arc<AtomicU8>>,
     timeline_signals: Vec<(Arc<timeline::Timeline>, u64)>,
     recordings: Vec<Recording>,
     originals: Vec<RecordingCell>,
 }
-unsafe fn decode(d: &Arc<Driver>, info: &vk::SubmitInfo<'_>) -> VkResult<Packet> {
+pub(super) unsafe fn decode(d: &Arc<Driver>, info: &vk::SubmitInfo<'_>) -> VkResult<Packet> {
     if info.s_type != vk::StructureType::SUBMIT_INFO {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     }
@@ -157,6 +203,7 @@ pub(super) unsafe fn submit(
     infos: *const vk::SubmitInfo<'_>,
     fence: vk::Fence,
 ) -> VkResult<()> {
+    let _frame = crate::frame_profile::Span::new("submit", "queue_submit");
     let d = driver(queue.as_raw(), Kind::Queue)?;
     if d.lost.load(Ordering::Acquire) {
         return Err(vk::Result::ERROR_DEVICE_LOST);
@@ -175,10 +222,13 @@ pub(super) unsafe fn submit(
     if references > 16384 {
         return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
     }
-    let mut packets = infos
+    let packets = infos
         .iter()
         .map(|info| decode(&d, info))
         .collect::<VkResult<Vec<_>>>()?;
+    enqueue(d, packets, fence)
+}
+pub(super) fn enqueue(d: Arc<Driver>, mut packets: Vec<Packet>, fence: vk::Fence) -> VkResult<()> {
     if packets.is_empty() {
         packets.push(Packet::default());
     }
@@ -234,8 +284,11 @@ pub(super) unsafe fn submit(
     }
     Ok(())
 }
-fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
-    for (index, packet) in packets.iter().enumerate() {
+fn run(d: Arc<Driver>, mut packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
+    let _frame = crate::frame_profile::Span::new("work", "queue_run");
+    let packet_count = packets.len();
+    for index in 0..packet_count {
+        let packet = &mut packets[index];
         let result = (|| {
             for wait in &packet.waits {
                 wait.wait(&d)?;
@@ -252,7 +305,7 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                 }
                 reserved.push(s.clone());
             }
-            let recordings = packet.recordings.clone();
+            let recordings = { std::mem::take(&mut packet.recordings) };
             let submissions = call(&d, move |rt| {
                 let result = (|| {
                     let recordings = profile_work("queue::resolve_recordings", || {
@@ -277,10 +330,24 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                         }
                         Ok(())
                     })?;
+                    // Descriptor identities are materialized only by execute.
+                    // Clear old cached groups first if this packet might need
+                    // the remaining capacity, preserving the previous maximum
+                    // number of distinct groups accepted in one packet.
+                    let definitions = recordings.iter().fold(0usize, |sum, recording| {
+                        sum.saturating_add(recording.descriptors.len())
+                    });
+                    if rt.resources.descriptor_groups_need_capacity(definitions) {
+                        rt.resources.release_descriptor_groups(&rt.table, |id| {
+                            rt.cache
+                                .release_bind_group(id)
+                                .map_err(crate::runtime::backend_failure)
+                        })?;
+                    }
                     let mut submissions = Vec::new();
                     for r in recordings {
-                        match profile_work("queue::execute", || execute(rt, r)) {
-                            Ok(mut receipts) => submissions.append(&mut receipts),
+                        match profile_work("queue::execute", || execute(rt, r, &mut submissions)) {
+                            Ok(()) => {}
                             Err(error) => {
                                 {
                                     eprintln!("[SGFX Vulkan] queue execution failed: {error:?}");
@@ -296,16 +363,19 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
                     }
                     Ok(submissions)
                 })();
-                // All resolved recordings in this packet have now been
-                // consumed. Backends retain native bindings for submitted
-                // commands, so these immutable descriptor snapshots no longer
-                // need logical table slots or materialization-cache entries.
+                // Keep common groups across packets. A bounded LRU evicts only
+                // after all resolved recordings have been consumed; native
+                // submitted commands already own their bindings.
                 let cleanup = profile_work("queue::release_descriptors", || {
-                    rt.resources.release_descriptor_groups(&rt.table, |id| {
-                        rt.cache
-                            .release_bind_group(id)
-                            .map_err(crate::runtime::backend_failure)
-                    })
+                    rt.resources.trim_descriptor_groups(
+                        &rt.table,
+                        crate::resources::CACHED_DESCRIPTOR_GROUPS,
+                        |id| {
+                            rt.cache
+                                .release_bind_group(id)
+                                .map_err(crate::runtime::backend_failure)
+                        },
+                    )
                 });
                 let submissions = result?;
                 if let Err(error) = cleanup {
@@ -326,7 +396,7 @@ fn run(d: Arc<Driver>, packets: Vec<Packet>, fence: Option<Arc<AtomicU8>>) {
             }
             let request = CompletionRequest::Observe {
                 submissions,
-                fence: if index + 1 == packets.len() {
+                fence: if index + 1 == packet_count {
                     fence.clone()
                 } else {
                     None
