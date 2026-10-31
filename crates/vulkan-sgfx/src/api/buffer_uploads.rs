@@ -217,6 +217,19 @@ fn merge(ranges: &mut Vec<Range<u64>>) {
 }
 
 fn snapshot(resources: &Resources, ranges: Ranges) -> VkResult<BufferUploads> {
+    let mut measured = crate::progress::host_uploads();
+    snapshot_measured(
+        resources,
+        ranges,
+        measured.as_mut().map(|batch| &mut batch.stats),
+    )
+}
+
+fn snapshot_measured(
+    resources: &Resources,
+    ranges: Ranges,
+    mut measured: Option<&mut crate::progress::HostUploads>,
+) -> VkResult<BufferUploads> {
     let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
     let mut ops = Vec::new();
     let mut fresh = Vec::new();
@@ -227,16 +240,18 @@ fn snapshot(resources: &Resources, ranges: Ranges) -> VkResult<BufferUploads> {
         };
         let allocation = resources.memories.get(&memory).ok_or(invalid)?;
         merge(&mut ranges);
+        let full = ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end == buffer.size;
         if !allocation.mapped {
             if resources.uploaded_unmapped_buffers.contains(&handle) {
                 continue;
             }
             // Partial source/descriptor uploads never prove the entire buffer
             // synchronized, even after this recording has completed.
-            if ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end == buffer.size {
+            if full {
                 fresh.push((handle, memory));
             }
         }
+        let mut buffer_bytes = 0;
         for range in ranges {
             let start = offset
                 .checked_add(range.start)
@@ -247,6 +262,9 @@ fn snapshot(resources: &Resources, ranges: Ranges) -> VkResult<BufferUploads> {
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or(invalid)?;
             let mut bytes = allocation.bytes.get(start..end).ok_or(invalid)?.to_vec();
+            if let Some(stats) = measured.as_mut() {
+                stats.copied_span(bytes.len(), &mut buffer_bytes, full, allocation.mapped);
+            }
             bytes.resize(bytes.len().next_multiple_of(4), 0);
             ops.push(ir::OwnedCommand::WriteBuffer {
                 buffer: buffer.id,
@@ -329,6 +347,22 @@ mod tests {
         )
     }
 
+    fn measured_recording(
+        resources: &Resources,
+        rec: &ResolvedRecording,
+    ) -> (BufferUploads, crate::progress::HostUploads) {
+        let mut measured = crate::progress::HostUploads::default();
+        let ranges = collect(
+            resources,
+            &rec.used_buffers,
+            &rec.descriptors,
+            &rec.source_upload_ranges,
+        )
+        .unwrap();
+        let uploads = snapshot_measured(resources, ranges, Some(&mut measured)).unwrap();
+        (uploads, measured)
+    }
+
     #[test]
     fn small_copies_from_64_and_128_mib_buffers_upload_only_source_union() {
         for size in [64 * 1024 * 1024, 128 * 1024 * 1024] {
@@ -358,8 +392,12 @@ mod tests {
             );
             assert_eq!(rec.referenced_buffers, [source, destination]);
             assert_eq!(rec.ops.len(), 3);
-            let (ops, fresh) = snapshot_recording(&resources, &rec).unwrap();
+            let ((ops, fresh), measured) = measured_recording(&resources, &rec);
             assert!(fresh.is_empty());
+            assert_eq!(measured.bytes, 1552);
+            assert_eq!((measured.full_buffers, measured.partial_buffers), (0, 1));
+            assert_eq!(measured.max_buffer_bytes, 1552);
+            assert_eq!((measured.mapped_bytes, measured.unmapped_bytes), (1552, 0));
             let source_id = resources.buffers[&source].id;
             assert!(matches!(ops.as_slice(), [
                 ir::OwnedCommand::WriteBuffer { buffer: first, offset: 4096, data: a },
@@ -389,11 +427,45 @@ mod tests {
         )
         .unwrap();
         rec.used_buffers.push(destination); // e.g. an index/vertex use or unknown barrier scope
-        let (ops, _) = snapshot_recording(&resources, &rec).unwrap();
+        let ((ops, _), measured) = measured_recording(&resources, &rec);
+        assert_eq!(measured.bytes, 36);
+        assert_eq!((measured.full_buffers, measured.partial_buffers), (1, 1));
+        assert_eq!(measured.max_buffer_bytes, 32);
         assert!(matches!(ops.as_slice(), [
             ir::OwnedCommand::WriteBuffer { offset: 4, data: a, .. },
             ir::OwnedCommand::WriteBuffer { offset: 0, data: b, .. },
         ] if a == &[1; 4] && b == &[2; 32]));
+    }
+
+    #[test]
+    fn measured_spans_exclude_cached_buffers_padding_and_failed_reads() {
+        let (_, mut resources, source, destination) = copy_fixture(8, false);
+        resources.uploaded_unmapped_buffers.insert(source);
+        resources.buffers.get_mut(&destination).unwrap().size = 5;
+        let ranges = Ranges::from([
+            (source, std::iter::once(0..8).collect()),
+            (destination, std::iter::once(0..5).collect()),
+        ]);
+        let mut measured = crate::progress::HostUploads::default();
+        let (ops, _) = snapshot_measured(&resources, ranges, Some(&mut measured)).unwrap();
+        assert!(
+            matches!(ops.as_slice(), [ir::OwnedCommand::WriteBuffer { data, .. }] if data.len() == 8)
+        );
+        assert_eq!(
+            measured.bytes, 5,
+            "count actual cloned bytes, not the padded command payload"
+        );
+        assert_eq!((measured.full_buffers, measured.partial_buffers), (1, 0));
+        assert_eq!((measured.max_buffer_bytes, measured.unmapped_bytes), (5, 5));
+        let mut measured = crate::progress::HostUploads::default();
+        let ranges = Ranges::from([(destination, vec![0..2, 16..20])]);
+        assert!(snapshot_measured(&resources, ranges, Some(&mut measured)).is_err());
+        assert_eq!(
+            measured.bytes, 2,
+            "an error does not erase bytes already cloned"
+        );
+        assert_eq!((measured.full_buffers, measured.partial_buffers), (0, 1));
+        assert_eq!(measured.max_buffer_bytes, 2);
     }
 
     #[test]
