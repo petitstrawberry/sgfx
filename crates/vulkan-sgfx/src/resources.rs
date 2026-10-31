@@ -864,6 +864,30 @@ impl Resources {
         uniform_alignment: u32,
         storage_alignment: u32,
     ) -> Result<ir::BindGroupId, vk::Result> {
+        self.descriptor_group_with_layout_inner(
+            table,
+            handle,
+            dynamic_offsets,
+            layout,
+            uniform_alignment,
+            storage_alignment,
+        )
+        .inspect_err(|error| {
+            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
+                self.trace_descriptor_group_failure(table, handle, layout, error);
+            }
+        })
+    }
+
+    fn descriptor_group_with_layout_inner(
+        &mut self,
+        table: &ir::ResourceTable,
+        handle: vk::DescriptorSet,
+        dynamic_offsets: &[u32],
+        layout: &ir::BindGroupLayoutDesc,
+        uniform_alignment: u32,
+        storage_alignment: u32,
+    ) -> Result<ir::BindGroupId, vk::Result> {
         let invalid = vk::Result::ERROR_INITIALIZATION_FAILED;
         let set = self.descriptor_sets.get(&handle).ok_or(invalid)?;
         if set.invalid || !specialized_layout_matches(&set.layout, layout) {
@@ -1003,13 +1027,7 @@ impl Resources {
             };
             entries.push(ir::BindGroupEntry::new(entry.binding(), resource));
         }
-        let desc = ir::BindGroupDesc::new(table, layout.clone(), entries)
-            .inspect_err(|error| {
-                if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                    self.trace_descriptor_group_failure(table, handle, set, layout, error);
-                }
-            })
-            .map_err(failure)?;
+        let desc = ir::BindGroupDesc::new(table, layout.clone(), entries).map_err(failure)?;
         // Validate live resources above even on a cache hit. A set may be used
         // by pipelines with distinct reflected views of its Vulkan layout.
         if dynamic_offsets.is_empty()
@@ -1044,17 +1062,17 @@ impl Resources {
         &self,
         table: &ir::ResourceTable,
         handle: vk::DescriptorSet,
-        set: &DescriptorSet,
         layout: &ir::BindGroupLayoutDesc,
-        error: &ir::Error,
+        error: &vk::Result,
     ) {
+        let set = self.descriptor_sets.get(&handle);
         eprintln!(
             "[SGFX Vulkan] descriptor validation failed: set={handle:?} error={error:?} declared_layout={:?} reflected_layout={layout:?}",
-            set.layout,
+            set.map(|set| &set.layout),
         );
         for entry in layout.entries() {
-            let binding = set.ir_to_source(entry.binding());
-            let bound = binding.and_then(|binding| set.bindings.get(&binding));
+            let binding = set.and_then(|set| set.ir_to_source(entry.binding()));
+            let bound = set.and_then(|set| binding.and_then(|binding| set.bindings.get(&binding)));
             eprintln!(
                 "[SGFX Vulkan] descriptor validation entry: set={handle:?} expected={entry:?} source_binding={binding:?} bound={bound:?}"
             );
@@ -3388,6 +3406,43 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_diagnostics_cover_errors_before_and_after_descriptor_construction() {
+        let table = ir::ResourceTable::new();
+        let mut resources = Resources::new();
+        let handle = vk::DescriptorSet::from_raw(1);
+        let layout = ir::BindGroupLayoutDesc::new(vec![]).unwrap();
+        assert_eq!(
+            resources.descriptor_group_with_layout(&table, handle, &[], &layout, 256, 256),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        let mut set = DescriptorSet::new(
+            HashMap::new(),
+            vk::DescriptorPool::null(),
+            layout.clone(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        set.invalid = true;
+        resources.descriptor_sets.insert(handle, set);
+        assert_eq!(
+            resources.descriptor_group_with_layout(&table, handle, &[], &layout, 256, 256),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        );
+        resources.descriptor_sets.get_mut(&handle).unwrap().invalid = false;
+        let group = resources
+            .descriptor_group_with_layout(&table, handle, &[], &layout, 256, 256)
+            .unwrap();
+        // Fail during cached-ID lookup, after BindGroupDesc::new succeeded.
+        table.release_bind_group(group).unwrap();
+        assert_eq!(
+            resources.descriptor_group_with_layout(&table, handle, &[], &layout, 256, 256),
+            Err(vk::Result::ERROR_FEATURE_NOT_PRESENT)
+        );
+    }
 
     #[cfg(all(not(target_os = "scarlet"), feature = "backend-wgpu"))]
     fn lifecycle_runtime() -> crate::runtime::Runtime {
