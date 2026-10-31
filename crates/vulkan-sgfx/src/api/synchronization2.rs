@@ -61,6 +61,22 @@ pub(super) fn execute(
         reap_completed(rt, retained)?;
         return Ok(());
     }
+    if let Action::IndirectRead(read) = action {
+        if rt.device_lost.load(Ordering::Acquire) {
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
+        if indirect::read_host(
+            &rt.resources,
+            read,
+            rt.capabilities.supports_shader_draw_parameters(),
+        )? {
+            // Prefix submission and its receipts are preserved. CPU-authored
+            // arguments need no retirement; keep the usual bounded observer
+            // window for all the already submitted work.
+            reap_completed(rt, retained)?;
+            return Ok(());
+        }
+    }
     profile_work("sync::gpu_wait", || {
         // Count control points by CPU observation and receipt presence before
         // draining. `receipts` does not imply a blocking wait; `empty` can still

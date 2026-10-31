@@ -6,6 +6,29 @@ use std::ops::Range;
 pub(super) struct Readbacks(BTreeMap<vk::Buffer, Vec<Range<u64>>>);
 
 impl Readbacks {
+    /// Resolve to allocation coordinates so a different buffer handle cannot
+    /// hide a preceding GPU write. Missing/invalid metadata is not a proof.
+    pub(super) fn may_write(
+        &self,
+        resources: &crate::resources::Resources,
+        buffer: vk::Buffer,
+        range: Range<u64>,
+    ) -> bool {
+        let Some((memory, target)) = allocation_range(resources, buffer, range) else {
+            return true;
+        };
+        self.0.iter().any(|(writer, ranges)| {
+            ranges.iter().any(|range| {
+                let Some((written_memory, written)) =
+                    allocation_range(resources, *writer, range.clone())
+                else {
+                    return true;
+                };
+                memory == written_memory && target.start < written.end && written.start < target.end
+            })
+        })
+    }
+
     pub(super) fn insert(&mut self, buffer: vk::Buffer, offset: u64, size: u64) -> VkResult<()> {
         let end = offset
             .checked_add(size)
@@ -39,6 +62,30 @@ impl Readbacks {
     pub(super) fn into_ranges(self) -> impl Iterator<Item = (vk::Buffer, Vec<Range<u64>>)> {
         self.0.into_iter()
     }
+}
+
+pub(super) fn allocation_range(
+    resources: &crate::resources::Resources,
+    handle: vk::Buffer,
+    range: Range<u64>,
+) -> Option<(vk::DeviceMemory, Range<u64>)> {
+    let buffer = resources.buffers.get(&handle)?;
+    let (memory, offset) = buffer.bound?;
+    let allocation = resources
+        .memories
+        .get(&memory)?
+        .bytes
+        .materialized_slice()?;
+    if range.start > range.end
+        || range.end > buffer.size
+        || offset.checked_add(buffer.size)? > u64::try_from(allocation.len()).ok()?
+    {
+        return None;
+    }
+    Some((
+        memory,
+        offset.checked_add(range.start)?..offset.checked_add(range.end)?,
+    ))
 }
 
 #[cfg(test)]

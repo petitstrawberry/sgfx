@@ -38,6 +38,11 @@ pub(crate) struct AlignedBytes {
     len: usize,
 }
 impl AlignedBytes {
+    /// Observe an existing mirror without materializing GPU-only allocations.
+    pub(crate) fn materialized_slice(&self) -> Option<&[u8]> {
+        (self.words.len() == self.len.div_ceil(8)).then(|| &**self)
+    }
+
     /// GPU image storage lives in the backend. Reserve its logical byte range
     /// without allocating and clearing a redundant CPU mirror for every image.
     /// Buffers and explicit mappings materialize the mirror before access.
@@ -3404,6 +3409,15 @@ pub(crate) fn lookup(name: &CStr) -> vk::PFN_vkVoidFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_mirror_observation_does_not_materialize_gpu_storage() {
+        let mut bytes = AlignedBytes::unbacked(13).unwrap();
+        assert!(bytes.materialized_slice().is_none());
+        assert!(bytes.words.is_empty());
+        bytes.materialize().unwrap();
+        assert_eq!(bytes.materialized_slice().unwrap(), &[0; 13]);
+    }
 
     #[test]
     fn descriptor_diagnostics_cover_errors_before_and_after_descriptor_construction() {
