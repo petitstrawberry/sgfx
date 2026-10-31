@@ -4722,6 +4722,7 @@ fn push_programmable_pipeline(
             commands,
             pipeline.vertex_elements_handle,
             &description.vertex_buffers,
+            &description.vertex.input_locations,
         )
     }
 }
@@ -4802,22 +4803,9 @@ fn push_programmable_vertex_elements(
     commands: &mut Vec<u8>,
     handle: u32,
     layouts: &[crate::ir::VertexBufferLayout],
+    input_locations: &[u32],
 ) -> HandleResult<()> {
-    let attributes: Vec<_> = layouts
-        .iter()
-        .enumerate()
-        .flat_map(|(slot, layout)| {
-            layout
-                .attributes()
-                .iter()
-                .map(move |attribute| (slot, layout, attribute))
-        })
-        .collect();
-    let count = attributes
-        .iter()
-        .map(|(_, _, attribute)| attribute.location() + 1)
-        .max()
-        .unwrap_or(0);
+    let count = input_locations.len() as u32;
     if count > 16 {
         return Err(HandleError::InvalidParameter);
     }
@@ -4830,13 +4818,17 @@ fn push_programmable_vertex_elements(
         ),
     );
     push_dword(commands, handle);
-    for location in 0..count {
-        // Shader IN numbers correspond to locations, independently of the
-        // application's attribute order. Fill unused holes with a valid fetch.
-        let (slot, layout, attribute) = attributes
+    for &location in input_locations {
+        // Match the compiler's dense IN slots, preserving each logical
+        // attribute's buffer, format, offset and instance divisor.
+        let (slot, layout, attribute) = layouts
             .iter()
-            .find(|(_, _, attribute)| attribute.location() == location)
-            .or_else(|| attributes.first())
+            .enumerate()
+            .find_map(|(slot, layout)| {
+                layout.attributes().iter()
+                    .find(|attribute| attribute.location() == location)
+                    .map(|attribute| (slot, layout, attribute))
+            })
             .ok_or(HandleError::InvalidParameter)?;
         push_dword(commands, attribute.offset());
         push_dword(
@@ -4847,7 +4839,7 @@ fn push_programmable_vertex_elements(
                 0
             },
         );
-        push_dword(commands, *slot as u32);
+        push_dword(commands, slot as u32);
         push_dword(
             commands,
             match attribute.format() {
@@ -7034,21 +7026,19 @@ mod tests {
         )
         .unwrap();
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 67, core::slice::from_ref(&layout))
+        push_programmable_vertex_elements(&mut commands, 67, core::slice::from_ref(&layout), &[2, 0])
             .unwrap();
         let words = dwords(&commands);
         assert_eq!(
             words[0],
-            command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 13)
+            command_header(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 9)
         );
         assert_eq!(words[1], 67);
-        assert_eq!(&words[2..6], &[0, 0, 0, VIRGL_FORMAT_R32G32B32_FLOAT]);
-        // The undeclared location has a safe fetch, while location 2 retains
-        // its true byte offset and normalized format despite the input order.
-        assert_eq!(&words[6..10], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
-        assert_eq!(&words[10..14], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
+        // Logical location 2 is dense slot 0, and location 0 is dense slot 1.
+        assert_eq!(&words[2..6], &[12, 0, 0, VIRGL_FORMAT_R8G8B8A8_UNORM]);
+        assert_eq!(&words[6..10], &[0, 0, 0, VIRGL_FORMAT_R32G32B32_FLOAT]);
         commands.clear();
-        push_programmable_vertex_elements(&mut commands, 68, &[]).unwrap();
+        push_programmable_vertex_elements(&mut commands, 68, &[], &[]).unwrap();
         assert_eq!(
             dwords(&commands),
             alloc::vec![
@@ -7789,7 +7779,7 @@ mod tests {
             .with_step_mode(VertexStepMode::Instance),
         ];
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
+        push_programmable_vertex_elements(&mut commands, 9, &layouts, &[0, 1, 2]).unwrap();
         assert_eq!(
             &dwords(&commands)[2..],
             &[0, 0, 0, 29, 0, 1, 1, 29, 8, 1, 1, 28]
@@ -7808,7 +7798,7 @@ mod tests {
         )
         .unwrap();
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 9, &[layout]).unwrap();
+        push_programmable_vertex_elements(&mut commands, 9, &[layout], &[0, 1]).unwrap();
         assert_eq!(&dwords(&commands)[2..], &[0, 0, 0, 29, 8, 0, 0, 28]);
     }
 
@@ -7832,7 +7822,7 @@ mod tests {
             .unwrap(),
         ];
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 9, &layouts).unwrap();
+        push_programmable_vertex_elements(&mut commands, 9, &layouts, &[0, 1, 2, 3]).unwrap();
         assert_eq!(
             &dwords(&commands)[2..],
             &[0, 0, 0, 193, 0, 0, 1, 192, 8, 0, 1, 92, 12, 0, 1, 186]

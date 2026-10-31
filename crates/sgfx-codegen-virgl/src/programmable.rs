@@ -151,7 +151,8 @@ pub struct CompiledShader {
     pub first_instance_register: Option<u32>,
     /// Sampling pairs bound independently for each shader stage.
     pub textures: Vec<TextureSamplerBinding>,
-    /// Input locations consumed by the shader, for pipeline validation.
+    /// Logical input locations in declaration order. Vertex TGSI IN slots use
+    /// the dense index in this list; native vertex elements must use this order.
     pub input_locations: Vec<u32>,
     /// Output locations produced by the shader, for pipeline validation.
     pub output_locations: Vec<u32>,
@@ -847,8 +848,16 @@ impl<'a> Compiler<'a> {
                     };
                     self.vertex_inputs.push((*location, format));
                 }
-                let index = if !input && self.stage == ShaderStage::Vertex {
-                    *location + 1
+                let index = if self.stage == ShaderStage::Vertex {
+                    if input {
+                        // VirGL's legacy vertex binding path indexes inputs by
+                        // declaration count. Keep its slots dense even when the
+                        // application's locations contain gaps; retain logical
+                        // locations in input_locations for vertex fetch setup.
+                        self.input_locations.len() as u32 - 1
+                    } else {
+                        *location + 1
+                    }
                 } else {
                     *location
                 };
