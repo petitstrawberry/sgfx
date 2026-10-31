@@ -12,6 +12,131 @@ pub use sgfx_codegen_virgl::programmable::ShaderCompileError;
 #[derive(Debug)]
 pub enum ShaderCompileError {}
 
+#[cfg(feature = "programmable")]
+const INDEX_BOUNDS_CACHE_SIZE: usize = 32;
+
+#[cfg(feature = "programmable")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct IndexBoundsKey {
+    buffer: ir::BufferId,
+    slot: usize,
+    revision: u64,
+    start: usize,
+    end: usize,
+    format: IndexFormat,
+}
+
+#[cfg(feature = "programmable")]
+#[derive(Clone, Copy)]
+struct IndexBoundsEntry {
+    key: IndexBoundsKey,
+    bounds: Option<(u32, u32)>,
+}
+
+/// Fixed round-robin cache owned by one ExecutionPlan's PendingBuffers only.
+/// Raw bounds are independent of baseVertex; no command bytes are retained.
+#[cfg(feature = "programmable")]
+#[derive(Default)]
+pub(super) struct IndexBoundsCache {
+    entries: [Option<IndexBoundsEntry>; INDEX_BOUNDS_CACHE_SIZE],
+    next: usize,
+}
+
+#[cfg(feature = "programmable")]
+impl IndexBoundsCache {
+    fn get(&self, key: IndexBoundsKey) -> Option<Option<(u32, u32)>> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.bounds)
+    }
+
+    fn insert(&mut self, key: IndexBoundsKey, bounds: Option<(u32, u32)>) {
+        self.entries[self.next] = Some(IndexBoundsEntry { key, bounds });
+        self.next = (self.next + 1) % INDEX_BOUNDS_CACHE_SIZE;
+    }
+
+    pub(super) fn invalidate(&mut self, slot: usize) {
+        for entry in &mut self.entries {
+            if entry.is_some_and(|entry| entry.key.slot == slot) {
+                *entry = None;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "programmable")]
+fn raw_index_bounds(
+    bytes: &[u8],
+    format: IndexFormat,
+) -> Result<Option<(u32, u32)>, IrSubmitError> {
+    let mut bounds = None;
+    for index in bytes.chunks_exact(format.byte_size() as usize) {
+        let index = match format {
+            IndexFormat::Uint16 => u32::from(read_u16(index, 0)?),
+            IndexFormat::Uint32 => read_u32(index, 0)?,
+        };
+        bounds = Some(
+            bounds.map_or((index, index), |(minimum, maximum): (u32, u32)| {
+                (minimum.min(index), maximum.max(index))
+            }),
+        );
+    }
+    Ok(bounds)
+}
+
+#[cfg(feature = "programmable")]
+fn maximum_with_base(bounds: Option<(u32, u32)>, base_vertex: i32) -> Result<u32, IrSubmitError> {
+    let Some((minimum, maximum)) = bounds else {
+        return Ok(0);
+    };
+    // Signed addition is monotone: validating both extrema proves every index
+    // fits, including a negative base underflow hidden by a valid maximum.
+    u32::try_from(i64::from(minimum) + i64::from(base_vertex))
+        .map_err(|_| ir::Error::OutOfBounds)?;
+    Ok(u32::try_from(i64::from(maximum) + i64::from(base_vertex))
+        .map_err(|_| ir::Error::OutOfBounds)?)
+}
+
+#[cfg(feature = "programmable")]
+pub(super) fn cached_index_maximum<R: PlanResourceAccess + ?Sized>(
+    resources: &R,
+    pending: &PendingBuffers<'_>,
+    buffer: BufferRef<'_>,
+    range: core::ops::Range<usize>,
+    format: IndexFormat,
+    base_vertex: i32,
+) -> Result<u32, IrSubmitError> {
+    // Keep PendingBuffers::range's validation on hits, without allocating a
+    // merged pending range or scanning its bytes again.
+    let length = pending
+        .plan
+        .length(resources.buffer_shadows(), buffer.slot())?;
+    if range.start > range.end || range.end > length {
+        return Err(IrSubmitError::InvalidVertexData);
+    }
+    resources.table().buffer(buffer)?;
+    let key = IndexBoundsKey {
+        buffer: buffer.id(),
+        slot: buffer.slot(),
+        revision: pending.revision(resources, buffer)?,
+        start: range.start,
+        end: range.end,
+        format,
+    };
+    let cached = pending.index_bounds.borrow().get(key);
+    let bounds = if let Some(bounds) = cached {
+        bounds
+    } else {
+        let bytes = pending.range(resources, buffer, range)?;
+        let bounds = raw_index_bounds(bytes.as_ref(), format)?;
+        pending.index_bounds.borrow_mut().insert(key, bounds);
+        bounds
+    };
+    maximum_with_base(bounds, base_vertex)
+}
+
 impl IrResources {
     /// Parse and semantically validate a shader before admitting its handle.
     #[cfg(feature = "programmable")]
@@ -1162,22 +1287,15 @@ pub(super) fn decode_draw(
         let end = start
             .checked_add(u64::from(count) * size)
             .ok_or(ir::Error::Overflow)?;
-        let range = pending.range(
+        maximum_vertex = cached_index_maximum(
             resources,
+            pending,
             buffer,
             usize::try_from(start).map_err(|_| ir::Error::Overflow)?
                 ..usize::try_from(end).map_err(|_| ir::Error::Overflow)?,
+            format,
+            base_vertex,
         )?;
-        maximum_vertex = 0;
-        for index in range.chunks_exact(size as usize) {
-            let index = match format {
-                IndexFormat::Uint16 => u32::from(read_u16(index, 0)?),
-                IndexFormat::Uint32 => read_u32(index, 0)?,
-            };
-            let resolved = i64::from(index) + i64::from(base_vertex);
-            maximum_vertex =
-                maximum_vertex.max(u32::try_from(resolved).map_err(|_| ir::Error::OutOfBounds)?);
-        }
         Some(driver::IrIndexBufferBinding {
             buffer: buffer_spec(resources, pending, buffer)?,
             offset: u32::try_from(offset).map_err(|_| ir::Error::Overflow)?,
@@ -1368,6 +1486,112 @@ pub(super) fn decode_draw(
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn raw_index_extrema_preserve_per_index_signed_bounds_checks() {
+        for format in [IndexFormat::Uint16, IndexFormat::Uint32] {
+            for values in [&[][..], &[0, 2, 7][..], &[2, 9, 3][..], &[u32::MAX, 0][..]] {
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .flat_map(|index| match format {
+                        IndexFormat::Uint16 => (*index as u16).to_le_bytes().to_vec(),
+                        IndexFormat::Uint32 => index.to_le_bytes().to_vec(),
+                    })
+                    .collect();
+                for base in [i32::MIN, -10, -2, 0, 2, i32::MAX] {
+                    // Independent version of the previous per-index validation.
+                    let mut expected = Ok(0u32);
+                    for item in bytes.chunks_exact(format.byte_size() as usize) {
+                        let raw = if format == IndexFormat::Uint16 {
+                            u32::from(u16::from_le_bytes(item.try_into().unwrap()))
+                        } else {
+                            u32::from_le_bytes(item.try_into().unwrap())
+                        };
+                        match u32::try_from(i64::from(raw) + i64::from(base)) {
+                            Ok(index) => expected = expected.map(|maximum| maximum.max(index)),
+                            Err(_) => {
+                                expected = Err(());
+                                break;
+                            }
+                        }
+                    }
+                    let actual = maximum_with_base(raw_index_bounds(&bytes, format).unwrap(), base);
+                    match expected {
+                        Ok(value) => assert_eq!(actual.unwrap(), value),
+                        Err(()) => assert!(matches!(
+                            actual,
+                            Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds))
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_cache_is_bounded_and_keys_identity_revision_exact_range_and_format() {
+        let table = ResourceTable::new();
+        let foreign = ResourceTable::new();
+        let define = |table: &ResourceTable| {
+            table
+                .define_buffer(ir::BufferDesc::new(256, BufferUsage::INDEX).unwrap())
+                .unwrap()
+                .id()
+        };
+        let buffer = define(&table);
+        let key = IndexBoundsKey {
+            buffer,
+            slot: 0,
+            revision: 7,
+            start: 0,
+            end: 4,
+            format: IndexFormat::Uint16,
+        };
+        let mut cache = IndexBoundsCache::default();
+        cache.insert(key, Some((1, 9)));
+        assert_eq!(cache.get(key), Some(Some((1, 9))));
+        for different in [
+            IndexBoundsKey {
+                buffer: define(&table),
+                ..key
+            },
+            IndexBoundsKey {
+                buffer: define(&foreign),
+                ..key
+            },
+            IndexBoundsKey { revision: 8, ..key },
+            IndexBoundsKey { start: 2, ..key },
+            IndexBoundsKey { end: 6, ..key },
+            IndexBoundsKey {
+                format: IndexFormat::Uint32,
+                ..key
+            },
+        ] {
+            assert_eq!(cache.get(different), None);
+        }
+        for index in 1..=INDEX_BOUNDS_CACHE_SIZE {
+            cache.insert(
+                IndexBoundsKey {
+                    start: index * 4,
+                    end: index * 4 + 4,
+                    ..key
+                },
+                Some((0, index as u32)),
+            );
+        }
+        assert_eq!(
+            cache.entries.iter().flatten().count(),
+            INDEX_BOUNDS_CACHE_SIZE
+        );
+        assert_eq!(
+            cache.get(key),
+            None,
+            "round-robin eviction must remove the oldest entry"
+        );
+        cache.invalidate(0);
+        assert!(cache.entries.iter().all(Option::is_none));
+    }
+
     const SHADER: &str = "struct Transform { mvp: mat4x4<f32>, }; @group(0) @binding(0) var<uniform> transform: Transform;
         struct Output { @builtin(position) position: vec4<f32>, @location(0) color: vec3<f32>, };
         @vertex fn vs(@location(0) position: vec3<f32>, @location(1) color: vec3<f32>) -> Output {

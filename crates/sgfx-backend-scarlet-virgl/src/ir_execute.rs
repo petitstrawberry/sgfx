@@ -653,6 +653,8 @@ fn commit_prepared_buffer_updates(
 struct PendingBuffers<'a> {
     plan: BufferOnlyPlan<'a>,
     canonical_validations: Vec<(usize, u64)>,
+    #[cfg(feature = "programmable")]
+    index_bounds: RefCell<programmable::IndexBoundsCache>,
 }
 
 #[path = "buffer_ranges.rs"]
@@ -1174,6 +1176,10 @@ impl<'a> PendingBuffers<'a> {
         // proves the pending bytes present at the draw that performed it.
         self.canonical_validations
             .retain(|(candidate, _)| *candidate != slot);
+        // A pending upload revision can cover several different byte states
+        // within this plan. Every write/copy must discard their index proof.
+        #[cfg(feature = "programmable")]
+        self.index_bounds.get_mut().invalidate(slot);
     }
 
     fn write(
@@ -4506,6 +4512,160 @@ mod tests {
     struct TestPlanResources<'a> {
         table: &'a ResourceTable,
         shadows: &'a [BufferShadow],
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn index_cache_tracks_pending_writes_and_copies_even_at_the_same_revision() {
+        let table = ResourceTable::new();
+        let usage = BufferUsage::INDEX | BufferUsage::COPY_SRC | BufferUsage::COPY_DST;
+        let source = table
+            .define_buffer(ir::BufferDesc::new(16, usage).unwrap())
+            .unwrap();
+        let destination = table
+            .define_buffer(ir::BufferDesc::new(16, usage).unwrap())
+            .unwrap();
+        let words = |values: &[u32]| values.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let shadows = [
+            range_test_shadow(words(&[8, 7, 6, 5])),
+            range_test_shadow(words(&[1, 2, 3, 4])),
+        ];
+        let resources = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        let mut pending = PendingBuffers::new();
+        let maximum = |pending: &PendingBuffers<'_>| {
+            programmable::cached_index_maximum(
+                &resources,
+                pending,
+                destination,
+                0..16,
+                IndexFormat::Uint32,
+                0,
+            )
+            .unwrap()
+        };
+        assert_eq!(maximum(&pending), 4);
+        assert_eq!(maximum(&pending), 4);
+        pending
+            .write(&table, &shadows, destination, 0, &[9, 0, 0, 0])
+            .unwrap();
+        let revision = pending.revision(&resources, destination).unwrap();
+        assert_eq!(maximum(&pending), 9);
+        pending
+            .write(&table, &shadows, destination, 0, &[11, 0, 0, 0])
+            .unwrap();
+        assert_eq!(pending.revision(&resources, destination).unwrap(), revision);
+        assert_eq!(maximum(&pending), 11);
+        pending
+            .write(&table, &shadows, destination, 0, &[2, 0, 0, 0])
+            .unwrap();
+        assert_eq!(maximum(&pending), 4);
+        pending
+            .copy(&table, &shadows, (source, 0), (destination, 0), 16)
+            .unwrap();
+        assert_eq!(pending.revision(&resources, destination).unwrap(), revision);
+        assert_eq!(maximum(&pending), 8);
+        pending
+            .copy(&table, &shadows, (destination, 4), (destination, 0), 12)
+            .unwrap();
+        assert_eq!(maximum(&pending), 7);
+        assert_eq!(shadows[destination.slot()].revision, 7);
+        assert_eq!(
+            shadows[destination.slot()].bytes.as_deref(),
+            Some(words(&[1, 2, 3, 4]).as_slice())
+        );
+        let fresh_plan = PendingBuffers::new();
+        assert_eq!(
+            maximum(&fresh_plan),
+            4,
+            "another plan must not inherit pending bounds"
+        );
+    }
+
+    #[cfg(feature = "programmable")]
+    #[test]
+    fn cached_index_ranges_formats_base_vertices_and_invalid_ranges_match_the_scan() {
+        let table = ResourceTable::new();
+        let buffer = table
+            .define_buffer(ir::BufferDesc::new(16, BufferUsage::INDEX).unwrap())
+            .unwrap();
+        let mut shadows = [range_test_shadow(vec![
+            1, 0, 2, 0, 7, 0, 3, 0, 255, 255, 255, 255,
+        ])];
+        let pending = PendingBuffers::new();
+        {
+            let resources = TestPlanResources {
+                table: &table,
+                shadows: &shadows,
+            };
+            let maximum = |range, format, base| {
+                programmable::cached_index_maximum(
+                    &resources, &pending, buffer, range, format, base,
+                )
+            };
+            assert_eq!(maximum(0..4, IndexFormat::Uint16, 0).unwrap(), 2);
+            assert_eq!(maximum(0..4, IndexFormat::Uint32, 0).unwrap(), 131073);
+            assert_eq!(maximum(0..2, IndexFormat::Uint16, 0).unwrap(), 1);
+            assert_eq!(maximum(2..6, IndexFormat::Uint16, 0).unwrap(), 7);
+            assert_eq!(maximum(0..4, IndexFormat::Uint16, 5).unwrap(), 7);
+            assert_eq!(maximum(0..4, IndexFormat::Uint16, -1).unwrap(), 1);
+            for (range, format, base) in [
+                (0..4, IndexFormat::Uint16, -2),
+                (8..12, IndexFormat::Uint32, 1),
+            ] {
+                assert!(matches!(
+                    maximum(range, format, base),
+                    Err(IrSubmitError::InvalidIr(ir::Error::OutOfBounds))
+                ));
+            }
+            assert_eq!(maximum(0..0, IndexFormat::Uint16, i32::MIN).unwrap(), 0);
+            assert!(matches!(
+                maximum(0..14, IndexFormat::Uint16, 0),
+                Err(IrSubmitError::InvalidVertexData)
+            ));
+            assert!(matches!(
+                maximum(4..2, IndexFormat::Uint16, 0),
+                Err(IrSubmitError::InvalidVertexData)
+            ));
+        }
+        // Accepted revision changes form a new key, and a hit never bypasses
+        // the current shadow-length validation.
+        shadows[0].revision += 1;
+        shadows[0].bytes.as_mut().unwrap()[0] = 9;
+        let resources = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        assert_eq!(
+            programmable::cached_index_maximum(
+                &resources,
+                &pending,
+                buffer,
+                0..4,
+                IndexFormat::Uint16,
+                0
+            )
+            .unwrap(),
+            9
+        );
+        shadows[0].bytes.as_mut().unwrap().truncate(2);
+        let resources = TestPlanResources {
+            table: &table,
+            shadows: &shadows,
+        };
+        assert!(matches!(
+            programmable::cached_index_maximum(
+                &resources,
+                &pending,
+                buffer,
+                0..4,
+                IndexFormat::Uint16,
+                0
+            ),
+            Err(IrSubmitError::InvalidVertexData)
+        ));
     }
 
     impl PlanResourceAccess for TestPlanResources<'_> {
