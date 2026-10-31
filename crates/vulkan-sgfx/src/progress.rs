@@ -79,6 +79,14 @@ pub(crate) fn host_uploads() -> Option<HostUploadBatch> {
     })
 }
 
+// Presentation counters are consumed only by platform WSI builds.
+#[cfg_attr(
+    not(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    )),
+    allow(dead_code)
+)]
 struct Progress {
     started: Instant,
     reported: Instant,
@@ -121,6 +129,13 @@ pub(crate) fn submitted(draws: u64) {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn presented(swapchain: u64) {
     crate::frame_profile::presented();
     let Some(state) = state() else {

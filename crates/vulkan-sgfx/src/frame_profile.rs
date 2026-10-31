@@ -54,6 +54,14 @@ struct Profile {
     spare: Mutex<Vec<Event>>,
     output: Mutex<BufWriter<std::fs::File>>,
     frames: AtomicU64,
+    // Read by the platform WSI presentation hook.
+    #[cfg_attr(
+        not(any(
+            target_os = "scarlet",
+            all(target_os = "linux", feature = "scarlet-wsi")
+        )),
+        allow(dead_code)
+    )]
     presented: AtomicU64,
     dropped: AtomicU64,
 }
@@ -149,6 +157,13 @@ impl Profile {
     }
 }
 pub(crate) struct Span(Option<(&'static Profile, Event)>);
+#[cfg_attr(
+    not(any(
+        target_os = "scarlet",
+        all(target_os = "linux", feature = "scarlet-wsi")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn presented() {
     if let Some(profile) = profile() {
         let now = profile.now();

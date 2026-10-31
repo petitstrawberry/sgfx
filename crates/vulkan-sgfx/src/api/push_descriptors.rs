@@ -559,7 +559,7 @@ mod tests {
             completion_sender: mpsc::channel().0,
             completion_thread: Mutex::new(None),
             queue: AtomicU64::new(0),
-            queue_sender: mpsc::channel().0,
+            queue_sender: mpsc::sync_channel(4096).0,
             queue_thread: Mutex::new(None),
             timeline_enabled: false,
             synchronization2_enabled: false,
