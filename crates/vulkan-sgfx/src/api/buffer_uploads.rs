@@ -240,7 +240,9 @@ fn snapshot_measured(
             continue;
         };
         let allocation = resources.memories.get(&memory).ok_or(invalid)?;
-        if !allocation.host_written { continue; }
+        if !allocation.host_written {
+            continue;
+        }
         merge(&mut ranges);
         let full = ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end == buffer.size;
         if !allocation.mapped {
@@ -318,7 +320,14 @@ mod tests {
                 .id();
             let mut bytes = AlignedBytes::zeroed(size as usize).unwrap();
             bytes.fill(raw as u8);
-            resources.memories.insert(memory, Memory { bytes, mapped, host_written: true });
+            resources.memories.insert(
+                memory,
+                Memory {
+                    bytes,
+                    mapped,
+                    host_written: true,
+                },
+            );
             resources.buffers.insert(
                 handle,
                 Buffer {

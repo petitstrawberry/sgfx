@@ -67,7 +67,14 @@ impl<T: Transport> Job<T> {
         receipts
             .try_reserve(chunks.len().min(MAX_NATIVE_IN_FLIGHT))
             .map_err(|_| AdmissionError::OutOfMemory)?;
-        Ok(Self { chunks, owner, signal, next: 0, receipts, bytes })
+        Ok(Self {
+            chunks,
+            owner,
+            signal,
+            next: 0,
+            receipts,
+            bytes,
+        })
     }
 }
 
@@ -103,7 +110,9 @@ impl<T: Transport> Scheduler<T> {
     }
 
     pub(crate) fn reserve_admission(&mut self) -> Result<(), AdmissionError<T::Error>> {
-        self.jobs.try_reserve(MAX_SUBMISSIONS).map_err(|_| AdmissionError::OutOfMemory)
+        self.jobs
+            .try_reserve(MAX_SUBMISSIONS)
+            .map_err(|_| AdmissionError::OutOfMemory)
     }
 
     // All fallible allocation precedes publication. No transport operation is

@@ -1344,7 +1344,8 @@ unsafe extern "system" fn create_buffer(
             if r.resources.buffers.len() >= ir::MAX_BUFFERS {
                 return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
             }
-            let id = r.allocate_buffer(ir::BufferDesc::new(backing_size, ir_usage).map_err(failure)?)?;
+            let id =
+                r.allocate_buffer(ir::BufferDesc::new(backing_size, ir_usage).map_err(failure)?)?;
             let handle = vk::Buffer::from_raw(crate::api::next_id());
             r.resources.buffers.insert(
                 handle,

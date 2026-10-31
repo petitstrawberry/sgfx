@@ -13,9 +13,9 @@ core::arch::global_asm!(".hidden __scarlet_getauxval", ".hidden __scarlet_start"
 
 mod api;
 mod clear;
-mod frame_profile;
 #[cfg(all(target_os = "linux", feature = "scarlet-wsi"))]
 mod display;
+mod frame_profile;
 mod images;
 mod input_attachments;
 mod instance;

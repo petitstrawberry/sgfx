@@ -57,7 +57,9 @@ pub(super) fn execute(
     // in FIFO order by the backend. Only CPU observations below need a submit
     // boundary; a GPU-only dependency must not create a separate receipt.
     if matches!(action, Action::Barrier) && rt.capabilities.supports_global_resource_barriers() {
-        ops.push(ir::OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::Global));
+        ops.push(ir::OwnedCommand::ResourceBarrier(
+            ir::OwnedResourceBarrier::Global,
+        ));
         return Ok(());
     }
     // A boundary with no preceding commands has nothing new to dispatch. The

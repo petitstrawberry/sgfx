@@ -423,7 +423,8 @@ impl OwnedCommandBuffer {
     ///
     /// No backend work is performed. Errors are the same as [`Self::record`].
     pub fn validate(&self, resources: &ResourceTable) -> Result<()> {
-        self.record_with(resources, CommandEncoder::for_validation(resources)).map(|_| ())
+        self.record_with(resources, CommandEncoder::for_validation(resources))
+            .map(|_| ())
     }
 
     /// Resolve resource identities and record a validated borrowed buffer.

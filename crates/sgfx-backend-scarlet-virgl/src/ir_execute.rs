@@ -1132,10 +1132,16 @@ fn common_buffer_prefix(old: &[u8], new: &[u8]) -> usize {
         let at = i * 8;
         let delta = u64::from_le_bytes(old[at..at + 8].try_into().unwrap())
             ^ u64::from_le_bytes(new[at..at + 8].try_into().unwrap());
-        if delta != 0 { return at + delta.trailing_zeros() as usize / 8; }
+        if delta != 0 {
+            return at + delta.trailing_zeros() as usize / 8;
+        }
     }
     let at = words * 8;
-    at + old[at..n].iter().zip(&new[at..n]).take_while(|(a, b)| a == b).count()
+    at + old[at..n]
+        .iter()
+        .zip(&new[at..n])
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 fn common_buffer_suffix(old: &[u8], new: &[u8]) -> usize {
@@ -1146,11 +1152,18 @@ fn common_buffer_suffix(old: &[u8], new: &[u8]) -> usize {
         let b = new.len() - matched - 8;
         let delta = u64::from_le_bytes(old[a..a + 8].try_into().unwrap())
             ^ u64::from_le_bytes(new[b..b + 8].try_into().unwrap());
-        if delta != 0 { return matched + delta.leading_zeros() as usize / 8; }
+        if delta != 0 {
+            return matched + delta.leading_zeros() as usize / 8;
+        }
         matched += 8;
     }
-    matched + old[..old.len() - matched].iter().rev()
-        .zip(new[..new.len() - matched].iter().rev()).take_while(|(a, b)| a == b).count()
+    matched
+        + old[..old.len() - matched]
+            .iter()
+            .rev()
+            .zip(new[..new.len() - matched].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count()
 }
 
 /// Bound changed bytes without walking large unchanged regions byte by byte.
@@ -1168,7 +1181,10 @@ fn changed_buffer_bytes(
     let old = previous.get(start..).unwrap_or(&[]);
     let overlap = old.len().min(data.len());
     let mut prefix = 0;
-    for (old, new) in old[..overlap].chunks(4096).zip(data[..overlap].chunks(4096)) {
+    for (old, new) in old[..overlap]
+        .chunks(4096)
+        .zip(data[..overlap].chunks(4096))
+    {
         if !equal_buffer_chunk(old, new) {
             prefix += common_buffer_prefix(old, new);
             break;

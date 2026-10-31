@@ -90,9 +90,11 @@ impl Runtime {
         desc: ir::BufferDesc,
     ) -> Result<ir::BufferId, ash::vk::Result> {
         let completed = self.in_flight.completed_serial();
-        if let Some(index) = self.cached_buffers.iter().position(|buffer| {
-            buffer.desc == desc && buffer.after_submission <= completed
-        }) {
+        if let Some(index) = self
+            .cached_buffers
+            .iter()
+            .position(|buffer| buffer.desc == desc && buffer.after_submission <= completed)
+        {
             let buffer = self.cached_buffers.swap_remove(index);
             self.cached_buffer_bytes -= buffer.desc.size();
             // Keep the native allocation and its table identity. Every Vulkan
@@ -104,14 +106,23 @@ impl Runtime {
             Ok(buffer) => Ok(buffer.id()),
             Err(ir::Error::ResourceLimitExceeded) if !self.cached_buffers.is_empty() => {
                 self.flush_cached_buffers()?;
-                self.table.define_buffer(desc).map(|b| b.id()).map_err(crate::resources::failure)
+                self.table
+                    .define_buffer(desc)
+                    .map(|b| b.id())
+                    .map_err(crate::resources::failure)
             }
             Err(error) => Err(crate::resources::failure(error)),
         }
     }
 
     pub(crate) fn cache_buffer(&mut self, id: ir::BufferId) -> Result<(), ash::vk::Result> {
-        let desc = self.table.buffer(self.table.buffer_ref(id).map_err(crate::resources::failure)?)
+        let desc = self
+            .table
+            .buffer(
+                self.table
+                    .buffer_ref(id)
+                    .map_err(crate::resources::failure)?,
+            )
             .map_err(crate::resources::failure)?;
         // Only memory/slot pressure drains the cache. Ordinary per-frame
         // destruction neither waits for other GPU work nor resynchronizes the
@@ -134,21 +145,29 @@ impl Runtime {
     }
 
     fn flush_cached_buffers(&mut self) -> Result<(), ash::vk::Result> {
-        if self.cached_buffers.is_empty() { return Ok(()); }
+        if self.cached_buffers.is_empty() {
+            return Ok(());
+        }
         let _frame = crate::frame_profile::Span::new("work", "buffer_cache::pressure_drain");
         self.in_flight.wait();
         // Preserve one table revision across the whole physical batch. A
         // failed prefix must not recycle IDs whose release status is unknown.
         let result = (|| {
             for buffer in &self.cached_buffers {
-                self.cache.release_buffer(buffer.id).map_err(backend_failure)?;
+                self.cache
+                    .release_buffer(buffer.id)
+                    .map_err(backend_failure)?;
             }
             for buffer in &self.cached_buffers {
-                self.table.release_buffer(buffer.id).map_err(crate::resources::failure)?;
+                self.table
+                    .release_buffer(buffer.id)
+                    .map_err(crate::resources::failure)?;
             }
             Ok(())
         })();
-        if result.is_err() { self.lost = true; } else {
+        if result.is_err() {
+            self.lost = true;
+        } else {
             self.cached_buffers.clear();
             self.cached_buffer_bytes = 0;
         }

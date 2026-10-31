@@ -611,7 +611,10 @@ impl Resources {
                     if view.format() == ir::TextureFormat::Depth32Float
                         && desc.layout().entries().iter().any(|layout| {
                             layout.binding() == entry.binding()
-                                && matches!(layout.ty(), BindingType::SampledTextureView { depth: false, .. })
+                                && matches!(
+                                    layout.ty(),
+                                    BindingType::SampledTextureView { depth: false, .. }
+                                )
                         })
                     {
                         return Err(Error::Unsupported(UnsupportedFeature::TextureFormat));

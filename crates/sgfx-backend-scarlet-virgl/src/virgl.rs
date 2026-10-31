@@ -4044,7 +4044,8 @@ pub(crate) fn push_dword(commands: &mut Vec<u8>, value: u32) {
 }
 
 fn push_words(commands: &mut Vec<u8>, values: &[u32]) -> HandleResult<()> {
-    commands.try_reserve(core::mem::size_of_val(values))
+    commands
+        .try_reserve(core::mem::size_of_val(values))
         .map_err(|_| HandleError::OutOfResources)?;
     commands.extend(values.iter().flat_map(|value| value.to_le_bytes()));
     Ok(())
@@ -4825,7 +4826,9 @@ fn push_programmable_vertex_elements(
             .iter()
             .enumerate()
             .find_map(|(slot, layout)| {
-                layout.attributes().iter()
+                layout
+                    .attributes()
+                    .iter()
                     .find(|attribute| attribute.location() == location)
                     .map(|attribute| (slot, layout, attribute))
             })
@@ -6056,11 +6059,24 @@ fn push_instanced_draw_parameters(
         _ => return Err(HandleError::InvalidParameter),
     };
     // Base instance remains in the shader constant bank on this backend.
-    push_words(commands, &[
-        command_header(VIRGL_CCMD_DRAW_VBO, 0, 12), start_vertex, vertex_count,
-        primitive, u32::from(indexed), instance_count, base_vertex as u32,
-        0, 0, 0, 0, u32::MAX, 0,
-    ])
+    push_words(
+        commands,
+        &[
+            command_header(VIRGL_CCMD_DRAW_VBO, 0, 12),
+            start_vertex,
+            vertex_count,
+            primitive,
+            u32::from(indexed),
+            instance_count,
+            base_vertex as u32,
+            0,
+            0,
+            0,
+            0,
+            u32::MAX,
+            0,
+        ],
+    )
 }
 
 pub(crate) fn push_shader(commands: &mut Vec<u8>, handle: u32, shader_type: u32, source: &str) {
@@ -7026,8 +7042,13 @@ mod tests {
         )
         .unwrap();
         let mut commands = Vec::new();
-        push_programmable_vertex_elements(&mut commands, 67, core::slice::from_ref(&layout), &[2, 0])
-            .unwrap();
+        push_programmable_vertex_elements(
+            &mut commands,
+            67,
+            core::slice::from_ref(&layout),
+            &[2, 0],
+        )
+        .unwrap();
         let words = dwords(&commands);
         assert_eq!(
             words[0],

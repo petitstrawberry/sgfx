@@ -2489,7 +2489,9 @@ impl RecordedCommand {
                 // inside the command stream and have no backend operation.
                 // Keep global/storage scopes on the conservative boundary path.
                 let fifo_only = memory.is_empty()
-                    && rec.ops[barrier_start..].iter().all(barrier_only::ordinary_barrier);
+                    && rec.ops[barrier_start..]
+                        .iter()
+                        .all(barrier_only::ordinary_barrier);
                 if (*full_scope || !memory.is_empty()) && !fifo_only {
                     rec.synchronizations.push(synchronization2::Insertion {
                         position: rec.ops.len(),
@@ -2501,8 +2503,6 @@ impl RecordedCommand {
         }
         Ok(())
     }
-
-
 }
 
 fn resolve_recording(rt: &mut Runtime, source: &Recording) -> VkResult<ResolvedRecording> {
@@ -2916,7 +2916,9 @@ unsafe extern "system" fn begin_command_buffer(
     {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let mut recording = existing.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut recording = existing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     recording.reset(false);
     recording.state = RecordingState::Recording;
     recording.one_time = one_time;
@@ -4109,7 +4111,9 @@ fn wait_and_consume_semaphores(d: &Driver, semaphores: &[Arc<AtomicU8>]) -> VkRe
             if d.lost.load(Ordering::Acquire) {
                 return Err(vk::Result::ERROR_DEVICE_LOST);
             }
-            Ok(semaphore.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire).is_ok())
+            Ok(semaphore
+                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok())
         })?;
     }
     Ok(())
@@ -4166,21 +4170,42 @@ pub(crate) fn wait_queue_semaphores(queue: vk::Queue, handles: &[vk::Semaphore])
     wait_and_consume_semaphores(&d, &semaphores)
 }
 
-#[cfg(any(target_os = "scarlet", all(target_os = "linux", feature = "scarlet-wsi")))]
-pub(crate) fn enqueue_presentation(queue: vk::Queue, handles: &[vk::Semaphore], packet: crate::wsi::Presentation) -> VkResult<()> {
+#[cfg(any(
+    target_os = "scarlet",
+    all(target_os = "linux", feature = "scarlet-wsi")
+))]
+pub(crate) fn enqueue_presentation(
+    queue: vk::Queue,
+    handles: &[vk::Semaphore],
+    packet: crate::wsi::Presentation,
+) -> VkResult<()> {
     let driver = driver(queue.as_raw(), Kind::Queue)?;
-    if driver.lost.load(Ordering::Acquire) { return Err(vk::Result::ERROR_DEVICE_LOST); }
-    if handles.len() > 64 { return Err(vk::Result::ERROR_INITIALIZATION_FAILED); }
+    if driver.lost.load(Ordering::Acquire) {
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    if handles.len() > 64 {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
     let mut waits = std::array::from_fn(|_| None);
     {
         let semaphores = driver.semaphores.lock().unwrap_or_else(|e| e.into_inner());
         for (index, (slot, handle)) in waits.iter_mut().zip(handles).enumerate() {
-            if handles[..index].contains(handle) { return Err(vk::Result::ERROR_INITIALIZATION_FAILED); }
-            *slot = Some(Arc::clone(semaphores.get(&handle.as_raw()).ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?));
+            if handles[..index].contains(handle) {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            *slot = Some(Arc::clone(
+                semaphores
+                    .get(&handle.as_raw())
+                    .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?,
+            ));
         }
     }
     driver.pending.reserve_pending(1)?;
-    if driver.queue_sender.send(queue::Request::Present(Arc::clone(&driver), waits, packet)).is_err() {
+    if driver
+        .queue_sender
+        .send(queue::Request::Present(Arc::clone(&driver), waits, packet))
+        .is_err()
+    {
         driver.pending.finish();
         driver.mark_lost();
         return Err(vk::Result::ERROR_DEVICE_LOST);
@@ -4977,7 +5002,9 @@ fn invalidate_recorded_descriptor_sets(recordings: &Recordings, sets: &[vk::Desc
         let mut recording = recording
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if sets.iter().any(|set| recording.descriptor_refs.contains(set))
+        if sets
+            .iter()
+            .any(|set| recording.descriptor_refs.contains(set))
         {
             recording.fail(vk::Result::ERROR_INITIALIZATION_FAILED);
             if recording.state == RecordingState::Executable {
