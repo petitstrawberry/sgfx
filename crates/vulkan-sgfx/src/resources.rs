@@ -873,9 +873,7 @@ impl Resources {
             storage_alignment,
         )
         .inspect_err(|error| {
-            if std::env::var_os("SGFX_VULKAN_TRACE").is_some() {
-                self.trace_descriptor_group_failure(table, handle, layout, error);
-            }
+            self.trace_descriptor_group_failure(table, handle, layout, error);
         })
     }
 
