@@ -129,10 +129,17 @@ pub struct Capabilities {
     float_color: bool,
     immediate_buffer_readback: bool,
     global_resource_barriers: bool,
+    implicit_resource_barriers: bool,
     limits: Limits,
 }
 
 impl Capabilities {
+    /// Validated non-storage resource transitions need no explicit operation on
+    /// this queue. This does not grant global, cross-queue or completion ordering.
+    pub const fn supports_implicit_resource_barriers(&self) -> bool {
+        self.implicit_resource_barriers
+    }
+
     /// Backend support for global dependencies inside one command stream.
     pub const fn supports_global_resource_barriers(&self) -> bool {
         self.global_resource_barriers
@@ -1464,6 +1471,7 @@ fn discover_wgpu_adapters() -> Vec<Adapter> {
                     float_color: false,
                     immediate_buffer_readback: false,
                     global_resource_barriers: true,
+                    implicit_resource_barriers: sgfx_backend_wgpu::IMPLICIT_RESOURCE_BARRIERS,
                     limits: runtime,
                 },
                 backend: AdapterBackend::Wgpu(WgpuAdapter {
@@ -1712,6 +1720,7 @@ struct DynamicFeatures {
     float_color: bool,
     immediate_buffer_readback: bool,
     global_resource_barriers: bool,
+    implicit_resource_barriers: bool,
 }
 
 #[cfg(sgfx_dynamic)]
@@ -1742,6 +1751,7 @@ impl From<crate::dynamic::Capabilities> for DynamicFeatures {
             float_color: capabilities.supports_float_color(),
             immediate_buffer_readback: capabilities.supports_immediate_buffer_readback(),
             global_resource_barriers: capabilities.supports_global_resource_barriers(),
+            implicit_resource_barriers: capabilities.supports_implicit_resource_barriers(),
         }
     }
 }
@@ -1779,6 +1789,7 @@ fn dynamic_capabilities(features: DynamicFeatures) -> Capabilities {
         float_color: features.float_color,
         immediate_buffer_readback: features.immediate_buffer_readback,
         global_resource_barriers: features.global_resource_barriers,
+        implicit_resource_barriers: features.implicit_resource_barriers,
         limits: Limits {
             max_push_constants_size: if programmable && features.push_constants_128 {
                 128
@@ -2096,5 +2107,21 @@ mod tests {
             Instance::with_preference(BackendPreference::Metal),
             Err(Error::BackendUnavailable(BackendKind::Metal))
         ));
+    }
+    #[test]
+    fn implicit_barriers_require_an_explicit_backend_guarantee() {
+        let old = dynamic_capabilities(DynamicFeatures {
+            rendering: true,
+            global_resource_barriers: true,
+            ..Default::default()
+        });
+        assert!(!old.supports_implicit_resource_barriers());
+        let supported = dynamic_capabilities(DynamicFeatures {
+            rendering: true,
+            implicit_resource_barriers: true,
+            ..Default::default()
+        });
+        assert!(supported.supports_implicit_resource_barriers());
+        assert!(!supported.supports_global_resource_barriers());
     }
 }

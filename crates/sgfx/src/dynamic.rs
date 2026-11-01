@@ -83,6 +83,11 @@ impl Drop for Owner {
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities(u64);
 impl Capabilities {
+    /// Ordinary validated resource transitions are implicit on this ordered queue.
+    pub fn supports_implicit_resource_barriers(self) -> bool {
+        self.0 & abi::IMPLICIT_RESOURCE_BARRIERS != 0
+    }
+
     /// Global resource-dependency command support in the command ABI.
     pub fn supports_global_resource_barriers(self) -> bool {
         self.0 & abi::GLOBAL_RESOURCE_BARRIERS != 0

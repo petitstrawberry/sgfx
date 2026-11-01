@@ -4,47 +4,12 @@
 //! avoiding compatibility decoding of native ABI command storage.
 use sgfx::ir;
 
-pub(super) fn is_noop(commands: &[ir::OwnedCommand]) -> bool {
-    !commands.is_empty() && commands.iter().all(ordinary_barrier)
-}
+use sgfx::backend::support::barriers;
 
-pub(super) fn ordinary_barrier(command: &ir::OwnedCommand) -> bool {
-    match command {
-        ir::OwnedCommand::ResourceBarrier(ir::OwnedResourceBarrier::Buffer {
-            before,
-            after,
-            ..
-        }) => ordinary_buffer_access(*before) && ordinary_buffer_access(*after),
-        ir::OwnedCommand::ResourceBarrier(
-            ir::OwnedResourceBarrier::Texture { before, after, .. }
-            | ir::OwnedResourceBarrier::TextureMip { before, after, .. },
-        ) => ordinary_texture_access(*before) && ordinary_texture_access(*after),
-        _ => false,
-    }
+pub(super) fn is_noop(implicit_transitions: bool, commands: &[ir::OwnedCommand]) -> bool {
+    barriers::can_skip(implicit_transitions, commands)
 }
-
-fn ordinary_buffer_access(access: ir::BufferAccess) -> bool {
-    matches!(
-        access,
-        ir::BufferAccess::CopyDestination
-            | ir::BufferAccess::CopySource
-            | ir::BufferAccess::Vertex
-            | ir::BufferAccess::Index
-            | ir::BufferAccess::Uniform
-    )
-}
-
-fn ordinary_texture_access(access: ir::TextureAccess) -> bool {
-    // Core replay accepts storage transitions that native validate_barrier
-    // rejects. Leave storage (and any future access scope) on the backend path.
-    matches!(
-        access,
-        ir::TextureAccess::CopyDestination
-            | ir::TextureAccess::CopySource
-            | ir::TextureAccess::Sampled
-            | ir::TextureAccess::RenderAttachment
-    )
-}
+pub(super) use barriers::ordinary_barrier;
 
 #[cfg(test)]
 mod tests {
@@ -92,7 +57,11 @@ mod tests {
     fn classify(table: &ir::ResourceTable, ops: Vec<C>) -> ir::Result<bool> {
         let owned = ir::OwnedCommandBuffer::new(ops);
         owned.record(table)?;
-        Ok(is_noop(owned.commands()))
+        assert!(
+            !is_noop(false, owned.commands()),
+            "unadvertised drivers must submit validated barriers"
+        );
+        Ok(is_noop(true, owned.commands()))
     }
 
     #[test]
@@ -110,7 +79,7 @@ mod tests {
             // Do not call recorded.commands(): that lazily decodes the ABI
             // recording and allocates a compatibility Vec. Owned IR is intact.
             assert!(!owned.commands().is_empty());
-            assert_eq!(is_noop(owned.commands()), expected);
+            assert_eq!(is_noop(true, owned.commands()), expected);
         };
         let barrier = C::ResourceBarrier(R::Buffer {
             buffer,
