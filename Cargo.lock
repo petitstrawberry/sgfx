@@ -1714,6 +1714,8 @@ dependencies = [
  "pollster",
  "raw-window-handle",
  "sgfx-core",
+ "web-sys",
+ "web-time",
  "wgpu",
 ]
 

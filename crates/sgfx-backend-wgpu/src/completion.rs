@@ -3,7 +3,10 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use sgfx_core::backend::{Completion, CompletionStatus};
 
@@ -70,15 +73,20 @@ impl Submission {
         // A private marker is last written by this submission. Mapping it
         // observes that exact submission, unlike on_submitted_work_done alone,
         // which can attach to a later concurrent raw-queue submit.
+        #[cfg(target_arch = "wasm32")]
+        let retained_marker = marker.clone();
         marker
             .slice(..)
             .map_async(raw::MapMode::Read, move |result| {
                 callback_observation.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
+                #[cfg(target_arch = "wasm32")]
+                drop(retained_marker);
             });
         device.raw_queue().on_submitted_work_done(move || {
             // Retain the marker independently of public receipts so dropping
             // one cannot cancel mapping and falsely return tracking capacity.
             // WGPU runs earlier registered map callbacks before this callback.
+            #[cfg(not(target_arch = "wasm32"))]
             drop(marker);
             drop(slot);
         });
