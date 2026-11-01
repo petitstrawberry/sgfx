@@ -357,7 +357,7 @@ impl NativeScheduler {
         pending
             .try_reserve(MAX_SUBMISSIONS)
             .map_err(|_| HandleError::OutOfResources)?;
-        let mut scheduler = Scheduler::new();
+        let mut scheduler = Scheduler::new(crate::scheduler::LIMITS);
         scheduler
             .reserve_admission()
             .map_err(|_| HandleError::OutOfResources)?;
@@ -396,7 +396,7 @@ impl NativeScheduler {
             .filter(|n| *n <= MAX_STREAM_BYTES)
             .ok_or(AdmissionError::TooLarge)?;
         let signal = Arc::new(Signal::with_bytes(bytes).map_err(|_| AdmissionError::OutOfMemory)?);
-        let job = Job::prepare(chunks, queue, Arc::clone(&signal))?;
+        let job = Job::prepare(chunks, queue, Arc::clone(&signal), crate::scheduler::LIMITS)?;
         {
             let mut state = lock(&self.shared.admission);
             if let Some(error) = state.failure {

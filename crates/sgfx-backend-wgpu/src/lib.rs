@@ -34,6 +34,10 @@ use sgfx_core::ir::{
     TextureRef, TextureSampleMode, TextureUsage, VertexAttribute, VertexFormat,
 };
 
+/// WGPU inserts ordinary resource transitions while preserving queue order.
+/// Storage/global dependencies and completion still use their explicit paths.
+pub const IMPLICIT_RESOURCE_BARRIERS: bool = true;
+
 /// Result returned by the WGPU backend.
 pub type Result<T> = core::result::Result<T, Error>;
 

@@ -2486,9 +2486,11 @@ impl RecordedCommand {
                 // Retire preceding GPU work at this control point for legacy
                 // memory barriers, just as for synchronization2 dependencies.
                 // Ordinary resource barriers are validated/replayed in order
-                // inside the command stream and have no backend operation.
+                // inside the command stream. Only a backend that explicitly
+                // guarantees implicit transitions may omit their boundary.
                 // Keep global/storage scopes on the conservative boundary path.
-                let fifo_only = memory.is_empty()
+                let fifo_only = rt.capabilities.supports_implicit_resource_barriers()
+                    && memory.is_empty()
                     && rec.ops[barrier_start..]
                         .iter()
                         .all(barrier_only::ordinary_barrier);
@@ -4413,7 +4415,10 @@ fn submit_owned_batch(
             crate::resources::failure(error)
         })
     })?;
-    if barrier_only::is_noop(owned.commands()) {
+    if barrier_only::is_noop(
+        rt.capabilities.supports_implicit_resource_barriers(),
+        owned.commands(),
+    ) {
         // These validated transitions need no backend operation on our ordered
         // queue. Keep outer control points and FIFO completion observations:
         // an empty receipt list still completes after the earlier queue prefix.

@@ -221,6 +221,13 @@ pub const FLOAT_COLOR_ATTACHMENTS: u64 = 1 << 24;
 pub const IMMEDIATE_BUFFER_READBACK: u64 = 1 << 25;
 /// ResourceBarrier discriminator 3: a global outside-pass memory dependency.
 pub const GLOBAL_RESOURCE_BARRIERS: u64 = 1 << 26;
+/// Validated ordinary resource transitions need no explicit backend operation
+/// on one ordered queue: copy, vertex/index/uniform, sampled and attachment
+/// accesses only. Does not cover storage, global dependencies, other queues,
+/// external producers, host visibility, GPU completion or presentation.
+/// Older drivers omit this bit and retain explicit submission/synchronization.
+pub const IMPLICIT_RESOURCE_BARRIERS: u64 = 1 << 27;
+
 /// Optional timing extension; existing v2 table layouts remain unchanged.
 pub const TIMESTAMP_ENTRY: &[u8] = b"sgfx_backend_get_timestamp_api_v2\0";
 #[repr(C)]

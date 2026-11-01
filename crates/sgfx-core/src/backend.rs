@@ -56,3 +56,6 @@ pub trait CommandExecutor {
         commands: &CommandBuffer<'r, 'data>,
     ) -> Result<(), Self::Error>;
 }
+
+/// Portable planning, upload and dispatch building blocks for backend authors.
+pub mod support;

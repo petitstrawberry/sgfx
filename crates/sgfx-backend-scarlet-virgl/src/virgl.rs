@@ -2162,7 +2162,9 @@ impl Queue {
                     bytes
                 } else {
                     scratch.resize(end - offset, 0);
-                    source.copy_range(offset..end, &mut scratch)?;
+                    source
+                        .copy_range(offset..end, &mut scratch)
+                        .map_err(|_| HandleError::InvalidParameter)?;
                     &scratch
                 };
                 // Rotate before choosing arena offsets, but reserve only this
@@ -4883,7 +4885,7 @@ struct ProgrammableBindings {
     dsa: Option<u32>,
     pipeline: Option<(u32, u32, u32, u32)>,
     vertex_buffers: Option<[(u32, u32, u32); 8]>,
-    constants: Option<Rc<[IrConstantBuffer]>>,
+    constants: sgfx_core::backend::support::state::SharedState<[IrConstantBuffer]>,
     first_instance: Option<[u32; 3]>,
     vertex_constants: Vec<u32>,
     fragment_constants: Vec<u32>,
@@ -4899,9 +4901,7 @@ fn push_programmable_constants(
     draw_parameters: [u32; 3],
     bindings: &mut ProgrammableBindings,
 ) -> HandleResult<()> {
-    let constants_unchanged = bindings.constants.as_ref().is_some_and(|previous| {
-        Rc::ptr_eq(previous, constants) || previous.as_ref() == constants.as_ref()
-    });
+    let constants_unchanged = bindings.constants.matches(constants);
     let instance_unchanged =
         first_instance_register.is_none_or(|_| bindings.first_instance == Some(draw_parameters));
     if constants_unchanged && instance_unchanged {
@@ -4958,7 +4958,7 @@ fn push_programmable_constants(
     if !constants_unchanged && !bindings.fragment_constants.is_empty() {
         push_constant_words(commands, PIPE_SHADER_FRAGMENT, &bindings.fragment_constants)?;
     }
-    bindings.constants = Some(Rc::clone(constants));
+    bindings.constants.remember(constants);
     bindings.first_instance = first_instance_register.map(|_| draw_parameters);
     Ok(())
 }
@@ -5046,7 +5046,7 @@ fn push_programmable_draw(
         );
         push_bind_object(commands, VIRGL_OBJECT_BLEND, state.blend_handle);
         bindings.pipeline = Some(pipeline_key);
-        bindings.constants = None;
+        bindings.constants.clear();
     }
     if bindings.rasterizer != Some(state.rasterizer_handle) {
         push_bind_object(commands, VIRGL_OBJECT_RASTERIZER, state.rasterizer_handle);
