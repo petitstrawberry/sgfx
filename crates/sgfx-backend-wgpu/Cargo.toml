@@ -20,3 +20,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "77e64a81115d78fab7c63671c2a6c16aac060c05", default-features = false, features = ["backend-abi"] }
 naga = { version = "24", features = ["wgsl-in", "spv-out"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+web-time = "1"

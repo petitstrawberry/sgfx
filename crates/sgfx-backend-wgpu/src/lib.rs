@@ -543,6 +543,34 @@ impl WindowContext {
         )
     }
 
+    /// Create a browser WebGPU context without blocking the JavaScript thread.
+    /// The surface owns its canvas handle. WebGL fallback is intentionally disabled.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn from_canvas(canvas: web_sys::HtmlCanvasElement) -> Result<Self> {
+        let width = canvas.width().max(1);
+        let height = canvas.height().max(1);
+        let instance = raw::Instance::new(&raw::InstanceDescriptor {
+            backends: raw::Backends::BROWSER_WEBGPU,
+            ..Default::default()
+        });
+        let surface = instance
+            .create_surface(raw::SurfaceTarget::Canvas(canvas))
+            .map_err(|_| Error::SurfaceCreation)?;
+        let adapter = instance
+            .request_adapter(&raw::RequestAdapterOptions {
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })
+            .await
+            .ok_or(Error::AdapterUnavailable)?;
+        let (device, queue) = adapter
+            .request_device(&raw::DeviceDescriptor::default(), None)
+            .await
+            .map_err(|_| Error::DeviceRequest)?;
+        let context = Device::new(device, queue).create_context();
+        Self::from_parts(instance, &adapter, context, surface, width, height, false)
+    }
+
     /// Create presentation state for an existing WGPU device and CAMetalLayer.
     ///
     /// This is used by API frontends whose device was selected before the
