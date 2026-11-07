@@ -150,7 +150,11 @@ mod tests {
         assert_eq!(second[0].bytes, [9; 80]);
         assert_eq!(second[0].arena, Some(0));
         let empty = stream.take().unwrap();
-        assert_eq!(empty.len(), 1, "empty submissions still publish a checkpoint");
+        assert_eq!(
+            empty.len(),
+            1,
+            "empty submissions still publish a checkpoint"
+        );
         assert!(empty[0].bytes.is_empty());
     }
 
