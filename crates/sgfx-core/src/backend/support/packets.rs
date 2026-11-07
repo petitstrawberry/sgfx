@@ -117,6 +117,12 @@ impl<const MAX_STREAM_BYTES: usize, const UPLOAD_ARENA_COUNT: usize>
         }
         Ok(self.chunks)
     }
+
+    /// Drain a submission while retaining its negotiated transport limit.
+    pub fn take(&mut self) -> Result<Vec<Chunk>, Error> {
+        let replacement = Self::new(self.limit);
+        core::mem::replace(self, replacement).finish()
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +131,32 @@ mod tests {
     const UPLOAD_ARENA_COUNT: usize = 4;
     const MAX_STREAM_BYTES: usize = 512 * 1024 * 1024;
     type TestPackets = Packets<MAX_STREAM_BYTES, UPLOAD_ARENA_COUNT>;
+
+    #[test]
+    fn draining_packets_preserves_limit_and_resets_upload_offsets_and_byte_budget() {
+        let mut stream = TestPackets::new(128);
+        stream.prepare(80).unwrap();
+        assert_eq!(stream.upload_range(60).unwrap(), (0, 0));
+        stream.append(&[7; 80]).unwrap();
+        let first = stream.take().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].bytes, [7; 80]);
+        assert_eq!(first[0].arena, Some(0));
+        assert_eq!(stream.prepare(129), Err(Error::TooLarge));
+        assert_eq!(stream.upload_range(60).unwrap(), (0, 0));
+        stream.append(&[9; 80]).unwrap();
+        let second = stream.take().unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].bytes, [9; 80]);
+        assert_eq!(second[0].arena, Some(0));
+        let empty = stream.take().unwrap();
+        assert_eq!(
+            empty.len(),
+            1,
+            "empty submissions still publish a checkpoint"
+        );
+        assert!(empty[0].bytes.is_empty());
+    }
 
     #[test]
     fn large_stream_splits_at_packet_boundaries_and_reuses_only_between_chunks() {
