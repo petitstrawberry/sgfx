@@ -155,7 +155,8 @@ pub struct IrResources {
     backend: driver::IrResources,
     images: Vec<ImageMapping>,
     buffer_shadows: Vec<BufferShadow>,
-    canonical_buffer_revisions: Vec<Option<u64>>,
+    // Revision and whether texture coordinates were validated as well as color/position.
+    canonical_buffer_revisions: Vec<Option<(u64, bool)>>,
     submission_failed: bool,
     cleanup_complete: bool,
     #[cfg(feature = "programmable")]
@@ -523,14 +524,17 @@ impl IrResources {
             .ok_or(IrSubmitError::InvalidVertexData)
     }
 
-    fn canonical_buffer_revision(&self, slot: usize) -> Option<u64> {
+    fn canonical_buffer_revision(&self, slot: usize) -> Option<(u64, bool)> {
         self.canonical_buffer_revisions.get(slot).copied().flatten()
     }
 
-    fn commit_canonical_validations(&mut self, validations: Vec<(usize, u64)>) {
-        for (slot, revision) in validations {
+    fn commit_canonical_validations(&mut self, validations: Vec<(usize, u64, bool)>) {
+        for (slot, revision, uv) in validations {
             if let Some(validated) = self.canonical_buffer_revisions.get_mut(slot) {
-                *validated = Some(revision);
+                *validated = Some((
+                    revision,
+                    uv || validated.is_some_and(|(old, old_uv)| old == revision && old_uv),
+                ));
             }
         }
     }
@@ -652,7 +656,7 @@ fn commit_prepared_buffer_updates(
 #[derive(Default)]
 struct PendingBuffers<'a> {
     plan: BufferOnlyPlan<'a>,
-    canonical_validations: Vec<(usize, u64)>,
+    canonical_validations: Vec<(usize, u64, bool)>,
     #[cfg(feature = "programmable")]
     index_bounds: RefCell<programmable::IndexBoundsCache>,
     #[cfg(all(test, feature = "programmable"))]
@@ -1137,7 +1141,7 @@ impl<'a> PendingBuffers<'a> {
         // Upload revisions cover the entire stream, but a validation only
         // proves the pending bytes present at the draw that performed it.
         self.canonical_validations
-            .retain(|(candidate, _)| *candidate != slot);
+            .retain(|(candidate, _, _)| *candidate != slot);
         // A pending upload revision can cover several different byte states
         // within this plan. Every write/copy must discard their index proof.
         #[cfg(feature = "programmable")]
@@ -1257,24 +1261,35 @@ impl<'a> PendingBuffers<'a> {
 
     fn canonical_needs_validation(
         &self,
-        resources: &IrResources,
+        accepted: Option<(u64, bool)>,
         slot: usize,
         revision: u64,
+        uv: bool,
     ) -> bool {
-        resources.canonical_buffer_revision(slot) != Some(revision)
-            && !self.canonical_validations.contains(&(slot, revision))
+        !accepted.is_some_and(|(old, old_uv)| old == revision && (!uv || old_uv))
+            && !self
+                .canonical_validations
+                .iter()
+                .any(|&(key, old, old_uv)| key == slot && old == revision && (!uv || old_uv))
     }
 
     fn mark_canonical_validated(
         &mut self,
         slot: usize,
         revision: u64,
+        uv: bool,
     ) -> Result<(), IrSubmitError> {
-        if !self.canonical_validations.contains(&(slot, revision)) {
+        if let Some((_, _, validated_uv)) = self
+            .canonical_validations
+            .iter_mut()
+            .find(|(key, old, _)| *key == slot && *old == revision)
+        {
+            *validated_uv |= uv;
+        } else {
             self.canonical_validations
                 .try_reserve(1)
                 .map_err(|_| IrSubmitError::OutOfMemory)?;
-            self.canonical_validations.push((slot, revision));
+            self.canonical_validations.push((slot, revision, uv));
         }
         Ok(())
     }
@@ -1283,19 +1298,26 @@ impl<'a> PendingBuffers<'a> {
         &self,
         resources: &IrResources,
         buffer: BufferRef<'_>,
-    ) -> Result<(), IrSubmitError> {
+        uv: bool,
+    ) -> Result<bool, IrSubmitError> {
         let slot = buffer.slot();
         let length = self.plan.length(&resources.buffer_shadows, slot)?;
         if length == 0 || !length.is_multiple_of(40) {
             return Err(IrSubmitError::InvalidVertexData);
         }
-        let mut record = [0u8; 40];
-        for start in (0..length).step_by(40) {
+        // Resolve sparse overlays in bounded blocks rather than querying the
+        // range index for every vertex. No whole-buffer snapshot is allocated.
+        let mut block = [0u8; 40 * 128];
+        let mut valid_uv = true;
+        for start in (0..length).step_by(block.len()) {
+            let count = block.len().min(length - start);
             self.plan
-                .read_range(&resources.buffer_shadows, slot, start, &mut record);
-            validate_canonical_record(&record)?;
+                .read_range(&resources.buffer_shadows, slot, start, &mut block[..count]);
+            for record in block[..count].chunks_exact(40) {
+                valid_uv &= validate_canonical_record(record, uv)?;
+            }
         }
-        Ok(())
+        Ok(valid_uv)
     }
 }
 
@@ -1303,7 +1325,7 @@ struct ExecutionPlan<'a> {
     has_content_preserving_pass: bool,
     events: Vec<ExecutionEvent<'a>>,
     buffer_updates: BufferOnlyPlan<'a>,
-    canonical_validations: Vec<(usize, u64)>,
+    canonical_validations: Vec<(usize, u64, bool)>,
 }
 
 #[cfg(feature = "profile-submissions")]
@@ -3134,10 +3156,15 @@ fn decode_draw_vertices(
     let persistent_supported = is_canonical_persistent_layout(info)
         && descriptor.size() <= u64::from(u32::MAX)
         && offset <= u64::from(u32::MAX);
-    let vertices = if persistent_supported {
+    let persistent_revision = if persistent_supported {
         let revision = pending_buffers.revision(resources, buffer)?;
-        let needs_validation =
-            pending_buffers.canonical_needs_validation(resources, buffer.slot(), revision);
+        let uv = !matches!(info.state.fragment, IrFragmentProgram::VertexColor);
+        let needs_validation = pending_buffers.canonical_needs_validation(
+            resources.canonical_buffer_revision(buffer.slot()),
+            buffer.slot(),
+            revision,
+            uv,
+        );
         let length = pending_buffers
             .plan
             .length(&resources.buffer_shadows, buffer.slot())?;
@@ -3149,12 +3176,26 @@ fn decode_draw_vertices(
             first_vertex,
             vertex_count,
         )?;
-        if needs_validation {
-            pending_buffers.validate_canonical(resources, buffer)?;
-        }
-        if needs_validation {
-            pending_buffers.mark_canonical_validated(buffer.slot(), revision)?;
-        }
+        let valid = if needs_validation {
+            match pending_buffers.validate_canonical(resources, buffer, uv) {
+                Ok(valid_uv) => {
+                    pending_buffers.mark_canonical_validated(buffer.slot(), revision, valid_uv)?;
+                    true
+                }
+                // The new color-only path used to decode only the referenced
+                // range. Unused records may contain invalid values; preserve
+                // that behavior by validating/repacking just this draw below.
+                Err(IrSubmitError::InvalidVertexData) if !uv => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            true
+        };
+        valid.then_some(revision)
+    } else {
+        None
+    };
+    let vertices = if let Some(revision) = persistent_revision {
         let offset = u32::try_from(offset).map_err(|_| IrSubmitError::InvalidVertexData)?;
         DecodedVertices::Persistent {
             binding: IrVertexBufferBinding {
@@ -3209,14 +3250,16 @@ fn is_canonical_persistent_layout(info: PipelineInfo) -> bool {
     info.stride == 40
         && info.position == VertexAttribute::new(0, VertexFormat::Float32x4, 0)
         && info.secondary == Some(VertexAttribute::new(1, VertexFormat::Float32x4, 16))
-        && info.tertiary == Some(VertexAttribute::new(2, VertexFormat::Float32x2, 32))
-        && matches!(
-            info.state.fragment,
-            IrFragmentProgram::VertexColor
-                | IrFragmentProgram::TextureVertexColorRgba
-                | IrFragmentProgram::TextureVertexColorRgbIgnoreAlpha
-                | IrFragmentProgram::TextureVertexColorAlphaMask
-        )
+        // Color-only draws never consume UVs. Their unused trailing bytes do
+        // not require an attribute declaration or repacking the whole mesh.
+        && match info.state.fragment {
+            IrFragmentProgram::VertexColor => true,
+            IrFragmentProgram::TextureVertexColorRgba
+            | IrFragmentProgram::TextureVertexColorRgbIgnoreAlpha
+            | IrFragmentProgram::TextureVertexColorAlphaMask =>
+                info.tertiary == Some(VertexAttribute::new(2, VertexFormat::Float32x2, 32)),
+            _ => false,
+        }
 }
 
 fn validate_canonical_vertex_range(
@@ -3256,8 +3299,8 @@ fn validate_canonical_vertex_range(
     Ok(())
 }
 
-fn validate_canonical_record(record: &[u8]) -> Result<(), IrSubmitError> {
-    for offset in [0, 4, 8, 12, 32, 36] {
+fn validate_canonical_record(record: &[u8], uv: bool) -> Result<bool, IrSubmitError> {
+    for offset in [0, 4, 8, 12] {
         if !read_f32(record, offset)?.is_finite() {
             return Err(IrSubmitError::InvalidVertexData);
         }
@@ -3268,7 +3311,13 @@ fn validate_canonical_record(record: &[u8]) -> Result<(), IrSubmitError> {
             return Err(IrSubmitError::InvalidVertexData);
         }
     }
-    Ok(())
+    // A color-only draw can also establish the texture proof opportunistically,
+    // but ignored UV bytes must never reject it or prove a later texture read.
+    let valid_uv = read_f32(record, 32)?.is_finite() && read_f32(record, 36)?.is_finite();
+    if uv && !valid_uv {
+        return Err(IrSubmitError::InvalidVertexData);
+    }
+    Ok(valid_uv)
 }
 
 fn decode_indexed_draw_vertices(
@@ -5252,6 +5301,59 @@ mod tests {
     }
 
     #[test]
+    fn color_only_persistent_vertices_ignore_unused_uv_without_proving_texture_reads() {
+        let table = ResourceTable::new();
+        let pipeline = table
+            .define_render_pipeline(
+                ir::RenderPipelineDesc::new(
+                    TextureFormat::Bgra8Unorm,
+                    PrimitiveTopology::TriangleList,
+                    ir::VertexBufferLayout::new(
+                        40,
+                        vec![
+                            VertexAttribute::new(0, VertexFormat::Float32x4, 0),
+                            VertexAttribute::new(1, VertexFormat::Float32x4, 16),
+                        ],
+                    )
+                    .unwrap(),
+                    FragmentProgram::VertexColor,
+                    BlendState::REPLACE,
+                    ir::RasterState::new(ir::CullMode::None, ir::FrontFace::CounterClockwise),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut info = pipeline_info(&table, pipeline).unwrap();
+        assert!(is_canonical_persistent_layout(info));
+        let mut record = [0; 40];
+        record[32..36].copy_from_slice(&f32::NAN.to_le_bytes());
+        record[36..40].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        assert!(!validate_canonical_record(&record, false).unwrap());
+        assert!(validate_canonical_record(&record, true).is_err());
+        record[16..20].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(validate_canonical_record(&record, false).is_err());
+        info.state.fragment = IrFragmentProgram::TextureVertexColorRgba;
+        assert!(!is_canonical_persistent_layout(info));
+        info.tertiary = Some(VertexAttribute::new(2, VertexFormat::Float32x2, 32));
+        assert!(is_canonical_persistent_layout(info));
+        info.stride = 32;
+        assert!(!is_canonical_persistent_layout(info));
+
+        let mut pending = PendingBuffers::new();
+        pending.mark_canonical_validated(0, 7, false).unwrap();
+        assert!(!pending.canonical_needs_validation(None, 0, 7, false));
+        assert!(pending.canonical_needs_validation(None, 0, 7, true));
+        pending.mark_canonical_validated(0, 7, true).unwrap();
+        pending.mark_canonical_validated(0, 7, false).unwrap();
+        assert!(!pending.canonical_needs_validation(None, 0, 7, true));
+        pending.invalidate_canonical_validation(0);
+        assert!(pending.canonical_needs_validation(None, 0, 7, false));
+        assert!(pending.canonical_needs_validation(Some((7, false)), 0, 7, true));
+        assert!(!pending.canonical_needs_validation(Some((7, true)), 0, 7, false));
+        assert!(pending.canonical_needs_validation(Some((7, true)), 0, 8, false));
+    }
+
+    #[test]
     fn fixed_narrow_render_pipeline_lowers_implicit_alpha_and_channel_masks() {
         for (format, mask) in [
             (TextureFormat::R8Unorm, 1),
@@ -5755,30 +5857,30 @@ mod tests {
         assert_ne!(revision, shadows[first.slot()].revision);
         let other_revision = pending.revision(&resources, other).unwrap();
         pending
-            .mark_canonical_validated(first.slot(), revision)
+            .mark_canonical_validated(first.slot(), revision, true)
             .unwrap();
         pending
-            .mark_canonical_validated(other.slot(), other_revision)
+            .mark_canonical_validated(other.slot(), other_revision, true)
             .unwrap();
         assert!(
             pending
                 .canonical_validations
-                .contains(&(first.slot(), revision))
+                .contains(&(first.slot(), revision, true))
         );
         pending.write(&table, &shadows, first, 0, &[8; 40]).unwrap();
         assert_eq!(pending.revision(&resources, first).unwrap(), revision);
         assert!(
             !pending
                 .canonical_validations
-                .contains(&(first.slot(), revision))
+                .contains(&(first.slot(), revision, true))
         );
         assert!(
             pending
                 .canonical_validations
-                .contains(&(other.slot(), other_revision))
+                .contains(&(other.slot(), other_revision, true))
         );
         pending
-            .mark_canonical_validated(first.slot(), revision)
+            .mark_canonical_validated(first.slot(), revision, true)
             .unwrap();
         pending
             .copy(&table, &shadows, (other, 0), (first, 40), 40)
@@ -5787,15 +5889,15 @@ mod tests {
         assert!(
             !pending
                 .canonical_validations
-                .contains(&(first.slot(), revision))
+                .contains(&(first.slot(), revision, true))
         );
         assert!(
             pending
                 .canonical_validations
-                .contains(&(other.slot(), other_revision))
+                .contains(&(other.slot(), other_revision, true))
         );
         pending
-            .mark_canonical_validated(first.slot(), revision)
+            .mark_canonical_validated(first.slot(), revision, true)
             .unwrap();
         assert!(pending.write(&table, &shadows, first, 79, &[9; 4]).is_err());
         assert!(
@@ -5806,12 +5908,12 @@ mod tests {
         assert!(
             pending
                 .canonical_validations
-                .contains(&(first.slot(), revision))
+                .contains(&(first.slot(), revision, true))
         );
         assert!(
             pending
                 .canonical_validations
-                .contains(&(other.slot(), other_revision))
+                .contains(&(other.slot(), other_revision, true))
         );
         assert_eq!(shadows[0].bytes.as_deref(), Some(&[3; 80][..]));
         assert_eq!(shadows[0].revision, 7);
