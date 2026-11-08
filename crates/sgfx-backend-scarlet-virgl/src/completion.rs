@@ -251,8 +251,8 @@ impl SubmitMode {
         else {
             return Ok(());
         };
-        let staged = core::mem::replace(packets, Packets::new(0))
-            .finish()
+        let staged = packets
+            .take()
             .map_err(|error| packet_error(error, too_large))?;
         let mut chunks = Vec::new();
         chunks
