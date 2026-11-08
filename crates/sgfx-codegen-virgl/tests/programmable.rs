@@ -905,13 +905,35 @@ fn cube_array_depth_comparison_and_texel_loads_preserve_binding_types() {
 // oracle uses IEEE f32 arithmetic and bit masks, independently of Naga's
 // matrix layout and expression lowering. Host-driver acceptance is separate.
 fn evaluate_math_tgsi(tgsi: &str, inputs: &[[f32; 4]]) -> [f32; 4] {
+    evaluate_constant_tgsi(tgsi, inputs, &[])
+}
+
+fn evaluate_constant_tgsi(tgsi: &str, inputs: &[[f32; 4]], constants: &[[f32; 4]]) -> [f32; 4] {
     use std::collections::HashMap;
     let mut registers: HashMap<String, [u32; 4]> = HashMap::new();
     for (index, input) in inputs.iter().enumerate() {
         registers.insert(format!("IN[{index}]"), input.map(f32::to_bits));
     }
+    for (index, value) in constants.iter().enumerate() {
+        registers.insert(format!("CONST[{index}]"), value.map(f32::to_bits));
+    }
     fn components(registers: &HashMap<String, [u32; 4]>, operand: &str) -> [u32; 4] {
-        let (register, swizzle) = operand.split_once('.').unwrap_or((operand, "xyzw"));
+        let (register, swizzle) = operand.rsplit_once('.').unwrap_or((operand, "xyzw"));
+        let resolved;
+        let register = if let Some(offset) = register
+            .strip_prefix("CONST[ADDR[0].x+")
+            .and_then(|v| v.strip_suffix(']'))
+        {
+            let index = registers["ADDR[0]"][0] + offset.parse::<u32>().unwrap();
+            resolved = format!("CONST[{index}]");
+            assert!(
+                registers.contains_key(&resolved),
+                "out-of-bounds constant read: {resolved}"
+            );
+            resolved.as_str()
+        } else {
+            register
+        };
         let value = registers.get(register).copied().unwrap_or([0; 4]);
         let indices: Vec<_> = swizzle.chars().map(|c| "xyzw".find(c).unwrap()).collect();
         std::array::from_fn(|i| value[indices[i % indices.len()]])
@@ -951,7 +973,8 @@ fn evaluate_math_tgsi(tgsi: &str, inputs: &[[f32; 4]]) -> [f32; 4] {
         for component in mask.chars().map(|c| "xyzw".find(c).unwrap()) {
             let f = |arg: usize| f32::from_bits(source[arg][component]);
             let bits = match opcode {
-                "MOV" => source[0][component],
+                "MOV" | "UARL" => source[0][component],
+                "UMUL" => source[0][component].wrapping_mul(source[1][component]),
                 "ADD" => (f(0) + f(1)).to_bits(),
                 "SUB" => (f(0) - f(1)).to_bits(),
                 "MUL" => (f(0) * f(1)).to_bits(),
@@ -1276,4 +1299,49 @@ fn explicit_sampling_gradients_keep_both_derivative_vectors() {
         .find(|line| line.contains(": TXD "))
         .unwrap();
     assert_eq!(line.matches(',').count(), 5);
+}
+
+#[test]
+fn large_uniform_array_indexing_is_bounded_and_constant_cost() {
+    // Covers the 65-tap blur kernel and arrays with multi-register elements.
+    for stride in [1usize, 2] {
+        let (element, access) = if stride == 1 {
+            ("vec4<f32>", "")
+        } else {
+            ("mat2x4<f32>", "[1]")
+        };
+        let source = format!(
+            r#"
+struct Uniforms {{ prefix: vec4<f32>, values: array<{element}, 65> }};
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@fragment fn main(@location(0) @interpolate(flat) index: u32) -> @location(0) vec4<f32> {{
+    return uniforms.values[index]{access};
+}}
+"#
+        );
+        let constants: Vec<_> = (0..1 + 65 * stride)
+            .map(|i| [i as f32, i as f32 + 0.25, -1.0, 1.0])
+            .collect();
+        for module in [wgsl(&source), spirv(&source)] {
+            let shader = compile_shader(&module, ShaderStage::Fragment, "main").unwrap();
+            assert_eq!(
+                shader.uniform_buffers[0].required_size as usize,
+                constants.len() * 16
+            );
+            assert!(
+                shader.tgsi.lines().count() < 60,
+                "array lookup expanded to a selection chain"
+            );
+            for index in [0, 1, 32, 64, 65, u32::MAX] {
+                let result =
+                    evaluate_constant_tgsi(&shader.tgsi, &[[f32::from_bits(index); 4]], &constants);
+                let expected = if index < 65 {
+                    constants[1 + index as usize * stride + stride - 1]
+                } else {
+                    [0.0; 4]
+                };
+                assert_eq!(result, expected, "stride={stride}, index={index}");
+            }
+        }
+    }
 }

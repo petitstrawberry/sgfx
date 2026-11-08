@@ -23,6 +23,7 @@ pub struct Capabilities {
     image_upload: bool,
     image_readback: bool,
     depth: bool,
+    programmable_graphics: bool,
 }
 
 impl Capabilities {
@@ -69,6 +70,12 @@ impl Capabilities {
     /// `true` when depth-enabled passes are supported.
     pub const fn supports_depth(&self) -> bool {
         self.depth
+    }
+
+    /// Return whether the selected backend supports programmable graphics.
+    /// Renderers can use WGSL pipelines when this capability is available.
+    pub const fn supports_programmable_graphics(&self) -> bool {
+        self.programmable_graphics
     }
 }
 
@@ -142,6 +149,7 @@ impl Device {
                     image_upload: capabilities.supports_image_upload(),
                     image_readback: capabilities.supports_image_readback(),
                     depth: capabilities.supports_depth(),
+                    programmable_graphics: capabilities.supports_programmable_graphics(),
                 }
             }
             #[cfg(sgfx_dynamic_virgl)]
@@ -153,6 +161,7 @@ impl Device {
                     image_upload: capabilities.supports_image_upload(),
                     image_readback: capabilities.supports_image_readback(),
                     depth: capabilities.supports_depth(),
+                    programmable_graphics: capabilities.supports_programmable_graphics(),
                 }
             }
         }

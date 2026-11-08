@@ -10,7 +10,7 @@ type Result<T> = core::result::Result<T, IrSubmitError>;
 
 fn publish_compute_shadow(
     shadow: &mut BufferShadow,
-    canonical_revision: &mut Option<u64>,
+    canonical_revision: &mut Option<(u64, bool)>,
     bytes: Vec<u8>,
     revision: u64,
 ) {
@@ -662,7 +662,7 @@ mod tests {
                 .len(),
             2
         );
-        let mut canonical_revision = Some(9);
+        let mut canonical_revision = Some((9, true));
         let mut computed = vec![3; 64];
         computed[40..44].fill(7);
         publish_compute_shadow(&mut shadow, &mut canonical_revision, computed.clone(), 10);

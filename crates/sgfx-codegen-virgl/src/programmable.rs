@@ -469,11 +469,15 @@ impl<'a> Compiler<'a> {
                 base,
                 size: naga::ArraySize::Constant(n),
                 ..
-            } if n.get() <= 64 => {
-                Shape::Aggregate(vec![
-                    self.shape(&self.module.types[*base].inner)?;
-                    n.get() as usize
-                ])
+            } => {
+                let element = self.shape(&self.module.types[*base].inner)?;
+                if (n.get() as usize)
+                    .checked_mul(element.len())
+                    .is_none_or(|n| n > 4096)
+                {
+                    return Err(unsupported("more than 4096 aggregate scalar lanes"));
+                }
+                Shape::Aggregate(vec![element; n.get() as usize])
             }
             T::Pointer { base, .. } => self.shape(&self.module.types[*base].inner)?,
             T::ValuePointer {
@@ -565,6 +569,9 @@ impl<'a> Compiler<'a> {
             return self.storage_load(inner, *slot, *metadata, offset);
         }
         if let Some(read) = &value.indirect {
+            if let Some(result) = self.indexed_constant(value, read)? {
+                return Ok(result);
+            }
             let result = self.allocate(value.shape.clone(), false)?;
             let zero = self.immediate(Literal::U32(0))?;
             for dst in &result.lanes {
@@ -588,35 +595,128 @@ impl<'a> Compiler<'a> {
         let result = self.allocate(value.shape.clone(), false)?;
         for (dst, src) in result.lanes.iter().zip(&value.lanes) {
             if let Some(address) = src.constant_byte {
-                for binding in &mut self.uniforms {
-                    let start = binding.first_register * 16;
-                    if let Some(offset) = address.checked_sub(start).filter(|&n| n < binding.size) {
-                        binding.required_size = binding.required_size.max(offset + 4);
-                        break;
-                    }
-                }
-                if let Some(push) = &mut self.push_constants {
-                    let start = push.first_register * 16;
-                    if let Some(offset) = address.checked_sub(start).filter(|&n| n < push.size) {
-                        if let Some(member) = self
-                            .push_constant_members
-                            .iter()
-                            .find(|member| member.contains(&offset))
-                        {
-                            if !push.required_ranges.contains(member) {
-                                push.required_ranges.push(member.clone());
-                                push.required_ranges.sort_by_key(|range| range.start);
-                                push.required_size = push.required_size.max(member.end);
-                            }
-                        } else {
-                            return Err(unsupported("push-constant read outside root members"));
-                        }
-                    }
-                }
+                self.record_constant_read(address)?;
             }
             self.instruction("MOV", dst, &[src])?;
         }
         Ok(result)
+    }
+    fn record_constant_read(&mut self, address: u32) -> Result<()> {
+        for binding in &mut self.uniforms {
+            let start = binding.first_register * 16;
+            if let Some(offset) = address.checked_sub(start).filter(|&n| n < binding.size) {
+                binding.required_size = binding.required_size.max(offset + 4);
+                break;
+            }
+        }
+        if let Some(push) = &mut self.push_constants {
+            let start = push.first_register * 16;
+            if let Some(offset) = address.checked_sub(start).filter(|&n| n < push.size) {
+                if let Some(member) = self
+                    .push_constant_members
+                    .iter()
+                    .find(|member| member.contains(&offset))
+                {
+                    if !push.required_ranges.contains(member) {
+                        push.required_ranges.push(member.clone());
+                        push.required_ranges.sort_by_key(|range| range.start);
+                        push.required_size = push.required_size.max(member.end);
+                    }
+                } else {
+                    return Err(unsupported("push-constant read outside root members"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower register-strided constant arrays to a bounded indirect load.
+    /// Local arrays and packed matrix/vector indexing keep the selection path.
+    fn indexed_constant(&mut self, value: &Value, read: &IndirectAccess) -> Result<Option<Value>> {
+        let Some(first) = read.elements.first() else {
+            return Ok(None);
+        };
+        if read.elements.len() < 2 || first.indirect.is_some() || first.lanes.is_empty() {
+            return Ok(None);
+        }
+        let Some(start) = first.lanes[0].constant_byte else {
+            return Ok(None);
+        };
+        let Some(next) = read.elements[1]
+            .lanes
+            .first()
+            .and_then(|lane| lane.constant_byte)
+        else {
+            return Ok(None);
+        };
+        let Some(stride) = next
+            .checked_sub(start)
+            .filter(|stride| *stride > 0 && stride % 16 == 0)
+        else {
+            return Ok(None);
+        };
+        for (i, element) in read.elements.iter().enumerate() {
+            if element.indirect.is_some() || element.lanes.len() != first.lanes.len() {
+                return Ok(None);
+            }
+            for (source, base) in element.lanes.iter().zip(&first.lanes) {
+                if source.constant_byte.is_none()
+                    || base
+                        .constant_byte
+                        .and_then(|base| base.checked_add(i as u32 * stride))
+                        != source.constant_byte
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        // Preserve descriptor span validation for every potential source lane.
+        for element in &read.elements {
+            for lane in &element.lanes {
+                self.record_constant_read(lane.constant_byte.unwrap())?;
+            }
+        }
+        let result = self.allocate(value.shape.clone(), false)?;
+        let valid = self.allocate(Shape::Scalar(K::Bool), false)?;
+        let offset = self.allocate(Shape::Scalar(K::Uint), false)?;
+        let count = self.immediate(Literal::U32(read.elements.len() as u32))?;
+        let zero = self.immediate(Literal::U32(0))?;
+        self.instruction("USLT", &valid.lanes[0], &[&read.index, &count.lanes[0]])?;
+        // Clamp before addressing so an invalid index cannot read another binding.
+        self.instruction(
+            "UCMP",
+            &offset.lanes[0],
+            &[&valid.lanes[0], &read.index, &zero.lanes[0]],
+        )?;
+        if stride != 16 {
+            let stride = self.immediate(Literal::U32(stride / 16))?;
+            self.instruction(
+                "UMUL",
+                &offset.lanes[0],
+                &[&offset.lanes[0], &stride.lanes[0]],
+            )?;
+        }
+        let declaration = String::from("DCL ADDR[0]");
+        if !self.declarations.contains(&declaration) {
+            self.declarations.push(declaration);
+        }
+        let address = Lane {
+            register: String::from("ADDR[0]"),
+            component: 0,
+            constant_byte: None,
+        };
+        self.instruction("UARL", &address, &[&offset.lanes[0]])?;
+        for (dst, base) in result.lanes.iter().zip(&first.lanes) {
+            let byte = base.constant_byte.unwrap();
+            let source = Lane {
+                register: format!("CONST[ADDR[0].x+{}]", byte / 16),
+                component: (byte % 16 / 4) as usize,
+                constant_byte: None,
+            };
+            self.instruction("MOV", dst, &[&source])?;
+            self.instruction("UCMP", dst, &[&valid.lanes[0], dst, &zero.lanes[0]])?;
+        }
+        Ok(Some(result))
     }
     fn store(&mut self, pointer: &Value, value: &Value) -> Result<()> {
         if self.stage == ShaderStage::Compute
