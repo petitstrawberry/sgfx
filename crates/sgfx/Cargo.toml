@@ -37,12 +37,12 @@ backend-wgpu = [
 scarlet-native-api = ["std", "backend-dynamic"]
 
 [dependencies]
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "77e64a81115d78fab7c63671c2a6c16aac060c05", default-features = false }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "e6886eb6683de0a75108bd7cd19eae729efe36b3", default-features = false }
 
 [target.'cfg(target_pointer_width = "64")'.dependencies]
 sgfx-backend-abi = { path = "../sgfx-backend-abi", optional = true }
 sgfx-backend-loader = { path = "../sgfx-backend-loader", default-features = false, optional = true }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "77e64a81115d78fab7c63671c2a6c16aac060c05", default-features = false, features = ["backend-abi"] }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "e6886eb6683de0a75108bd7cd19eae729efe36b3", default-features = false, features = ["backend-abi"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
 pollster = { version = "0.4", optional = true }
