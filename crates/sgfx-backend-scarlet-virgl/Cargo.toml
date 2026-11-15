@@ -14,9 +14,9 @@ programmable = ["sgfx-codegen-virgl/programmable"]
 profile-submissions = ["std"]
 
 [dependencies]
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", default-features = false, features = ["std"], optional = true }
-scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", optional = true }
-gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "97c99b0b3f2d651865a118500632f17725f7ecde", default-features = false }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "9f2d0043ded86caee4263fa7ea8b8f3ee4f585de", default-features = false, features = ["std"], optional = true }
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "9f2d0043ded86caee4263fa7ea8b8f3ee4f585de", optional = true }
+gpu-raw = { git = "https://github.com/petitstrawberry/Scarlet", rev = "9f2d0043ded86caee4263fa7ea8b8f3ee4f585de", default-features = false }
 sgfx-codegen-virgl = { path = "../sgfx-codegen-virgl" }
 sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "e6886eb6683de0a75108bd7cd19eae729efe36b3", default-features = false }
 
