@@ -13,7 +13,7 @@ profile-submissions = ["sgfx-backend-scarlet-virgl/profile-submissions"]
 
 [target.'cfg(any(target_os = "scarlet", all(target_os = "linux", target_arch = "aarch64")))'.dependencies]
 sgfx-backend-abi = { path = "../sgfx-backend-abi" }
-sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "77e64a81115d78fab7c63671c2a6c16aac060c05", features = ["backend-abi"] }
+sgfx-core = { git = "https://github.com/petitstrawberry/sgfx", rev = "e6886eb6683de0a75108bd7cd19eae729efe36b3", features = ["backend-abi"] }
 sgfx-backend-scarlet-virgl = { path = "../sgfx-backend-scarlet-virgl", features = ["backend-abi"] }
 
 [lints.rust]

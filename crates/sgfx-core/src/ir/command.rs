@@ -671,16 +671,10 @@ impl<'r, 'data> CommandEncoder<'r, 'data> {
         {
             return Err(Error::OutOfBounds);
         }
+        // Keep format policy in one place, including same-format float blits.
         if !src.format().blit_compatible(dst.format())
             || src.array_layer_count() != 1
             || dst.array_layer_count() != 1
-            || !matches!(
-                src.format(),
-                TextureFormat::Rgba8Unorm
-                    | TextureFormat::Bgra8Unorm
-                    | TextureFormat::R8Unorm
-                    | TextureFormat::Rg8Unorm
-            )
         {
             return Err(Error::InvalidDescriptor);
         }
