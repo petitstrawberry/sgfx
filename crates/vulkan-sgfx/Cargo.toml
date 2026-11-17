@@ -34,8 +34,8 @@ ash = { version = "0.38", default-features = false, features = ["loaded"] }
 dlmalloc = { version = "0.2.14", features = ["global"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2", default-features = false, features = ["std"] }
-framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "2ab9b89e9954b6de318d3b6be5b8cf73a94c98b2", default-features = false, features = ["std"], optional = true }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "15331d9a3577bd08228a4464d9e2f3a6e9daa78d", default-features = false, features = ["std"] }
+framebuffer = { git = "https://github.com/petitstrawberry/Scarlet", rev = "15331d9a3577bd08228a4464d9e2f3a6e9daa78d", default-features = false, features = ["std"], optional = true }
 sgfx = { path = "../sgfx", default-features = false, features = ["std", "backend-dynamic"] }
 
 [dev-dependencies]
